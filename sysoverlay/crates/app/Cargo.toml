@@ -7,10 +7,3 @@ license.workspace = true
 [dependencies]
 sysoverlay-core = { path = "../core" }
 sysoverlay-win = { path = "../win" }
-arc-swap = "1.7"
-windows = { version = "0.58", features = [
-  "Win32_System_Threading",
-  "Win32_Foundation",
-  "Win32_Storage_FileSystem",
-  "Win32_System_Diagnostics_Debug",
-] }

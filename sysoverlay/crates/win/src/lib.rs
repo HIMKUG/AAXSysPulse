@@ -28,13 +28,6 @@ pub mod config_io;
 // Re-export core types for convenience
 pub use sysoverlay_core::config::Config;
 pub use sysoverlay_core::snapshot::Snapshot;
-pub use sysoverlay_core::sampler::Sampler;
 
 // Re-export main window type
 pub use window::OverlayWindow;
-
-// Re-export samplers
-pub use proc_cpu::CpuSampler;
-pub use proc_mem::MemSampler;
-pub use proc_gpu::GpuSampler;
-pub use proc_net::NetSampler;

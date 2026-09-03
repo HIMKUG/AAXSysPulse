@@ -335,62 +335,6 @@ impl Config {
         s.push_str(&format!("fg {:06X}\n", self.fg.to_colorref()));
         s
     }
-
-    /// Load configuration from the config file.
-    ///
-    /// Reads from `%APPDATA%\SysOverlayC\config.txt`.
-    /// Returns default config if the file doesn't exist or can't be read.
-    pub fn load() -> Self {
-        let config_path = Self::config_path();
-        if let Ok(text) = std::fs::read_to_string(&config_path) {
-            let mut cfg = Self::parse(&text);
-            // Also try to load window position if stored
-            if let Some((x, y)) = Self::load_position_from_file(&config_path) {
-                cfg.window_pos = Some((x, y));
-            }
-            return cfg;
-        }
-        Self::default()
-    }
-
-    /// Get the config file path.
-    fn config_path() -> std::path::PathBuf {
-        let appdata = std::env::var("APPDATA")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let mut path = appdata;
-        path.push("SysOverlayC");
-        // Create directory if it doesn't exist
-        let _ = std::fs::create_dir_all(&path);
-        path.push("config.txt");
-        path
-    }
-
-    /// Load window position from config file.
-    fn load_position_from_file(path: &std::path::Path) -> Option<(i32, i32)> {
-        let text = std::fs::read_to_string(path).ok()?;
-        for line in text.lines() {
-            let line = line.trim();
-            if line.starts_with("pos ") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 3 {
-                    let x = parts[1].parse::<i32>().ok()?;
-                    let y = parts[2].parse::<i32>().ok()?;
-                    return Some((x, y));
-                }
-            }
-        }
-        None
-    }
-
-    /// Save configuration to the config file.
-    pub fn save(&self) -> std::io::Result<()> {
-        let path = Self::config_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, self.serialize())
-    }
 }
 
 #[cfg(test)]
