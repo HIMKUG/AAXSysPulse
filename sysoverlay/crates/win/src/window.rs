@@ -5,11 +5,12 @@ use crate::Snapshot;
 use std::sync::Mutex;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{GetDC, GetDeviceCaps, ReleaseDC, HORZRES, VERTRES};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW,
-    PostQuitMessage, RegisterClassW, SetWindowPos, TranslateMessage,
+    PostQuitMessage, RegisterClassExW, SetWindowPos, TranslateMessage,
     CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE, GWLP_USERDATA, IDC_ARROW,
-    IMAGE_ICON, LR_SHARED, LoadImageW, MSG, SWP_NOACTIVATE, SWP_NOSIZE,
+    IMAGE_ICON, LR_SHARED, LoadCursorW, MSG, SWP_NOACTIVATE, SWP_NOSIZE,
     SWP_NOZORDER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
@@ -63,11 +64,12 @@ impl OverlayWindow {
             });
         }
 
-        let cursor = unsafe {
-            LoadImageW(None, IDC_ARROW, IMAGE_ICON, 0, 0, LR_SHARED)
-                .map(|i| windows::Win32::UI::WindowsAndMessaging::HCURSOR(i.0))
-                .unwrap_or_default()
-        };
+        let cursor = unsafe { LoadCursorW(None, IDC_ARROW) }
+            .unwrap_or_default();
+
+        let hinst = unsafe { GetModuleHandleW(None) }
+            .map(|h| windows::Win32::Foundation::HINSTANCE(h.0))
+            .unwrap_or_default();
 
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -75,7 +77,7 @@ impl OverlayWindow {
             lpfnWndProc: Some(wndproc),
             cbClsExtra: 0,
             cbWndExtra: 0,
-            hInstance: windows::Win32::Foundation::HINSTANCE::default(),
+            hInstance: hinst,
             hIcon: windows::Win32::UI::WindowsAndMessaging::HICON::default(),
             hCursor: cursor,
             hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH::default(),
@@ -85,9 +87,11 @@ impl OverlayWindow {
         };
 
         unsafe {
-            let class_ptr = &wc as *const WNDCLASSEXW as *const std::ffi::c_void;
-            if RegisterClassW(std::mem::transmute(class_ptr)) == 0 {
-                return Err(WinError::new("Failed to register window class"));
+            if RegisterClassExW(&wc) == 0 {
+                let err = windows::Win32::Foundation::GetLastError();
+                return Err(WinError::new(&format!(
+                    "Failed to register window class (error {})", err.0
+                )));
             }
         }
 
@@ -112,7 +116,7 @@ impl OverlayWindow {
                 card_h,
                 None,
                 None,
-                None,
+                hinst,
                 None,
             )
         };
