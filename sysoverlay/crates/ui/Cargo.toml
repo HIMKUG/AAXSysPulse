@@ -4,4 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# UI rendering implementation (2A agent).
+[dependencies]
+sysoverlay-core = { path = "../core" }
+
+[dev-dependencies]
+png = "0.17"
