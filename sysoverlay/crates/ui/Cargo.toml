@@ -6,6 +6,4 @@ license.workspace = true
 
 [dependencies]
 sysoverlay-core = { path = "../core" }
-
-[dev-dependencies]
 png = "0.17"

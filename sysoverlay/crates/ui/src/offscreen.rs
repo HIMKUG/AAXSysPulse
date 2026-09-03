@@ -58,8 +58,7 @@ impl SoftwareSurface {
 
     /// Converts the surface to a PNG-encoded byte vector.
     ///
-    /// Uses the `png` crate (dev-dependency only).
-    #[cfg(test)]
+    /// Uses the `png` crate.
     pub fn to_png(&self) -> Vec<u8> {
         use png::{Encoder, ColorType};
 
