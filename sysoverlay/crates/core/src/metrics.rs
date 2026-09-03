@@ -12,17 +12,14 @@ use crate::snapshot::Metric;
 /// Returns CPU usage as a percentage (0.0..=100.0) clamped to sane bounds,
 /// or `Metric::Unavailable` if the deltas are all zero (avoid division by zero).
 pub fn cpu_usage(idle_delta: u64, kernel_delta: u64, user_delta: u64) -> Metric<f32> {
-    let total_delta = kernel_delta.saturating_add(user_delta);
-    if total_delta == 0 {
+    let total_time = idle_delta.saturating_add(kernel_delta).saturating_add(user_delta);
+    if total_time == 0 {
         return Metric::Unavailable;
     }
 
-    // Avoid division by zero; total_delta > 0 here.
-    let usage = 1.0 - (idle_delta as f64 / total_delta as f64);
-    let usage = usage * 100.0;
-
-    // Sanity clamp: sometimes the OS returns deltas that produce values
-    // slightly outside the valid range due to timing race conditions.
+    let busy_time = kernel_delta.saturating_add(user_delta);
+    // CPU usage = fraction of total time that was busy (not idle)
+    let usage = (busy_time as f64) / (total_time as f64) * 100.0;
     let usage = usage.clamp(0.0, 100.0) as f32;
     Metric::Value(usage)
 }
@@ -116,23 +113,23 @@ mod tests {
 
     #[test]
     fn test_cpu_usage_normal() {
-        // 50% usage: idle=50, kernel+user=50
+        // 50% usage: 50 units idle out of 100 total (kernel+user=50)
         let m = cpu_usage(50, 25, 25);
         assert_eq!(m, Metric::Value(50.0));
 
-        // 100% usage: no idle time
+        // 100% usage: no idle time (idle=0, kernel+user=100)
         let m = cpu_usage(0, 50, 50);
         assert_eq!(m, Metric::Value(100.0));
 
-        // 0% usage: all idle
+        // 0% usage: all idle (idle=100, kernel=0, user=0)
         let m = cpu_usage(100, 0, 0);
         assert_eq!(m, Metric::Value(0.0));
     }
 
     #[test]
     fn test_cpu_usage_clamp() {
-        // Deltas that produce slightly out-of-range values due to timing.
-        let m = cpu_usage(0, 100, 0); // idle=0, total=100 -> 100%
+        // Edge case: very small busy time
+        let m = cpu_usage(0, 1, 0);
         assert_eq!(m, Metric::Value(100.0));
     }
 

@@ -122,8 +122,10 @@ impl Zoom {
 impl FromStr for Zoom {
     type Err = ();
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let v = s.parse::<u32>().map_err(|_| ())?;
-        Ok(Zoom::from_int(v))
+        match s.parse::<u32>() {
+            Ok(v) => Ok(Zoom::from_int(v)),
+            Err(_) => Ok(Zoom::Zoom100), // Fallback for invalid input
+        }
     }
 }
 
@@ -241,6 +243,15 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Parse a boolean from string - accepts "1", "0", "true", "false"
+    fn parse_bool(s: &str) -> bool {
+        match s.trim().to_lowercase().as_str() {
+            "1" | "true" => true,
+            "0" | "false" => false,
+            _ => false,
+        }
+    }
+
     pub fn parse(text: &str) -> Self {
         let mut cfg = Config::default();
 
@@ -256,9 +267,7 @@ impl Config {
 
                 match key.as_str() {
                     "minimal" => {
-                        if let Ok(v) = value.parse::<bool>() {
-                            cfg.minimal = v;
-                        }
+                        cfg.minimal = Self::parse_bool(value);
                     }
                     "zoom" => {
                         if let Ok(z) = value.parse::<Zoom>() {
@@ -266,9 +275,7 @@ impl Config {
                         }
                     }
                     "hover" => {
-                        if let Ok(v) = value.parse::<bool>() {
-                            cfg.hover = v;
-                        }
+                        cfg.hover = Self::parse_bool(value);
                     }
                     "netunit" => {
                         cfg.net_unit = NetUnit::from_str(value);
@@ -300,9 +307,7 @@ impl Config {
                         }
                     }
                     "topmost" => {
-                        if let Ok(v) = value.parse::<bool>() {
-                            cfg.topmost = v;
-                        }
+                        cfg.topmost = Self::parse_bool(value);
                     }
                     _ => {}
                 }
