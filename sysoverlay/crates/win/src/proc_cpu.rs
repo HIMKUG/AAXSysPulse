@@ -1,22 +1,33 @@
-//! CPU sampler placeholder.
+//! CPU sampler using GetSystemTimes API.
 //!
-//! This is a placeholder implementation that returns fixed test values.
-//! The real CPU sampler using PDH will be implemented in a later phase.
+//! Collects CPU utilization by measuring idle, kernel, and user time deltas.
 
+use windows::Win32::Foundation::FILETIME;
+use windows::Win32::System::Threading::GetSystemTimes;
 use sysoverlay_core::metrics::cpu_usage;
 use sysoverlay_core::sampler::{SampleOutcome, Sampler};
 use sysoverlay_core::snapshot::{Metric, Snapshot};
 
-/// A placeholder CPU sampler that returns fixed values for testing.
+/// CPU sampler using GetSystemTimes API.
 pub struct CpuSampler {
-    /// Simulated CPU usage (0.0..=100.0)
-    cpu: f32,
+    /// Previous times for delta calculation: (idle, kernel, user) in 100ns units
+    prev: Option<(u64, u64, u64)>,
+    /// Current CPU usage to return
+    cpu: Metric<f32>,
 }
 
 impl CpuSampler {
-    /// Create a new CPU sampler with default test values.
+    /// Create a new CPU sampler.
     pub fn new() -> Self {
-        Self { cpu: 50.0 }
+        Self {
+            prev: None,
+            cpu: Metric::Unavailable,
+        }
+    }
+
+    /// Returns the current CPU usage metric.
+    pub fn get_cpu(&self) -> Metric<f32> {
+        self.cpu
     }
 }
 
@@ -28,27 +39,33 @@ impl Default for CpuSampler {
 
 impl Sampler for CpuSampler {
     fn name(&self) -> &'static str {
-        "cpu"
+        "CPU"
     }
 
     fn sample(&mut self, _prev: Option<&Snapshot>, _now_ms: u64) -> SampleOutcome {
-        // Placeholder: return fixed 50% CPU usage
-        // Real implementation will use GetSystemTimes + PDH
-        self.cpu = if self.cpu > 80.0 {
-            30.0
-        } else if self.cpu < 30.0 {
-            70.0
-        } else {
-            self.cpu + 5.0
-        };
+        unsafe {
+            let mut idle = FILETIME::default();
+            let mut kernel = FILETIME::default();
+            let mut user = FILETIME::default();
 
-        SampleOutcome::Ok
+            if !GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)).is_ok() {
+                return SampleOutcome::Transient("GetSystemTimes failed");
+            }
+
+            let idle_t = (idle.dwLowDateTime as u64) | ((idle.dwHighDateTime as u64) << 32);
+            let kernel_t = (kernel.dwLowDateTime as u64) | ((kernel.dwHighDateTime as u64) << 32);
+            let user_t = (user.dwLowDateTime as u64) | ((user.dwHighDateTime as u64) << 32);
+
+            if let Some((prev_idle, prev_kernel, prev_user)) = self.prev {
+                let idle_delta = idle_t.saturating_sub(prev_idle);
+                let kernel_delta = kernel_t.saturating_sub(prev_kernel);
+                let user_delta = user_t.saturating_sub(prev_user);
+
+                self.cpu = cpu_usage(idle_delta, kernel_delta, user_delta);
+            }
+
+            self.prev = Some((idle_t, kernel_t, user_t));
+            SampleOutcome::Ok
+        }
     }
-}
-
-/// Collect CPU metrics directly (for simple use cases).
-///
-/// Returns a dummy CPU metric for testing purposes.
-pub fn collect_cpu() -> Metric<f32> {
-    Metric::Value(50.0)
 }
