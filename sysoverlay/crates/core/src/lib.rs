@@ -9,6 +9,9 @@ pub mod sampler;
 pub mod metrics;
 pub mod layout;
 
+// Re-export Sampler trait for convenience
+pub use sampler::Sampler;
+
 // Placeholder modules (implemented in 1B phase).
 pub mod config;
 pub mod color;
