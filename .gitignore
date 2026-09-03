@@ -1,0 +1,22 @@
+# Build artifacts
+*.exe
+*.pdb
+*.obj
+*.o
+*.a
+*.lib
+
+# Image files
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.ico
+
+# Configuration and cache
+.AppData/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
