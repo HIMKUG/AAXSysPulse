@@ -67,7 +67,7 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
         // 全局 alpha：透明度百分比 × 悬停系数。
         // hover 模式：鼠标不在窗口上时近乎透明（C 版语义），
         // 点亮/变暗都是改 BLENDFUNCTION，不重画像素 —— 更快的路。
-        let hovered = crate::window::is_hovered(hwnd);
+        let hovered = crate::window::is_window_hovered(hwnd);
         let mut alpha_pct = cfg.opacity.clamp(1, 100) as u32;
         if cfg.hover && !hovered {
             alpha_pct = (alpha_pct * 15 / 100).max(3); // 平时近乎透明

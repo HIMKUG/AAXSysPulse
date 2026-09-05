@@ -8,7 +8,7 @@ use crate::Snapshot;
 use arc_swap::ArcSwap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT};
+use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, GetDC, GetDeviceCaps, GetMonitorInfoW, InvalidateRect,
     MonitorFromWindow, ReleaseDC, ValidateRect, HORZRES, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -17,7 +17,8 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, DestroyWindow,
-    IsWindowVisible, PostQuitMessage, RegisterClassExW, SetWindowPos, ShowWindow,
+    IsWindowVisible, PostQuitMessage, RegisterClassExW, SetLayeredWindowAttributes,
+     SetWindowPos, ShowWindow,
     TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW,
     LoadCursorW, MSG, SWP_NOACTIVATE, SWP_NOZORDER,
      SW_HIDE, SW_SHOW, WM_MOUSEACTIVATE,
@@ -186,7 +187,6 @@ pub const WM_NEW_SNAPSHOT: u32 = 0x8000 + 3;
 
 const HTCAPTION_VAL: isize = 2;
 const HTCLIENT_VAL: isize = 1;
-const HTTRANSPARENT_VAL: isize = 20;
 
 /// Retrieves ThreadState pointer from GWLP_USERDATA.
 ///
@@ -209,13 +209,26 @@ fn track_mouse_leave(hwnd: HWND) {
     let _ = unsafe { TrackMouseEvent(&mut tme) };
 }
 
+/// 用 alpha 控制穿透：alpha=255 完全不透明，alpha=0 完全透明（鼠标事件透传）。
+/// 不操作窗口样式，避免 SWP_FRAMECHANGED 触发额外合成。
+fn set_window_alpha(hwnd: HWND, alpha: u8) {
+    unsafe {
+        let _ = SetLayeredWindowAttributes(
+            hwnd,
+            COLORREF(0),
+            alpha,
+            windows::Win32::UI::WindowsAndMessaging::LWA_ALPHA,
+        );
+    }
+}
+
 /// 鼠标是否在窗口内（hover 渲染由 gdi::render 读取）。
-pub fn is_hovered(hwnd: HWND) -> bool {
-    let p = unsafe { get_state_ptr(hwnd) };
-    if p.is_null() {
+pub fn is_window_hovered(hwnd: HWND) -> bool {
+    let p = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA.0 as i32) };
+    if p == 0 {
         false
     } else {
-        unsafe { (*p).hovered }
+        unsafe { (*(p as *mut ThreadState)).hovered }
     }
 }
 
@@ -234,36 +247,16 @@ unsafe extern "system" fn wndproc(
 
         // 边框命中交给 DefWindowProc（WS_THICKFRAME 的 HTLEFT/HTRIGHT 等），
         // 只有客户区内部才当成标题栏（可拖动）。
-        // ── 命中测试：控制穿透与可拖拽的入口 ──────────────────────────────
-        //
-        // 旧的实现始终返回 HTCAPTION（覆盖了 DefWindowProc 默认行为），
-        // 导致 WS_EX_TRANSPARENT 样式从第一天起就完全失效。
-        //
-        // 新的实现：WM_NCHITTEST 本身就能传递"鼠标是否在我上方"的信息——
-        // 收到此消息即说明鼠标当前在窗口上。不依赖样式切换，零额外合成。
-        //
-        // 死锁破局：返回 HTTRANSPARENT 后确实收不到 WM_LBUTTONDOWN，
-        // 但 WM_NCHITTEST 本身随鼠标移动持续送达；第一次命中就已经把
-        // hover=true 写进去，所以下一次 WM_LBUTTONDOWN 必然能收到。
+        // 命中测试：拖拽必须用 HTCAPTION（HTTRANSPARENT 会导致死锁——返回后
+        // 窗口永远收不到 WM_LBUTTONDOWN，拖拽无法开始）。
+        // 穿透改用 SetLayeredWindowAttributes(alpha) 控制，与命中测试完全解耦。
         WM_NCHITTEST => {
-            let hit = unsafe { DefWindowProcW(hwnd, msg, _wparam, lparam) }.0;
-
-            if hit != HTCLIENT_VAL {
-                return LRESULT(hit);
+            let ht = unsafe { DefWindowProcW(hwnd, msg, _wparam, lparam) }.0;
+            if ht == HTCLIENT_VAL {
+                LRESULT(HTCAPTION_VAL)
+            } else {
+                LRESULT(ht)
             }
-
-            if let Some(state) = get_state_ptr(hwnd).as_mut() {
-                state.hovered = true;
-                track_mouse_leave(hwnd);
-
-                if state.dragging {
-                    return LRESULT(HTCAPTION_VAL);
-                }
-
-                return LRESULT(HTTRANSPARENT_VAL);
-            }
-
-            LRESULT(hit)
         }
 
         WM_LBUTTONDOWN => {
@@ -281,8 +274,20 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
 
+        // WM_MOUSEMOVE 到达即说明鼠标在窗口客户区内（Windows 只向鼠标所在窗口投递）。
+        // 非拖拽期间：标记 hover、登记离开事件、恢复 alpha。
         WM_MOUSEMOVE => {
             if let Some(state) = get_state_ptr(hwnd).as_mut() {
+                if !state.hovered {
+                    state.hovered = true;
+                    track_mouse_leave(hwnd);
+                    set_window_alpha(hwnd, 255);
+                    if state.cfg.hover {
+                        let snap = snap_get();
+                        crate::gdi::render(hwnd, &snap, &state.cfg);
+                    }
+                }
+
                 if state.dragging {
                     let cur = POINT {
                         x: (lparam.0 & 0xFFFF) as i16 as i32,
@@ -310,11 +315,13 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
 
-        // WM_MOUSELEAVE 只在鼠标真正离开（非 SetCapture 期间）才触发
+        // WM_MOUSELEAVE 只在鼠标真正离开（非 SetCapture 期间）才触发。
+        // 离开后恢复透明度（alpha→hover 透明度），让鼠标事件可透传给下层游戏。
         WM_MOUSELEAVE => {
             if let Some(state) = get_state_ptr(hwnd).as_mut() {
                 if !state.dragging {
                     state.hovered = false;
+                    set_window_alpha(hwnd, state.cfg.opacity.clamp(1, 100) as u8);
                 }
             }
             LRESULT(0)
@@ -323,7 +330,6 @@ unsafe extern "system" fn wndproc(
         WM_LBUTTONUP => {
             if let Some(state) = get_state_ptr(hwnd).as_mut() {
                 state.dragging = false;
-                // Persist position if the user moved the window
                 if state.pos_dirty {
                     let mut rect = RECT::default();
                     if GetWindowRect(hwnd, &mut rect).as_bool() {
@@ -331,7 +337,6 @@ unsafe extern "system" fn wndproc(
                     }
                     state.pos_dirty = false;
                 }
-                // Persist size if the user resized the window
                 if state.size_dirty {
                     let mut rect = RECT::default();
                     if GetWindowRect(hwnd, &mut rect).as_bool() {
