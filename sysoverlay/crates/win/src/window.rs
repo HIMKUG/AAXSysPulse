@@ -8,7 +8,7 @@ use crate::Snapshot;
 use arc_swap::ArcSwap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, GetDC, GetDeviceCaps, GetMonitorInfoW, InvalidateRect,
     MonitorFromWindow, ReleaseDC, ValidateRect, HORZRES, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -17,8 +17,8 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, DestroyWindow,
-    IsWindowVisible, PostQuitMessage, RegisterClassExW, SetLayeredWindowAttributes,
-     SetWindowPos, ShowWindow,
+    IsWindowVisible, PostQuitMessage, RegisterClassExW,
+    SetWindowPos, ShowWindow,
     TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW,
     LoadCursorW, MSG, SWP_NOACTIVATE, SWP_NOZORDER,
      SW_HIDE, SW_SHOW, WM_MOUSEACTIVATE,
@@ -209,19 +209,6 @@ fn track_mouse_leave(hwnd: HWND) {
     let _ = unsafe { TrackMouseEvent(&mut tme) };
 }
 
-/// 用 alpha 控制穿透：alpha=255 完全不透明，alpha=0 完全透明（鼠标事件透传）。
-/// 不操作窗口样式，避免 SWP_FRAMECHANGED 触发额外合成。
-fn set_window_alpha(hwnd: HWND, alpha: u8) {
-    unsafe {
-        let _ = SetLayeredWindowAttributes(
-            hwnd,
-            COLORREF(0),
-            alpha,
-            windows::Win32::UI::WindowsAndMessaging::LWA_ALPHA,
-        );
-    }
-}
-
 /// 鼠标是否在窗口内（hover 渲染由 gdi::render 读取）。
 pub fn is_window_hovered(hwnd: HWND) -> bool {
     let p = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA.0 as i32) };
@@ -275,18 +262,16 @@ unsafe extern "system" fn wndproc(
         }
 
         // WM_MOUSEMOVE 到达即说明鼠标在窗口客户区内（Windows 只向鼠标所在窗口投递）。
-        // 非拖拽期间：标记 hover（即使已经是 true，确保渲染逻辑执行）、
-        // 登记离开事件、恢复 alpha。
+        // 标记 hover 并通过 render 重算 src_alpha（悬停 → 恢复不透明）。
         WM_MOUSEMOVE => {
             if let Some(state) = get_state_ptr(hwnd).as_mut() {
                 if !state.hovered {
                     state.hovered = true;
-                }
-                if state.cfg.hover {
-                    track_mouse_leave(hwnd);
-                    set_window_alpha(hwnd, 255);
-                    let snap = snap_get();
-                    crate::gdi::render(hwnd, &snap, &state.cfg);
+                    if state.cfg.hover {
+                        track_mouse_leave(hwnd);
+                        let snap = snap_get();
+                        crate::gdi::render(hwnd, &snap, &state.cfg);
+                    }
                 }
 
                 if state.dragging {
@@ -317,12 +302,15 @@ unsafe extern "system" fn wndproc(
         }
 
         // WM_MOUSELEAVE 只在鼠标真正离开（非 SetCapture 期间）才触发。
-        // 离开后恢复透明度（alpha→hover 透明度），让鼠标事件可透传给下层游戏。
+        // 离开后标记非 hover，并通过 render 重算 src_alpha（恢复近乎透明）。
         WM_MOUSELEAVE => {
             if let Some(state) = get_state_ptr(hwnd).as_mut() {
                 if !state.dragging {
                     state.hovered = false;
-                    set_window_alpha(hwnd, state.cfg.opacity.clamp(1, 100) as u8);
+                    if state.cfg.hover {
+                        let snap = snap_get();
+                        crate::gdi::render(hwnd, &snap, &state.cfg);
+                    }
                 }
             }
             LRESULT(0)
@@ -347,6 +335,13 @@ unsafe extern "system" fn wndproc(
                 }
             }
             let _ = ReleaseCapture();
+            // SetCapture 期间 WM_MOUSELEAVE 不触发；释放后重新登记，
+            // 让系统立即评估鼠标是否还在窗口上（若不在会立刻补发 WM_MOUSELEAVE）。
+            if let Some(state) = get_state_ptr(hwnd).as_mut() {
+                if state.cfg.hover {
+                    track_mouse_leave(hwnd);
+                }
+            }
             LRESULT(0)
         }
 
@@ -365,6 +360,10 @@ unsafe extern "system" fn wndproc(
                 let was_dragging = state.dragging;
                 state.dragging = false;
                 if was_dragging {
+                    // 拖动结束后同样重新登记，避免 hovered 卡在旧状态
+                    if state.cfg.hover {
+                        track_mouse_leave(hwnd);
+                    }
                     let snap = snap_get();
                     crate::gdi::render(hwnd, &snap, &state.cfg);
                 }
