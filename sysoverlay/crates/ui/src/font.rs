@@ -209,6 +209,16 @@ const REPLACEMENT_CHAR: [u8; 16] = [
     0x7E,0x81,0x81,0x81,0x81,0x81,0x81,0x7E,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
 ];
 
+/// 自定义字形（位图字体只覆盖 ASCII，这里补充网速箭头）。
+/// ↑ U+2191（上行）：
+const GLYPH_UP: [u8; 16] = [
+    0x18,0x3C,0x7E,0xFF,0x18,0x18,0x18,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+];
+/// ↓ U+2193（下行）：
+const GLYPH_DOWN: [u8; 16] = [
+    0x00,0x18,0x18,0x18,0x18,0xFF,0x7E,0x3C,0x18,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+];
+
 /// Width of the bitmap font in pixels.
 pub const FONT_WIDTH: i32 = 8;
 
@@ -223,80 +233,360 @@ pub const FONT_SPACING: i32 = 1;
 /// Returns the bitmap bytes (16 bytes) for ASCII characters.
 /// Returns the replacement character bitmap for non-ASCII.
 pub fn get_char_bitmap(c: char) -> &'static [u8; 16] {
-    if c as u32 >= 0x20 && c as u32 <= 0x7E {
-        &FONT_BITMAP[(c as usize) - 0x20]
-    } else {
-        &REPLACEMENT_CHAR
+    match c {
+        '\u{2191}' => &GLYPH_UP,   // ↑
+        '\u{2193}' => &GLYPH_DOWN, // ↓
+        _ if (c as u32) >= 0x20 && (c as u32) <= 0x7E => &FONT_BITMAP[(c as usize) - 0x20],
+        _ => &REPLACEMENT_CHAR,
     }
 }
 
-/// Renders a character to a pixel buffer using pre-multiplied alpha compositing.
+/// Renders a character into a BGRA (pre-multiplied) pixel buffer.
+///
+/// # 为什么不再 `unsafe`
+///
+/// 旧签名是 `unsafe fn render_char(buf: *mut u8, buf_stride: i32, ...)`，
+/// 把边界检查的责任推给调用方 —— 但 `ui` crate 的硬约束是**零 `unsafe`**
+/// （`unsafe` 只允许出现在 `win` 平台层）。
+/// 改成吃 `&mut [u8]` + 表面尺寸后，越界由切片自身保证，
+/// 调用方（`SoftwareSurface`）也跟着变成全安全代码。
+///
+/// # 顺带修掉的一个 bug
+///
+/// 旧版有一行 `let dst_a = *pixel_ptr;` 并注释 "alpha at offset 3" ——
+/// 实际读到的是 offset 0（B 通道）。幸而该变量未被使用，
+/// 这里直接改为正确的 over 合成：`out = src + dst * (1 - src_a)`。
 ///
 /// # Arguments
 ///
-/// * `buf` - Output buffer in BGRA format (pre-multiplied alpha).
-/// * `buf_stride` - Number of bytes per row in the buffer.
-/// * `c` - Character to render.
-/// * `x` - Left position in pixels.
-/// * `y` - Top position in pixels.
-/// * `fg_color` - Foreground color (RGBA, pre-multiplied).
-///
-/// # Safety
-///
-/// Caller must ensure the buffer is large enough to hold the character at (x, y).
-pub unsafe fn render_char(
-    buf: *mut u8,
-    buf_stride: i32,
+/// * `pixels` - 目标 BGRA 预乘缓冲。
+/// * `surface_w` / `surface_h` - 目标表面尺寸（像素）。
+/// * `c` - 要绘制的字符（非 ASCII 走替代字形 ■）。
+/// * `x` / `y` - 左上角位置；越界部分自动裁剪（不 panic）。
+/// * `fg_color` - 前景色（预乘 alpha）。
+pub fn render_char(
+    pixels: &mut [u8],
+    surface_w: i32,
+    surface_h: i32,
     c: char,
     x: i32,
     y: i32,
     fg_color: crate::render::Rgba,
 ) {
-    let bitmap = get_char_bitmap(c);
-    let alpha = fg_color.alpha_float();
+    if surface_w <= 0 || surface_h <= 0 || fg_color.a == 0 {
+        return;
+    }
 
-    for row in 0..16i32 {
-        let row_offset = y + row;
-        if row_offset < 0 {
+    let bitmap = get_char_bitmap(c);
+    let factor = 1.0 - fg_color.alpha_float();
+
+    for row in 0..FONT_HEIGHT {
+        let py = y + row;
+        if py < 0 || py >= surface_h {
             continue;
         }
-        let row_bytes = bitmap[row as usize];
-        for col in 0..8i32 {
-            let bit = 7 - col; // Bitmap is left-to-right
-            if row_bytes & (1 << bit) != 0 {
-                let px = x + col;
-                if px < 0 {
-                    continue;
-                }
-                // BGRA format
-                let pixel_ptr = buf.add((row_offset * buf_stride + px * 4) as usize);
-                // Simple over operation with pre-multiplied alpha
-                let src_a = (255.0 * alpha) as u8;
-                let dst_a = *pixel_ptr; // alpha at offset 3
+        let bits = bitmap[row as usize];
+        if bits == 0 {
+            continue;
+        }
 
-                // Alpha compositing: out = src + dst * (1 - src_a/255)
-                // For pre-multiplied: out = src + dst * (1 - src_a/255)
-                let src_r = fg_color.r as f32;
-                let src_g = fg_color.g as f32;
-                let src_b = fg_color.b as f32;
-                let dst_r = *pixel_ptr.add(2) as f32; // B at offset 0, actually this is wrong...
-                let dst_g = *pixel_ptr.add(1) as f32;
-                let dst_b = *pixel_ptr.add(0) as f32;
+        for col in 0..FONT_WIDTH {
+            if bits & (1 << (7 - col)) == 0 {
+                continue;
+            }
+            let px = x + col;
+            if px < 0 || px >= surface_w {
+                continue;
+            }
 
-                let factor = 1.0 - (src_a as f32 / 255.0);
-                let out_r = src_r + dst_r * factor;
-                let out_g = src_g + dst_g * factor;
-                let out_b = src_b + dst_b * factor;
+            let idx = ((py * surface_w + px) * 4) as usize;
+            if idx + 3 >= pixels.len() {
+                continue;
+            }
 
-                // We only write if the source is visible
-                if src_a > 0 {
-                    *pixel_ptr = out_b as u8;      // B
-                    *pixel_ptr.add(1) = out_g as u8; // G
-                    *pixel_ptr.add(2) = out_r as u8; // R
-                    // Approximate: just set our alpha
-                    *pixel_ptr.add(3) = src_a.max(*pixel_ptr.add(3));
+            let dst_b = pixels[idx] as f32;
+            let dst_g = pixels[idx + 1] as f32;
+            let dst_r = pixels[idx + 2] as f32;
+            let dst_a = pixels[idx + 3] as f32;
+
+            // 预乘 alpha 的 over 合成：out = src + dst * (1 - src_a)
+            let out_r = fg_color.r as f32 + dst_r * factor;
+            let out_g = fg_color.g as f32 + dst_g * factor;
+            let out_b = fg_color.b as f32 + dst_b * factor;
+            let out_a = (fg_color.a as f32 + dst_a * factor).min(255.0);
+
+            pixels[idx] = out_b as u8;     // B
+            pixels[idx + 1] = out_g as u8; // G
+            pixels[idx + 2] = out_r as u8; // R
+            pixels[idx + 3] = out_a as u8; // A
+        }
+    }
+}
+
+/// 位图字体的字符串宽度（像素）。
+///
+/// 与 [`render_char`] 的排布保持一致：`n * (W + SPACING) - SPACING`。
+pub fn measure(s: &str) -> i32 {
+    let n = s.chars().count() as i32;
+    (n * (FONT_WIDTH + FONT_SPACING) - FONT_SPACING).max(0)
+}
+
+/// 整数倍缩放下的字符串宽度（像素）。
+///
+/// 每个字形像素放大为 `scale × scale` 块，字距同步放大：
+/// `(n * (W + SPACING) - SPACING) * scale`。
+/// 横向条的对齐稳定性依赖本函数：槽位宽 = 模板串宽 × scale，
+/// 与实际内容无关，数值位数变化不会位移后续元素。
+pub fn measure_scaled(s: &str, scale: u32) -> i32 {
+    measure(s) * scale.max(1) as i32
+}
+
+/// 渲染一个字符到 BGRA 预乘缓冲，字形像素放大为 `scale × scale` 实心块。
+///
+/// 逻辑与 [`render_char`] 一致（预乘 over 合成），仅增加了块复制。
+/// 越界部分自动裁剪，不 panic。
+pub fn render_char_scaled(
+    pixels: &mut [u8],
+    surface_w: i32,
+    surface_h: i32,
+    c: char,
+    x: i32,
+    y: i32,
+    scale: u32,
+    fg_color: crate::render::Rgba,
+) {
+    if surface_w <= 0 || surface_h <= 0 || fg_color.a == 0 {
+        return;
+    }
+    // P3 快路径：**不透明**前景（正文/阴影/描边用的都是不透明色）时，
+    // over 合成退化为「直接写 4 字节」——省掉读-改-写和全部 f32 运算。
+    // 语义与慢路径严格等价（src_a=1 → out = src，out_a = 255），见单测。
+    if fg_color.a == 255 {
+        render_char_scaled_opaque(
+            pixels,
+            surface_w,
+            surface_h,
+            c,
+            x,
+            y,
+            scale.max(1) as i32,
+            fg_color,
+        );
+    } else {
+        render_char_scaled_blend(pixels, surface_w, surface_h, c, x, y, scale, fg_color);
+    }
+}
+
+/// 不透明快路径：直接写 BGRA，裁剪在块级别外提（不再逐像素判越界）。
+fn render_char_scaled_opaque(
+    pixels: &mut [u8],
+    surface_w: i32,
+    surface_h: i32,
+    c: char,
+    x: i32,
+    y: i32,
+    scale: i32,
+    fg_color: crate::render::Rgba,
+) {
+    let bitmap = get_char_bitmap(c);
+    let (b, g, r) = (fg_color.b, fg_color.g, fg_color.r);
+
+    for row in 0..FONT_HEIGHT {
+        let bits = bitmap[row as usize];
+        if bits == 0 {
+            continue;
+        }
+        let py0 = y + row * scale;
+        if py0 + scale <= 0 || py0 >= surface_h {
+            continue; // 整块在画布外
+        }
+        let dy0 = if py0 < 0 { -py0 } else { 0 };
+        let dy1 = (surface_h - py0).min(scale);
+
+        for col in 0..FONT_WIDTH {
+            if bits & (1 << (7 - col)) == 0 {
+                continue;
+            }
+            let px0 = x + col * scale;
+            if px0 + scale <= 0 || px0 >= surface_w {
+                continue;
+            }
+            let dx0 = if px0 < 0 { -px0 } else { 0 };
+            let dx1 = (surface_w - px0).min(scale);
+
+            for dy in dy0..dy1 {
+                let row_off = ((py0 + dy) * surface_w) as usize * 4;
+                for dx in dx0..dx1 {
+                    let idx = row_off + ((px0 + dx) as usize) * 4;
+                    if idx + 3 >= pixels.len() {
+                        continue;
+                    }
+                    pixels[idx] = b;
+                    pixels[idx + 1] = g;
+                    pixels[idx + 2] = r;
+                    pixels[idx + 3] = 255;
                 }
             }
         }
+    }
+}
+
+/// 半透明路径：保留原始 over 合成（预乘 alpha），逐像素混合。
+///
+/// 我们的 UI 目前不用半透明字，但它是快路径的**语义基准**，
+/// 单测逐像素比对两条路径，防止快路径日后被改歪。
+fn render_char_scaled_blend(
+    pixels: &mut [u8],
+    surface_w: i32,
+    surface_h: i32,
+    c: char,
+    x: i32,
+    y: i32,
+    scale: u32,
+    fg_color: crate::render::Rgba,
+) {
+    let scale = scale.max(1) as i32;
+    if surface_w <= 0 || surface_h <= 0 || fg_color.a == 0 {
+        return;
+    }
+
+    let bitmap = get_char_bitmap(c);
+    let factor = 1.0 - fg_color.alpha_float();
+
+    for row in 0..FONT_HEIGHT {
+        let py0 = y + row * scale;
+        let bits = bitmap[row as usize];
+        if bits == 0 {
+            continue;
+        }
+        for col in 0..FONT_WIDTH {
+            if bits & (1 << (7 - col)) == 0 {
+                continue;
+            }
+            let px0 = x + col * scale;
+            // scale × scale 实心块
+            for dy in 0..scale {
+                let py = py0 + dy;
+                if py < 0 || py >= surface_h {
+                    continue;
+                }
+                for dx in 0..scale {
+                    let px = px0 + dx;
+                    if px < 0 || px >= surface_w {
+                        continue;
+                    }
+                    let idx = ((py * surface_w + px) * 4) as usize;
+                    if idx + 3 >= pixels.len() {
+                        continue;
+                    }
+                    let dst_r = pixels[idx + 2] as f32;
+                    let dst_g = pixels[idx + 1] as f32;
+                    let dst_b = pixels[idx] as f32;
+                    let dst_a = pixels[idx + 3] as f32;
+                    let out_r = fg_color.r as f32 + dst_r * factor;
+                    let out_g = fg_color.g as f32 + dst_g * factor;
+                    let out_b = fg_color.b as f32 + dst_b * factor;
+                    let out_a = (fg_color.a as f32 + dst_a * factor).min(255.0);
+                    pixels[idx] = out_b as u8;
+                    pixels[idx + 1] = out_g as u8;
+                    pixels[idx + 2] = out_r as u8;
+                    pixels[idx + 3] = out_a as u8;
+                }
+            }
+        }
+    }
+}
+
+/// 按缩放渲染一整串字符（字符间距同步放大）。
+pub fn render_str_scaled(
+    pixels: &mut [u8],
+    surface_w: i32,
+    surface_h: i32,
+    s: &str,
+    x: i32,
+    y: i32,
+    scale: u32,
+    fg_color: crate::render::Rgba,
+) {
+    let mut cursor = x;
+    let step = (FONT_WIDTH + FONT_SPACING) * scale.max(1) as i32;
+    for c in s.chars() {
+        render_char_scaled(pixels, surface_w, surface_h, c, cursor, y, scale, fg_color);
+        cursor += step;
+    }
+}
+
+#[cfg(test)]
+mod perf_path_tests {
+    use super::*;
+    use crate::render::Rgba;
+
+    const W: i32 = 64;
+    const H: i32 = 24;
+
+    fn render_with(pixels: &mut [u8], c: char, scale: u32, color: Rgba, x: i32, y: i32) {
+        render_char_scaled(pixels, W, H, c, x, y, scale, color);
+    }
+
+    /// 快路径（不透明直写）必须与 over 合成慢路径**逐像素一致**。
+    ///
+    /// 这条测试是 P3 优化的护栏：若哪天快路径被改歪（忘了预乘、
+    /// 写错通道顺序、裁剪边界差一像素），这里会立刻红。
+    #[test]
+    fn opaque_fast_path_matches_blend_path() {
+        let cases: [(char, u32, i32, i32); 12] = [
+            ('A', 1, 0, 0),
+            ('A', 2, 3, 2),
+            ('g', 3, 5, 1),
+            ('%', 4, 1, 0),
+            ('0', 2, 7, 3),
+            (' ', 2, 0, 0),
+            ('\u{2191}', 3, 2, 2),
+            ('\u{2193}', 4, 0, 1),
+            // 越界：左/上越界、右/下越界、完全越界
+            ('W', 3, -12, -6),
+            ('W', 3, 50, 18),
+            ('M', 4, -20, -20),
+            ('M', 2, 70, 30),
+        ];
+
+        for (c, scale, x, y) in cases {
+            let color = Rgba::opaque(200, 100, 50);
+            let mut fast = vec![0u8; (W * H * 4) as usize];
+            let mut slow = vec![0u8; (W * H * 4) as usize];
+
+            render_with(&mut fast, c, scale, color, x, y);
+            // 慢路径绕过 a==255 的快分支，直接调合成实现
+            render_char_scaled_blend(&mut slow, W, H, c, x, y, scale, color);
+
+            assert_eq!(
+                fast, slow,
+                "快/慢路径不一致: char={:?} scale={} at({},{})",
+                c, scale, x, y
+            );
+        }
+    }
+
+    /// 快路径必须真的画出了东西（防止写成空实现而测试仍“通过”）。
+    #[test]
+    fn opaque_fast_path_actually_draws() {
+        let mut px = vec![0u8; (W * H * 4) as usize];
+        render_with(&mut px, 'A', 2, Rgba::opaque(10, 20, 30), 2, 2);
+        let non_zero = px.iter().filter(|&&v| v != 0).count();
+        assert!(non_zero > 0, "快路径什么都没画");
+        // 不透明绘制：alpha 通道必须全 255（被覆盖处）
+        let opaque_px = px.chunks_exact(4).filter(|c| c[3] == 255).count();
+        assert!(opaque_px > 0, "不透明像素的 alpha 必须为 255");
+    }
+
+    /// 半透明前景仍走合成路径，结果与底色有关（快路径不得介入）。
+    #[test]
+    fn translucent_uses_blend_path() {
+        let mut px = vec![0u8; (W * H * 4) as usize];
+        let semi = Rgba::new(255, 255, 255, 128);
+        render_with(&mut px, 'A', 1, semi, 0, 0);
+        // 半透明下 A 通道应为 128 量级，而不是快路径的 255
+        let has_semi = px.chunks_exact(4).any(|c| c[3] != 0 && c[3] != 255);
+        assert!(has_semi, "半透明应走合成路径");
     }
 }

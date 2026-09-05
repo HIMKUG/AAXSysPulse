@@ -1,28 +1,14 @@
-//! Memory sampler placeholder.
+//! Memory sampler using GlobalMemoryStatusEx API.
 
-use sysoverlay_core::sampler::{SampleOutcome, Sampler};
+use sysoverlay_core::sampler::{SampleOutcome, Sampler, SamplerId};
 use sysoverlay_core::snapshot::{MemoryStat, Snapshot};
 
-/// Memory sampler.
-pub struct MemSampler {
-    mem: MemoryStat,
-}
+/// Memory sampler using GlobalMemoryStatusEx.
+pub struct MemSampler;
 
 impl MemSampler {
-    /// Create a new memory sampler.
     pub fn new() -> Self {
-        Self {
-            mem: MemoryStat {
-                load_pct: 0.0,
-                used_gb: 0.0,
-                total_gb: 0.0,
-            },
-        }
-    }
-
-    /// Get current memory statistics.
-    pub fn get_memory_stat(&self) -> MemoryStat {
-        self.mem
+        Self
     }
 }
 
@@ -34,16 +20,48 @@ impl Default for MemSampler {
 
 impl Sampler for MemSampler {
     fn name(&self) -> &'static str {
-        "Memory"
+        "memory"
     }
 
-    fn sample(&mut self, _prev: Option<&Snapshot>, _now_ms: u64) -> SampleOutcome {
-        // TODO: Implement with GlobalMemoryStatusEx
-        self.mem = MemoryStat {
-            load_pct: 50.0,
-            used_gb: 8.0,
-            total_gb: 16.0,
-        };
-        SampleOutcome::Ok
+    fn id(&self) -> SamplerId {
+        SamplerId::Memory
+    }
+
+    fn sample(
+        &mut self,
+        _prev: Option<&Snapshot>,
+        now_ms: u64,
+        out: &mut Snapshot,
+    ) -> SampleOutcome {
+        unsafe {
+            let mut mem_status =
+                windows::Win32::System::SystemInformation::MEMORYSTATUSEX::default();
+            mem_status.dwLength =
+                std::mem::size_of::<windows::Win32::System::SystemInformation::MEMORYSTATUSEX>()
+                    as u32;
+
+            if windows::Win32::System::SystemInformation::GlobalMemoryStatusEx(&mut mem_status).is_err() {
+                return SampleOutcome::Transient;
+            }
+
+            let total_gb =
+                mem_status.ullTotalPhys as f64 / (1024.0 * 1024.0 * 1024.0);
+            let avail_gb =
+                mem_status.ullAvailPhys as f64 / (1024.0 * 1024.0 * 1024.0);
+            let used_gb = total_gb - avail_gb;
+            let load_pct = if total_gb > 0.0 {
+                ((used_gb / total_gb) * 100.0) as f32
+            } else {
+                0.0
+            };
+
+            out.memory = MemoryStat {
+                load_pct: load_pct.min(100.0),
+                used_gb: used_gb as f32,
+                total_gb: total_gb as f32,
+            };
+            out.timestamp_ms = now_ms;
+            SampleOutcome::Ok
+        }
     }
 }

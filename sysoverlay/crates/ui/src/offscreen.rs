@@ -7,7 +7,7 @@
 //! Pixel format: BGRA with pre-multiplied alpha (matching Windows DIB format).
 
 use crate::render::{FontSpec, Rect, RenderTarget, Rgba};
-use crate::font::{FONT_WIDTH, FONT_HEIGHT, FONT_SPACING, render_char};
+use crate::font::{measure, render_char, FONT_HEIGHT, FONT_SPACING, FONT_WIDTH};
 
 /// Software surface for offscreen rendering.
 ///
@@ -35,20 +35,49 @@ impl SoftwareSurface {
         }
     }
 
-    /// Returns the byte offset for pixel (x, y) in BGRA format.
-    fn pixel_offset(&self, x: i32, y: i32) -> i32 {
-        (y * self.width + x) * 4
+    /// **复用缓冲**：尺寸/容量不变时只清零，不重新分配。
+    ///
+    /// 悬浮窗每帧都要一块同尺寸的画布；逐帧 `vec![0u8; 187_200]` 的
+    /// 分配 + 清零是纯浪费（P2）。尺寸真的变了才重新分配。
+    pub fn resize(&mut self, width: i32, height: i32) {
+        let need = (width.max(0) * height.max(0) * 4) as usize;
+        if self.width != width || self.height != height || self.pixels.len() != need {
+            self.pixels = vec![0u8; need];
+            self.width = width;
+            self.height = height;
+        } else {
+            self.pixels.fill(0);
+        }
     }
 
-    /// Returns a mutable pointer to the pixel at (x, y).
+    /// 在 (x, y) 处做**预乘 alpha 的 over 合成**：`out = src + dst * (1 - src_a)`。
     ///
-    /// # Safety
-    ///
-    /// The caller must ensure x and y are within surface bounds.
-    fn pixel_ptr_mut(&mut self, x: i32, y: i32) -> *mut u8 {
-        let offset = self.pixel_offset(x, y);
-        // SAFETY: offset is computed from valid coordinates and stays within bounds
-        unsafe { self.pixels.as_mut_ptr().add(offset as usize) }
+    /// 越界坐标静默忽略 —— 裁剪是渲染器的责任，不该让调用方去做边界算术，
+    /// 更不该为此引入 `unsafe`（`ui` crate 必须零 `unsafe`）。
+    fn blend_pixel(&mut self, x: i32, y: i32, color: Rgba) {
+        if x < 0 || y < 0 || x >= self.width || y >= self.height {
+            return;
+        }
+        let idx = ((y * self.width + x) * 4) as usize;
+        if idx + 3 >= self.pixels.len() {
+            return;
+        }
+
+        let factor = 1.0 - color.alpha_float();
+        let dst_b = self.pixels[idx] as f32;
+        let dst_g = self.pixels[idx + 1] as f32;
+        let dst_r = self.pixels[idx + 2] as f32;
+        let dst_a = self.pixels[idx + 3] as f32;
+
+        let out_r = color.r as f32 + dst_r * factor;
+        let out_g = color.g as f32 + dst_g * factor;
+        let out_b = color.b as f32 + dst_b * factor;
+        let out_a = (color.a as f32 + dst_a * factor).min(255.0);
+
+        self.pixels[idx] = out_b as u8;     // B
+        self.pixels[idx + 1] = out_g as u8; // G
+        self.pixels[idx + 2] = out_r as u8; // R
+        self.pixels[idx + 3] = out_a as u8; // A
     }
 
     /// Clears the surface to transparent.
@@ -79,40 +108,78 @@ impl SoftwareSurface {
     }
 }
 
+impl SoftwareSurface {
+    /// Clears (sets to transparent) the four corner regions of a rounded rectangle.
+    fn clear_corners(&mut self, r: Rect, radius: i32, _color: Rgba) {
+        if radius <= 0 {
+            return;
+        }
+        let transparent = Rgba::transparent();
+        for y in r.y..r.bottom() {
+            for x in r.x..r.right() {
+                let in_tl = point_in_circle(x, y, r.x + radius, r.y + radius, radius);
+                let in_tr = point_in_circle(x, y, r.right() - radius, r.y + radius, radius);
+                let in_bl = point_in_circle(x, y, r.x + radius, r.bottom() - radius, radius);
+                let in_br = point_in_circle(x, y, r.right() - radius, r.bottom() - radius, radius);
+                if in_tl || in_tr || in_bl || in_br {
+                    self.blend_pixel(x, y, transparent);
+                }
+            }
+        }
+    }
+}
+
+/// Checks if a point is inside a rectangle.
+fn _point_in_rect(x: i32, y: i32, r: &Rect) -> bool {
+    x >= r.x && x < r.right() && y >= r.y && y < r.bottom()
+}
+
+/// Checks if a point is inside a circle centered at (cx, cy) with given radius.
+fn point_in_circle(x: i32, y: i32, cx: i32, cy: i32, radius: i32) -> bool {
+    let dx = (x - cx) as i64;
+    let dy = (y - cy) as i64;
+    dx * dx + dy * dy <= (radius as i64) * (radius as i64)
+}
+
 /// Checks if a point is inside a rounded rectangle.
-///
-/// Uses simple circle approximation at corners.
 fn point_in_round_rect(x: i32, y: i32, r: &Rect, radius: i32) -> bool {
-    // Outside bounding box
     if x < r.x || x >= r.right() || y < r.y || y >= r.bottom() {
         return false;
     }
-
     if radius <= 0 {
-        return true; // Sharp corners
+        return true;
     }
 
-    // Check corner regions
-    let inner = Rect::with_pos(r.x + radius, r.y + radius, r.w - radius * 2, r.h - radius * 2);
-    if x >= inner.x && x < inner.right() && y >= inner.y && y < inner.bottom() {
-        return true; // Center region
+    let inner_x = r.x + radius;
+    let inner_y = r.y + radius;
+    let inner_w = r.w - radius * 2;
+    let inner_h = r.h - radius * 2;
+
+    // If corners meet/overlap, the inner strip collapses to a line or empty space.
+    // In that case every pixel in the bounding box is valid (the whole rect looks pill-shaped).
+    if inner_h <= 0 || inner_w <= 0 {
+        return true;
     }
 
-    // Corner checks
-    let corners = [
-        (r.x + radius, r.y + radius),                           // top-left
-        (r.right() - radius, r.y + radius),                     // top-right
-        (r.x + radius, r.bottom() - radius),                    // bottom-left
-        (r.right() - radius, r.bottom() - radius),              // bottom-right
-    ];
+    // Clearly inside the center strip.
+    if x >= inner_x && x < inner_x + inner_w && y >= inner_y && y < inner_y + inner_h {
+        return true;
+    }
 
-    for (cx, cy) in corners {
-        let dx = x - cx;
-        let dy = y - cy;
-        let dist_sq = (dx * dx + dy * dy) as i64;
-        let radius_sq = (radius as i64) * (radius as i64);
-        if dist_sq <= radius_sq {
-            return true;
+    // Check the relevant corner only.
+    if x < r.x + radius {
+        // Left side
+        if y < r.y + radius {
+            return point_in_circle(x, y, r.x + radius, r.y + radius, radius); // top-left
+        } else if y >= r.bottom() - radius {
+            return point_in_circle(x, y, r.x + radius, r.bottom() - radius, radius); // bottom-left
+        }
+    } else if x >= r.right() - radius {
+        // Right side
+        if y < r.y + radius {
+            return point_in_circle(x, y, r.right() - radius, r.y + radius, radius); // top-right
+        } else if y >= r.bottom() - radius {
+            return point_in_circle(x, y, r.right() - radius, r.bottom() - radius, radius); // bottom-right
         }
     }
 
@@ -120,53 +187,52 @@ fn point_in_round_rect(x: i32, y: i32, r: &Rect, radius: i32) -> bool {
 }
 
 impl RenderTarget for SoftwareSurface {
+    fn clear(&mut self) {
+        self.pixels.fill(0);
+    }
+
+    /// 按系数缩放 alpha。
+    ///
+    /// 注意：像素是**预乘**的，只改 alpha 会让残留的 RGB 在合成时溢出，
+    /// 所以 RGB 必须同步按同一系数缩放（这正是 v2 §1.2 `blend_onto` 要表达的语义）。
+    fn scale_alpha(&mut self, factor: f32) {
+        let f = factor.clamp(0.0, 1.0);
+        for p in self.pixels.chunks_exact_mut(4) {
+            p[0] = (p[0] as f32 * f) as u8;
+            p[1] = (p[1] as f32 * f) as u8;
+            p[2] = (p[2] as f32 * f) as u8;
+            p[3] = (p[3] as f32 * f) as u8;
+        }
+    }
+
     /// Fills a rectangle with rounded corners using pre-multiplied alpha compositing.
     fn fill_round_rect(&mut self, r: Rect, radius: i32, color: Rgba) {
         if r.w <= 0 || r.h <= 0 || color.a == 0 {
             return;
         }
 
-        // For small radius, just use fill_rect
-        if radius <= 0 {
+        // 半径过大时（常见于小高度进度条），先填满再做四角裁圆。
+        if radius * 2 >= r.h {
             self.fill_rect(r, color);
+            if radius <= 0 {
+                return;
+            }
+            let clamped = radius.min(r.w / 2).min(r.h / 2);
+            self.clear_corners(r, clamped, color);
             return;
         }
 
-        // Clamp radius to prevent artifacts
+        // 标准圆角路径：逐像素判定。
         let radius = radius.min(r.w / 2).min(r.h / 2);
-
-        // Alpha factor for compositing
-        let src_a = color.alpha_float();
-
         for y in r.y..r.bottom() {
             for x in r.x..r.right() {
                 if point_in_round_rect(x, y, &r, radius) {
-                    let ptr = self.pixel_ptr_mut(x, y);
-                    unsafe {
-                        // BGRA order
-                        let dst_b = *ptr as f32;
-                        let dst_g = *ptr.add(1) as f32;
-                        let dst_r = *ptr.add(2) as f32;
-                        let dst_a = *ptr.add(3) as f32;
-
-                        // Pre-multiplied alpha compositing: out = src + dst * (1 - src_a)
-                        let factor = 1.0 - src_a;
-                        let out_r = color.r as f32 + dst_r * factor;
-                        let out_g = color.g as f32 + dst_g * factor;
-                        let out_b = color.b as f32 + dst_b * factor;
-                        let out_a = (src_a * 255.0 + dst_a * factor).min(255.0);
-
-                        *ptr = out_b as u8;
-                        *ptr.add(1) = out_g as u8;
-                        *ptr.add(2) = out_r as u8;
-                        *ptr.add(3) = out_a as u8;
-                    }
+                    self.blend_pixel(x, y, color);
                 }
             }
         }
     }
 
-    /// Fills a rectangle with sharp corners.
     fn fill_rect(&mut self, r: Rect, color: Rgba) {
         if r.w <= 0 || r.h <= 0 || color.a == 0 {
             return;
@@ -178,29 +244,24 @@ impl RenderTarget for SoftwareSurface {
             return;
         }
 
-        let src_a = color.alpha_float();
+        // 逐行取切片，兼顾安全与速度：
+        // 切片自身保证行内不越界，避免了每个像素重复做边界检查。
+        let factor = 1.0 - color.alpha_float();
+        let src_a = color.a as f32;
 
         for y in r.y..r.bottom() {
-            let row_offset = y * self.width * 4;
-            for x in r.x..r.right() {
-                let offset = row_offset + x * 4;
-                let idx = offset as usize;
+            let start = ((y * self.width + r.x) * 4) as usize;
+            let end = start + (r.w * 4) as usize;
+            let row = match self.pixels.get_mut(start..end) {
+                Some(s) => s,
+                None => continue,
+            };
+            for p in row.chunks_exact_mut(4) {
                 // BGRA
-                let dst_b = self.pixels[idx] as f32;
-                let dst_g = self.pixels[idx + 1] as f32;
-                let dst_r = self.pixels[idx + 2] as f32;
-                let dst_a = self.pixels[idx + 3] as f32;
-
-                let factor = 1.0 - src_a;
-                let out_r = color.r as f32 + dst_r * factor;
-                let out_g = color.g as f32 + dst_g * factor;
-                let out_b = color.b as f32 + dst_b * factor;
-                let out_a = (src_a * 255.0 + dst_a * factor).min(255.0);
-
-                self.pixels[idx] = out_b as u8;
-                self.pixels[idx + 1] = out_g as u8;
-                self.pixels[idx + 2] = out_r as u8;
-                self.pixels[idx + 3] = out_a as u8;
+                p[0] = (color.b as f32 + p[0] as f32 * factor) as u8;
+                p[1] = (color.g as f32 + p[1] as f32 * factor) as u8;
+                p[2] = (color.r as f32 + p[2] as f32 * factor) as u8;
+                p[3] = (src_a + p[3] as f32 * factor).min(255.0) as u8;
             }
         }
     }
@@ -220,28 +281,60 @@ impl RenderTarget for SoftwareSurface {
         // Approximate: clip to rect height (we use fixed 16px font height)
         let _clip_h = at.h.min(FONT_HEIGHT);
 
+        let limit = at.x + at.w;
         for c in s.chars() {
-            // Simple character-by-character rendering with clipping
-            if x + FONT_WIDTH <= at.x + at.w {
-                unsafe {
-                    render_char(
-                        self.pixels.as_mut_ptr(),
-                        self.width * 4,
-                        c,
-                        x,
-                        y,
-                        color,
-                    );
-                }
+            if x + FONT_WIDTH > limit {
+                break; // 超出给定矩形就停，不换行
             }
+            render_char(
+                &mut self.pixels,
+                self.width,
+                self.height,
+                c,
+                x,
+                y,
+                color,
+            );
             x += FONT_WIDTH + FONT_SPACING;
         }
     }
 
     /// Measures text dimensions when rendered with the bitmap font.
     fn measure_text(&self, s: &str, _font: FontSpec) -> (i32, i32) {
-        let width = (s.len() as i32) * (FONT_WIDTH + FONT_SPACING) - FONT_SPACING;
-        (width.max(0), FONT_HEIGHT)
+        (measure(s), FONT_HEIGHT)
+    }
+
+    fn blit_coverage(
+        &mut self,
+        at: Rect,
+        coverage: &[u8],
+        cov_stride: usize,
+        cov_w: i32,
+        cov_h: i32,
+        color: Rgba,
+    ) {
+        if at.w <= 0 || at.h <= 0 || color.a == 0 {
+            return;
+        }
+        let w = at.w.min(cov_w);
+        let h = at.h.min(cov_h);
+
+        for y in 0..h {
+            let start = (y as usize) * cov_stride;
+            let row = match coverage.get(start..start + w as usize) {
+                Some(r) => r,
+                None => continue,
+            };
+            for x in 0..w {
+                let cov = row[x as usize];
+                if cov == 0 {
+                    continue;
+                }
+                // 覆盖率 → alpha，再按非预乘颜色构造预乘色
+                let a = ((color.a as u32 * cov as u32) / 255) as u8;
+                self.blend_pixel(at.x + x, at.y + y, Rgba::new(color.r, color.g, color.b, a));
+            }
+        }
     }
 }
 
@@ -284,5 +377,16 @@ mod tests {
         let png = surface.to_png();
         // PNG header check
         assert_eq!(&png[0..8], &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+    }
+
+    /// Regression: fill_round_rect(100x6, radius=3) must actually write pixels.
+    #[test]
+    fn test_fill_round_rect_small() {
+        let mut s = SoftwareSurface::new(100, 6);
+        // Simulate QualityDecoration's draw_progress: track (100x6, radius=3)
+        s.fill_round_rect(Rect::with_pos(0, 0, 100, 6), 3, Rgba::opaque(41, 43, 48));
+        // Center pixel must be painted
+        let center = ((3 * 100 + 50) * 4) as usize;
+        assert_ne!(s.pixels[center + 3], 0, "center pixel alpha must be > 0");
     }
 }

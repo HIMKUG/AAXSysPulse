@@ -30,6 +30,16 @@ impl Rect {
         Self { x, y, w, h }
     }
 
+    /// 从 `layout::RowLayout` 使用的 `(x, y, w, h)` 元组构造。
+    pub fn from_tuple(t: (i32, i32, i32, i32)) -> Self {
+        Self {
+            x: t.0,
+            y: t.1,
+            w: t.2,
+            h: t.3,
+        }
+    }
+
     /// Returns the right edge (x + w).
     pub fn right(&self) -> i32 {
         self.x + self.w
@@ -54,7 +64,7 @@ impl Rect {
 ///
 /// In pre-multiplied alpha, the RGB components are scaled by the alpha value.
 /// This format is used internally by our BGRA software rasterizer.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rgba {
     /// Red component (0-255, pre-multiplied by alpha).
     pub r: u8,
@@ -132,6 +142,18 @@ impl FontSpec {
 /// This trait is implemented by surfaces that can be drawn to.
 /// All coordinates are in pixels with origin at top-left.
 pub trait RenderTarget {
+    /// 清空整个目标为**全透明**。
+    ///
+    /// 每帧重绘必须先清屏：分层窗口 (`UpdateLayeredWindow`) 是按 alpha 合成的，
+    /// 残留的上一帧像素会叠加出"重影"。
+    fn clear(&mut self);
+
+    /// 整体缩放 alpha（悬停淡入/淡出用）。
+    ///
+    /// 放在 trait 里而不是让调用方去摸 `pixels`，
+    /// 是为了保持 `RenderTarget` 的实现可替换（GDI 直写路径也能实现它）。
+    fn scale_alpha(&mut self, factor: f32);
+
     /// Fills a rectangle with rounded corners using the given color.
     ///
     /// If `radius` is 0, behaves like a regular filled rectangle.
@@ -149,4 +171,25 @@ pub trait RenderTarget {
     ///
     /// Returns (width, height) in pixels.
     fn measure_text(&self, s: &str, font: FontSpec) -> (i32, i32);
+
+    /// 把一块**灰度覆盖率蒙版**按给定颜色合成到 `at` 区域。
+    ///
+    /// 这是高质量文字路径的接缝：GDI 把字形画进离屏 DC 后提取出
+    /// 每像素的抗锯齿覆盖率（0..255），再交给本方法做预乘 alpha 合成。
+    ///
+    /// 之所以需要它，是因为 `draw_text` 只有"整字符"粒度，
+    /// 无法表达矢量字形的灰阶边缘；而 `ui` 又不能自己调 Win32。
+    ///
+    /// * `coverage` - 行优先的灰度蒙版，每行 `cov_stride` 字节。
+    /// * `at` - 合成区域，尺寸应 <= 蒙版尺寸。
+    /// * `color` - 文字颜色（**非**预乘，本方法内部按覆盖率预乘）。
+    fn blit_coverage(
+        &mut self,
+        at: Rect,
+        coverage: &[u8],
+        cov_stride: usize,
+        cov_w: i32,
+        cov_h: i32,
+        color: Rgba,
+    );
 }

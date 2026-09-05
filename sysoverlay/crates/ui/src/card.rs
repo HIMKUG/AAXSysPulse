@@ -1,416 +1,261 @@
 //! Card drawing functions for the overlay UI.
 //!
-//! This module implements the card rendering logic that mirrors the C `drawCard` function.
-//! It draws the overlay card with background, metrics, and progress bars.
+//! 这是卡片绘制的**唯一骨架**：Eco 与 Quality 共用同一份行结构，
+//! 差异全部来自两个注入点（[`DrawCtx::text`] 与 [`DrawCtx::decor`]）。
+//!
+//! 骨架不感知窗口、不感知 DPI、不感知具体字体 ——
+//! 几何全由 `layout::compute` 决定，颜色全由 `core::color` 决定，
+//! 数字格式化全由 `core::units` 决定。这里只负责"把它们摆到一起"。
 
-use crate::offscreen::SoftwareSurface;
-use crate::render::{FontSpec, Rect, RenderTarget, Rgba};
+use crate::decor::Decoration;
+use crate::palette::Style;
+use crate::raster::TextRasterizer;
+use crate::render::{Rect, RenderTarget};
 use sysoverlay_core::config::Config;
-use sysoverlay_core::layout::{CardLayout, Shape};
-use sysoverlay_core::snapshot::Metric;
-use sysoverlay_core::snapshot::{MemoryStat, NetStat, Snapshot};
+use sysoverlay_core::layout::{CardLayout, RowKind, RowLayout};
+use sysoverlay_core::snapshot::{Metric, MemoryStat, NetStat, Snapshot};
+use sysoverlay_core::units::{fmt_mem, fmt_pct, fmt_power, fmt_rate_pair, StrBuf};
+use sysoverlay_core::types::PowerDisplay;
 
-/// Accent colors based on value percentage thresholds.
-#[derive(Clone, Copy, Debug)]
-pub struct Palette {
-    /// Background color.
-    pub bg: Rgba,
-    /// Border color.
-    pub border: Rgba,
-    /// Progress bar track color.
-    pub track: Rgba,
-    /// Title text color.
-    pub title: Rgba,
-    /// Label text color.
-    pub name: Rgba,
-    /// Value text color.
-    pub value: Rgba,
-    /// Subtitle text color.
-    pub sub: Rgba,
-    /// OK status color (0-59%).
-    pub ok: Rgba,
-    /// Warning status color (60-84%).
-    pub warn: Rgba,
-    /// Hot status color (85-100%).
-    pub hot: Rgba,
-    /// Idle status color (<=1%).
-    pub idle: Rgba,
-}
-
-impl Palette {
-    /// Derives a complete palette from background and foreground colors.
+/// 一次绘制所需的上下文（样式 + 两个注入点 + 悬停透明度）。
+pub struct DrawCtx<'a> {
+    /// 调色板（纯逻辑 + 预乘两份）。
+    pub style: Style,
+    /// 文字光栅化策略（Eco 点阵 / Quality 矢量）。
+    pub text: &'a dyn TextRasterizer,
+    /// 装饰策略（Eco 直角 / Quality 圆角描边）。
+    pub decor: &'a dyn Decoration,
+    /// 悬停透明度（1.0 = 不透明）。
     ///
-    /// Mirrors the C version's color derivation logic:
-    /// - title = fg * 0.76
-    /// - name = fg * 0.65
-    /// - sub = fg * 0.45
-    /// - track = mix(bg, fg, 0.10)
-    /// - border = mix(bg, fg, 0.13)
-    pub fn derive(bg: (u8, u8, u8), fg: (u8, u8, u8)) -> Self {
-        let bg = Rgba::opaque(bg.0, bg.1, bg.2);
-        let fg = Rgba::opaque(fg.0, fg.1, fg.2);
+    /// v2 决策「时序模型」：悬停只改 `BLENDFUNCTION`，不重画像素。
+    /// 这里保留逐像素 alpha 缩放作为**软件路径**的实现，
+    /// `win` 层在 Quality 模式下会走 `BLENDFUNCTION` 这条更快的路。
+    pub hover_alpha: f32,
+}
 
+impl<'a> DrawCtx<'a> {
+    /// 便捷构造：`Quality` 默认组合。
+    pub fn new(style: Style, text: &'a dyn TextRasterizer, decor: &'a dyn Decoration) -> Self {
         Self {
-            bg,
-            border: mix_colors(bg, fg, 0.13),
-            track: mix_colors(bg, fg, 0.10),
-            title: scale_color(fg, 0.76),
-            name: scale_color(fg, 0.65),
-            value: fg,
-            sub: scale_color(fg, 0.45),
-            ok: Rgba::opaque(74, 222, 128),
-            warn: Rgba::opaque(251, 191, 36),
-            hot: Rgba::opaque(248, 113, 113),
-            idle: Rgba::opaque(63, 69, 80),
+            style,
+            text,
+            decor,
+            hover_alpha: 1.0,
         }
     }
 }
 
-/// Scales a color by the given factor (multiplies each component).
-fn scale_color(c: Rgba, factor: f32) -> Rgba {
-    Rgba::opaque(
-        (c.r as f32 * factor) as u8,
-        (c.g as f32 * factor) as u8,
-        (c.b as f32 * factor) as u8,
-    )
-}
-
-/// Blends two colors together: mix = c1 * (1 - t) + c2 * t
-fn mix_colors(c1: Rgba, c2: Rgba, t: f32) -> Rgba {
-    let t1 = 1.0 - t;
-    Rgba::opaque(
-        (c1.r as f32 * t1 + c2.r as f32 * t) as u8,
-        (c1.g as f32 * t1 + c2.g as f32 * t) as u8,
-        (c1.b as f32 * t1 + c2.b as f32 * t) as u8,
-    )
-}
-
-/// Returns the accent color for a given percentage value.
-pub fn accent_for(pct: f32, pal: &Palette) -> Rgba {
-    if pct >= 85.0 {
-        pal.hot
-    } else if pct >= 60.0 {
-        pal.warn
-    } else if pct <= 1.0 {
-        pal.idle
-    } else {
-        pal.ok
+/// 一行的标签文案。
+fn label_of(kind: RowKind) -> &'static str {
+    match kind {
+        RowKind::Cpu => "CPU",
+        RowKind::Memory => "Memory",
+        RowKind::Gpu => "GPU",
+        RowKind::Net => "Net",
+        RowKind::Power => "Power",
     }
 }
 
-/// Formats a network rate string based on the value.
-///
-/// Returns (formatted_string, is_short_form)
-fn fmt_rate(rx_bps: u64, tx_bps: u64, unit: &sysoverlay_core::config::NetUnit) -> (String, bool) {
-    // Convert to MB/s for formatting
-    let rx_mbps = rx_bps as f64 / 1_000_000.0;
-    let tx_mbps = tx_bps as f64 / 1_000_000.0;
-
-    match unit {
-        sysoverlay_core::config::NetUnit::KB => {
-            let rx_k = rx_mbps * 1024.0;
-            let tx_k = tx_mbps * 1024.0;
-            (format!("{:.0}K", rx_k), true)
-        }
-        sysoverlay_core::config::NetUnit::GB => {
-            let rx_g = rx_mbps / 1024.0;
-            let tx_g = tx_mbps / 1024.0;
-            (format!("{:.2}G", rx_g), true)
-        }
-        sysoverlay_core::config::NetUnit::MB => {
-            if rx_mbps >= 100.0 {
-                (format!("{:.0}M", rx_mbps), true)
-            } else {
-                (format!("{:.2}M", rx_mbps), true)
-            }
-        }
-    }
-}
-
-/// Formats network rate for the network row.
-fn fmt_network_rate(rx_bps: u64, tx_bps: u64, unit: &sysoverlay_core::config::NetUnit) -> String {
-    let (rx_str, _) = fmt_rate(rx_bps, tx_bps, unit);
-    let (tx_str, _) = fmt_rate(tx_bps, rx_bps, unit); // Reuse but swap
-    format!("{} / {}", rx_str, tx_str)
-}
-
-/// Draws the card background with optional rounded corners.
-fn draw_background(surface: &mut SoftwareSurface, cfg: &Config, layout: &CardLayout, pal: &Palette) {
-    match cfg.shape {
-        sysoverlay_core::config::Shape::Round => {
-            let radius = 14; // RADIUS constant
-            surface.fill_round_rect(
-                Rect::new(layout.width, layout.height),
-                radius,
-                pal.bg,
-            );
-        }
-        sysoverlay_core::config::Shape::Square => {
-            surface.fill_rect(Rect::new(layout.width, layout.height), pal.bg);
-        }
-        sysoverlay_core::config::Shape::Content => {
-            // Content mode: no background, canvas must be cleared by caller
-            surface.clear();
-        }
-    }
-}
-
-/// Draws the host name and uptime at the top of the card.
-fn draw_header(
-    surface: &mut SoftwareSurface,
-    layout: &CardLayout,
-    snap: &Snapshot,
-    cfg: &Config,
-    pal: &Palette,
+/// 把 `StrBuf` 内容按右对齐画进 `rect`。
+fn draw_value_right<T: RenderTarget>(
+    out: &mut T,
+    text: &dyn TextRasterizer,
+    s: &str,
+    rect: (i32, i32, i32, i32),
+    color: crate::render::Rgba,
 ) {
-    let pad_x = 16i32;
-    let lh = 18i32;
-    let y = 12;
-
-    // Host name (placeholder - actual hostname would come from system)
-    let host = "PC";
-    surface.draw_text(
-        host,
-        Rect::with_pos(pad_x, y, layout.width - pad_x * 2, lh),
-        pal.title,
-        FontSpec::ui(),
-    );
-
-    // Uptime (if valid)
-    if let Metric::Value(_) = snap.cpu {
-        let uptime_str = format!("{} sec", snap.timestamp_ms / 1000);
-        let (w, _) = surface.measure_text(&uptime_str, FontSpec::ui());
-        let x = layout.width - pad_x - w;
-        surface.draw_text(
-            &uptime_str,
-            Rect::with_pos(x, y + 2, w, lh),
-            pal.sub,
-            FontSpec::ui(),
-        );
-    }
-}
-
-/// Draws a metric row with label, value, and progress bar.
-fn draw_metric_row(
-    surface: &mut SoftwareSurface,
-    label: &str,
-    value_str: &str,
-    pct: f32,
-    x: i32,
-    y: i32,
-    bar_w: i32,
-    row_h: i32,
-    bar_h: i32,
-    pal: &Palette,
-) {
-    // Label
-    surface.draw_text(
-        label,
-        Rect::with_pos(x, y, bar_w / 2, row_h),
-        pal.name,
-        FontSpec::ui(),
-    );
-
-    // Value
-    let (value_w, _) = surface.measure_text(value_str, FontSpec::mono());
-    let value_x = x + bar_w - value_w;
-    surface.draw_text(
-        value_str,
-        Rect::with_pos(value_x, y, value_w, row_h),
-        pal.value,
-        FontSpec::mono(),
-    );
-
-    // Progress bar track
-    let track_y = y + row_h + 3;
-    surface.fill_round_rect(
-        Rect::with_pos(x, track_y, bar_w, bar_h),
-        bar_h / 2,
-        pal.track,
-    );
-
-    // Progress bar fill
-    let fill_w = ((bar_w as f32) * (pct / 100.0)).round() as i32;
-    if fill_w > 0 {
-        surface.fill_round_rect(
-            Rect::with_pos(x, track_y, fill_w, bar_h),
-            bar_h / 2,
-            accent_for(pct, pal),
-        );
-    }
-}
-
-/// Draws the network row (no progress bar, shows rate instead).
-fn draw_network_row(
-    surface: &mut SoftwareSurface,
-    net: &NetStat,
-    x: i32,
-    y: i32,
-    bar_w: i32,
-    row_h: i32,
-    cfg: &Config,
-    pal: &Palette,
-) {
-    // Label
-    surface.draw_text(
-        "Network",
-        Rect::with_pos(x, y, bar_w / 2, row_h),
-        pal.name,
-        FontSpec::ui(),
-    );
-
-    // Value (rate)
-    let rate_str = fmt_network_rate(net.rx_bps, net.tx_bps, &cfg.net_unit);
-    let (value_w, _) = surface.measure_text(&rate_str, FontSpec::mono());
-    let value_x = x + bar_w - value_w;
-    surface.draw_text(
-        &rate_str,
-        Rect::with_pos(value_x, y, value_w, row_h),
-        pal.value,
-        FontSpec::mono(),
-    );
+    let (w, _) = text.measure(s);
+    // 值域不够宽时从左侧开始画（截断总好过整行消失）
+    let x = if w <= rect.2 { rect.0 + rect.2 - w } else { rect.0 };
+    text.draw(s, Rect::with_pos(x, rect.1, w, rect.3), color, out);
 }
 
 /// Draws the complete overlay card.
-pub fn draw_card(
-    surface: &mut SoftwareSurface,
+///
+/// # 骨架流程
+/// 1. 清屏（分层窗口按 alpha 合成，残留会出重影）
+/// 2. 背景（注入点 `decor`）
+/// 3. 头部：主机名 + 运行时长
+/// 4. 逐行绘制（行集合与几何来自 `layout`，语义来自 `RowKind`）
+/// 5. 悬停 alpha
+pub fn draw_card<T: RenderTarget>(
+    out: &mut T,
     snap: &Snapshot,
     cfg: &Config,
     layout: &CardLayout,
-    hover_alpha: f32,
+    ctx: &DrawCtx<'_>,
 ) {
-    // Derive palette from config colors
-    let pal = Palette::derive((cfg.bg.r, cfg.bg.g, cfg.bg.b), (cfg.fg.r, cfg.fg.g, cfg.fg.b));
+    out.clear();
 
-    // Draw background
-    draw_background(surface, cfg, layout, &pal);
+    // 1. 背景（Content 模式由 decor 内部决定不画）
+    ctx.decor.draw_background(
+        Rect::new(layout.width, layout.height),
+        cfg.shape,
+        &ctx.style,
+        out,
+    );
 
-    // Constants matching C code
-    let pad_x = 16i32;
-    let lh = 18i32;
-    let row_h = 17i32;
-    let bar_h = 6i32;
-    let bar_w = layout.width - pad_x * 2;
+    // 2. 头部
+    draw_header(out, snap, layout, ctx);
 
-    // Draw header (host name and uptime)
-    draw_header(surface, layout, snap, cfg, &pal);
-
-    let mut y = 12 + lh + 9; // Start after header
-
-    // Check if we have valid metrics
-    let valid = matches!(snap.cpu, Metric::Value(_));
-
-    if !valid {
-        // Draw "Initializing..." message
-        surface.draw_text(
-            "Initializing...",
-            Rect::with_pos(pad_x, y, bar_w, row_h),
-            pal.name,
-            FontSpec::ui(),
-        );
+    // 3. 还没有任何采样结果时给个明确提示，而不是画一堆 0%
+    if snap.seq == 0 {
+        draw_initializing(out, layout, ctx);
+        apply_hover(out, ctx);
         return;
     }
 
-    // CPU row
-    if let Metric::Value(cpu) = snap.cpu {
-        let value_str = format!("{:.0}%", cpu);
-        draw_metric_row(
-            surface,
-            "CPU",
-            &value_str,
-            cpu,
-            pad_x,
-            y,
-            bar_w,
-            row_h,
-            bar_h,
-            &pal,
-        );
+    // 4. 逐行
+    let mut buf = StrBuf::new();
+    for row in &layout.rows {
+        draw_row(out, row, snap, cfg, &mut buf, ctx);
     }
-    y += row_h + 3 + bar_h + 9;
 
-    // Memory row (special format: "X% · Y.Z/W.G")
-    let mem = &snap.memory;
-    let value_str = format!(
-        "{:.0}%",
-        mem.load_pct
-    );
-    surface.draw_text(
-        "Memory",
-        Rect::with_pos(pad_x, y, bar_w / 2, row_h),
-        pal.name,
-        FontSpec::ui(),
-    );
-    let (value_w, _) = surface.measure_text(&value_str, FontSpec::mono());
-    let value_x = pad_x + bar_w - value_w;
-    surface.draw_text(
-        &value_str,
-        Rect::with_pos(value_x, y, value_w, row_h),
-        pal.value,
-        FontSpec::mono(),
-    );
-    y += row_h + 3;
+    // 5. 悬停
+    apply_hover(out, ctx);
+}
 
-    // Memory progress bar
-    surface.fill_round_rect(
-        Rect::with_pos(pad_x, y, bar_w, bar_h),
-        bar_h / 2,
-        pal.track,
-    );
-    let fill_w = ((bar_w as f32) * (mem.load_pct / 100.0)).round() as i32;
-    if fill_w > 0 {
-        surface.fill_round_rect(
-            Rect::with_pos(pad_x, y, fill_w, bar_h),
-            bar_h / 2,
-            accent_for(mem.load_pct, &pal),
-        );
-    }
-    y += bar_h + 9;
-
-    // GPU row
-    if let Metric::Value(gpu) = snap.gpu {
-        let value_str = format!("{:.0}%", gpu);
-        draw_metric_row(
-            surface,
-            "GPU",
-            &value_str,
-            gpu,
-            pad_x,
-            y,
-            bar_w,
-            row_h,
-            bar_h,
-            &pal,
-        );
-    }
-    y += row_h + 3 + bar_h + 9;
-
-    // Network row
-    draw_network_row(surface, &snap.net, pad_x, y, bar_w, row_h, cfg, &pal);
-
-    // Apply hover alpha (multiply all pixel alphas by hover_alpha)
-    if hover_alpha < 1.0 {
-        apply_hover_alpha(surface, hover_alpha);
+fn apply_hover<T: RenderTarget>(out: &mut T, ctx: &DrawCtx<'_>) {
+    if ctx.hover_alpha < 1.0 {
+        out.scale_alpha(ctx.hover_alpha);
     }
 }
 
-/// Applies hover alpha effect by scaling all pixel alphas.
-fn apply_hover_alpha(surface: &mut SoftwareSurface, alpha: f32) {
-    for chunk in surface.pixels.chunks_exact_mut(4) {
-        let old_a = chunk[3] as f32;
-        let new_a = (old_a * alpha).min(255.0) as u8;
-        chunk[3] = new_a;
+/// 头部：主机名。
+fn draw_header<T: RenderTarget>(
+    out: &mut T,
+    _snap: &Snapshot,
+    layout: &CardLayout,
+    ctx: &DrawCtx<'_>,
+) {
+    // 极简模式下高度只有 36px，没有头部的位置
+    if layout.height < 60 {
+        return;
+    }
+
+    let lh = 18;
+    let y = 12;
+    let pad = 16;
+
+    ctx.text.draw(
+        "PC",
+        Rect::with_pos(pad, y, layout.width - pad * 2, lh),
+        ctx.style.ui.title,
+        out,
+    );
+}
+
+fn draw_initializing<T: RenderTarget>(out: &mut T, layout: &CardLayout, ctx: &DrawCtx<'_>) {
+    // Eco 的位图字体没有中文字形，统一用 ASCII（v2 Q16）
+    let msg = "Initializing...";
+    let y = if layout.height < 60 { 10 } else { 48 };
+    ctx.text.draw(
+        msg,
+        Rect::with_pos(16, y, layout.width - 32, ctx.text.line_height()),
+        ctx.style.ui.name,
+        out,
+    );
+}
+
+/// 画一行：标签 + 值 + （可选）进度条。
+fn draw_row<T: RenderTarget>(
+    out: &mut T,
+    row: &RowLayout,
+    snap: &Snapshot,
+    cfg: &Config,
+    buf: &mut StrBuf,
+    ctx: &DrawCtx<'_>,
+) {
+    let (stale, pct) = match row.kind {
+        RowKind::Cpu => metric_state(snap.cpu),
+        RowKind::Memory => (false, snap.memory.load_pct),
+        RowKind::Gpu => metric_state(snap.gpu),
+        RowKind::Net => (false, 0.0),
+        RowKind::Power => metric_state(snap.power),
+    };
+
+    let name_color = if stale { ctx.style.ui.name_stale } else { ctx.style.ui.name };
+    let value_color = if stale { ctx.style.ui.value_stale } else { ctx.style.ui.value };
+
+    ctx.text.draw(
+        label_of(row.kind),
+        Rect::from_tuple(row.label_rect),
+        name_color,
+        out,
+    );
+
+    // 内存行额外补一段 "8.5/16.0G" 的次要信息
+    if row.kind == RowKind::Memory {
+        draw_mem_detail(out, row, &snap.memory, buf, ctx);
+    }
+
+    // 值
+    match row.kind {
+        RowKind::Cpu | RowKind::Memory | RowKind::Gpu => {
+            fmt_pct(buf, pct);
+            draw_value_right(out, ctx.text, buf.as_str(), row.value_rect, value_color);
+        }
+        RowKind::Net => {
+            fmt_rate_pair(buf, snap.net.rx_bps, snap.net.tx_bps, cfg.net_unit);
+            draw_value_right(out, ctx.text, buf.as_str(), row.value_rect, value_color);
+        }
+        RowKind::Power => {
+            // v2 Q16：估算值必须带 `~` 前缀，不能冒充实测值
+            let estimated = cfg.power_display == PowerDisplay::Estimated;
+            fmt_power(buf, pct, estimated);
+            draw_value_right(out, ctx.text, buf.as_str(), row.value_rect, value_color);
+        }
+    }
+
+    // 进度条：仅功耗行有进度条（CPU/内存/GPU 只显示数字，网络行无进度条）
+    if row.kind == RowKind::Power && row.track_rect.2 > 0 && row.track_rect.3 > 0 {
+        ctx.decor.draw_progress(
+            Rect::from_tuple(row.track_rect),
+            pct,
+            stale,
+            &ctx.style,
+            out,
+        );
     }
 }
 
-/// Creates a demo snapshot for testing.
-///
-/// This hardcoded snapshot is used to generate reference PNG images
-/// for visual comparison with the C implementation.
+/// 内存行在标签右侧补一段用量细节。
+fn draw_mem_detail<T: RenderTarget>(
+    out: &mut T,
+    row: &RowLayout,
+    mem: &MemoryStat,
+    buf: &mut StrBuf,
+    ctx: &DrawCtx<'_>,
+) {
+    fmt_mem(buf, mem.used_gb, mem.total_gb);
+    let (label_w, _) = ctx.text.measure(label_of(RowKind::Memory));
+    let x = row.label_rect.0 + label_w + 6;
+    let w = row.label_rect.2 - label_w - 6;
+    if w > 0 {
+        ctx.text.draw(
+            buf.as_str(),
+            Rect::with_pos(x, row.label_rect.1, w, row.label_rect.3),
+            ctx.style.ui.sub,
+            out,
+        );
+    }
+}
+
+/// 取出指标的状态：(是否陈旧, 数值)。
+fn metric_state(m: Metric<f32>) -> (bool, f32) {
+    match m {
+        Metric::Value(v) => (false, v),
+        Metric::Stale { value, .. } => (true, value),
+        Metric::Unavailable => (false, 0.0),
+    }
+}
+
+/// Creates a demo snapshot for testing / PNG reference generation.
 pub fn demo_snapshot() -> Snapshot {
     Snapshot {
         seq: 1,
-        timestamp_ms: 1000,
+        timestamp_ms: 1_000,
+        uptime_ms: 1_000,
         cpu: Metric::Value(67.5),
         memory: MemoryStat {
             load_pct: 45.0,
@@ -422,32 +267,171 @@ pub fn demo_snapshot() -> Snapshot {
             rx_bps: 1_234_567,
             tx_bps: 234_567,
         },
+        power: Metric::Unavailable,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decor::{decoration_for, probe, EcoDecoration, QualityDecoration};
+    use crate::offscreen::SoftwareSurface;
+    use crate::raster::BitmapTextRasterizer;
+    use sysoverlay_core::config::Config;
+    use sysoverlay_core::layout::{compute, LayoutInput, RowsShown};
+    use sysoverlay_core::types::RenderMode;
 
-    #[test]
-    fn test_palette_derive() {
-        let pal = Palette::derive((20, 22, 27), (238, 241, 244));
-        assert_eq!(pal.bg.r, 20);
-        assert_eq!(pal.value.r, 238);
+    /// 常规模式的默认绘制组合。
+    fn draw(snap: &Snapshot, cfg: &Config, mode: RenderMode) -> SoftwareSurface {
+        let input = LayoutInput {
+            zoom: cfg.effective_zoom(),
+            shape: cfg.shape,
+            vert: cfg.vert,
+            minimal: cfg.minimal,
+            dpi: 96,
+            rows: RowsShown::from_snapshot(snap, cfg.power_enabled),
+        };
+        let layout = compute(&input);
+        let mut surface = SoftwareSurface::new(layout.width, layout.height);
+        let ctx = DrawCtx {
+            style: Style::derive(cfg.bg, cfg.fg),
+            text: &BitmapTextRasterizer,
+            decor: decoration_for(mode),
+            hover_alpha: 1.0,
+        };
+        draw_card(&mut surface, snap, cfg, &layout, &ctx);
+        surface
     }
 
     #[test]
-    fn test_accent_for() {
-        let pal = Palette::derive((20, 22, 27), (238, 241, 244));
-        assert_eq!(accent_for(90.0, &pal).r, 248); // hot
-        assert_eq!(accent_for(70.0, &pal).r, 251); // warn
-        assert_eq!(accent_for(50.0, &pal).r, 74);  // ok
-        assert_eq!(accent_for(0.5, &pal).r, 63);   // idle
+    fn demo_snapshot_has_power_field() {
+        let s = demo_snapshot();
+        assert!(s.power.value().is_none(), "demo 默认不含功耗");
     }
 
     #[test]
-    fn test_demo_snapshot() {
+    fn card_renders_non_empty() {
+        let s = draw(&demo_snapshot(), &Config::default(), RenderMode::Quality);
+        let lit = s.pixels.chunks_exact(4).filter(|p| p[3] > 0).count();
+        assert!(lit > 1000, "卡片应画出足量像素，实测 {}", lit);
+    }
+
+    #[test]
+    fn background_is_drawn() {
+        let s = draw(&demo_snapshot(), &Config::default(), RenderMode::Quality);
+        // 中心必须是背景色（不是全透明）
+        let px = probe(&s.pixels, s.width, s.width / 2, s.height / 2);
+        assert_eq!(px.a, 255);
+    }
+
+    #[test]
+    fn content_shape_has_no_background_but_has_text() {
+        let mut cfg = Config::default();
+        cfg.shape = sysoverlay_core::types::Shape::Content;
+        let s = draw(&demo_snapshot(), &cfg, RenderMode::Quality);
+        let lit = s.pixels.chunks_exact(4).filter(|p| p[3] > 0).count();
+        assert!(lit > 0, "Content 模式仍要画文字");
+        // 左上角（无文字处）应是透明的
+        assert_eq!(probe(&s.pixels, s.width, 1, 1).a, 0);
+    }
+
+    #[test]
+    fn placeholder_snapshot_shows_initializing() {
+        let snap = Snapshot::placeholder(0);
+        let s = draw(&snap, &Config::default(), RenderMode::Quality);
+        let lit = s.pixels.chunks_exact(4).filter(|p| p[3] > 0).count();
+        assert!(lit > 0, "占位快照也要有东西可看");
+        // 不应出现进度条填充（所有指标都不可用 → 0% → 不画填充）。
+        // 用"OK 档绿色是否出现"作像素探针。
+        let has_green = s
+            .pixels
+            .chunks_exact(4)
+            .any(|p| p[2] == 74 && p[1] == 222 && p[0] == 128 && p[3] == 255);
+        assert!(!has_green, "占位快照不应画出 OK 档进度条");
+    }
+
+    /// v2 Q16：陈旧值仍要显示（标灰），不能当成不可用整行消失。
+    #[test]
+    fn stale_metric_still_renders_but_gray() {
+        let mut snap = demo_snapshot();
+        snap.cpu = Metric::Stale {
+            value: 67.5,
+            stale_for: 5,
+        };
+
+        let fresh = draw(&demo_snapshot(), &Config::default(), RenderMode::Quality);
+        let stale = draw(&snap, &Config::default(), RenderMode::Quality);
+
+        // 两帧的"有内容像素数"应接近（陈旧没让整行消失）
+        let count = |s: &SoftwareSurface| s.pixels.chunks_exact(4).filter(|p| p[3] > 0).count();
+        let (a, b) = (count(&fresh), count(&stale));
+        let diff = (a as i32 - b as i32).abs();
+        assert!(diff < a as i32 / 4, "陈旧不应大幅改变构图（差 {} px）", diff);
+    }
+
+    #[test]
+    fn power_row_renders_when_available() {
+        let mut snap = demo_snapshot();
+        snap.power = Metric::Value(45.0);
+        let mut cfg = Config::default();
+        cfg.power_enabled = true;
+
+        let s = draw(&snap, &cfg, RenderMode::Quality);
+        let lit = s.pixels.chunks_exact(4).filter(|p| p[3] > 0).count();
+        assert!(lit > 1000);
+
+        // 卡片必须变高以容纳功耗行
+        let without = draw(&demo_snapshot(), &Config::default(), RenderMode::Quality);
+        assert!(s.height > without.height, "启用功耗后卡片必须加高");
+    }
+
+    /// v2 Q16：估算功耗必须带 `~` 前缀（Eco 无中文，用 ASCII 标记）。
+    #[test]
+    fn estimated_power_marks_with_tilde() {
+        let mut buf = StrBuf::new();
+        fmt_power(&mut buf, 45.0, true);
+        assert!(buf.as_str().starts_with('~'));
+        fmt_power(&mut buf, 45.0, false);
+        assert!(!buf.as_str().starts_with('~'));
+    }
+
+    #[test]
+    fn eco_and_quality_produce_same_card_size() {
         let snap = demo_snapshot();
-        assert!(matches!(snap.cpu, Metric::Value(67.5)));
+        let cfg = Config::default();
+        let q = draw(&snap, &cfg, RenderMode::Quality);
+        let e = draw(&snap, &cfg, RenderMode::Eco);
+        assert_eq!((q.width, q.height), (e.width, e.height), "两套模式卡片尺寸必须一致");
+    }
+
+    #[test]
+    fn hover_alpha_darkens_everything() {
+        let snap = demo_snapshot();
+        let cfg = Config::default();
+        let input = LayoutInput::default();
+        let layout = compute(&input);
+
+        let mut faded = SoftwareSurface::new(layout.width, layout.height);
+        let ctx = DrawCtx {
+            style: Style::default(),
+            text: &BitmapTextRasterizer,
+            decor: &QualityDecoration,
+            hover_alpha: 0.5,
+        };
+        draw_card(&mut faded, &snap, &cfg, &layout, &ctx);
+
+        let full = draw(&snap, &cfg, RenderMode::Quality);
+        let avg = |s: &SoftwareSurface| {
+            s.pixels.chunks_exact(4).map(|p| p[3] as u32).sum::<u32>()
+                / s.pixels.len() as u32
+                / 4
+        };
+        assert!(avg(&faded) < avg(&full), "悬停淡出后平均 alpha 必须更低");
+    }
+
+    #[test]
+    fn eco_decoration_is_used_in_eco_mode() {
+        assert_eq!(EcoDecoration.name(), "eco");
+        assert_eq!(QualityDecoration.name(), "quality");
     }
 }

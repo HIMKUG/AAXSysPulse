@@ -21,9 +21,25 @@ pub mod proc_cpu;
 pub mod proc_mem;
 pub mod proc_gpu;
 pub mod proc_net;
+pub mod gpu_detect;
+pub mod gpu_vendor;
+pub mod msr;
+pub mod power_system;
+pub mod sysinfo;
+pub mod elevate;
+pub mod probe;
 pub mod menu;
 pub mod dpi;
 pub mod config_io;
+pub mod tray;
+pub mod settings;
+pub mod autostart;
+pub mod theme;
+pub mod perf;
+pub mod history;
+pub mod graph;
+pub mod process;
+pub mod proc_list;
 
 // Re-export core types for convenience
 pub use sysoverlay_core::config::Config;
@@ -31,3 +47,5 @@ pub use sysoverlay_core::snapshot::Snapshot;
 
 // Re-export main window type
 pub use window::OverlayWindow;
+pub use window::{snap_store, get_shared_seq};
+pub use sampler::SystemSampler;

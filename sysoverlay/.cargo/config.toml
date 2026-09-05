@@ -1,0 +1,10 @@
+# 固定 MSVC 工具链路径（本机 VS 2022 BuildTools）：
+# 1. linker — 避免 Git Bash / 沙箱环境下 link.exe 被 /usr/bin/link.exe（coreutils 硬链接工具）劫持；
+# 2. /LIBPATH — 沙箱会剥离环境变量导致 rustc 的 MSVC 自动探测失效，显式传入库搜索路径。
+[target.x86_64-pc-windows-msvc]
+linker = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\link.exe"
+rustflags = [
+  "-C", "link-arg=/LIBPATH:C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64",
+  "-C", "link-arg=/LIBPATH:C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\um\\x64",
+  "-C", "link-arg=/LIBPATH:C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\ucrt\\x64",
+]

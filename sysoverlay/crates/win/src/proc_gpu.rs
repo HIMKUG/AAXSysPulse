@@ -1,165 +1,50 @@
-//! GPU sampler using PDH (Performance Data Helper) API.
+//! GPU sampler using D3DKMTQueryStatistics (WDDM 2.0+).
+//!
+//! 实现（RunningTime 增量法，与任务管理器「GPU 引擎」同一数据源）：
+//! 1. `D3DKMTEnumAdapters2` 枚举适配器（LUID）；
+//! 2. 每个适配器 `Type=ADAPTER` 查询拿 `NodeCount`（引擎数）；
+//! 3. 每个引擎 `Type=NODE` 查询拿 `GlobalInformation.RunningTime`
+//!    （该引擎累计运行时间，100ns 单位）；
+//! 4. 引擎利用率% = ΔRunningTime / (Δ墙钟ms × 100)，取所有引擎的**最大值**
+//!    （与任务管理器默认视图一致）。
+//!
+//! 说明：绑定里的 `D3DKMT_NODE_PERFDATA` 缺少 `UtilizationPercentage` 字段，
+//! 因此不使用 NodePerfData 路线；RunningTime 法在 WDDM 2.0+ 通用且免驱动。
+//!
+//! 探针（`SYSOVERLAY_PROBE=1`）记录每个适配器的 LUID / 引擎数 / 每引擎
+//! RunningTime 与算得的百分比——GPU 一直显示 `--` 时看这里。
 
-use windows::Win32::System::Performance::{
-    PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
-    PdhGetFormattedCounterArrayW, PdhOpenQueryW, PDH_FMT_COUNTERVALUE_ITEM_W,
-    PDH_FMT_DOUBLE,
-};
-use sysoverlay_core::metrics::node_key;
-use sysoverlay_core::sampler::{SampleOutcome, Sampler};
+use crate::probe;
+use sysoverlay_core::sampler::{SampleOutcome, Sampler, SamplerId};
 use sysoverlay_core::snapshot::{Metric, Snapshot};
+use windows::Wdk::Graphics::Direct3D::{
+    D3DKMTEnumAdapters2, D3DKMTQueryStatistics, D3DKMT_ADAPTERINFO, D3DKMT_ENUMADAPTERS2,
+    D3DKMT_QUERYSTATISTICS, D3DKMT_QUERYSTATISTICS_QUERY_NODE,
+};
+use windows::Wdk::Graphics::Direct3D::{
+    D3DKMT_QUERYSTATISTICS_ADAPTER as QUERY_TYPE_ADAPTER,
+    D3DKMT_QUERYSTATISTICS_NODE as QUERY_TYPE_NODE,
+};
 
-/// GPU sampler using PDH API.
+/// 速率计算的最小间隔（毫秒）。
+const MIN_DT_MS: u64 = 50;
+
+/// GPU sampler using D3DKMTQueryStatistics.
 pub struct GpuSampler {
-    query: isize,
-    gpu_counter: isize,
-    pdh_available: bool,
-    gpu: Metric<f32>,
+    /// 首次硬失败后置 false（诚实降级：驱动不支持 WDDM 2.0 统计时）。
+    available: bool,
+    /// (上次墙钟 ms, 各引擎 RunningTime 的扁平数组, 引擎数)
+    prev: Option<(u64, Vec<i64>)>,
 }
 
 impl GpuSampler {
-    /// Create a new GPU sampler.
     pub fn new() -> Self {
-        let mut sampler = Self {
-            query: 0,
-            gpu_counter: 0,
-            pdh_available: false,
-            gpu: Metric::Unavailable,
-        };
-
-        if sampler.init_pdh() {
-            sampler.pdh_available = true;
-        }
-
-        sampler
+        Self { available: true, prev: None }
     }
 
-    /// Create a GPU sampler that always returns Unavailable.
-    pub fn unavailable() -> Self {
-        Self {
-            query: 0,
-            gpu_counter: 0,
-            pdh_available: false,
-            gpu: Metric::Unavailable,
-        }
-    }
-
-    /// Returns the current GPU usage metric.
-    pub fn get_gpu(&self) -> Metric<f32> {
-        self.gpu
-    }
-
-    fn init_pdh(&mut self) -> bool {
-        unsafe {
-            let mut query: isize = 0;
-            let result = PdhOpenQueryW(None, 0, &mut query);
-            if result != 0 {
-                return false;
-            }
-
-            let gpu_path = windows::core::w!(r"\GPU Engine(*)\Utilization Percentage");
-            let mut gpu_counter: isize = 0;
-
-            let result = PdhAddEnglishCounterW(query, gpu_path, 0, &mut gpu_counter);
-            if result != 0 {
-                PdhCloseQuery(query);
-                return false;
-            }
-
-            let result = PdhCollectQueryData(query);
-            if result != 0 {
-                PdhCloseQuery(query);
-                return false;
-            }
-
-            self.query = query;
-            self.gpu_counter = gpu_counter;
-            true
-        }
-    }
-
-    fn close_pdh(&mut self) {
-        if self.query != 0 {
-            unsafe { PdhCloseQuery(self.query); }
-            self.query = 0;
-        }
-        self.gpu_counter = 0;
-        self.pdh_available = false;
-    }
-
-    fn sample_gpu_internal(&mut self) -> Metric<f32> {
-        if !self.pdh_available || self.query == 0 {
-            return Metric::Unavailable;
-        }
-
-        unsafe {
-            let result = PdhCollectQueryData(self.query);
-            if result != 0 {
-                return Metric::Unavailable;
-            }
-
-            let mut buffer_size: u32 = 0;
-            let mut item_count: u32 = 0;
-
-            let ret = PdhGetFormattedCounterArrayW(
-                self.gpu_counter, PDH_FMT_DOUBLE, &mut buffer_size, &mut item_count, None,
-            );
-
-            // PDH_MORE_DATA = 0x800007D
-            if ret != 0x800007D_u32 {
-                return Metric::Unavailable;
-            }
-
-            if buffer_size == 0 || item_count == 0 {
-                return Metric::Unavailable;
-            }
-
-            let mut buffer: Vec<u8> = vec![0u8; buffer_size as usize];
-
-            let ret = PdhGetFormattedCounterArrayW(
-                self.gpu_counter, PDH_FMT_DOUBLE, &mut buffer_size, &mut item_count,
-                Some(buffer.as_mut_ptr() as *mut _),
-            );
-
-            if ret != 0 {
-                return Metric::Unavailable;
-            }
-
-            let items = std::slice::from_raw_parts(
-                buffer.as_ptr() as *const PDH_FMT_COUNTERVALUE_ITEM_W,
-                item_count as usize,
-            );
-
-            // Use owned Strings to avoid lifetime issues
-            let mut node_totals: Vec<(String, f32)> = Vec::new();
-
-            for item in items {
-                let name_ptr = item.szName.as_ptr();
-                if name_ptr.is_null() {
-                    continue;
-                }
-
-                let name_str = wide_to_string(name_ptr);
-
-                if item.FmtValue.CStatus != 0 {
-                    continue;
-                }
-
-                let util = (item.FmtValue.Anonymous.doubleValue as f32).max(0.0).min(100.0);
-
-                if let Some(key) = node_key(&name_str) {
-                    if let Some(entry) = node_totals.iter_mut().find(|e| e.0 == key) {
-                        entry.1 += util;
-                    } else {
-                        node_totals.push((key.to_string(), util));
-                    }
-                }
-            }
-
-            node_totals.into_iter().map(|(_, total)| total).fold(None, |max, v| {
-                Some(max.map_or(v, |m| v.max(m)))
-            }).map(Metric::Value).unwrap_or(Metric::Unavailable)
-        }
+    /// Always returns a sampler; first sample probes driver and degrades honestly.
+    pub fn available() -> Self {
+        Self::new()
     }
 }
 
@@ -169,34 +54,130 @@ impl Default for GpuSampler {
     }
 }
 
-impl Drop for GpuSampler {
-    fn drop(&mut self) {
-        self.close_pdh();
+/// 一次枚举拿到的全部引擎 RunningTime。
+fn collect_running_times(probe_on: bool) -> Option<Vec<i64>> {
+    unsafe {
+        // 第一次调用：NumAdapters=0、pAdapters=NULL → 返回需要的适配器数
+        let mut n = D3DKMT_ENUMADAPTERS2 {
+            NumAdapters: 0,
+            pAdapters: std::ptr::null_mut(),
+        };
+        let st = D3DKMTEnumAdapters2(&mut n);
+        if st.is_err() {
+            if probe_on {
+                probe::log(&format!("gpu enum#1 failed nt=0x{:x}", st.0 as u32));
+            }
+            if n.NumAdapters == 0 {
+                return None;
+            }
+        }
+        if n.NumAdapters == 0 {
+            if probe_on {
+                probe::log("gpu no adapters");
+            }
+            return None;
+        }
+
+        let mut infos: Vec<D3DKMT_ADAPTERINFO> = Vec::with_capacity(n.NumAdapters as usize);
+        infos.resize_with(n.NumAdapters as usize, D3DKMT_ADAPTERINFO::default);
+        n.pAdapters = infos.as_mut_ptr();
+        let st2 = D3DKMTEnumAdapters2(&mut n);
+        if st2.is_err() {
+            if probe_on {
+                probe::log(&format!("gpu enum#2 failed nt=0x{:x}", st.0 as u32));
+            }
+            return None;
+        }
+
+        let mut times: Vec<i64> = Vec::new();
+        for (ai, info) in infos.iter().enumerate() {
+            // 引擎数
+            let mut qa = D3DKMT_QUERYSTATISTICS::default();
+            qa.Type = QUERY_TYPE_ADAPTER;
+            qa.AdapterLuid = info.AdapterLuid;
+            let node_count = if D3DKMTQueryStatistics(&qa).is_ok() {
+                qa.QueryResult.AdapterInformation.NodeCount
+            } else {
+                0
+            };
+            if probe_on {
+                probe::log(&format!(
+                    "gpu adapter {ai} luid=0x{:08x}_0x{:08x} nodes={node_count}",
+                    info.AdapterLuid.LowPart, info.AdapterLuid.HighPart
+                ));
+            }
+            for node in 0..node_count {
+                let mut qn = D3DKMT_QUERYSTATISTICS::default();
+                qn.Type = QUERY_TYPE_NODE;
+                qn.AdapterLuid = info.AdapterLuid;
+                qn.Anonymous.QueryNode = D3DKMT_QUERYSTATISTICS_QUERY_NODE { NodeId: node };
+                let rt = if D3DKMTQueryStatistics(&qn).is_ok() {
+                    // 100ns 累计运行时间
+                    qn.QueryResult.NodeInformation.GlobalInformation.RunningTime
+                } else {
+                    0
+                };
+                if probe_on {
+                    probe::log(&format!("gpu adapter {ai} node{node} running_time_100ns={rt}"));
+                }
+                times.push(rt);
+            }
+        }
+        Some(times)
     }
 }
 
 impl Sampler for GpuSampler {
     fn name(&self) -> &'static str {
-        "GPU"
+        "gpu"
     }
 
-    fn sample(&mut self, _prev: Option<&Snapshot>, _now_ms: u64) -> SampleOutcome {
-        self.gpu = self.sample_gpu_internal();
+    fn id(&self) -> SamplerId {
+        SamplerId::Gpu
+    }
 
-        if matches!(self.gpu, Metric::Unavailable) {
-            SampleOutcome::Transient("GPU sampling failed")
-        } else {
-            SampleOutcome::Ok
+    fn sample(&mut self, _prev_snap: Option<&Snapshot>, now_ms: u64, out: &mut Snapshot) -> SampleOutcome {
+        if !self.available {
+            out.gpu = Metric::Unavailable;
+            return SampleOutcome::Skipped;
         }
-    }
-}
+        let probe_on = probe::enabled();
+        let Some(times) = collect_running_times(probe_on) else {
+            // 枚举失败：可能没有 WDDM 2.0 统计支持（部分虚拟机/老驱动）
+            out.gpu = Metric::Unavailable;
+            return SampleOutcome::Transient;
+        };
 
-fn wide_to_string(ptr: *const u16) -> String {
-    if ptr.is_null() {
-        return String::new();
-    }
-    unsafe {
-        let len = (0..).take_while(|&i| *ptr.add(i) != 0).count();
-        String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+        let mut pct: Option<f32> = None;
+        if let Some((pms, prev)) = &self.prev {
+            let dt = now_ms.saturating_sub(*pms);
+            if dt >= MIN_DT_MS && prev.len() == times.len() && !times.is_empty() {
+                let mut max_pct: f32 = 0.0;
+                for (rt, prt) in times.iter().zip(prev.iter()) {
+                    let drt = rt.saturating_sub(*prt);
+                    // % = Δ(100ns) / (Δms × 100)
+                    let node_pct = (drt as f64 / (dt as f64 * 100.0)) as f32;
+                    if node_pct > max_pct {
+                        max_pct = node_pct;
+                    }
+                    if probe_on {
+                        probe::log(&format!(
+                            "gpu node dt={dt} delta_100ns={drt} pct={node_pct:.1}"
+                        ));
+                    }
+                }
+                pct = Some(max_pct.clamp(0.0, 100.0));
+            }
+        }
+
+        self.prev = Some((now_ms, times));
+
+        if let Some(p) = pct {
+            out.gpu = Metric::Value(p);
+        } else if self.prev.is_some() {
+            // 首轮：只有基线，先给 0 避免 UI 一直 `--`
+            out.gpu = Metric::Value(0.0);
+        }
+        SampleOutcome::Ok
     }
 }

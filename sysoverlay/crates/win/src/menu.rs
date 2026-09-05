@@ -1,70 +1,46 @@
-//! Context menu placeholder.
-//!
-//! This module provides placeholder implementations for the context menu
-/// functionality. The real implementation will use TrackPopupMenu API.
+//! 托盘右键菜单：设置 / 退出。
 
-use windows::Win32::Foundation::{HWND};
-use windows::Win32::UI::WindowsAndMessaging::{HMENU, TPM_LEFTALIGN, TPM_RETURNCMD};
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::WindowsAndMessaging::{
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, SetForegroundWindow,
+    TrackPopupMenu, HMENU, MF_SEPARATOR, MF_STRING, TPM_LEFTALIGN,
+};
 
-/// Menu item identifiers
-pub const IDM_TOPMOST: u16 = 1;
-pub const IDM_MINIMAL: u16 = 2;
-pub const IDM_HOVER: u16 = 3;
-pub const IDM_BGCLR: u16 = 6;
-pub const IDM_FGCLR: u16 = 7;
-pub const IDM_CLRDEF: u16 = 8;
-pub const IDM_QUIT: u16 = 9;
+pub const IDM_SETTINGS: u16 = 1;
+pub const IDM_QUIT: u16 = 2;
+pub const IDM_CHARTS: u16 = 3;
+pub const IDM_PROCESSES: u16 = 4;
 
-/// Placeholder context menu state
-pub struct MenuState {
-    /// Whether topmost mode is enabled
-    pub topmost: bool,
-    /// Whether minimal mode is enabled
-    pub minimal: bool,
-    /// Whether hover mode is enabled
-    pub hover: bool,
+unsafe fn append(menu: HMENU, id: u16, label: &str) {
+    let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
+    let _ = AppendMenuW(menu, MF_STRING, id as usize, windows::core::PCWSTR(wide.as_ptr()));
 }
 
-impl Default for MenuState {
-    fn default() -> Self {
-        Self {
-            topmost: true,
-            minimal: false,
-            hover: false,
-        }
-    }
-}
+/// 在光标处弹出托盘菜单，返回选中的命令 ID。
+pub fn show_tray_menu(hwnd: HWND) -> Option<u16> {
+    unsafe {
+        let menu = match CreatePopupMenu() {
+            Ok(m) => m,
+            Err(_) => return None,
+        };
+        append(menu, IDM_SETTINGS, "Settings");
+        append(menu, IDM_CHARTS, "Charts");
+        append(menu, IDM_PROCESSES, "Processes");
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+        append(menu, IDM_QUIT, "Quit");
 
-/// Show the context menu at the current cursor position.
-///
-/// This is a placeholder that will be implemented with TrackPopupMenu
-/// in a later phase.
-pub fn show_menu(_hwnd: HWND) -> Option<u16> {
-    // Placeholder: menu handling not yet implemented
-    // Real implementation will:
-    // 1. Create popup menu with TrackPopupMenu
-    // 2. Return selected command ID
-    None
-}
+        // 托盘菜单标准前置：让窗口前台化，否则菜单不随点击外消失
+        let _ = SetForegroundWindow(hwnd);
 
-/// Handle a menu command.
-///
-/// This processes the selected menu item.
-pub fn handle_command(_cmd: u16) {
-    // Placeholder: menu command handling not yet implemented
-    match _cmd {
-        IDM_QUIT => {
-            // Will post WM_CLOSE
+        let mut pt = windows::Win32::Foundation::POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let cmd = TrackPopupMenu(menu, TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, None);
+        let _ = DestroyMenu(menu);
+
+        if cmd.as_bool() {
+            Some(cmd.0 as u16)
+        } else {
+            None
         }
-        IDM_TOPMOST => {
-            // Will toggle topmost mode
-        }
-        IDM_MINIMAL => {
-            // Will toggle minimal mode
-        }
-        IDM_HOVER => {
-            // Will toggle hover mode
-        }
-        _ => {}
     }
 }

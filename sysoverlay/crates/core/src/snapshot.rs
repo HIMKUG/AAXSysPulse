@@ -3,12 +3,17 @@
 //! All fields are scalar types, so `Clone` is cheap (shallow copy).
 
 /// A complete sampling result, immutable once produced.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct Snapshot {
     /// Monotonically increasing sequence number.
     pub seq: u64,
     /// Unix timestamp in milliseconds.
     pub timestamp_ms: u64,
+    /// 系统已运行时长（毫秒，来自 `GetTickCount64`）。
+    ///
+    /// 与 `timestamp_ms` 是两回事：后者是墙钟时间（量级 ~1.7e12），
+    /// 早期版本直接拿 `timestamp_ms / 1000` 当"运行时长"显示，是个明显错误。
+    pub uptime_ms: u64,
     /// CPU utilization percentage (0.0..=100.0).
     pub cpu: Metric<f32>,
     /// Memory statistics.
@@ -17,6 +22,30 @@ pub struct Snapshot {
     pub gpu: Metric<f32>,
     /// Network statistics (bytes per second).
     pub net: NetStat,
+    /// CPU 封装功耗（瓦）。
+    ///
+    /// 默认 `Unavailable`：功耗是可选附加组件（v2 决策「驱动边界」），
+    /// 驱动没装时主程序**不会**因此降级，这一行直接隐藏。
+    pub power: Metric<f32>,
+}
+
+impl Snapshot {
+    /// 启动时的占位快照：什么都还没有，全部 `Unavailable`。
+    ///
+    /// `app` 用它初始化 `ArcSwap`，这样第一帧就有东西可画
+    /// （渲染为 "Initializing..."），而不是等采样线程的第一帧。
+    pub fn placeholder(now_ms: u64) -> Self {
+        Self {
+            seq: 0,
+            timestamp_ms: now_ms,
+            uptime_ms: 0,
+            cpu: Metric::Unavailable,
+            memory: MemoryStat::default(),
+            gpu: Metric::Unavailable,
+            net: NetStat::default(),
+            power: Metric::Unavailable,
+        }
+    }
 }
 
 /// A metric value with optional staleness information.
@@ -29,6 +58,12 @@ pub enum Metric<T> {
     Stale { value: T, stale_for: u32 },
     /// No data available (sensor unavailable, etc.).
     Unavailable,
+}
+
+impl<T> Default for Metric<T> {
+    fn default() -> Self {
+        Metric::Unavailable
+    }
 }
 
 impl<T: Copy> Metric<T> {

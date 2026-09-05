@@ -9,17 +9,39 @@ use crate::snapshot::Metric;
 /// `idle_delta`, `kernel_delta`, and `user_delta` are time differences
 /// in 100-nanosecond units (same unit as `FILETIME`).
 ///
+/// # `GetSystemTimes` 语义（关键）
+///
+/// Windows `GetSystemTimes` 的三个输出**不是**互相独立的三项：
+///
+/// - `lpKernelTime`（内核态）**已经包含** `lpIdleTime`（空闲）时间；
+/// - `lpUserTime`（用户态）与 kernel 并列，不含 idle；
+/// - 三者都是**所有核心的累加值**。
+///
+/// 因此：
+///
+/// ```text
+/// total = kernel + user     // 全部核心的 CPU 时间总量
+/// busy  = total - idle      // 真正干活的时间
+/// usage = busy / total
+/// ```
+///
+/// > 历史 bug：旧实现写成 `total = idle + kernel + user`，把已经包含在 kernel
+/// > 里的 idle **又加了一遍**。旧式 `(k+u)/(i+k+u)` 恒大于正确的 `(k+u-i)/(k+u)`，
+/// > 净效果是 **CPU% 系统性偏高** —— 实测 4 核 50% 负载会被算成 66.7%。
+///
 /// Returns CPU usage as a percentage (0.0..=100.0) clamped to sane bounds,
-/// or `Metric::Unavailable` if the deltas are all zero (avoid division by zero).
+/// or `Metric::Unavailable` if the total delta is zero (avoid division by zero).
 pub fn cpu_usage(idle_delta: u64, kernel_delta: u64, user_delta: u64) -> Metric<f32> {
-    let total_time = idle_delta.saturating_add(kernel_delta).saturating_add(user_delta);
-    if total_time == 0 {
+    // kernel 已含 idle，所以总时间就是 kernel + user，不再额外加 idle。
+    let total = kernel_delta.saturating_add(user_delta);
+    if total == 0 {
         return Metric::Unavailable;
     }
 
-    let busy_time = kernel_delta.saturating_add(user_delta);
-    // CPU usage = fraction of total time that was busy (not idle)
-    let usage = (busy_time as f64) / (total_time as f64) * 100.0;
+    // 理论上有 idle <= total；计数异常（如系统时间回拨）时 saturating 归零。
+    let busy = total.saturating_sub(idle_delta);
+
+    let usage = (busy as f64) / (total as f64) * 100.0;
     let usage = usage.clamp(0.0, 100.0) as f32;
     Metric::Value(usage)
 }
@@ -60,85 +82,86 @@ pub fn ema(prev: f32, next: f32, alpha: f32) -> f32 {
     prev + alpha * (next - prev)
 }
 
-/// GPU engine node key extraction.
-///
-/// PDH instance names for GPU engines have the form:
-/// `luid_0x00000000_0x0001D3A5_phys_0_eng_0_engtype_3D_pid_1234`
-///
-/// This function extracts the node key portion (from `luid_` to just before `_pid_`)
-/// which groups all per-process engine usage by physical node.
-///
-/// Returns `None` if the string does not contain `luid_` or `pid_`.
-pub fn node_key(instance: &str) -> Option<&str> {
-    let luid_start = instance.find("luid_")?;
-    let pid_start = instance.find("_pid_")?;
-
-    // node key spans from luid_ start to just before _pid_
-    let end = pid_start;
-    if luid_start >= end {
-        return None;
-    }
-    Some(&instance[luid_start..end])
-}
-
-/// Aggregate GPU engine nodes: sum utilization per node and return the maximum.
-///
-/// `instances` is an iterator of `(instance_name, utilization)` pairs.
-///
-/// Returns the utilization of the busiest node, or `None` if there are no instances.
-pub fn aggregate_gpu_nodes<'a>(instances: impl Iterator<Item = (&'a str, f32)>) -> Option<f32> {
-    // Group by node key and sum.
-    let mut node_totals: Vec<(&'a str, f32)> = Vec::new();
-
-    for (name, util) in instances {
-        let key = node_key(name)?;
-        // Clamp negative values to zero (some PDH counters can return spurious negatives).
-        let util = util.max(0.0);
-
-        if let Some(entry) = node_totals.iter_mut().find(|e| e.0 == key) {
-            entry.1 += util;
-        } else {
-            node_totals.push((key, util));
-        }
-    }
-
-    node_totals.into_iter().map(|(_, total)| total).fold(None, |max, v| {
-        Some(max.map_or(v, |m| v.max(m)))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // ── cpu_usage：GetSystemTimes 语义（kernel 已含 idle） ────────────
+
+    /// 4 核机器、1 秒窗口、50% 负载：
+    /// total(kernel+user) = 100，其中 idle = 50 → busy = 50 → 50%。
     #[test]
-    fn test_cpu_usage_normal() {
-        // 50% usage: 50 units idle out of 100 total (kernel+user=50)
-        let m = cpu_usage(50, 25, 25);
+    fn test_cpu_usage_half_busy() {
+        let m = cpu_usage(50, 60, 40);
         assert_eq!(m, Metric::Value(50.0));
+    }
 
-        // 100% usage: no idle time (idle=0, kernel+user=100)
-        let m = cpu_usage(0, 50, 50);
+    /// 完全跑满：idle = 0，busy = total → 100%。
+    #[test]
+    fn test_cpu_usage_fully_busy() {
+        let m = cpu_usage(0, 60, 40);
         assert_eq!(m, Metric::Value(100.0));
+    }
 
-        // 0% usage: all idle (idle=100, kernel=0, user=0)
-        let m = cpu_usage(100, 0, 0);
+    /// 完全空闲：所有时间都算进 kernel（idle 包含在 kernel 内），busy = 0。
+    #[test]
+    fn test_cpu_usage_fully_idle() {
+        let m = cpu_usage(100, 100, 0);
         assert_eq!(m, Metric::Value(0.0));
     }
 
+    /// 全部为零（没有经过任何时间）→ 不可用，而不是除零 panic。
     #[test]
-    fn test_cpu_usage_clamp() {
-        // Edge case: very small busy time
-        let m = cpu_usage(0, 1, 0);
-        assert_eq!(m, Metric::Value(100.0));
-    }
-
-    #[test]
-    fn test_cpu_usage_unavailable() {
-        // All zeros -> unavailable (no time elapsed).
+    fn test_cpu_usage_unavailable_on_zero_total() {
         let m = cpu_usage(0, 0, 0);
         assert_eq!(m, Metric::Unavailable);
     }
+
+    /// **回归测试**：这是此前那条 bug 的直接断言。
+    ///
+    /// 旧公式 `total = idle + kernel + user` 会把同一份数据算成
+    /// `100 / 150 = 66.67%`，而正确答案是 50%。
+    #[test]
+    fn test_cpu_usage_does_not_double_count_idle() {
+        let m = cpu_usage(50, 60, 40);
+        let wrong = Metric::Value(66.666_664); // (60+40)/(50+60+40)
+        assert_ne!(m, wrong, "kernel 已含 idle，不得再单独加一次 idle");
+        assert_eq!(m, Metric::Value(50.0));
+    }
+
+    /// 计数异常（idle > total，例如系统时间回拨）时饱和到 0，不出现负数或 NaN。
+    #[test]
+    fn test_cpu_usage_idle_exceeds_total_saturates() {
+        let m = cpu_usage(150, 100, 0);
+        assert_eq!(m, Metric::Value(0.0));
+    }
+
+    /// 单核场景：kernel+user = 100，idle = 75 → 25%。
+    #[test]
+    fn test_cpu_usage_single_core_quarter() {
+        let m = cpu_usage(75, 70, 30);
+        assert_eq!(m, Metric::Value(25.0));
+    }
+
+    /// 多核真实量级：8 核 1 秒窗口 = 8×10^7 个 100ns 单位，其中 2 核满载。
+    /// idle = 6e7, kernel+user = 8e7 → busy = 2e7 → 25%。
+    #[test]
+    fn test_cpu_usage_realistic_magnitude() {
+        let unit_per_sec = 10_000_000u64;
+        let total = 8 * unit_per_sec;
+        let idle = 6 * unit_per_sec;
+        let m = cpu_usage(idle, total - unit_per_sec, unit_per_sec);
+        assert_eq!(m, Metric::Value(25.0));
+    }
+
+    /// 极小工作量的边界：busy = 1，total = 10000 → 0.01%（可表示，非 0）。
+    #[test]
+    fn test_cpu_usage_tiny_busy() {
+        let m = cpu_usage(9_999, 10_000, 0);
+        assert_eq!(m, Metric::Value(0.01));
+    }
+
+    // ── rate_per_sec ────────────────────────────────────────────────
 
     #[test]
     fn test_rate_per_sec_normal() {
@@ -169,6 +192,8 @@ mod tests {
         assert_eq!(rate_per_sec(0, 1000), Some(0));
     }
 
+    // ── ema ─────────────────────────────────────────────────────────
+
     #[test]
     fn test_ema() {
         assert_eq!(ema(0.0, 10.0, 0.5), 5.0);
@@ -178,59 +203,8 @@ mod tests {
     }
 
     #[test]
-    fn test_node_key() {
-        let name = "luid_0x00000000_0x0001D3A5_phys_0_eng_0_engtype_3D_pid_1234";
-        assert_eq!(node_key(name), Some("luid_0x00000000_0x0001D3A5_phys_0_eng_0_engtype_3D"));
-    }
-
-    #[test]
-    fn test_node_key_no_luid() {
-        let name = "invalid_instance_name";
-        assert_eq!(node_key(name), None);
-    }
-
-    #[test]
-    fn test_node_key_no_pid() {
-        let name = "luid_0x1234_phys_0_eng_0";
-        assert_eq!(node_key(name), None);
-    }
-
-    #[test]
-    fn test_aggregate_gpu_nodes_single() {
-        let instances = [("luid_0x1_phys_0_eng_0_engtype_3D_pid_100", 50.0)];
-        assert_eq!(aggregate_gpu_nodes(instances.into_iter()), Some(50.0));
-    }
-
-    #[test]
-    fn test_aggregate_gpu_nodes_multi_same_node() {
-        // Two processes on the same node.
-        let instances = [
-            ("luid_0x1_phys_0_eng_0_engtype_3D_pid_100", 30.0),
-            ("luid_0x1_phys_0_eng_0_engtype_3D_pid_200", 20.0),
-        ];
-        assert_eq!(aggregate_gpu_nodes(instances.into_iter()), Some(50.0));
-    }
-
-    #[test]
-    fn test_aggregate_gpu_nodes_different_nodes() {
-        let instances = [
-            ("luid_0x1_phys_0_eng_0_engtype_3D_pid_100", 30.0),
-            ("luid_0x2_phys_0_eng_0_engtype_3D_pid_100", 50.0),
-        ];
-        // Should return the max node total (50.0), not the sum.
-        assert_eq!(aggregate_gpu_nodes(instances.into_iter()), Some(50.0));
-    }
-
-    #[test]
-    fn test_aggregate_gpu_nodes_negative_clamped() {
-        let instances = [("luid_0x1_phys_0_eng_0_engtype_3D_pid_100", -10.0)];
-        // Negative should be clamped to 0.
-        assert_eq!(aggregate_gpu_nodes(instances.into_iter()), Some(0.0));
-    }
-
-    #[test]
-    fn test_aggregate_gpu_nodes_empty() {
-        let instances: [(&str, f32); 0] = [];
-        assert_eq!(aggregate_gpu_nodes(instances.into_iter()), None);
+    fn test_ema_alpha_zero_is_hold() {
+        // alpha=0 → 完全保持旧值
+        assert_eq!(ema(42.0, 999.0, 0.0), 42.0);
     }
 }
