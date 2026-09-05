@@ -221,6 +221,40 @@ fn main() {
     autostart::apply(cfg.autostart);
     publish_schedule_cfg(&cfg);
 
+    // ── 4b'. 诊断模式：SYSOVERLAY_DIAG 自动打开辅助窗口（子串匹配）──
+    // 无人值守复现与二分定位用（配合 SYSOVERLAY_PERF=1 / SYSOVERLAY_PROBE=1
+    // 收集 UI 线程卡顿与 CPU 占用证据）：
+    //   "1"/"all"     → 全部窗口
+    //   "settings"    → 仅设置窗口    "graph" → 仅曲线    "procs" → 仅进程榜
+    //   ",click"      → 附加：每 3s 自动模拟点击设置页 CPU 开关（复现 UI 不刷新）
+    let diag = std::env::var("SYSOVERLAY_DIAG").unwrap_or_default();
+    let diag_on = |token: &str| {
+        diag == "1" || diag == "all" || diag.split(',').any(|t| t == token)
+    };
+    if diag_on("settings") {
+        sysoverlay_win::settings::open_settings(window.hwnd());
+        if diag_on("click") {
+            sysoverlay_win::probe::log("diag: auto click loop started");
+            thread::spawn(move || {
+                // 先等设置窗口完成首帧，再每 3s 模拟点击一次 CPU 开关（共 10 次）
+                thread::sleep(Duration::from_millis(2_500));
+                sysoverlay_win::probe::log("diag: first click");
+                sysoverlay_win::settings::diag_click_cpu();
+                for i in 0..9 {
+                    thread::sleep(Duration::from_millis(3_000));
+                    sysoverlay_win::probe::log(&format!("diag: click #{}", i + 2));
+                    sysoverlay_win::settings::diag_click_cpu();
+                }
+            });
+        }
+    }
+    if diag_on("graph") {
+        sysoverlay_win::graph::open();
+    }
+    if diag_on("procs") {
+        sysoverlay_win::proc_list::open();
+    }
+
     // ── 4c. Spawn scheduler-driven sampling thread ────────────────────────
     // 分频调度：GPU/Net 不快于 1s（计数器本身 1s 才更新），
     // Auto 档刷新上限 = 启用源的最大有效间隔，成本超标自动降档。
@@ -239,6 +273,16 @@ fn main() {
         let overlay_hwnd = windows::Win32::Foundation::HWND(hwnd_addr as *mut _);
 
         loop {
+            // 覆盖层隐藏时完全停止采样：省 CPU + 彻底消除 AFMF 冲突（数值不更新，DWM 无合成）。
+            unsafe {
+                use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+                while !IsWindowVisible(overlay_hwnd).as_bool() {
+                    thread::sleep(Duration::from_secs(1));
+                    // 等待显示时用 resume 通知唤醒（系统唤醒/重新显示时发信号）
+                    let _ = resume_rx.recv_timeout(Duration::from_secs(5));
+                }
+            }
+
             // Check for resume notification
             if resume_rx.try_recv().is_ok() {
                 sampler.reset_backoff();
@@ -278,6 +322,19 @@ fn main() {
             // 睡到最近的到期源，而不是固定间隔——分频调度的节能关键
             let wake = sched.next_wake_ms(get_tick_count_ms(), &enabled);
             let sleep_ms = wake.saturating_sub(get_tick_count_ms()).max(1).min(5000);
+            // 采样循环探针：记录每轮采样耗时与休眠时长（sched 忙等/采样超支一眼可见）
+            sysoverlay_win::probe::log(&format!(
+                "cycle cost_ms={} sleep_ms={} penalty={} auto={} plan={}{}{}{}",
+                cost_ms,
+                sleep_ms,
+                sched.penalty(),
+                auto as u8,
+                plan.cpu as u8,
+                plan.mem as u8,
+                plan.gpu as u8,
+                plan.net as u8,
+            ));
+            sysoverlay_win::perf::note_cycle(cost_ms, sleep_ms);
             thread::sleep(Duration::from_millis(sleep_ms));
         }
     });

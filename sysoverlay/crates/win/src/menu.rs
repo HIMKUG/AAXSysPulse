@@ -2,8 +2,8 @@
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, SetForegroundWindow,
-    TrackPopupMenu, HMENU, MF_SEPARATOR, MF_STRING, TPM_LEFTALIGN,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos,
+    TrackPopupMenu, HMENU, MF_SEPARATOR, MF_STRING, TPM_LEFTALIGN, PA_NOACTIVATE,
 };
 
 pub const IDM_SETTINGS: u16 = 1;
@@ -29,12 +29,19 @@ pub fn show_tray_menu(hwnd: HWND) -> Option<u16> {
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
         append(menu, IDM_QUIT, "Quit");
 
-        // 托盘菜单标准前置：让窗口前台化，否则菜单不随点击外消失
-        let _ = SetForegroundWindow(hwnd);
-
+        // 不调用 SetForegroundWindow：用 TPM_NOACTIVATE 让菜单跟随托盘图标，
+        // 不抢游戏前台（AFMF 破坏路径 1：抢焦点）。
         let mut pt = windows::Win32::Foundation::POINT::default();
         let _ = GetCursorPos(&mut pt);
-        let cmd = TrackPopupMenu(menu, TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, None);
+        let cmd = TrackPopupMenu(
+            menu,
+            TPM_LEFTALIGN | windows::Win32::UI::WindowsAndMessaging::TRACK_POPUP_MENU_FLAGS(PA_NOACTIVATE as u32),
+            pt.x,
+            pt.y,
+            0,
+            hwnd,
+            None,
+        );
         let _ = DestroyMenu(menu);
 
         if cmd.as_bool() {

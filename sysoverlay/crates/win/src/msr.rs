@@ -35,11 +35,8 @@ const MSR_INTEL_DRAM_ENERGY: u32 = 0x619;
 /// IOCTL_OLS_READ_MSR = CTL_CODE(40000, 0x821, METHOD_BUFFERED, FILE_ANY_ACCESS)
 const IOCTL_OLS_READ_MSR: u32 = (40000u32 << 16) | (0x821u32 << 2);
 const DEVICE_PATH: &str = "\\\\.\\WinRing0_1_2_0";
-const SERVICE_NAME: &str = "SysOverlayWinRing0";
 /// 能量计数回退判定阈值（超过说明是异常而非回绕）。
 const WRAP_LIMIT_RAW: u64 = 1 << 31;
-
-type FnReadMsr = unsafe extern "system" fn(u32, *mut u32, *mut u32) -> i32;
 
 struct Ring0 {
     dev: windows::Win32::Foundation::HANDLE,
@@ -157,8 +154,8 @@ fn ring0() -> Option<&'static Ring0> {
             windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
             None,
         ) {
-            Ok(h) if !h.is_invalid() => h,
-            Ok(h) => {
+            Ok(_h) if !_h.is_invalid() => _h,
+            Ok(_h) => {
                 probe::log("msr open device returned invalid handle");
                 return None;
             }

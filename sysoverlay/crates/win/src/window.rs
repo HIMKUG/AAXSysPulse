@@ -9,13 +9,18 @@ use arc_swap::ArcSwap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT};
-use windows::Win32::Graphics::Gdi::{GetDC, GetDeviceCaps, InvalidateRect, ReleaseDC, HORZRES, VERTRES};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, EndPaint, GetDC, GetDeviceCaps, GetMonitorInfoW, InvalidateRect,
+    MonitorFromWindow, ReleaseDC, ValidateRect, HORZRES, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    PAINTSTRUCT, VERTRES,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, DestroyWindow,
     IsWindowVisible, PostQuitMessage, RegisterClassExW, SetWindowPos, ShowWindow,
     TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW,
-    LoadCursorW, MSG, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOW,
+    LoadCursorW, MSG, SWP_NOACTIVATE, SWP_NOZORDER,
+     SW_HIDE, SW_SHOW, WM_MOUSEACTIVATE,
     WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
     WS_EX_TOOLWINDOW, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
 };
@@ -181,6 +186,7 @@ pub const WM_NEW_SNAPSHOT: u32 = 0x8000 + 3;
 
 const HTCAPTION_VAL: isize = 2;
 const HTCLIENT_VAL: isize = 1;
+const HTTRANSPARENT_VAL: isize = 20;
 
 /// Retrieves ThreadState pointer from GWLP_USERDATA.
 ///
@@ -223,15 +229,41 @@ unsafe extern "system" fn wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        // 明确拒绝激活：防抢游戏前台 + AFMF 破坏路径 1（抢焦点）。
+        WM_MOUSEACTIVATE => LRESULT(3), // MA_NOACTIVATE = 3
+
         // 边框命中交给 DefWindowProc（WS_THICKFRAME 的 HTLEFT/HTRIGHT 等），
         // 只有客户区内部才当成标题栏（可拖动）。
+        // ── 命中测试：控制穿透与可拖拽的入口 ──────────────────────────────
+        //
+        // 旧的实现始终返回 HTCAPTION（覆盖了 DefWindowProc 默认行为），
+        // 导致 WS_EX_TRANSPARENT 样式从第一天起就完全失效。
+        //
+        // 新的实现：WM_NCHITTEST 本身就能传递"鼠标是否在我上方"的信息——
+        // 收到此消息即说明鼠标当前在窗口上。不依赖样式切换，零额外合成。
+        //
+        // 死锁破局：返回 HTTRANSPARENT 后确实收不到 WM_LBUTTONDOWN，
+        // 但 WM_NCHITTEST 本身随鼠标移动持续送达；第一次命中就已经把
+        // hover=true 写进去，所以下一次 WM_LBUTTONDOWN 必然能收到。
         WM_NCHITTEST => {
-            let ht = DefWindowProcW(hwnd, msg, _wparam, lparam).0;
-            if ht == HTCLIENT_VAL {
-                LRESULT(HTCAPTION_VAL)
-            } else {
-                LRESULT(ht)
+            let hit = unsafe { DefWindowProcW(hwnd, msg, _wparam, lparam) }.0;
+
+            if hit != HTCLIENT_VAL {
+                return LRESULT(hit);
             }
+
+            if let Some(state) = get_state_ptr(hwnd).as_mut() {
+                state.hovered = true;
+                track_mouse_leave(hwnd);
+
+                if state.dragging {
+                    return LRESULT(HTCAPTION_VAL);
+                }
+
+                return LRESULT(HTTRANSPARENT_VAL);
+            }
+
+            LRESULT(hit)
         }
 
         WM_LBUTTONDOWN => {
@@ -251,23 +283,18 @@ unsafe extern "system" fn wndproc(
 
         WM_MOUSEMOVE => {
             if let Some(state) = get_state_ptr(hwnd).as_mut() {
-                // ── hover 点亮（无论是否在拖）──
-                if !state.hovered {
-                    state.hovered = true;
-                    track_mouse_leave(hwnd);
-                    if state.cfg.hover {
-                        let snap = snap_get();
-                        crate::gdi::render(hwnd, &snap, &state.cfg);
-                    }
-                }
-                // ── 手动拖动 ──
                 if state.dragging {
                     let cur = POINT {
                         x: (lparam.0 & 0xFFFF) as i16 as i32,
                         y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                     };
-                    let new_x = state.win_start.x + (cur.x - state.drag_start.x);
-                    let new_y = state.win_start.y + (cur.y - state.drag_start.y);
+                    let (new_x, new_y) = clamp_to_monitor(
+                        state.win_start.x + (cur.x - state.drag_start.x),
+                        state.win_start.y + (cur.y - state.drag_start.y),
+                        state.cfg.window_size.map(|(w, _)| w).unwrap_or(200),
+                        state.cfg.window_size.map(|(_, h)| h).unwrap_or(60),
+                        hwnd,
+                    );
                     let _ = SetWindowPos(
                         hwnd,
                         None,
@@ -283,14 +310,12 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
 
-        // hover 模式：鼠标离开 → 变淡再画一帧（alpha 变化会改写指纹，正常重绘）
+        // WM_MOUSELEAVE 只在鼠标真正离开（非 SetCapture 期间）才触发
         WM_MOUSELEAVE => {
             if let Some(state) = get_state_ptr(hwnd).as_mut() {
-                if state.hovered && state.cfg.hover {
-                    let snap = snap_get();
-                    crate::gdi::render(hwnd, &snap, &state.cfg);
+                if !state.dragging {
+                    state.hovered = false;
                 }
-                state.hovered = false;
             }
             LRESULT(0)
         }
@@ -331,6 +356,12 @@ unsafe extern "system" fn wndproc(
                 }
                 state.pos_dirty = false;
                 state.size_dirty = false;
+                let was_dragging = state.dragging;
+                state.dragging = false;
+                if was_dragging {
+                    let snap = snap_get();
+                    crate::gdi::render(hwnd, &snap, &state.cfg);
+                }
             }
             LRESULT(0)
         }
@@ -356,10 +387,31 @@ unsafe extern "system" fn wndproc(
         }
 
         WM_PAINT => {
-            if let Some(state) = get_state_ptr(hwnd).as_mut() {
-                let snap = snap_get();
-                crate::gdi::render(hwnd, &snap, &state.cfg);
+            // 必须先验证更新区域再干活：本窗口是 WS_EX_LAYERED，像素走
+            // UpdateLayeredWindow，但 WM_PAINT 若不清空更新区域，
+            // GetMessageW 会以每秒数十万次的速度无限重新合成 WM_PAINT
+            // （实测 ~17 万次/秒，CPU 被吃走约 5~10%，同时洪泛消息队列
+            // 饿死同一线程上设置窗口的 WM_PAINT——两个症状同源）。
+            //
+            // 拖动期间（P3-1）：系统模态循环中 SetWindowPos 会触发 WM_PAINT，
+            // 此时只清更新区域，等到 WM_EXITSIZEMOVE 才合并渲染一帧。
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
+            if hdc.is_invalid() {
+                let _ = unsafe { ValidateRect(hwnd, None) };
+                return LRESULT(0);
             }
+            let is_dragging = get_state_ptr(hwnd)
+                .as_ref()
+                .map(|s| s.dragging)
+                .unwrap_or(false);
+            if !is_dragging {
+                if let Some(state) = get_state_ptr(hwnd).as_mut() {
+                    let snap = snap_get();
+                    crate::gdi::render(hwnd, &snap, &state.cfg);
+                }
+            }
+            let _ = unsafe { EndPaint(hwnd, &ps) };
             LRESULT(0)
         }
 
@@ -398,12 +450,14 @@ unsafe extern "system" fn wndproc(
 
         // ── 设置面板改动：重排版 + 自适应窗口尺寸 + 发布调度配置 ──
         WM_RECONFIG => {
+            let r0 = crate::perf::begin();
             if let Some(state) = get_state_ptr(hwnd).as_mut() {
                 publish_schedule_cfg(&state.cfg);
                 crate::gdi::fit_window(hwnd, &state.cfg);
                 let snap = snap_get();
                 crate::gdi::render(hwnd, &snap, &state.cfg);
             }
+            crate::perf::note_section("wnd_reconfig", r0);
             LRESULT(0)
         }
 
@@ -540,6 +594,22 @@ pub fn apply_topmost(hwnd: HWND, on: bool) {
     }
 }
 
+fn clamp_to_monitor(x: i32, y: i32, win_w: i32, win_h: i32, hwnd: HWND) -> (i32, i32) {
+    let hmon = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetMonitorInfoW(hmon, &mut mi) }.as_bool() {
+        return (x, y);
+    }
+    let rc = mi.rcWork;
+    const MARGIN: i32 = 64;
+    let max_x = (rc.right - win_w - MARGIN).max(rc.left);
+    let max_y = (rc.bottom - win_h - MARGIN).max(rc.top);
+    (x.clamp(rc.left, max_x), y.clamp(rc.top, max_y))
+}
+
 fn get_screen_size() -> (i32, i32) {
     unsafe {
         let hdc = GetDC(None);
@@ -605,7 +675,9 @@ impl OverlayWindow {
 
         // 内容自然尺寸（由渲染器决定：横向条 / 经典卡片）；用户曾手动调整过则用保存值
         let (strip_w, strip_h) = crate::gdi::natural_size(&state.cfg);
-        let (pos_x, pos_y) = state.cfg.window_pos.unwrap_or((screen_w - strip_w - 24, 24));
+        // 首次启动默认在左上方（x=screen_w/4），避开 AMD overlay 的右上角默认位。
+        // 后续位置由用户拖动决定，存入 window_pos 持久化。
+        let (pos_x, pos_y) = state.cfg.window_pos.unwrap_or((screen_w / 4, 24));
         let (win_w, win_h) = state.cfg.window_size.unwrap_or((strip_w, strip_h));
 
         let mut ex_style = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
@@ -639,6 +711,7 @@ impl OverlayWindow {
         unsafe {
             let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA.0 as i32, state_ptr);
         }
+        crate::probe::log(&format!("overlay hwnd=0x{:x}", hwnd.0 as usize));
 
         Ok(Self { hwnd, state })
     }
@@ -655,10 +728,13 @@ impl OverlayWindow {
                 // 0 = WM_QUIT；-1 = 错误——两者都退出
                 break;
             }
+            // 每消息耗时探针（SYSOVERLAY_PERF=1 时记录慢消息归属）
+            let diag = crate::perf::msg_begin();
             unsafe {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
+            crate::perf::msg_end(diag, msg.hwnd.0 as usize, msg.message);
         }
     }
 

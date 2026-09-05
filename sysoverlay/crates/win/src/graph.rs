@@ -10,7 +10,7 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, W
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreatePen, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect,
     MoveToEx, Polyline, SelectObject, SetBkMode, SetTextColor, DrawTextW, PS_SOLID, TRANSPARENT,
-    HDC, PAINTSTRUCT, HBRUSH, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
+    HDC, PAINTSTRUCT, HBRUSH, DT_LEFT, DT_SINGLELINE, DT_VCENTER, ValidateRect,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -131,6 +131,7 @@ unsafe fn paint(hwnd: HWND) {
     let mut ps = PAINTSTRUCT::default();
     let hdc = BeginPaint(hwnd, &mut ps);
     if hdc.is_invalid() {
+        let _ = unsafe { ValidateRect(hwnd, None) };
         return;
     }
     let mut rc = RECT::default();
@@ -179,10 +180,13 @@ unsafe fn paint(hwnd: HWND) {
         } else {
             label.to_string()
         };
-        let mut buf: Vec<u16> = cur.encode_utf16().collect();
-        let _ = SetTextColor(hdc, COLORREF(theme.label));
-        let mut lr = label_rect;
-        let _ = DrawTextW(hdc, &mut buf, &mut lr, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        // 空串 + DT_SINGLELINE|DT_VCENTER 会触发 user32!DrawTextW 空指针崩溃
+        if !cur.is_empty() {
+            let mut buf: Vec<u16> = cur.encode_utf16().collect();
+            let _ = SetTextColor(hdc, COLORREF(theme.label));
+            let mut lr = label_rect;
+            let _ = DrawTextW(hdc, &mut buf, &mut lr, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        }
 
         // 曲线车身
         let cy = y0 + s(d, LABEL_H);

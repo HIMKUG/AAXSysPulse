@@ -331,12 +331,10 @@ impl Adl {
                 if base + ADL_UDID_OFF + ADL_UDID_LEN > buf.len() {
                     break;
                 }
-                let idx = unsafe {
-                    std::ptr::read_unaligned(buf.as_ptr().add(base + ADL_INDEX_OFF) as *const i32)
-                };
                 let udid = &buf[base + ADL_UDID_OFF..base + ADL_UDID_OFF + ADL_UDID_LEN];
                 let ids = parse_udid_ids(udid);
                 if probe::enabled() {
+                    let idx = std::ptr::read_unaligned(buf.as_ptr().add(base + ADL_INDEX_OFF) as *const i32);
                     probe::log(&format!(
                         "adl adapter {k} idx={idx} udid={:?} ids={ids:?} want=(0x{:04x},0x{:04x})",
                         String::from_utf8_lossy(&udid[..udid.iter().position(|&c| c == 0).unwrap_or(32)]),
@@ -345,6 +343,7 @@ impl Adl {
                 }
                 if let Some((v, d)) = ids {
                     if v == gpu.vendor_id && d == gpu.device_id && adapter_index.is_none() {
+                        let idx = std::ptr::read_unaligned(buf.as_ptr().add(base + ADL_INDEX_OFF) as *const i32);
                         adapter_index = Some(idx);
                     }
                 }

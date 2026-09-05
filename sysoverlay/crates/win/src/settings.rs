@@ -62,6 +62,10 @@ const WM_SETCURSOR: u32 = 0x0020;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_MOUSELEAVE: u32 = 0x02A2;
+/// 诊断用（SYSOVERLAY_DIAG=settings,click）：模拟点击 CPU 开关。
+/// 在 UI 线程消息流内处理，与真实鼠标点击走完全相同的
+/// on_click → InvalidateRect → WM_PAINT 链路。
+const WM_DIAG_CLICK: u32 = 0x8000 + 41;
 
 // ── 控件语义 ID（沿用旧常量，便于对照） ──────────────────
 const IDC_CPU: i32 = 101;
@@ -216,6 +220,25 @@ pub fn open_settings(overlay: HWND) {
     create_dialog(overlay);
 }
 
+/// 诊断用：向设置窗口投递一次「模拟点击 CPU 开关」消息
+/// （SYSOVERLAY_DIAG=settings,click 时由主线程定时调用）。
+/// 窗口/布局不存在则静默跳过。
+pub fn diag_click_cpu() {
+    let hwnd = SETTINGS_HWND.load(Ordering::SeqCst);
+    if hwnd == -1 {
+        crate::probe::log("diag_click_cpu: no settings window");
+        return;
+    }
+    unsafe {
+        let _ = PostMessageW(
+            HWND(hwnd as *mut _),
+            WM_DIAG_CLICK,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    }
+}
+
 // ── 窗口创建 ─────────────────────────────────────────────
 
 /// 客户端总高（每张卡片的行数固定，只依赖 DPI）。
@@ -309,6 +332,7 @@ fn create_dialog(overlay: HWND) {
         }
 
         SETTINGS_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
+        crate::probe::log(&format!("settings hwnd=0x{:x}", hwnd.0 as usize));
         let _ = ShowWindow(hwnd, SW_SHOW);
     }
 }
@@ -632,6 +656,30 @@ unsafe extern "system" fn settings_wndproc(
             }
             LRESULT(0)
         }
+        WM_DIAG_CLICK => {
+            // 模拟点击 CPU 开关：UI 线程内取最新布局并走完整 on_click 链路
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_UD) as *mut SettingsCtx;
+            if let Some(ctx) = ptr.as_mut() {
+                if let Some(idx) = ctx.widgets.iter().position(|w| w.id == IDC_CPU) {
+                    let w = &ctx.widgets[idx];
+                    let pt = POINT {
+                        x: (w.rect.left + w.rect.right) / 2,
+                        y: (w.rect.top + w.rect.bottom) / 2,
+                    };
+                    crate::probe::log(&format!(
+                        "diag_click cpu rect={},{},{},{}",
+                        w.rect.left, w.rect.top, w.rect.right, w.rect.bottom
+                    ));
+                    on_click(ctx, idx, pt);
+                    let _ = InvalidateRect(hwnd, None, false);
+                } else {
+                    crate::probe::log("diag_click: CPU widget not found");
+                }
+            } else {
+                crate::probe::log("diag_click: ctx null");
+            }
+            LRESULT(0)
+        }
         WM_SETCURSOR => {
             let ptr = GetWindowLongPtrW(hwnd, GWLP_UD) as *mut SettingsCtx;
             if let Some(ctx) = ptr.as_ref() {
@@ -695,6 +743,7 @@ fn swatch_sel(palette: &[(u8, u8, u8)], color: Rgb) -> usize {
 
 /// 点击分发：Toggle → 语义开关；Segmented → 段索引；Stepper → ±；Button → Resize。
 fn on_click(ctx: &mut SettingsCtx, idx: usize, pt: POINT) {
+    let t0 = crate::perf::begin();
     let overlay = ctx.overlay;
     let (id, action) = {
         let w = &ctx.widgets[idx];
@@ -767,8 +816,25 @@ fn on_click(ctx: &mut SettingsCtx, idx: usize, pt: POINT) {
     }
     // 统一弹回同步（含拒绝非法操作后的回弹 + 按钮文字刷新）
     if let Some(now) = window::get_config_of(overlay) {
+        crate::probe::log(&format!(
+            "on_click before build_layout cfg_cpu_on={}",
+            now.show_cpu as u8
+        ));
         build_layout(ctx, &now);
+        let cpu_on = ctx
+            .widgets
+            .iter()
+            .find(|w| w.id == IDC_CPU)
+            .map(|w| matches!(w.kind, WKind::Toggle { on: true }))
+            .unwrap_or(false);
+        crate::probe::log(&format!(
+            "on_click after  build_layout widget_cpu_on={}",
+            cpu_on as u8
+        ));
+    } else {
+        crate::probe::log("on_click get_config_of(overlay) -> None");
     }
+    crate::perf::note_section("settings_onclick", t0);
 }
 
 enum Action {
@@ -969,11 +1035,31 @@ fn stepper_subrects(rect: &RECT) -> (RECT, RECT) {
 // ── 绘制 ─────────────────────────────────────────────────
 
 unsafe fn paint(hwnd: HWND) {
+    let t0 = crate::perf::begin();
     let ptr = GetWindowLongPtrW(hwnd, GWLP_UD) as *mut SettingsCtx;
     let Some(ctx) = ptr.as_ref() else { return };
+    // 诊断：paint 实际渲染的 CPU toggle 状态（与 config 对照，验证 UI 刷新链路）
+    {
+        let cpu_on = ctx
+            .widgets
+            .iter()
+            .find(|w| w.id == IDC_CPU)
+            .map(|w| matches!(w.kind, WKind::Toggle { on: true }))
+            .unwrap_or(false);
+        static LAST_CPU_ON: std::sync::atomic::AtomicIsize =
+            std::sync::atomic::AtomicIsize::new(-1);
+        let l = LAST_CPU_ON.swap(cpu_on as isize, std::sync::atomic::Ordering::Relaxed);
+        if l != cpu_on as isize {
+            crate::probe::log(&format!(
+                "settings paint cpu_toggle={} (changed)",
+                cpu_on as u8
+            ));
+        }
+    }
     let mut ps = PAINTSTRUCT::default();
     let hdc = BeginPaint(hwnd, &mut ps);
     if hdc.is_invalid() {
+        let _ = EndPaint(hwnd, &ps);
         return;
     }
     let mut rc = RECT::default();
@@ -1006,6 +1092,7 @@ unsafe fn paint(hwnd: HWND) {
     let _ = DeleteObject(bmp);
     let _ = DeleteDC(mem);
     let _ = EndPaint(hwnd, &ps);
+    crate::perf::note_section("settings_paint", t0);
 }
 
 unsafe fn draw_all(hdc: HDC, ctx: &SettingsCtx) {
@@ -1199,6 +1286,11 @@ unsafe fn ellipse(hdc: HDC, r: RECT, fill: u32, stroke: u32) {
 
 /// 文本（选定字体/颜色，绘制后还原字体）。
 unsafe fn text(hdc: HDC, s: &str, rect: RECT, color: u32, font: HFONT, fmt: DRAW_TEXT_FORMAT) {
+    // 空串直接跳过：DT_SINGLELINE|DT_VCENTER + 空文本会触发 user32!DrawTextW
+    // 空指针崩溃（0xC0000005 @ DrawTextW+0xF62，实测复现，空串无绘制意义）
+    if s.is_empty() {
+        return;
+    }
     let old = SelectObject(hdc, font);
     SetTextColor(hdc, COLORREF(color));
     SetBkMode(hdc, TRANSPARENT);

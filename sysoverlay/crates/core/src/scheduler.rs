@@ -50,13 +50,14 @@ impl Source {
     pub const fn min_effective_ms(self) -> u32 {
         match self {
             Source::Cpu | Source::Mem => 100,
-            Source::Gpu | Source::Net => 1_000,
+            Source::Gpu => 2_000, // D3DKMT 单次查询实测 60~90ms，必须硬限 ≥2s
+            Source::Net => 1_000,
         }
     }
 }
 
 /// 便捷常量数组：`MIN_EFFECTIVE_MS[src as usize]`。
-pub const MIN_EFFECTIVE_MS: [u32; SRC_COUNT] = [100, 100, 1_000, 1_000];
+pub const MIN_EFFECTIVE_MS: [u32; SRC_COUNT] = [100, 100, 2_000, 1_000];
 
 /// 一轮采样计划：哪些源这次要真的采样。
 ///
@@ -289,8 +290,8 @@ mod tests {
         let mut s = Scheduler::new(100, true);
         assert_eq!(
             s.base_interval_ms(&ALL_ON),
-            1_000,
-            "GPU/Net 在列时 Auto 上限是 1s"
+            2_000,
+            "GPU/Net 在列时 Auto 上限是 2s（GPU 最慢）"
         );
         assert_eq!(
             s.base_interval_ms(&CPU_ONLY),
@@ -318,8 +319,8 @@ mod tests {
         );
         assert_eq!(
             s.source_interval_ms(Source::Gpu, &ALL_ON),
-            1_000,
-            "手动 10fps 时 GPU 仍不快于 1s（计数器本身 1s 才更新）"
+            2_000,
+            "手动 10fps 时 GPU 仍不快于 2s（D3DKMT 单次 60~90ms，1s 采样超预算）"
         );
         assert_eq!(s.source_interval_ms(Source::Net, &ALL_ON), 1_000);
     }
@@ -360,11 +361,11 @@ mod tests {
     }
 
     #[test]
-    fn test_gpu_due_after_one_second() {
+    fn test_gpu_due_after_two_seconds() {
         let mut s = Scheduler::new(100, false);
         let _ = s.plan(0, &ALL_ON);
-        let plan = s.plan(1_000, &ALL_ON);
-        assert!(plan.gpu, "1000ms 时 GPU 必须到期");
+        let plan = s.plan(2_000, &ALL_ON);
+        assert!(plan.gpu, "2000ms 时 GPU 必须到期");
         assert!(plan.net);
     }
 
@@ -473,7 +474,7 @@ mod tests {
 
     #[test]
     fn test_min_effective_constants() {
-        assert_eq!(MIN_EFFECTIVE_MS, [100, 100, 1_000, 1_000]);
+        assert_eq!(MIN_EFFECTIVE_MS, [100, 100, 2_000, 1_000]);
         for &src in Source::ALL.iter() {
             assert_eq!(src.min_effective_ms(), MIN_EFFECTIVE_MS[src as usize]);
         }

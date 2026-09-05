@@ -77,7 +77,9 @@ impl SystemSampler {
 
         // CPU
         if plan.cpu {
+            let t = crate::perf::begin();
             let cpu_out = self.cpu.sample(prev, now_ms, &mut snap);
+            crate::perf::note_section("sample_cpu", t);
             self.push_diag(SamplerId::Cpu, cpu_out, 0);
         } else {
             self.push_diag(SamplerId::Cpu, SampleOutcome::Skipped, 0);
@@ -85,7 +87,9 @@ impl SystemSampler {
 
         // Memory
         if plan.mem {
+            let t = crate::perf::begin();
             let mem_out = self.mem.sample(prev, now_ms, &mut snap);
+            crate::perf::note_section("sample_mem", t);
             self.push_diag(SamplerId::Memory, mem_out, 0);
         } else {
             self.push_diag(SamplerId::Memory, SampleOutcome::Skipped, 0);
@@ -93,9 +97,11 @@ impl SystemSampler {
 
         // GPU：厂商模块优先（NVML/ADL/IGCL，用户拍板），失败回退 D3DKMT
         if plan.gpu {
+            let t = crate::perf::begin();
             let (v_util, v_watts) = gpu_vendor::sample();
             self.syspower.set_gpu_watts(v_watts);
             let gpu_out = self.gpu.sample(prev, now_ms, &mut snap);
+            crate::perf::note_section("sample_gpu", t);
             if let Some(u) = v_util {
                 snap.gpu = Metric::Value(u.clamp(0.0, 100.0));
             }
@@ -106,7 +112,9 @@ impl SystemSampler {
 
         // Network
         if plan.net {
+            let t = crate::perf::begin();
             let net_out = self.net.sample(prev, now_ms, &mut snap);
+            crate::perf::note_section("sample_net", t);
             self.push_diag(SamplerId::Net, net_out, 0);
         } else {
             self.push_diag(SamplerId::Net, SampleOutcome::Skipped, 0);
@@ -116,6 +124,7 @@ impl SystemSampler {
         // CPU 实测不可用（无管理员/无驱动）→ 整行关闭（Unavailable = 不显示不计算）
         if power_enabled && now_ms.saturating_sub(self.last_power_ms) >= self.power_interval_ms {
             self.last_power_ms = now_ms;
+            let t = crate::perf::begin();
             match self.syspower.sample(now_ms) {
                 Some(w) => {
                     snap.power = Metric::Value(w);
@@ -126,6 +135,7 @@ impl SystemSampler {
                     self.push_diag(SamplerId::Power, SampleOutcome::Skipped, 0);
                 }
             }
+            crate::perf::note_section("sample_power", t);
             // 发布 CPU 实测功率（供进程榜做功耗分摊，跨线程原子共享）
             crate::power_system::store_cpu_watts(self.syspower.cpu_watts());
         }

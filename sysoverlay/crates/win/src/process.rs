@@ -33,7 +33,7 @@ pub struct ProcStats {
     pub at_ms: u64,
 }
 
-/// NtQuerySystemInformation（ntdll，仅 x64 布局偏移适用）。
+// NtQuerySystemInformation（ntdll，仅 x64 布局偏移适用）。
 #[link(name = "ntdll")]
 extern "system" {
     fn NtQuerySystemInformation(

@@ -1,20 +1,23 @@
 //! 进程 Top 榜窗口：Top 8，可按 CPU / 内存切换排序（自绘）。
 //!
-//! 数据源 [`crate::process::ProcCollector`]（Nt API）。1s 定时器刷新，
-//! 差分基线保存在窗口上下文里，随窗口生命周期存续。
+//! 数据源 [`crate::process::ProcCollector`]（Nt API）。采样在独立后台线程执行，
+//! WM_TIMER 只负责触发重绘，消除全表扫描阻塞 UI 消息泵的问题。
 
 use std::sync::atomic::{AtomicIsize, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect,
     SetBkMode, SetTextColor, DrawTextW, TRANSPARENT, HDC, PAINTSTRUCT, HBRUSH, DRAW_TEXT_FORMAT,
-    DT_LEFT, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
+    DT_LEFT, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, ValidateRect,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, IsWindow,
-    KillTimer, LoadCursorW, RegisterClassExW, SetTimer, ShowWindow, IDC_ARROW, SW_SHOW,
+    KillTimer, LoadCursorW, PostMessageW, RegisterClassExW, SetTimer, ShowWindow,
+    IsWindowVisible, IDC_ARROW, SW_SHOW,
     WINDOW_EX_STYLE, WNDCLASSEXW, WS_CAPTION, WS_SYSMENU,
 };
 
@@ -38,9 +41,24 @@ const WM_ERASEBKGND: u32 = 0x0014;
 const WM_CLOSE: u32 = 0x0010;
 const WM_DESTROY: u32 = 0x0002;
 const WM_LBUTTONDOWN: u32 = 0x0201;
+const WM_NEW_SAMPLE: u32 = 0x8000;
 const GWLP_UD: i32 = -21;
 
+use std::sync::Mutex;
+
 static PROCS_HWND: AtomicIsize = AtomicIsize::new(-1);
+static PROCS_SAMPLE_THREAD: AtomicIsize = AtomicIsize::new(-1);
+static PROCS_HISTORY: Mutex<Option<ProcStats>> = Mutex::new(None);
+
+pub fn procs_push(stats: ProcStats) {
+    if let Ok(mut guard) = PROCS_HISTORY.lock() {
+        *guard = Some(stats);
+    }
+}
+
+fn procs_take_latest() -> Option<ProcStats> {
+    PROCS_HISTORY.lock().ok()?.take()
+}
 
 fn s(dpi: u32, v: i32) -> i32 {
     v * dpi as i32 / 96
@@ -54,13 +72,12 @@ enum SortBy {
 }
 
 struct Ctx {
-    collector: ProcCollector,
     latest: ProcStats,
     sort: SortBy,
 }
 
-/// 打开（或前置）进程窗口。
 pub fn open() {
+    crate::probe::log("[procs] open enter");
     let existing = PROCS_HWND.load(Ordering::SeqCst);
     if existing != -1 {
         let hwnd = HWND(existing as *mut _);
@@ -81,6 +98,7 @@ fn create() {
             Ok(h) => h,
             Err(_) => return,
         };
+        crate::probe::log("[procs] create: module ok");
         static REGISTERED: std::sync::Once = std::sync::Once::new();
         REGISTERED.call_once(|| {
             let wc = WNDCLASSEXW {
@@ -92,10 +110,13 @@ fn create() {
                 hbrBackground: HBRUSH::default(),
                 ..Default::default()
             };
-            let _ = RegisterClassExW(&wc);
+            let rc = RegisterClassExW(&wc);
+            crate::probe::log(&format!("[procs] create: RegisterClassExW rc={rc:x} err=0x{:x}", windows::Win32::Foundation::GetLastError().0));
         });
+        crate::probe::log("[procs] create: class registered");
 
         let d = dpi::get_system_dpi();
+        crate::probe::log("[procs] create: before CreateWindowExW");
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             windows::core::w!("SysOverlay_Procs"),
@@ -110,20 +131,46 @@ fn create() {
             hinst,
             None,
         );
+        crate::probe::log("[procs] create: CreateWindowExW returned");
         let Ok(hwnd) = hwnd else { return };
         let ctx = Box::new(Ctx {
-            collector: ProcCollector::new(),
             latest: ProcStats { entries: Vec::new(), at_ms: 0 },
             sort: SortBy::Cpu,
         });
         let _ = SetWindowLongPtrW(hwnd, GWLP_UD, Box::into_raw(ctx) as isize);
+        crate::probe::log("[procs] create: ctx attached");
         PROCS_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
+
+        let hwnd_addr = hwnd.0 as isize;
+        let _sampler_thread = thread::spawn(move || {
+            let hwnd = HWND(hwnd_addr as *mut _);
+            let mut collector = ProcCollector::new();
+            loop {
+                if !IsWindow(hwnd).as_bool() {
+                    break;
+                }
+                let snap = collector.sample();
+                if IsWindowVisible(hwnd).as_bool() {
+                    let _ = PostMessageW(
+                        hwnd,
+                        WM_NEW_SAMPLE,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+                procs_push(snap);
+                thread::sleep(Duration::from_secs(1));
+            }
+            PROCS_SAMPLE_THREAD.store(-1, Ordering::SeqCst);
+        });
+
         let _ = SetTimer(hwnd, 1, 1000, None);
+        crate::probe::log("[procs] create: timer set");
         let _ = ShowWindow(hwnd, SW_SHOW);
+        crate::probe::log("[procs] create: shown");
     }
 }
 
-/// 取窗口上下文可变引用（仅 UI 线程调用，无并发）。
 fn ctx_of(hwnd: HWND) -> Option<&'static mut Ctx> {
     let p = unsafe { GetWindowLongPtrW(hwnd, GWLP_UD) as *mut Ctx };
     if p.is_null() {
@@ -139,23 +186,32 @@ unsafe extern "system" fn procs_wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    crate::probe::log(&format!(
+        "[procs] wndproc msg=0x{msg:04X} w=0x{:X} l=0x{:X}",
+        wparam.0 as u32, lparam.0 as u32
+    ));
     match msg {
-        WM_TIMER => {
-            // 采样 + 重排
+        WM_NEW_SAMPLE => {
             if let Some(ctx) = ctx_of(hwnd) {
-                ctx.latest = ctx.collector.sample();
-                sort_entries(ctx);
+                if let Some(h) = procs_take_latest() {
+                    ctx.latest = h;
+                    sort_entries(ctx);
+                }
             }
             let _ = InvalidateRect(hwnd, None, false);
             LRESULT(0)
         }
+        WM_TIMER => {
+            LRESULT(0)
+        }
         WM_PAINT => {
+            crate::probe::log("[procs] WM_PAINT in");
             paint(hwnd);
+            crate::probe::log("[procs] WM_PAINT out");
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
         WM_LBUTTONDOWN => {
-            // 点击表头切换排序：Process(左) / CPU%(中) / Watts(右) / Memory(最右)
             if let Some(ctx) = ctx_of(hwnd) {
                 let d = dpi::get_system_dpi();
                 let x = (lparam.0 & 0xFFFF) as i16 as i32;
@@ -214,11 +270,14 @@ fn fmt_mem(bytes: u64) -> String {
 }
 
 unsafe fn paint(hwnd: HWND) {
+    crate::probe::log("[procs] paint step0 theme");
     let theme = Theme::system();
     let d = dpi::get_system_dpi();
     let mut ps = PAINTSTRUCT::default();
+    crate::probe::log("[procs] paint step1 BeginPaint");
     let hdc = BeginPaint(hwnd, &mut ps);
     if hdc.is_invalid() {
+        let _ = unsafe { ValidateRect(hwnd, None) };
         return;
     }
     let mut rc = RECT::default();
@@ -233,10 +292,10 @@ unsafe fn paint(hwnd: HWND) {
     let bg = CreateSolidBrush(COLORREF(theme.window_bg));
     let _ = FillRect(hdc, &rc, bg);
     let _ = DeleteObject(bg);
+    crate::probe::log("[procs] paint step2 bg done");
 
     SetBkMode(hdc, TRANSPARENT);
 
-    // 表头（点击列头可切换排序）：Process | CPU % | Watts | Memory
     let header_h = s(d, 20);
     let cpu_col = RECT { left: w / 2 + s(d, 12), top: 0, right: w - s(d, 240), bottom: header_h };
     let watt_col = RECT { left: w - s(d, 240), top: 0, right: w - s(d, 150), bottom: header_h };
@@ -249,7 +308,7 @@ unsafe fn paint(hwnd: HWND) {
     txt(hdc, "Memory", mem_col, DT_RIGHT);
     set_color(hdc, theme.label);
 
-    // 列表
+    crate::probe::log("[procs] paint step3 entries");
     let entries_owned;
     let entries = if let Some(ctx) = ctx_of(hwnd) {
         entries_owned = ctx.latest.entries.clone();
@@ -259,6 +318,7 @@ unsafe fn paint(hwnd: HWND) {
     };
 
     let row_h = ((h - header_h) / TOP_N as i32).max(18);
+    crate::probe::log("[procs] paint step4 rows");
     for (i, e) in entries.iter().take(TOP_N).enumerate() {
         let y = header_h + i as i32 * row_h;
         let name_r = RECT { left: s(d, 12), top: y, right: w / 2 - s(d, 8), bottom: y + row_h };
@@ -269,7 +329,7 @@ unsafe fn paint(hwnd: HWND) {
         let watt_label = if e.power_w > 0.05 {
             format!("{:.1}W", e.power_w)
         } else {
-            String::new() // 无 CPU 实测功率读数时整列留空
+            String::new()
         };
         txt(hdc, &watt_label, watt_r, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
         let mem_r = RECT { left: w - s(d, 150), top: y, right: w - s(d, 12), bottom: y + row_h };
@@ -284,6 +344,9 @@ unsafe fn set_color(hdc: HDC, color: u32) {
 }
 
 unsafe fn txt(hdc: HDC, text: &str, rect: RECT, fmt: DRAW_TEXT_FORMAT) {
+    if text.is_empty() {
+        return;
+    }
     let mut buf: Vec<u16> = text.encode_utf16().collect();
     let mut r = rect;
     let _ = DrawTextW(hdc, &mut buf, &mut r, fmt);
