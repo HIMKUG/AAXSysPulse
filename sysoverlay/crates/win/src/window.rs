@@ -275,17 +275,18 @@ unsafe extern "system" fn wndproc(
         }
 
         // WM_MOUSEMOVE 到达即说明鼠标在窗口客户区内（Windows 只向鼠标所在窗口投递）。
-        // 非拖拽期间：标记 hover、登记离开事件、恢复 alpha。
+        // 非拖拽期间：标记 hover（即使已经是 true，确保渲染逻辑执行）、
+        // 登记离开事件、恢复 alpha。
         WM_MOUSEMOVE => {
             if let Some(state) = get_state_ptr(hwnd).as_mut() {
                 if !state.hovered {
                     state.hovered = true;
+                }
+                if state.cfg.hover {
                     track_mouse_leave(hwnd);
                     set_window_alpha(hwnd, 255);
-                    if state.cfg.hover {
-                        let snap = snap_get();
-                        crate::gdi::render(hwnd, &snap, &state.cfg);
-                    }
+                    let snap = snap_get();
+                    crate::gdi::render(hwnd, &snap, &state.cfg);
                 }
 
                 if state.dragging {

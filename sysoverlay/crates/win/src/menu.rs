@@ -3,7 +3,7 @@
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos,
-    TrackPopupMenu, HMENU, MF_SEPARATOR, MF_STRING, TPM_LEFTALIGN, PA_NOACTIVATE,
+    TrackPopupMenu, HMENU, MF_SEPARATOR, MF_STRING, TPM_LEFTALIGN, TPM_RETURNCMD, PA_NOACTIVATE,
 };
 
 pub const IDM_SETTINGS: u16 = 1;
@@ -35,7 +35,8 @@ pub fn show_tray_menu(hwnd: HWND) -> Option<u16> {
         let _ = GetCursorPos(&mut pt);
         let cmd = TrackPopupMenu(
             menu,
-            TPM_LEFTALIGN | windows::Win32::UI::WindowsAndMessaging::TRACK_POPUP_MENU_FLAGS(PA_NOACTIVATE as u32),
+            TPM_LEFTALIGN | TPM_RETURNCMD
+                | windows::Win32::UI::WindowsAndMessaging::TRACK_POPUP_MENU_FLAGS(PA_NOACTIVATE as u32),
             pt.x,
             pt.y,
             0,
