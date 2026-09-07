@@ -1,22 +1,31 @@
 //! GDI 渲染管线 —— 双渲染器调度 + DIB 上屏。
 //!
 //! 管线：
-//!   1. 按 [`Config::render_style`] 选渲染器（`ui::Renderer`：Strip / Classic）
-//!   2. 计算**全局 alpha** = 透明度 × 悬停系数（hover 模式平时近乎透明）
+//!   1. 按 [`Config::render_style`] 选渲染器（`ui::Renderer`：Strip / Vertical）
+//!   2. 计算**全局 alpha** = 悬停/非悬停两档透明度 + 三次方缓出过渡动画
 //!   3. 内容指纹脏检查：指纹未变 → 跳过整帧（不建画布、不 ULW）
 //!   4. 渲染器画进复用的 [`SoftwareSurface`] → DIB 缓存 → `UpdateLayeredWindow`
 //!
-//! 渲染细节（文字/卡片/装饰）全部在 `ui`，本文件只负责 Win32 的搬运。
+//! 渲染细节（文字/排布）全部在 `ui`，本文件只负责 Win32 的搬运。
+//!
+//! # 透明度过渡动画
+//!
+//! 悬停↔非悬停切换时按 [`Config::anim_ms`] 动画到目标透明度，曲线为
+//! 三次方缓出（`1-(1-t)^3`，非线性：起步快、收尾慢）。动画期间用
+//! `SetTimer(16ms)` 驱动逐帧重绘，到达目标后 `KillTimer` 归零开销。
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use std::sync::{LazyLock, Mutex, OnceLock};
+use std::time::Instant;
 
-use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
+use windows::Win32::Foundation::{BOOL, COLORREF, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     BLENDFUNCTION, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, DIB_RGB_COLORS,
     GetDC, ReleaseDC, SelectObject, BI_RGB, BITMAPINFO, HBITMAP, HDC,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    SetWindowPos, UpdateLayeredWindow, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
+    KillTimer, SetTimer, SetWindowPos, UpdateLayeredWindow, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOZORDER,
 };
 
 #[link(name = "user32")]
@@ -24,21 +33,97 @@ extern "system" {
     fn GetWindowRect(hwnd: HWND, lpRect: *mut RECT) -> BOOL;
 }
 
-use windows::Win32::Foundation::BOOL;
-
 use sysoverlay_ui::offscreen::SoftwareSurface;
-use sysoverlay_ui::{ClassicRenderer, Renderer, StripRenderer};
+use sysoverlay_ui::{Renderer, StripRenderer, VerticalRenderer};
 
 use crate::Config;
 use crate::perf;
 use crate::Snapshot;
 
-/// 按配置选择渲染器实例（'static，零分配）。
+/// 悬浮窗透明度动画定时器 ID（仅本窗口使用；graph/procs 的定时器在各自窗口互不干扰）。
+pub const ANIM_TIMER_ID: usize = 7;
+
+/// 按配置选择渲染器实例（'static，零分配）。旧卡片式（Classic）折入横版条。
 fn renderer_for(style: sysoverlay_core::types::RenderStyle) -> &'static dyn Renderer {
     match style {
-        sysoverlay_core::types::RenderStyle::Classic => &ClassicRenderer,
-        sysoverlay_core::types::RenderStyle::Strip => &StripRenderer,
+        sysoverlay_core::types::RenderStyle::Classic | sysoverlay_core::types::RenderStyle::Strip => {
+            &StripRenderer
+        }
+        sysoverlay_core::types::RenderStyle::Vertical => &VerticalRenderer,
     }
+}
+
+// ── 透明度过渡动画状态（UI 线程独占） ──────────────────────
+
+/// 一次过渡动画：从 `from_pct` 经过 `anim_ms` 到 `to_pct`（百分比 0..=100）。
+#[derive(Clone, Copy, Debug)]
+struct AnimState {
+    active: bool,
+    t0: Instant,
+    from_pct: f32,
+    to_pct: f32,
+}
+
+impl Default for AnimState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            t0: Instant::now(),
+            from_pct: 35.0,
+            to_pct: 35.0,
+        }
+    }
+}
+
+static ANIM_STATE: LazyLock<Mutex<AnimState>> = LazyLock::new(|| Mutex::new(AnimState::default()));
+
+/// 上一帧实际送屏的 alpha（百分比 × 100，0..=10000，避免浮点原子）。
+static RENDERED_PCT_X100: AtomicU32 = AtomicU32::new(3500);
+
+/// 三次方缓出：t ∈ [0,1] → e ∈ [0,1]，起步快、收尾慢（非线性过渡）。
+fn ease_out_cubic(t: f32) -> f32 {
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// 计算本帧 alpha 百分比；动画进行中返回 true（调用方应确保后续帧继续到来）。
+fn compute_alpha_pct(hwnd: HWND, cfg: &Config) -> (f32, bool) {
+    let hovered = crate::window::is_window_hovered(hwnd);
+    let desired = if hovered {
+        cfg.hover_opacity as f32
+    } else {
+        cfg.normal_opacity as f32
+    };
+    let anim_ms = cfg.anim_ms as f32;
+    let rendered = RENDERED_PCT_X100.load(AtomicOrdering::Relaxed) as f32 / 100.0;
+
+    let Ok(mut anim) = ANIM_STATE.lock() else {
+        return (desired, false);
+    };
+
+    if anim.active {
+        let t = (anim.t0.elapsed().as_secs_f32() * 1000.0 / anim_ms).clamp(0.0, 1.0);
+        if t >= 1.0 {
+            anim.active = false;
+            anim.from_pct = anim.to_pct;
+            return (anim.to_pct, false);
+        }
+        let e = ease_out_cubic(t);
+        let pct = anim.from_pct + (anim.to_pct - anim.from_pct) * e;
+        return (pct, true);
+    }
+
+    // 未在过渡：仅在目标变化时启动新的过渡（含 anim_ms=0 的直接跳变）
+    if (rendered - desired).abs() < 0.05 {
+        return (desired, false);
+    }
+    if anim_ms <= 0.5 {
+        return (desired, false);
+    }
+    anim.active = true;
+    anim.t0 = Instant::now();
+    anim.from_pct = rendered;
+    anim.to_pct = desired;
+    (rendered, true)
 }
 
 /// 上一帧的指纹（`u64::MAX` 表示还没有画过）。
@@ -64,20 +149,19 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
 
         let renderer = renderer_for(cfg.render_style);
 
-        // 全局 alpha：透明度百分比 × 悬停系数。
-        // hover 模式：鼠标不在窗口上时近乎透明（C 版语义），
-        // 点亮/变暗都是改 BLENDFUNCTION，不重画像素 —— 更快的路。
-        let hovered = crate::window::is_window_hovered(hwnd);
-        let mut alpha_pct = cfg.opacity.clamp(1, 100) as u32;
-        if cfg.hover && !hovered {
-            alpha_pct = (alpha_pct * 15 / 100).max(3); // 平时近乎透明
-        }
-        let src_alpha = ((alpha_pct as f32 / 100.0) * 255.0).round() as u8;
+        // 全局 alpha：悬停/非悬停两档透明度，切换时三次方缓出过渡。
+        // 动画进行中 → SetTimer 逐帧推进；结束后 KillTimer 归零开销。
+        let (alpha_pct_f, animating) = compute_alpha_pct(hwnd, cfg);
+        let src_alpha = ((alpha_pct_f.clamp(1.0, 100.0) / 100.0) * 255.0).round() as u8;
 
         // 脏检查：指纹未变 → 什么都不做
         let sig = renderer.frame_hash(snap, cfg, width, height, src_alpha);
         if LAST_FRAME_HASH.load(std::sync::atomic::Ordering::Relaxed) == sig {
             perf::note_skipped();
+            // 动画未走完但帧被跳过（理论上只在末帧重复时发生）：继续驱动定时器
+            if animating {
+                let _ = SetTimer(hwnd, ANIM_TIMER_ID, 16, None);
+            }
             return;
         }
         LAST_FRAME_HASH.store(sig, std::sync::atomic::Ordering::Relaxed);
@@ -91,6 +175,16 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
         let (nat_w, nat_h) = renderer.draw(&mut surface, snap, cfg);
 
         update_layered(hwnd, &surface, width, height, src_alpha);
+
+        // 记录本帧实际送屏的 alpha 作为下一次过渡的起点
+        RENDERED_PCT_X100.store((alpha_pct_f.clamp(1.0, 100.0) * 100.0) as u32, AtomicOrdering::Relaxed);
+
+        // 动画未走完 → 定期器拉下一帧；走完 → 停表归零开销
+        if animating {
+            let _ = SetTimer(hwnd, ANIM_TIMER_ID, 16, None);
+        } else {
+            let _ = KillTimer(hwnd, ANIM_TIMER_ID);
+        }
 
         // 窗口尺寸与内容自然尺寸漂移过大（项开关/风格切换后未 fit）时兜底校正
         if (nat_w - width).abs() > 8 || (nat_h - height).abs() > 8 {
@@ -263,10 +357,17 @@ pub fn natural_size(cfg: &Config) -> (i32, i32) {
     renderer_for(cfg.render_style).natural_size(cfg)
 }
 
-/// 让窗口自适应内容尺寸（保持左上角位置）。
+/// 让窗口自适应尺寸：手动设置过宽高（`window_size = Some`）时沿用用户尺寸，
+/// 否则按内容自然尺寸（保持左上角位置）。
 /// 设置项变化（项开关 / 风格 / 字号）后由 WM_RECONFIG 调用。
 pub fn fit_window(hwnd: HWND, cfg: &Config) {
-    let (w, h) = natural_size(cfg);
+    let (nx, ny) = natural_size(cfg);
+    let (w, h) = cfg
+        .window_size
+        .filter(|&(w, h)| w >= 60 && h >= 40)
+        .unwrap_or((nx, ny));
+    let w = w.max(60);
+    let h = h.max(40);
     unsafe {
         let _ = SetWindowPos(hwnd, None, 0, 0, w, h, SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOMOVE);
         // 不调 InvalidateRect：尺寸变化后由调用方（WM_RECONFIG）直接 render 一帧，

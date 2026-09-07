@@ -20,10 +20,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsWindowVisible, PostQuitMessage, RegisterClassExW,
     SetWindowPos, ShowWindow,
     TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW,
-    LoadCursorW, MSG, SWP_NOACTIVATE, SWP_NOZORDER,
+    LoadCursorW, MSG, SWP_NOACTIVATE, SWP_NOZORDER, SWP_NOSIZE,
      SW_HIDE, SW_SHOW, WM_MOUSEACTIVATE,
     WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
     WS_EX_TOOLWINDOW, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
+    GetCursorPos,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
@@ -185,9 +186,6 @@ pub const WM_RECONFIG: u32 = 0x8000 + 2;
 /// 阻塞在 GetMessageW 上（空闲 0% CPU），有新数据才画。
 pub const WM_NEW_SNAPSHOT: u32 = 0x8000 + 3;
 
-const HTCAPTION_VAL: isize = 2;
-const HTCLIENT_VAL: isize = 1;
-
 /// Retrieves ThreadState pointer from GWLP_USERDATA.
 ///
 /// 返回 null 表示窗口尚未完成创建（WM_CREATE/WM_SIZE 等消息在
@@ -232,26 +230,21 @@ unsafe extern "system" fn wndproc(
         // 明确拒绝激活：防抢游戏前台 + AFMF 破坏路径 1（抢焦点）。
         WM_MOUSEACTIVATE => LRESULT(3), // MA_NOACTIVATE = 3
 
-        // 边框命中交给 DefWindowProc（WS_THICKFRAME 的 HTLEFT/HTRIGHT 等），
-        // 只有客户区内部才当成标题栏（可拖动）。
-        // 命中测试：拖拽必须用 HTCAPTION（HTTRANSPARENT 会导致死锁——返回后
-        // 窗口永远收不到 WM_LBUTTONDOWN，拖拽无法开始）。
-        // 穿透改用 SetLayeredWindowAttributes(alpha) 控制，与命中测试完全解耦。
-        WM_NCHITTEST => {
-            let ht = unsafe { DefWindowProcW(hwnd, msg, _wparam, lparam) }.0;
-            if ht == HTCLIENT_VAL {
-                LRESULT(HTCAPTION_VAL)
-            } else {
-                LRESULT(ht)
-            }
-        }
+        // 命中测试：整个客户区返回 HTCLIENT（原样）。
+        // 不要改成 HTCAPTION —— 那会把客户区当标题栏，鼠标消息全部变成
+        // WM_NCMOUSEMOVE / WM_NCLBUTTONDOWN，导致自身的 hover（WM_MOUSEMOVE）
+        // 和拖拽（WM_LBUTTONDOWN + SetCapture）逻辑永远收不到消息。
+        WM_NCHITTEST => LRESULT(
+            unsafe { DefWindowProcW(hwnd, msg, _wparam, lparam) }.0,
+        ),
 
         WM_LBUTTONDOWN => {
             if let Some(state) = get_state_ptr(hwnd).as_mut() {
-                state.drag_start = POINT {
-                    x: (lparam.0 & 0xFFFF) as i16 as i32,
-                    y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
-                };
+                // 记录**屏幕坐标**基准（客户区坐标会随窗口移动而漂移，
+                // 拖动用客户区坐标会形成反馈环导致窗口振荡/拖不远）。
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                state.drag_start = pt;
                 let mut rect = RECT::default();
                 let _ = GetWindowRect(hwnd, &mut rect);
                 state.win_start = POINT { x: rect.left, y: rect.top };
@@ -275,25 +268,26 @@ unsafe extern "system" fn wndproc(
                 }
 
                 if state.dragging {
-                    let cur = POINT {
-                        x: (lparam.0 & 0xFFFF) as i16 as i32,
-                        y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
-                    };
-                    let (new_x, new_y) = clamp_to_monitor(
-                        state.win_start.x + (cur.x - state.drag_start.x),
-                        state.win_start.y + (cur.y - state.drag_start.y),
-                        state.cfg.window_size.map(|(w, _)| w).unwrap_or(200),
-                        state.cfg.window_size.map(|(_, h)| h).unwrap_or(60),
-                        hwnd,
-                    );
+                    let mut pt = POINT::default();
+                    let _ = GetCursorPos(&mut pt);
+                    let new_x = state.win_start.x + (pt.x - state.drag_start.x);
+                    let new_y = state.win_start.y + (pt.y - state.drag_start.y);
+                    // 用窗口**实际**尺寸做边界限制。cfg.window_size 可能是历史脏值
+                    // (0x0)——用 0 限制会把右/下边界算成只有 64px 的伪边界，
+                    // 表现为"只能拖一小段就被钉住"，随后光标脱窗触发 mouseleave。
+                    let mut wr0 = RECT::default();
+                    let _ = GetWindowRect(hwnd, &mut wr0);
+                    let w = (wr0.right - wr0.left).max(1) as i32;
+                    let h = (wr0.bottom - wr0.top).max(1) as i32;
+                    let (clamped_x, clamped_y) = clamp_to_monitor(new_x, new_y, w, h, hwnd);
                     let _ = SetWindowPos(
                         hwnd,
                         None,
-                        new_x,
-                        new_y,
+                        clamped_x,
+                        clamped_y,
                         0,
                         0,
-                        SWP_NOACTIVATE | SWP_NOZORDER,
+                        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
                     );
                     state.pos_dirty = true;
                 }
@@ -307,10 +301,8 @@ unsafe extern "system" fn wndproc(
             if let Some(state) = get_state_ptr(hwnd).as_mut() {
                 if !state.dragging {
                     state.hovered = false;
-                    if state.cfg.hover {
-                        let snap = snap_get();
-                        crate::gdi::render(hwnd, &snap, &state.cfg);
-                    }
+                    let snap = snap_get();
+                    crate::gdi::render(hwnd, &snap, &state.cfg);
                 }
             }
             LRESULT(0)
@@ -337,10 +329,12 @@ unsafe extern "system" fn wndproc(
             let _ = ReleaseCapture();
             // SetCapture 期间 WM_MOUSELEAVE 不触发；释放后重新登记，
             // 让系统立即评估鼠标是否还在窗口上（若不在会立刻补发 WM_MOUSELEAVE）。
-            if let Some(state) = get_state_ptr(hwnd).as_mut() {
-                if state.cfg.hover {
-                    track_mouse_leave(hwnd);
-                }
+            track_mouse_leave(hwnd);
+            // 拖动模式已结束，立即提交一帧权威画面（而非沿用拖动前的旧帧/悬停帧），
+            // 此时 hovered 状态与"光标是否还在窗口上"一致，光标脱窗则自动回到半透明。
+            if let Some(state) = get_state_ptr(hwnd).as_ref() {
+                let snap = snap_get();
+                crate::gdi::render(hwnd, &snap, &state.cfg);
             }
             LRESULT(0)
         }
@@ -384,9 +378,17 @@ unsafe extern "system" fn wndproc(
         }
 
         WM_TIMER => {
-            if let Some(state) = get_state_ptr(hwnd).as_mut() {
-                let snap = snap_get();
-                crate::gdi::render(hwnd, &snap, &state.cfg);
+            // 拖动期间不渲染：随时可能已被 SetWindowPos 刷新过几何，渲染只会
+            // 提交过期/悬停帧；等 WM_LBUTTONUP/WM_EXITSIZEMOVE 统一补一帧。
+            let dragging = get_state_ptr(hwnd)
+                .as_ref()
+                .map(|s| s.dragging)
+                .unwrap_or(false);
+            if !dragging && IsWindowVisible(hwnd).as_bool() {
+                if let Some(state) = get_state_ptr(hwnd).as_mut() {
+                    let snap = snap_get();
+                    crate::gdi::render(hwnd, &snap, &state.cfg);
+                }
             }
             LRESULT(0)
         }
@@ -468,7 +470,13 @@ unsafe extern "system" fn wndproc(
 
         // ── 采样线程新快照：可见才渲染（推送式，空闲零开销） ──
         WM_NEW_SNAPSHOT => {
-            if IsWindowVisible(hwnd).as_bool() {
+            // 拖动期间同样不渲染（见 WM_TIMER/WM_PAINT 注释）：采样线程每帧
+            // 都会推一帧，若在拖动中渲染会把消失的悬停态/过期帧提交上去。
+            let dragging = get_state_ptr(hwnd)
+                .as_ref()
+                .map(|s| s.dragging)
+                .unwrap_or(false);
+            if !dragging && IsWindowVisible(hwnd).as_bool() {
                 if let Some(state) = get_state_ptr(hwnd).as_ref() {
                     let snap = snap_get();
                     crate::gdi::render(hwnd, &snap, &state.cfg);
@@ -605,14 +613,24 @@ fn clamp_to_monitor(x: i32, y: i32, win_w: i32, win_h: i32, hwnd: HWND) -> (i32,
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
         ..Default::default()
     };
-    if unsafe { GetMonitorInfoW(hmon, &mut mi) }.as_bool() {
+    if !unsafe { GetMonitorInfoW(hmon, &mut mi) }.as_bool() {
+        // 取显示器信息失败：保守退回原始坐标（不改动窗口位置）
         return (x, y);
     }
     let rc = mi.rcWork;
+    // AFMF 兼容约束：坐标必须落在 [rc.left, rc.right - win_w - 64] ×
+    // [rc.top, rc.bottom - win_h - 64] 内（防 AMD 驱动多屏误判）。
+    // min 侧允许贴边（rc.left/rc.top），不加额外边距，否则窗口拖回
+    // 屏幕边缘会被"弹开"，表现为拖不动 / 只能拖一小段。
     const MARGIN: i32 = 64;
     let max_x = (rc.right - win_w - MARGIN).max(rc.left);
     let max_y = (rc.bottom - win_h - MARGIN).max(rc.top);
-    (x.clamp(rc.left, max_x), y.clamp(rc.top, max_y))
+    let min_x = rc.left;
+    let min_y = rc.top;
+    (
+        x.clamp(min_x, max_x),
+        y.clamp(min_y, max_y),
+    )
 }
 
 fn get_screen_size() -> (i32, i32) {
@@ -683,7 +701,17 @@ impl OverlayWindow {
         // 首次启动默认在左上方（x=screen_w/4），避开 AMD overlay 的右上角默认位。
         // 后续位置由用户拖动决定，存入 window_pos 持久化。
         let (pos_x, pos_y) = state.cfg.window_pos.unwrap_or((screen_w / 4, 24));
-        let (win_w, win_h) = state.cfg.window_size.unwrap_or((strip_w, strip_h));
+        // 兜底：历史脏数据里可能存了 0x0（早期拖动缺 SWP_NOSIZE 被缩成 0）。
+        // 遇到非正尺寸用内容自然尺寸，避免创建 0x0 的隐形窗口。
+        let (saved_w, saved_h) = state
+            .cfg
+            .window_size
+            .unwrap_or((strip_w, strip_h));
+        let (win_w, win_h) = if saved_w > 0 && saved_h > 0 {
+            (saved_w, saved_h)
+        } else {
+            (strip_w, strip_h)
+        };
 
         let mut ex_style = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
         if state.cfg.topmost {
@@ -716,7 +744,6 @@ impl OverlayWindow {
         unsafe {
             let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA.0 as i32, state_ptr);
         }
-        crate::probe::log(&format!("overlay hwnd=0x{:x}", hwnd.0 as usize));
 
         Ok(Self { hwnd, state })
     }

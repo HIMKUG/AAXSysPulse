@@ -28,7 +28,7 @@
 
 // 枚举与颜色的唯一真源在 `core::types` / `core::color`，此处重导出保持 API 稳定。
 pub use crate::color::Rgb;
-pub use crate::types::{NetUnit, PowerDisplay, RenderMode, RenderStyle, Shape, VertLayout, Zoom};
+pub use crate::types::{Lang, Metric, MetricColors, NetUnit, PowerDisplay, RenderMode, RenderStyle, Shape, VertLayout, Zoom};
 
 /// 配置文件格式版本。用于将来格式变更时的迁移锚点。
 pub const CONFIG_VERSION: u32 = 2;
@@ -72,8 +72,23 @@ pub struct Config {
     pub show_net: bool,
     /// 内存显示模式：false = 百分比，true = 实际占用量（GB，不显示总量）。
     pub mem_show_gb: bool,
-    /// 位图字体缩放倍数（1..=4）。字形 = 8×16 基准。
-    pub font_scale: u32,
+    /// 正文字号（像素，8.0..=40.0，0.5 步进）。旧键 `font_scale` 迁移为 ×16。
+    pub font_size: f32,
+    /// 逐指标字号覆盖（None = 跟随全局 `font_size`）。
+    /// 索引与 [`Metric`] 顺序一致：CPU/MEM/GPU/Net/Power。
+    pub metric_font_sizes: [Option<f32>; 5],
+    /// 指标与指标之间的间距（px，0..=64）。横版 = 水平空隙，竖版 = 上下空隙。
+    pub metric_gap: u32,
+    /// 每个指标「名称 ↔ 数值」之间的间距（px，0..=64）。
+    pub label_value_gap: u32,
+    /// 悬停时的透明度（%，0..=100）。别名旧键 `opacity`。
+    pub hover_opacity: u8,
+    /// 非悬停时的透明度（%，0..=100，默认 35，旧版 hover 关 = 恒悬停档）。
+    pub normal_opacity: u8,
+    /// 悬停↔非悬停与设置页翻页的过渡动画时长（ms，100..=2000，默认 300）。
+    pub anim_ms: u32,
+    /// 逐项配色：每个指标的名称/数值色槽，None = 跟随 `fg`。
+    pub metric_colors: [MetricColors; 5],
     /// 文字阴影（颜色自动取字体反色：白字黑影 / 黑字白影）。
     pub text_shadow: bool,
     /// 文字描边（1px 四向，颜色同阴影规则）。
@@ -97,6 +112,11 @@ pub struct Config {
     // ── v3 新增 ──────────────────────────────────────────────
     /// 渲染风格：Classic（旧 C 版卡片）/ Strip（v3 横向条）。
     pub render_style: RenderStyle,
+    /// 界面语言：En / Zh（全界面双语切换）。
+    pub lang: Lang,
+    /// 全屏游戏自动隐藏悬浮窗（根治 AFMF 合成层破坏）。
+    /// 检测到全屏应用时隐藏，退出全屏自动恢复。默认开。
+    pub afmf_auto_hide: bool,
 }
 
 impl Default for Config {
@@ -122,7 +142,15 @@ impl Default for Config {
             show_gpu: true,
             show_net: true,
             mem_show_gb: false,
-            font_scale: 2,
+            // 32px ≈ 旧默认 font_scale 2（16px 基准 ×2）
+            font_size: 32.0,
+            metric_font_sizes: [None; 5],
+            metric_gap: 8,
+            label_value_gap: 6,
+            hover_opacity: 90,
+            normal_opacity: 35,
+            anim_ms: 300,
+            metric_colors: [MetricColors::default(); 5],
             text_shadow: true,
             text_outline: false,
             autostart: false,
@@ -133,6 +161,8 @@ impl Default for Config {
             exclude_virtual_nic: true,
             debug_log: false,
             render_style: RenderStyle::Strip,
+            lang: Lang::En,
+            afmf_auto_hide: true,
         }
     }
 }
@@ -198,20 +228,72 @@ impl Config {
                 "show_gpu" => cfg.show_gpu = Self::parse_bool(value, cfg.show_gpu),
                 "show_net" => cfg.show_net = Self::parse_bool(value, cfg.show_net),
                 "mem_gb" => cfg.mem_show_gb = Self::parse_bool(value, cfg.mem_show_gb),
+                // 新字号（px，0.5 步进）
+                "font_size" | "fontsize" => {
+                    if let Ok(v) = value.parse::<f32>() {
+                        cfg.font_size = (v.clamp(8.0, 40.0) * 2.0).round() / 2.0;
+                    }
+                }
+                // 旧字号（bitmap 缩放倍数）迁移：×16 像素，再钳位到合法范围
                 "font_scale" => {
                     if let Ok(v) = value.parse::<u32>() {
-                        cfg.font_scale = v.clamp(1, 4);
+                        cfg.font_size = ((v.clamp(1, 4) as f32) * 16.0).clamp(8.0, 40.0);
+                    }
+                }
+                "metric_gap" | "mgap" => {
+                    if let Ok(v) = value.parse::<u32>() {
+                        cfg.metric_gap = v.clamp(0, 64);
+                    }
+                }
+                "label_value_gap" | "label_gap" | "lvgap" => {
+                    if let Ok(v) = value.parse::<u32>() {
+                        cfg.label_value_gap = v.clamp(0, 64);
+                    }
+                }
+                "hover_opacity" | "opacity" => {
+                    if let Ok(v) = value.parse::<u32>() {
+                        cfg.hover_opacity = v.clamp(0, 100) as u8;
+                    }
+                }
+                "normal_opacity" => {
+                    if let Ok(v) = value.parse::<u32>() {
+                        cfg.normal_opacity = v.clamp(0, 100) as u8;
+                    }
+                }
+                "anim_ms" | "anim" => {
+                    if let Ok(v) = value.parse::<u32>() {
+                        cfg.anim_ms = v.clamp(0, 500);
+                    }
+                }
+                // 逐项配色：mc_<metric>_lbl|val  <COLORREF|0>
+                //  "0"/"off"/"none"/"follow"/"default" → None（跟随全局文字色）
+                _ if key.starts_with("mc_") => {
+                    if let Some((slot, color)) = parse_metric_color(&key, value) {
+                        let idx = match slot.0 {
+                            Metric::Cpu => 0,
+                            Metric::Mem => 1,
+                            Metric::Gpu => 2,
+                            Metric::Net => 3,
+                            Metric::Power => 4,
+                        };
+                        let mc = &mut cfg.metric_colors[idx];
+                        if slot.1 {
+                            mc.label = color;
+                        } else {
+                            mc.value = color;
+                        }
+                    }
+                }
+                // 逐指标字号覆盖：mfs_<metric>  <size|0>（0 = 跟随全局字号）
+                _ if key.starts_with("mfs_") => {
+                    if let Some(idx) = parse_metric_font_size(&key, value) {
+                        cfg.metric_font_sizes[idx.0] = idx.1;
                     }
                 }
                 "shadow" => cfg.text_shadow = Self::parse_bool(value, cfg.text_shadow),
                 "outline" => cfg.text_outline = Self::parse_bool(value, cfg.text_outline),
                 "autostart" => cfg.autostart = Self::parse_bool(value, cfg.autostart),
                 "topmost" => cfg.topmost = Self::parse_bool(value, cfg.topmost),
-                "opacity" => {
-                    if let Ok(v) = value.parse::<u32>() {
-                        cfg.opacity = v.clamp(1, 100) as u8;
-                    }
-                }
                 // C 版 interval 是 100ms 单位 → 换算为 ms 并吸附到允许档位。
                 "interval" => {
                     if let Ok(v) = value.parse::<u32>() {
@@ -285,6 +367,14 @@ impl Config {
                         cfg.render_style = s;
                     }
                 }
+                "lang" | "language" => {
+                    if let Some(l) = Lang::from_config(value) {
+                        cfg.lang = l;
+                    }
+                }
+                "afmf_auto_hide" | "fullscreen_hide" => {
+                    cfg.afmf_auto_hide = Self::parse_bool(value, cfg.afmf_auto_hide);
+                }
                 // 未知键静默忽略：C 版或更新版本的配置文件都能安全加载。
                 _ => {}
             }
@@ -314,12 +404,17 @@ impl Config {
         s.push_str(&format!("show_gpu {}\n", self.show_gpu as u32));
         s.push_str(&format!("show_net {}\n", self.show_net as u32));
         s.push_str(&format!("mem_gb {}\n", self.mem_show_gb as u32));
-        s.push_str(&format!("font_scale {}\n", self.font_scale));
+        s.push_str(&format!("font_size {:.1}\n", self.font_size));
+        s.push_str(&format!("metric_gap {}\n", self.metric_gap));
+        s.push_str(&format!("label_value_gap {}\n", self.label_value_gap));
         s.push_str(&format!("shadow {}\n", self.text_shadow as u32));
         s.push_str(&format!("outline {}\n", self.text_outline as u32));
         s.push_str(&format!("autostart {}\n", self.autostart as u32));
         s.push_str(&format!("topmost {}\n", self.topmost as u32));
-        s.push_str(&format!("opacity {}\n", self.opacity));
+        // 旧键 opacity 继续输出（语义 = 悬停透明度），C 版读得动
+        s.push_str(&format!("opacity {}\n", self.hover_opacity));
+        s.push_str(&format!("normal_opacity {}\n", self.normal_opacity));
+        s.push_str(&format!("anim_ms {}\n", self.anim_ms));
         // C 版单位是 100ms
         s.push_str(&format!("interval {}\n", self.interval_ms / 100));
         s.push_str(&format!("refresh_auto {}\n", self.refresh_auto as u32));
@@ -342,6 +437,24 @@ impl Config {
         ));
         s.push_str(&format!("debug_log {}\n", self.debug_log as u32));
         s.push_str(&format!("render_style {}\n", self.render_style.to_config()));
+        s.push_str(&format!("lang {}\n", self.lang.to_config()));
+        s.push_str(&format!("afmf_auto_hide {}\n", self.afmf_auto_hide as u32));
+        // 逐项配色：只有非跟随全局的色槽才落盘
+        for (i, metric) in Metric::ALL.iter().enumerate() {
+            let mc = &self.metric_colors[i];
+            if let Some(c) = mc.label {
+                s.push_str(&format!("mc_{}_lbl {:06X}\n", metric.key_name(), c.to_colorref()));
+            }
+            if let Some(c) = mc.value {
+                s.push_str(&format!("mc_{}_val {:06X}\n", metric.key_name(), c.to_colorref()));
+            }
+        }
+        // 逐指标字号覆盖：只有非跟随全局的槽才落盘
+        for (i, metric) in Metric::ALL.iter().enumerate() {
+            if let Some(size) = self.metric_font_sizes[i] {
+                s.push_str(&format!("mfs_{} {:.1}\n", metric.key_name(), size));
+            }
+        }
         s
     }
 
@@ -409,6 +522,67 @@ fn snap_interval_ms(ms: u32) -> u32 {
     best
 }
 
+/// 解析逐项配色的键与值。
+///
+/// 键形如 `mc_<metric>_lbl` / `mc_<metric>_val`（metric ∈ cpu/mem/gpu/net/power）。
+/// 返回 `Some((slot, Option<Rgb>))`：`slot.1 == true` 表示名称槽（label），
+/// 否则为数值槽（value）。值 `0`/`off`/`none`/`follow`/`default` → `None`（跟随全局）。
+/// 未知指标名或非法值返回 `None`（静默忽略）。
+fn parse_metric_color(key: &str, value: &str) -> Option<((Metric, bool), Option<Rgb>)> {
+    // 去掉 "mc_" 前缀后剩余 <metric>_lbl|val
+    let rest = key.strip_prefix("mc_")?;
+    let (metric_part, slot_part) = rest.rsplit_once('_')?;
+    let metric = match metric_part {
+        "cpu" => Metric::Cpu,
+        "mem" => Metric::Mem,
+        "gpu" => Metric::Gpu,
+        "net" => Metric::Net,
+        "power" => Metric::Power,
+        _ => return None,
+    };
+    let slot = match slot_part {
+        "lbl" | "label" => true,
+        "val" | "value" => false,
+        _ => return None,
+    };
+    let v = value.trim();
+    let color = match v.to_ascii_lowercase().as_str() {
+        "0" | "off" | "none" | "follow" | "default" => None,
+        _ => {
+            let cr = u32::from_str_radix(v.trim_start_matches("0x").trim_start_matches('#'), 16).ok()?;
+            Some(Rgb::from_colorref(cr))
+        }
+    };
+    Some(((metric, slot), color))
+}
+
+/// 解析逐指标字号覆盖的键与值。
+///
+/// 键形如 `mfs_<metric>`（metric ∈ cpu/mem/gpu/net/power）。
+/// 返回 `Some((idx, Option<f32>))`：`idx` 为 [`Metric`] 数组下标，
+/// 值 `0`/`off`/`none`/`follow`/`default` → `None`（跟随全局字号）。
+/// 未知指标名或非法值返回 `None`（静默忽略）。
+fn parse_metric_font_size(key: &str, value: &str) -> Option<(usize, Option<f32>)> {
+    let rest = key.strip_prefix("mfs_")?;
+    let idx = match rest {
+        "cpu" => 0,
+        "mem" => 1,
+        "gpu" => 2,
+        "net" => 3,
+        "power" => 4,
+        _ => return None,
+    };
+    let v = value.trim();
+    let size = match v.to_ascii_lowercase().as_str() {
+        "0" | "off" | "none" | "follow" | "default" => None,
+        _ => {
+            let s = (v.parse::<f32>().ok()?.clamp(8.0, 40.0) * 2.0).round() / 2.0;
+            Some(s)
+        }
+    };
+    Some((idx, size))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,7 +611,8 @@ fg F4F1EE
 
         assert_eq!(cfg.window_pos, Some((1200, 40)), "pos 必须能被读回（此前写而不读）");
         assert!(cfg.topmost);
-        assert_eq!(cfg.opacity, 90);
+        assert_eq!(cfg.hover_opacity, 90, "旧键 opacity → 悬停透明度");
+        assert_eq!(cfg.normal_opacity, 35, "没有 normal_opacity 行时用默认 35");
         assert_eq!(cfg.interval_ms, 1000, "C 版 interval 10 = 10×100ms");
         assert!(!cfg.minimal);
         assert_eq!(cfg.zoom, Zoom::Zoom100);
@@ -472,7 +647,12 @@ fg F4F1EE
     fn test_roundtrip_non_default() {
         let mut cfg = Config::default();
         cfg.topmost = false;
-        cfg.opacity = 40;
+        cfg.hover_opacity = 40;
+        cfg.normal_opacity = 15;
+        cfg.font_size = 20.5;
+        cfg.metric_gap = 24;
+        cfg.label_value_gap = 12;
+        cfg.anim_ms = 300;
         cfg.interval_ms = 2000;
         cfg.minimal = true;
         cfg.zoom = Zoom::Zoom150;
@@ -488,6 +668,15 @@ fg F4F1EE
         cfg.power_display = PowerDisplay::Battery;
         cfg.power_interval_ms = 5000;
         cfg.exclude_virtual_nic = false;
+        cfg.render_style = RenderStyle::Vertical;
+        cfg.metric_colors[0] = MetricColors {
+            label: Some(Rgb::new(0x12, 0x34, 0x56)),
+            value: None,
+        };
+        cfg.metric_colors[3] = MetricColors {
+            label: None,
+            value: Some(Rgb::new(0xAB, 0xCD, 0xEF)),
+        };
 
         let text = cfg.serialize();
         let parsed = Config::parse(&text);
@@ -588,7 +777,7 @@ fg F4F1EE
     fn test_key_value_format_also_accepted() {
         let cfg = Config::parse("topmost=0\nopacity=70\nshape=square\nnetunit=gb\nvert=splitcol\n");
         assert!(!cfg.topmost);
-        assert_eq!(cfg.opacity, 70);
+        assert_eq!(cfg.hover_opacity, 70);
         assert_eq!(cfg.shape, Shape::Square);
         assert_eq!(cfg.net_unit, NetUnit::GB);
         assert_eq!(cfg.vert, VertLayout::SplitCol);
@@ -647,7 +836,9 @@ fg F4F1EE
         for input in inputs {
             let cfg = Config::parse(input);
             // 只要不 panic 且值域合法即可
-            assert!((1..=100).contains(&cfg.opacity), "opacity 越界: {}", input);
+            assert!((0..=100).contains(&cfg.hover_opacity), "hover_opacity 越界: {}", input);
+            assert!((0..=100).contains(&cfg.normal_opacity), "normal_opacity 越界: {}", input);
+            assert_eq!(cfg.font_size, (cfg.font_size.clamp(8.0, 40.0) * 2.0).round() / 2.0, "字号 0.5 步进: {}", input);
             assert!(
                 INTERVAL_MS_ALLOWED.contains(&cfg.interval_ms),
                 "interval 未吸附: {} → {}",
@@ -742,7 +933,12 @@ fg F4F1EE
         let cfg = Config::default();
         assert!(!cfg.minimal);
         assert_eq!(cfg.zoom, Zoom::Zoom100);
-        assert_eq!(cfg.opacity, 90);
+        assert_eq!(cfg.hover_opacity, 90);
+        assert_eq!(cfg.normal_opacity, 35);
+        assert_eq!(cfg.font_size, 32.0);
+        assert_eq!(cfg.metric_gap, 8);
+        assert_eq!(cfg.label_value_gap, 6);
+        assert_eq!(cfg.anim_ms, 150);
         assert!(cfg.topmost);
         assert_eq!(cfg.version, CONFIG_VERSION);
         assert!(!cfg.power_enabled, "功耗默认关闭（零开销原则）");
@@ -769,26 +965,71 @@ fg F4F1EE
     #[test]
     fn test_render_style_roundtrip_both_ways() {
         let mut cfg = Config::default();
-        cfg.render_style = RenderStyle::Classic;
+        cfg.render_style = RenderStyle::Strip;
         assert_eq!(Config::parse(&cfg.serialize()), cfg);
 
-        cfg.render_style = RenderStyle::Strip;
+        cfg.render_style = RenderStyle::Vertical;
         assert_eq!(Config::parse(&cfg.serialize()), cfg);
     }
 
     #[test]
     fn test_render_style_accepts_numeric_and_string() {
+        // 卡片式（旧 0/classic）删除后迁移为横版条状，不再保留
         assert_eq!(
             Config::parse("render_style 0").render_style,
-            RenderStyle::Classic
+            RenderStyle::Strip
         );
         assert_eq!(
             Config::parse("render_style classic").render_style,
-            RenderStyle::Classic
+            RenderStyle::Strip
         );
         assert_eq!(Config::parse("render_style 1").render_style, RenderStyle::Strip);
         assert_eq!(Config::parse("style strip").render_style, RenderStyle::Strip);
+        assert_eq!(
+            Config::parse("render_style vertical").render_style,
+            RenderStyle::Vertical
+        );
+        assert_eq!(Config::parse("style 2").render_style, RenderStyle::Vertical);
         // 未知值保留默认，不 panic
         assert_eq!(Config::parse("render_style ???").render_style, RenderStyle::Strip);
+    }
+
+    // ── v4 逐指标字号覆盖 ────────────────────────────────────
+
+    #[test]
+    fn test_metric_font_size_default_follows_global() {
+        let cfg = Config::default();
+        assert_eq!(cfg.metric_font_sizes, [None; 5], "默认全部跟随全局字号");
+    }
+
+    #[test]
+    fn test_metric_font_size_parse_and_serialize_roundtrip() {
+        let mut cfg = Config::default();
+        cfg.metric_font_sizes[0] = Some(24.0); // CPU
+        cfg.metric_font_sizes[3] = Some(16.5); // Net
+        let text = cfg.serialize();
+        let parsed = Config::parse(&text);
+        assert_eq!(parsed, cfg, "逐指标字号往返失败，实际输出:\n{}", text);
+        assert!(text.contains("mfs_cpu 24.0\n"));
+        assert!(text.contains("mfs_net 16.5\n"));
+        // 跟随全局的槽不落盘
+        assert!(!text.contains("mfs_mem"));
+        assert!(!text.contains("mfs_gpu"));
+        assert!(!text.contains("mfs_power"));
+    }
+
+    #[test]
+    fn test_metric_font_size_accepts_follow_and_clamps() {
+        let cfg = Config::parse("mfs_cpu follow\nmfs_gpu 999\nmfs_mem 12.25");
+        assert_eq!(cfg.metric_font_sizes[0], None, "follow → None");
+        assert_eq!(cfg.metric_font_sizes[2], Some(40.0), "越界 clamp 到 40");
+        assert_eq!(cfg.metric_font_sizes[1], Some(12.5), "0.5 步进四舍五入 (12.25→12.5)");
+        assert_eq!(cfg.metric_font_sizes[3], None, "未指定的槽保持跟随");
+    }
+
+    #[test]
+    fn test_metric_font_size_unknown_ignored() {
+        let cfg = Config::parse("mfs_xxx 20.0\nmfs");
+        assert_eq!(cfg.metric_font_sizes, [None; 5]);
     }
 }

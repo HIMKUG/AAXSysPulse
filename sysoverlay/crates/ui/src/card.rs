@@ -45,14 +45,19 @@ impl<'a> DrawCtx<'a> {
     }
 }
 
-/// 一行的标签文案。
-fn label_of(kind: RowKind) -> &'static str {
-    match kind {
-        RowKind::Cpu => "CPU",
-        RowKind::Memory => "Memory",
-        RowKind::Gpu => "GPU",
-        RowKind::Net => "Net",
-        RowKind::Power => "Power",
+/// 一行的标签文案（按语言切换：英文缩写 / 中文）。
+fn label_of(kind: RowKind, lang: sysoverlay_core::types::Lang) -> &'static str {
+    use sysoverlay_core::types::Lang;
+    let zh = lang == Lang::Zh;
+    match (kind, zh) {
+        (RowKind::Cpu, _) => "CPU",
+        (RowKind::Memory, false) => "Memory",
+        (RowKind::Memory, true) => "内存",
+        (RowKind::Gpu, _) => "GPU",
+        (RowKind::Net, false) => "Net",
+        (RowKind::Net, true) => "网络",
+        (RowKind::Power, false) => "Power",
+        (RowKind::Power, true) => "功耗",
     }
 }
 
@@ -178,7 +183,7 @@ fn draw_row<T: RenderTarget>(
     let value_color = if stale { ctx.style.ui.value_stale } else { ctx.style.ui.value };
 
     ctx.text.draw(
-        label_of(row.kind),
+        label_of(row.kind, cfg.lang),
         Rect::from_tuple(row.label_rect),
         name_color,
         out,
@@ -186,7 +191,7 @@ fn draw_row<T: RenderTarget>(
 
     // 内存行额外补一段 "8.5/16.0G" 的次要信息
     if row.kind == RowKind::Memory {
-        draw_mem_detail(out, row, &snap.memory, buf, ctx);
+        draw_mem_detail(out, row, &snap.memory, buf, ctx, cfg.lang);
     }
 
     // 值
@@ -226,9 +231,10 @@ fn draw_mem_detail<T: RenderTarget>(
     mem: &MemoryStat,
     buf: &mut StrBuf,
     ctx: &DrawCtx<'_>,
+    lang: sysoverlay_core::types::Lang,
 ) {
     fmt_mem(buf, mem.used_gb, mem.total_gb);
-    let (label_w, _) = ctx.text.measure(label_of(RowKind::Memory));
+    let (label_w, _) = ctx.text.measure(label_of(RowKind::Memory, lang));
     let x = row.label_rect.0 + label_w + 6;
     let w = row.label_rect.2 - label_w - 6;
     if w > 0 {

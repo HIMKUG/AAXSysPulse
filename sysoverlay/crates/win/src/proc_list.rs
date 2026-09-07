@@ -2,23 +2,30 @@
 //!
 //! 数据源 [`crate::process::ProcCollector`]（Nt API）。采样在独立后台线程执行，
 //! WM_TIMER 只负责触发重绘，消除全表扫描阻塞 UI 消息泵的问题。
+//!
+//! 自绘标题栏（固定 / 最小化 / 关闭三个圆角矩形按钮）：
+//! - 固定：置顶且不可拖动，悬停标题栏才显示解锁按钮
+//! - 最小化：隐藏窗口；采样线程探测到不可见后停采样（CPU 归零）
+//! - 关闭：销毁窗口，采样线程随 IsWindow 失效自动退出
 
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect,
-    SetBkMode, SetTextColor, DrawTextW, TRANSPARENT, HDC, PAINTSTRUCT, HBRUSH, DRAW_TEXT_FORMAT,
-    DT_LEFT, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, ValidateRect,
+    ScreenToClient, SelectObject, SetBkMode, SetTextColor, DrawTextW, TRANSPARENT, HDC, HFONT,
+    PAINTSTRUCT, HBRUSH, DRAW_TEXT_FORMAT, DT_LEFT, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
+    ValidateRect,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, IsWindow,
-    KillTimer, LoadCursorW, PostMessageW, RegisterClassExW, SetTimer, ShowWindow,
-    IsWindowVisible, IDC_ARROW, SW_SHOW,
-    WINDOW_EX_STYLE, WNDCLASSEXW, WS_CAPTION, WS_SYSMENU,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, IsWindow, IsWindowVisible,
+    KillTimer, LoadCursorW, PostMessageW, RegisterClassExW, SetTimer, SetWindowPos, ShowWindow,
+    IDC_ARROW, SW_HIDE, SW_SHOW, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, WINDOW_EX_STYLE, WNDCLASSEXW, WS_POPUP,
 };
 
 #[link(name = "user32")]
@@ -30,6 +37,7 @@ extern "system" {
 use crate::dpi;
 use crate::process::{ProcCollector, ProcStats};
 use crate::theme::Theme;
+use crate::titlebar;
 
 const W_L: i32 = 460;
 const H_L: i32 = 280;
@@ -40,9 +48,16 @@ const WM_PAINT: u32 = 0x000F;
 const WM_ERASEBKGND: u32 = 0x0014;
 const WM_CLOSE: u32 = 0x0010;
 const WM_DESTROY: u32 = 0x0002;
+const WM_NCHITTEST: u32 = 0x0084;
+const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
+const WM_MOUSELEAVE: u32 = 0x02A2;
 const WM_NEW_SAMPLE: u32 = 0x8000;
+const HTCAPTION: isize = 2;
+const HTCLIENT: isize = 1;
+const HTTRANSPARENT: isize = -1;
 const GWLP_UD: i32 = -21;
+const TIMER_ID: usize = 1;
 
 use std::sync::Mutex;
 
@@ -74,6 +89,9 @@ enum SortBy {
 struct Ctx {
     latest: ProcStats,
     sort: SortBy,
+    tb: titlebar::TitleBarState,
+    font: HFONT,
+    tracking: bool,
 }
 
 pub fn open() {
@@ -83,6 +101,8 @@ pub fn open() {
         let hwnd = HWND(existing as *mut _);
         if unsafe { IsWindow(hwnd) }.as_bool() {
             unsafe {
+                // 最小化隐藏后重新打开：恢复定时器
+                let _ = SetTimer(hwnd, TIMER_ID, 1000, None);
                 let _ = ShowWindow(hwnd, SW_SHOW);
             }
             return;
@@ -121,11 +141,11 @@ fn create() {
             WINDOW_EX_STYLE(0),
             windows::core::w!("SysOverlay_Procs"),
             windows::core::w!("SysOverlay - Processes"),
-            WS_CAPTION | WS_SYSMENU,
+            WS_POPUP,
             300,
             260,
             s(d, W_L),
-            s(d, H_L),
+            s(d, H_L + titlebar::TB_H),
             None,
             None,
             hinst,
@@ -136,6 +156,9 @@ fn create() {
         let ctx = Box::new(Ctx {
             latest: ProcStats { entries: Vec::new(), at_ms: 0 },
             sort: SortBy::Cpu,
+            tb: titlebar::TitleBarState::default(),
+            font: titlebar::title_font(d),
+            tracking: false,
         });
         let _ = SetWindowLongPtrW(hwnd, GWLP_UD, Box::into_raw(ctx) as isize);
         crate::probe::log("[procs] create: ctx attached");
@@ -149,22 +172,25 @@ fn create() {
                 if !IsWindow(hwnd).as_bool() {
                     break;
                 }
-                let snap = collector.sample();
-                if IsWindowVisible(hwnd).as_bool() {
-                    let _ = PostMessageW(
-                        hwnd,
-                        WM_NEW_SAMPLE,
-                        WPARAM(0),
-                        LPARAM(0),
-                    );
+                // 最小化隐藏期间不采样（省 CPU）；探测到可见再恢复
+                if !IsWindowVisible(hwnd).as_bool() {
+                    thread::sleep(Duration::from_secs(5));
+                    continue;
                 }
+                let snap = collector.sample();
+                let _ = PostMessageW(
+                    hwnd,
+                    WM_NEW_SAMPLE,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
                 procs_push(snap);
                 thread::sleep(Duration::from_secs(1));
             }
             PROCS_SAMPLE_THREAD.store(-1, Ordering::SeqCst);
         });
 
-        let _ = SetTimer(hwnd, 1, 1000, None);
+        let _ = SetTimer(hwnd, TIMER_ID, 1000, None);
         crate::probe::log("[procs] create: timer set");
         let _ = ShowWindow(hwnd, SW_SHOW);
         crate::probe::log("[procs] create: shown");
@@ -211,12 +237,126 @@ unsafe extern "system" fn procs_wndproc(
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
+        // 标题栏命中：按钮区 HTCLIENT 收鼠标；空白区 HTCAPTION 走系统拖动；
+        // 固定态空白区 HTTRANSPARENT（不可拖动，仅悬停显示解锁按钮）。
+        WM_NCHITTEST => {
+            let d = dpi::get_system_dpi();
+            let mut sc = POINT {
+                x: (lparam.0 & 0xFFFF) as u16 as i32,
+                y: ((lparam.0 >> 16) & 0xFFFF) as u16 as i32,
+            };
+            let _ = ScreenToClient(hwnd, &mut sc);
+            if titlebar::in_title_bar(d, sc) {
+                let mut rc = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rc);
+                let win_w = rc.right - rc.left;
+                if let Some(ctx) = ctx_of(hwnd) {
+                    if ctx.tb.pinned {
+                        if titlebar::hit_button(d, win_w, sc, true).is_some() {
+                            return LRESULT(HTCLIENT);
+                        }
+                        return LRESULT(HTTRANSPARENT);
+                    }
+                    if titlebar::hit_button(d, win_w, sc, false).is_some() {
+                        return LRESULT(HTCLIENT);
+                    }
+                    return LRESULT(HTCAPTION);
+                }
+            }
+            LRESULT(HTCLIENT)
+        }
+        WM_MOUSEMOVE => {
+            if let Some(ctx) = ctx_of(hwnd) {
+                let d = dpi::get_system_dpi();
+                let mut rc = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rc);
+                let win_w = rc.right - rc.left;
+                let pt = POINT {
+                    x: (lparam.0 & 0xFFFF) as u16 as i32,
+                    y: ((lparam.0 >> 16) & 0xFFFF) as u16 as i32,
+                };
+                let over = titlebar::in_title_bar(d, pt);
+                let hover = if over {
+                    titlebar::hit_button(d, win_w, pt, ctx.tb.pinned)
+                } else {
+                    None
+                };
+                if ctx.tb.over != over || ctx.tb.hover != hover {
+                    ctx.tb.over = over;
+                    ctx.tb.hover = hover;
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+                if !ctx.tracking {
+                    ctx.tracking = true;
+                    let mut te = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    let _ = TrackMouseEvent(&mut te);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            if let Some(ctx) = ctx_of(hwnd) {
+                ctx.tracking = false;
+                ctx.tb.over = false;
+                ctx.tb.hover = None;
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
         WM_LBUTTONDOWN => {
             if let Some(ctx) = ctx_of(hwnd) {
                 let d = dpi::get_system_dpi();
-                let x = (lparam.0 & 0xFFFF) as i16 as i32;
-                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-                if y < s(d, 20) {
+                let x = (lparam.0 & 0xFFFF) as u16 as i32;
+                let y = ((lparam.0 >> 16) & 0xFFFF) as u16 as i32;
+                // 1) 标题栏按钮
+                if titlebar::in_title_bar(d, POINT { x, y }) {
+                    let mut rc = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut rc);
+                    let win_w = rc.right - rc.left;
+                    if let Some(btn) = titlebar::hit_button(d, win_w, POINT { x, y }, ctx.tb.pinned) {
+                        match btn {
+                            titlebar::TitleBtn::Pin => {
+                                ctx.tb.pinned = true;
+                                ctx.tb.hover = None;
+                                let _ = SetWindowPos(
+                                    hwnd,
+                                    HWND_TOPMOST,
+                                    0, 0, 0, 0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                                );
+                                crate::probe::log("[procs] pin on");
+                            }
+                            titlebar::TitleBtn::Unlock => {
+                                ctx.tb.pinned = false;
+                                let _ = SetWindowPos(
+                                    hwnd,
+                                    HWND_NOTOPMOST,
+                                    0, 0, 0, 0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                                );
+                                crate::probe::log("[procs] pin off");
+                            }
+                            titlebar::TitleBtn::Min => {
+                                let _ = KillTimer(hwnd, TIMER_ID);
+                                let _ = ShowWindow(hwnd, SW_HIDE);
+                                crate::probe::log("[procs] minimized");
+                            }
+                            titlebar::TitleBtn::Close => {
+                                let _ = DestroyWindow(hwnd);
+                                crate::probe::log("[procs] close btn");
+                            }
+                        }
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
+                }
+                // 2) 表头排序区（标题栏下方）
+                if y >= s(d, titlebar::TB_H) && y < s(d, titlebar::TB_H + 20) {
                     let wl = s(d, W_L);
                     ctx.sort = if x >= wl - s(d, 150) {
                         if ctx.sort == SortBy::Mem { SortBy::Cpu } else { SortBy::Mem }
@@ -236,9 +376,10 @@ unsafe extern "system" fn procs_wndproc(
             LRESULT(0)
         }
         WM_DESTROY => {
-            let _ = KillTimer(hwnd, 1);
+            let _ = KillTimer(hwnd, TIMER_ID);
             let p = GetWindowLongPtrW(hwnd, GWLP_UD) as *mut Ctx;
             if !p.is_null() {
+                let _ = DeleteObject((*p).font);
                 drop(Box::from_raw(p));
                 let _ = SetWindowLongPtrW(hwnd, GWLP_UD, 0);
             }
@@ -262,10 +403,15 @@ fn sort_entries(ctx: &mut Ctx) {
 }
 
 fn fmt_mem(bytes: u64) -> String {
-    if bytes >= 1_048_576 {
-        format!("{:.1}G", bytes as f64 / 1_048_576.0).trim_end_matches(".0").to_string()
+    if bytes >= 1_073_741_824 {
+        // >= 1 GiB → GB
+        format!("{:.1}G", bytes as f64 / 1_073_741_824.0).trim_end_matches(".0").to_string()
+    } else if bytes >= 1_048_576 {
+        // >= 1 MiB → MB
+        format!("{:.1}M", bytes as f64 / 1_048_576.0).trim_end_matches(".0").to_string()
     } else {
-        format!("{}M", (bytes / 1024).max(1))
+        // < 1 MiB → KB
+        format!("{}K", (bytes / 1024).max(1))
     }
 }
 
@@ -294,14 +440,24 @@ unsafe fn paint(hwnd: HWND) {
     let _ = DeleteObject(bg);
     crate::probe::log("[procs] paint step2 bg done");
 
+    // 自绘标题栏
+    let font = ctx_of(hwnd).map(|c| c.font).unwrap_or_default();
+    let (tb_title, tb_state) = match ctx_of(hwnd) {
+        Some(c) => (Some("SysOverlay - Processes"), &c.tb),
+        None => (None, &titlebar::TitleBarState::default()),
+    };
+    titlebar::draw(hdc, &theme, d, w, tb_title, tb_state, font);
+    let _ = SelectObject(hdc, font);
+
     SetBkMode(hdc, TRANSPARENT);
 
+    let header_y = s(d, titlebar::TB_H);
     let header_h = s(d, 20);
-    let cpu_col = RECT { left: w / 2 + s(d, 12), top: 0, right: w - s(d, 240), bottom: header_h };
-    let watt_col = RECT { left: w - s(d, 240), top: 0, right: w - s(d, 150), bottom: header_h };
-    let mem_col = RECT { left: w - s(d, 150), top: 0, right: w - s(d, 12), bottom: header_h };
+    let cpu_col = RECT { left: w / 2 + s(d, 12), top: header_y, right: w - s(d, 240), bottom: header_y + header_h };
+    let watt_col = RECT { left: w - s(d, 240), top: header_y, right: w - s(d, 150), bottom: header_y + header_h };
+    let mem_col = RECT { left: w - s(d, 150), top: header_y, right: w - s(d, 12), bottom: header_y + header_h };
     set_color(hdc, theme.secondary);
-    let name_r = RECT { left: s(d, 12), top: 0, right: w / 2, bottom: header_h };
+    let name_r = RECT { left: s(d, 12), top: header_y, right: w / 2, bottom: header_y + header_h };
     txt(hdc, "Process", name_r, DT_LEFT);
     txt(hdc, "CPU %", cpu_col, DT_RIGHT);
     txt(hdc, "Watts", watt_col, DT_RIGHT);
@@ -317,10 +473,10 @@ unsafe fn paint(hwnd: HWND) {
         &[]
     };
 
-    let row_h = ((h - header_h) / TOP_N as i32).max(18);
+    let row_h = ((h - header_y - header_h) / TOP_N as i32).max(18);
     crate::probe::log("[procs] paint step4 rows");
     for (i, e) in entries.iter().take(TOP_N).enumerate() {
-        let y = header_h + i as i32 * row_h;
+        let y = header_y + header_h + i as i32 * row_h;
         let name_r = RECT { left: s(d, 12), top: y, right: w / 2 - s(d, 8), bottom: y + row_h };
         txt(hdc, &e.name, name_r, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         let cpu_r = RECT { left: w / 2, top: y, right: w - s(d, 240), bottom: y + row_h };

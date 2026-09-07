@@ -516,6 +516,129 @@ pub fn render_str_scaled(
     }
 }
 
+// ── v4 浮点字号：0.5 步进（8.0..=40.0 px） ─────────────────
+
+/// 把配置字号（px，基准字形高 16px）换算为渲染缩放比。
+///
+/// 位图字形 8×16 是 "1.0 倍" 的基准：字号 16px ↔ scale 1.0。
+/// 字号 8..=40 的 0.5 步进直接映射到 scale 0.5..=2.5。
+/// 与旧 `font_scale`（整数倍 1..=4）相比，这一步能让用户在
+/// 8px 量级上做更精细的连续调节。
+pub fn scale_of_font(font_size: f32) -> f32 {
+    (font_size.clamp(8.0, 40.0) / FONT_HEIGHT as f32).max(0.5)
+}
+
+/// 浮点缩放下的字符串宽度（像素，向上取整）。
+///
+/// 与 [`render_str_scaled_f`] 的排布一致（最近邻放大，字符间距同比例）。
+pub fn measure_scaled_f(s: &str, scale: f32) -> i32 {
+    let n = s.chars().count() as f32;
+    let w = (n * (FONT_WIDTH as f32 + FONT_SPACING as f32) - FONT_SPACING as f32) * scale;
+    (w.ceil() as i32).max(0)
+}
+
+/// 浮点缩放：把一个字形像素放大为 `scale × scale` 的最近邻块。
+///
+/// 与整数版 [`render_char_scaled`] 的区别仅在块边界用浮点计算：
+/// 字形源像素 (row, col) 覆盖目标区间
+/// `[x + col*scale, x + (col+1)*scale) × [y + row*scale, y + (row+1)*scale)`，
+/// 块内全部像素取同一个源像素（最近邻）。越界自动裁剪，不 panic。
+pub fn render_char_scaled_f(
+    pixels: &mut [u8],
+    surface_w: i32,
+    surface_h: i32,
+    c: char,
+    x: i32,
+    y: i32,
+    scale: f32,
+    fg_color: crate::render::Rgba,
+) {
+    if surface_w <= 0 || surface_h <= 0 || fg_color.a == 0 || scale <= 0.0 {
+        return;
+    }
+
+    let bitmap = get_char_bitmap(c);
+    let (b, g, r) = (fg_color.b, fg_color.g, fg_color.r);
+    let factor = 1.0 - fg_color.alpha_float();
+
+    for row in 0..FONT_HEIGHT as usize {
+        let bits = bitmap[row];
+        if bits == 0 {
+            continue;
+        }
+        let y0 = y as f32 + row as f32 * scale;
+        let y1 = y0 + scale;
+        let py0 = y0.floor() as i32;
+        let py1 = (y1.ceil() as i32).max(py0 + 1);
+        if py1 <= 0 || py0 >= surface_h {
+            continue; // 整行在画布外
+        }
+        let dy0 = if py0 < 0 { -py0 } else { 0 };
+        let dy1 = (surface_h - py0).min(py1 - py0);
+
+        for col in 0..FONT_WIDTH as usize {
+            if bits & (1 << (7 - col)) == 0 {
+                continue;
+            }
+            let x0 = x as f32 + col as f32 * scale;
+            let x1 = x0 + scale;
+            let px0 = x0.floor() as i32;
+            let px1 = (x1.ceil() as i32).max(px0 + 1);
+            if px1 <= 0 || px0 >= surface_w {
+                continue;
+            }
+            let dx0 = if px0 < 0 { -px0 } else { 0 };
+            let dx1 = (surface_w - px0).min(px1 - px0);
+
+            for dy in dy0..dy1 {
+                let row_off = ((py0 + dy) * surface_w) as usize * 4;
+                for dx in dx0..dx1 {
+                    let idx = row_off + ((px0 + dx) as usize) * 4;
+                    if idx + 3 >= pixels.len() {
+                        continue;
+                    }
+                    if fg_color.a == 255 {
+                        // 不透明快路径：直接写
+                        pixels[idx] = b;
+                        pixels[idx + 1] = g;
+                        pixels[idx + 2] = r;
+                        pixels[idx + 3] = 255;
+                    } else {
+                        // 半透明：预乘 over 合成
+                        let dst_r = pixels[idx + 2] as f32;
+                        let dst_g = pixels[idx + 1] as f32;
+                        let dst_b = pixels[idx] as f32;
+                        let dst_a = pixels[idx + 3] as f32;
+                        pixels[idx] = (fg_color.b as f32 + dst_b * factor) as u8;
+                        pixels[idx + 1] = (fg_color.g as f32 + dst_g * factor) as u8;
+                        pixels[idx + 2] = (fg_color.r as f32 + dst_r * factor) as u8;
+                        pixels[idx + 3] = (fg_color.a as f32 + dst_a * factor).min(255.0) as u8;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 浮点缩放渲染一整串字符（字符间距同比例放大）。
+pub fn render_str_scaled_f(
+    pixels: &mut [u8],
+    surface_w: i32,
+    surface_h: i32,
+    s: &str,
+    x: i32,
+    y: i32,
+    scale: f32,
+    fg_color: crate::render::Rgba,
+) {
+    let step = (FONT_WIDTH as f32 + FONT_SPACING as f32) * scale;
+    let mut cursor = x as f32;
+    for c in s.chars() {
+        render_char_scaled_f(pixels, surface_w, surface_h, c, cursor as i32, y, scale, fg_color);
+        cursor += step;
+    }
+}
+
 #[cfg(test)]
 mod perf_path_tests {
     use super::*;

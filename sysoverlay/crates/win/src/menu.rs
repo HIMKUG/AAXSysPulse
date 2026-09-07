@@ -23,11 +23,16 @@ pub fn show_tray_menu(hwnd: HWND) -> Option<u16> {
             Ok(m) => m,
             Err(_) => return None,
         };
-        append(menu, IDM_SETTINGS, "Settings");
-        append(menu, IDM_CHARTS, "Charts");
-        append(menu, IDM_PROCESSES, "Processes");
+        // 每次右键重建菜单 → 语言即时跟随当前配置（无需重启）
+        let lang = crate::window::get_config_of(hwnd)
+            .map(|c| c.lang)
+            .unwrap_or_default();
+        let t = |k: &'static str| crate::i18n::t(lang, k);
+        append(menu, IDM_SETTINGS, t("MenuSettings"));
+        append(menu, IDM_CHARTS, t("MenuCharts"));
+        append(menu, IDM_PROCESSES, t("MenuProcesses"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
-        append(menu, IDM_QUIT, "Quit");
+        append(menu, IDM_QUIT, t("MenuQuit"));
 
         // 不调用 SetForegroundWindow：用 TPM_NOACTIVATE 让菜单跟随托盘图标，
         // 不抢游戏前台（AFMF 破坏路径 1：抢焦点）。

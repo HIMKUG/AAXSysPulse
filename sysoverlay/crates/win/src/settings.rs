@@ -249,7 +249,8 @@ impl SpatialGrid {
         let max_r = (rect.bottom / self.cell_size).max(0).min(self.rows - 1) as usize;
         for r in min_r..=max_r {
             for c in min_c..=max_c {
-                self.cells[(r as i32 * self.cols + c as i32) as usize].push(widget_idx);
+                let idx = (r as i32 * self.cols + c as i32) as usize;
+                self.cells[idx].push(widget_idx);
             }
         }
     }
@@ -423,12 +424,11 @@ impl IWidget for SwatchesWidget {
 /// MetricSwatches 逐指标颜色选择器。
 pub struct MetricSwatchesWidget {
     pub id: WidgetId,
-    #[allow(dead_code)] metric: usize,  // 0=cpu, 1=mem, 2=gpu, 3=net
 }
 
 impl MetricSwatchesWidget {
-    pub fn new(id: WidgetId, metric: usize) -> Self {
-        Self { id, metric }
+    pub fn new(id: WidgetId, _metric: usize) -> Self {
+        Self { id }
     }
 }
 
@@ -465,13 +465,12 @@ pub struct SliderWidget {
     min: f32,
     max: f32,
     step: f32,
-    #[allow(dead_code)] unit: &'static str,
     dp: u32,
 }
 
 impl SliderWidget {
-    pub fn new(id: WidgetId, min: f32, max: f32, step: f32, unit: &'static str, dp: u32) -> Self {
-        Self { id, min, max, step, unit, dp }
+    pub fn new(id: WidgetId, min: f32, max: f32, step: f32, _unit: &str, dp: u32) -> Self {
+        Self { id, min, max, step, dp }
     }
 }
 
@@ -564,7 +563,8 @@ fn build_spatial_grids(ctx: &SettingsCtx) -> Vec<SpatialGrid> {
     ctx.pages
         .iter()
         .map(|page| {
-            let mut grid = SpatialGrid::new(s(ctx.dpi, CLIENT_W), s(ctx.dpi, 600), s(ctx.dpi, 30));
+            let page_h = page.h.max(s(ctx.dpi, 200));
+            let mut grid = SpatialGrid::new(s(ctx.dpi, CLIENT_W), page_h, s(ctx.dpi, 30));
             for (idx, w) in page.widgets.iter().enumerate() {
                 grid.insert(idx, w.rect);
             }
@@ -1588,7 +1588,7 @@ fn apply_slider_cfg(overlay: HWND, id: i32, v: f32, commit: bool) {
         }
         IDC_WW | IDC_WH => {
             let w = if id == IDC_WW { v.round().clamp(60.0, 2000.0) as i32 } else { v.round().clamp(40.0, 2000.0) as i32 };
-            let cur = cfg.window_size.unwrap_or_else(|| gdi_natural(cfg));
+            let cur = cfg.window_size.unwrap_or_else(|| crate::gdi::natural_size(cfg));
             let nv = if id == IDC_WW { (w, cur.1) } else { (cur.0, w) };
             if cfg.window_size != Some(nv) {
                 cfg.window_size = Some(nv);
@@ -1617,16 +1617,12 @@ fn apply_slider_cfg(overlay: HWND, id: i32, v: f32, commit: bool) {
     }
 }
 
-fn gdi_natural(cfg: &sysoverlay_core::config::Config) -> (i32, i32) {
-    crate::gdi::natural_size(cfg)
-}
-
 // ── 交互（点击类控件） ────────────────────────────────────
 
 fn on_click_plain(ctx: &mut SettingsCtx, idx: usize, pt: POINT) {
     let overlay = ctx.overlay;
     let w = &ctx.pages[ctx.page].widgets[idx];
-    let cfg = cfg_of(ctx).unwrap_or_default();
+    let Some(cfg) = cfg_of(ctx) else { return };
 
     // Toggle
     if w.kind.as_any().downcast_ref::<ToggleWidget>().is_some() {
@@ -1709,23 +1705,23 @@ fn apply_toggle(overlay: HWND, id: i32) {
     apply_config(overlay, |cfg| match id {
         IDC_CPU => {
             cfg.show_cpu = !cfg.show_cpu;
-            if guard(cfg) { true } else { cfg.show_cpu = !cfg.show_cpu; false }
+            if cfg.show_cpu || cfg.show_mem || cfg.show_gpu || cfg.show_net || cfg.power_enabled { true } else { cfg.show_cpu = !cfg.show_cpu; false }
         }
         IDC_MEM => {
             cfg.show_mem = !cfg.show_mem;
-            if guard(cfg) { true } else { cfg.show_mem = !cfg.show_mem; false }
+            if cfg.show_cpu || cfg.show_mem || cfg.show_gpu || cfg.show_net || cfg.power_enabled { true } else { cfg.show_mem = !cfg.show_mem; false }
         }
         IDC_GPU => {
             cfg.show_gpu = !cfg.show_gpu;
-            if guard(cfg) { true } else { cfg.show_gpu = !cfg.show_gpu; false }
+            if cfg.show_cpu || cfg.show_mem || cfg.show_gpu || cfg.show_net || cfg.power_enabled { true } else { cfg.show_gpu = !cfg.show_gpu; false }
         }
         IDC_NET => {
             cfg.show_net = !cfg.show_net;
-            if guard(cfg) { true } else { cfg.show_net = !cfg.show_net; false }
+            if cfg.show_cpu || cfg.show_mem || cfg.show_gpu || cfg.show_net || cfg.power_enabled { true } else { cfg.show_net = !cfg.show_net; false }
         }
         IDC_POWER => {
             cfg.power_enabled = !cfg.power_enabled;
-            if guard(cfg) { true } else { cfg.power_enabled = !cfg.power_enabled; false }
+            if cfg.show_cpu || cfg.show_mem || cfg.show_gpu || cfg.show_net || cfg.power_enabled { true } else { cfg.power_enabled = !cfg.power_enabled; false }
         }
         IDC_SHADOW => {
             cfg.text_shadow = !cfg.text_shadow;
@@ -1763,16 +1759,12 @@ fn apply_toggle(overlay: HWND, id: i32) {
             if cfg.window_size.is_some() {
                 cfg.window_size = None;
             } else {
-                cfg.window_size = Some(gdi_natural(cfg));
+                cfg.window_size = Some(crate::gdi::natural_size(cfg));
             }
             true
         }
         _ => false,
     });
-}
-
-fn guard(cfg: &sysoverlay_core::config::Config) -> bool {
-    cfg.show_cpu || cfg.show_mem || cfg.show_gpu || cfg.show_net || cfg.power_enabled
 }
 
 fn apply_segment(overlay: HWND, id: i32, idx: usize) {
@@ -1881,6 +1873,7 @@ fn commit_change(overlay: HWND, cfg: &Config, modified: bool) {
 
 unsafe fn paint(hwnd: HWND) {
     let Some(ctx) = ctx_of(hwnd) else { return };
+    let cfg = cfg_of(ctx);
     let mut ps = PAINTSTRUCT::default();
     let hdc = BeginPaint(hwnd, &mut ps);
     if hdc.is_invalid() {
@@ -1916,16 +1909,16 @@ unsafe fn paint(hwnd: HWND) {
         &ctx.theme,
         ctx.dpi,
         w,
-        Some(crate::i18n::t(ctx.theme_lang(), "WinTitle")),
+        Some(crate::i18n::t(SettingsCtx::theme_lang(cfg.as_ref()), "WinTitle")),
         &ctx.tb,
         ctx.fonts.small,
     );
 
     // 导航
-    draw_nav(mem, ctx, w);
+    draw_nav(mem, ctx, w, cfg.as_ref());
 
     // 内容区（翻页动画：水平滑入 + 淡入）
-    draw_content_animated(mem, ctx, w, h);
+    draw_content_animated(mem, ctx, w, h, cfg.as_ref());
 
     let _ = BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
     let _ = SelectObject(mem, old_bmp);
@@ -1936,10 +1929,8 @@ unsafe fn paint(hwnd: HWND) {
 
 /// 设置页自身语言（跟随全局 i18n）。
 impl SettingsCtx {
-    fn theme_lang(&self) -> sysoverlay_core::types::Lang {
-        cfg_of(self)
-            .map(|c| c.lang)
-            .unwrap_or(i18n_now())
+    fn theme_lang(cfg: Option<&Config>) -> sysoverlay_core::types::Lang {
+        cfg.map(|c| c.lang).unwrap_or_else(i18n_now)
     }
 }
 
@@ -1953,7 +1944,7 @@ fn i18n_now() -> sysoverlay_core::types::Lang {
 }
 
 /// 导航条：6 个均分分段。
-unsafe fn draw_nav(hdc: HDC, ctx: &SettingsCtx, win_w: i32) {
+unsafe fn draw_nav(hdc: HDC, ctx: &SettingsCtx, win_w: i32, cfg: Option<&Config>) {
     let t = &ctx.theme;
     let d = ctx.dpi;
     let top = s(d, titlebar::TB_H) + s(d, NAV_GAP);
@@ -1986,21 +1977,21 @@ unsafe fn draw_nav(hdc: HDC, ctx: &SettingsCtx, win_w: i32) {
             };
             round_rect(hdc, ir, s(d, NAV_H) / 2 - 2, t.seg_selected, t.seg_selected_stroke);
         }
-        let label = page_caption(i as usize, ctx.theme_lang());
+        let label = page_caption(i as usize, SettingsCtx::theme_lang(cfg));
         let color = if i as usize == ctx.page { t.label } else { t.secondary };
         text(hdc, label, r, color, ctx.fonts.small, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
     }
 }
 
 /// 内容区：翻页动画用独立层 AlphaBlend（滑动 + 淡入）。
-unsafe fn draw_content_animated(hdc: HDC, ctx: &SettingsCtx, win_w: i32, win_h: i32) {
+unsafe fn draw_content_animated(hdc: HDC, ctx: &SettingsCtx, win_w: i32, win_h: i32, cfg: Option<&Config>) {
     let content_top = s(ctx.dpi, titlebar::TB_H) + s(ctx.dpi, NAV_H + NAV_GAP);
     let content_h = (win_h - content_top).max(1);
 
     // 动画进度
     let (dx, alpha) = match &ctx.page_anim {
         Some(anim) => {
-            let dur_ms = cfg_of(ctx).map(|c| c.anim_ms).unwrap_or(300).max(1) as f32;
+            let dur_ms = cfg.and_then(|c| Some(c.anim_ms)).unwrap_or(300).max(1) as f32;
             let t = (anim.t0.elapsed().as_secs_f32() * 1000.0 / dur_ms).clamp(0.0, 1.0);
             let e = 1.0 - (1.0 - t).powi(3);
             (
@@ -2026,7 +2017,7 @@ unsafe fn draw_content_animated(hdc: HDC, ctx: &SettingsCtx, win_w: i32, win_h: 
     let _ = DeleteObject(bg);
 
     // 绘制内容（带水平偏移）
-    draw_page(tmp, ctx, &full, dx);
+    draw_page(tmp, ctx, &full, dx, cfg);
 
     // 淡入 + 上屏
     let bf = windows::Win32::Graphics::Gdi::BLENDFUNCTION {
@@ -2054,11 +2045,10 @@ unsafe fn draw_content_animated(hdc: HDC, ctx: &SettingsCtx, win_w: i32, win_h: 
     let _ = DeleteDC(tmp);
 }
 
-unsafe fn draw_page(hdc: HDC, ctx: &SettingsCtx, area: &RECT, dx: i32) {
+unsafe fn draw_page(hdc: HDC, ctx: &SettingsCtx, area: &RECT, dx: i32, cfg: Option<&Config>) {
     let t = &ctx.theme;
     let d = ctx.dpi;
     let page = &ctx.pages[ctx.page];
-    let cfg = cfg_of(ctx);
     SetBkMode(hdc, TRANSPARENT);
 
     for card in &page.cards {
@@ -2109,7 +2099,7 @@ unsafe fn draw_page(hdc: HDC, ctx: &SettingsCtx, area: &RECT, dx: i32) {
                 if ctx.is_editing() {
                     ws.editing = matches!(&ctx.interaction, Interaction::Editing { widget } if *widget == wi);
                 }
-                draw_widget(hdc, ctx, wi, &ws, dx);
+                draw_widget(hdc, ctx, wi, &ws, dx, ctx.fonts.small, ctx.fonts.body);
             }
         }
 
@@ -2128,7 +2118,7 @@ unsafe fn draw_page(hdc: HDC, ctx: &SettingsCtx, area: &RECT, dx: i32) {
     let _ = area;
 }
 
-unsafe fn draw_widget(hdc: HDC, ctx: &SettingsCtx, idx: usize, state: &WidgetState, dx: i32) {
+unsafe fn draw_widget(hdc: HDC, ctx: &SettingsCtx, idx: usize, state: &WidgetState, dx: i32, font11: HFONT, font13: HFONT) {
     let page = &ctx.pages[ctx.page];
     let w = &page.widgets[idx];
     let r = RECT {
@@ -2142,15 +2132,15 @@ unsafe fn draw_widget(hdc: HDC, ctx: &SettingsCtx, idx: usize, state: &WidgetSta
     if let Some(_toggle) = w.kind.as_any().downcast_ref::<ToggleWidget>() {
         draw_toggle_widget(w, state, hdc, ctx.dpi, &ctx.theme, r);
     } else if let Some(_seg) = w.kind.as_any().downcast_ref::<SegmentedWidget>() {
-        draw_segmented_widget(w, state, hdc, ctx.dpi, &ctx.theme, r);
+        draw_segmented_widget(w, state, hdc, ctx.dpi, &ctx.theme, r, font11);
     } else if let Some(_btn) = w.kind.as_any().downcast_ref::<ButtonWidget>() {
-        draw_button_widget(w, state, hdc, ctx.dpi, &ctx.theme, r);
+        draw_button_widget(w, state, hdc, ctx.dpi, &ctx.theme, r, font13);
     } else if let Some(_sw) = w.kind.as_any().downcast_ref::<SwatchesWidget>() {
         draw_swatches_widget(w, state, hdc, ctx.dpi, &ctx.theme, r);
     } else if let Some(_ms) = w.kind.as_any().downcast_ref::<MetricSwatchesWidget>() {
-        draw_metric_swatches_widget(w, state, hdc, ctx.dpi, &ctx.theme, r);
+        draw_metric_swatches_widget(w, state, hdc, ctx.dpi, &ctx.theme, r, font11);
     } else if let Some(slider) = w.kind.as_any().downcast_ref::<SliderWidget>() {
-        draw_slider_widget(w, state, hdc, ctx.dpi, &ctx.theme, r, slider.dp);
+        draw_slider_widget(w, state, hdc, ctx.dpi, &ctx.theme, r, slider.dp, font11);
     }
 }
 
@@ -2227,7 +2217,7 @@ unsafe fn kill_timer(hwnd: HWND, id: usize) {
 // ── 新版绘制函数（基于 WidgetState）─────────────────────────
 
 /// Segmented 绘制。
-unsafe fn draw_segmented_widget(w: &Widget, state: &WidgetState, hdc: HDC, dpi: u32, theme: &Theme, rect: RECT) {
+unsafe fn draw_segmented_widget(w: &Widget, state: &WidgetState, hdc: HDC, dpi: u32, theme: &Theme, rect: RECT, font: HFONT) {
     let sel = state.selected;
     let labels: &Box<[String]> = &w.kind.as_any().downcast_ref::<SegmentedWidget>().map(|s| &s.labels).unwrap();
     let n = labels.len().max(1) as i32;
@@ -2246,17 +2236,17 @@ unsafe fn draw_segmented_widget(w: &Widget, state: &WidgetState, hdc: HDC, dpi: 
             round_rect(hdc, ir, s(dpi, 5), theme.seg_selected, theme.seg_selected_stroke);
         }
         let color = if i == sel { theme.label } else { theme.secondary };
-        text(hdc, label, r, color, /*ctx.fonts.small*/ CreateFontW(-(11 * dpi as i32) / 72, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, windows::core::w!("Segoe UI")), DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+        text(hdc, label, r, color, font, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
     }
 }
 
 /// Button 绘制。
-unsafe fn draw_button_widget(w: &Widget, state: &WidgetState, hdc: HDC, dpi: u32, theme: &Theme, rect: RECT) {
+unsafe fn draw_button_widget(w: &Widget, state: &WidgetState, hdc: HDC, dpi: u32, theme: &Theme, rect: RECT, font: HFONT) {
     let hovered = state.hovered;
     let label: &String = w.kind.as_any().downcast_ref::<ButtonWidget>().map(|b| &b.label).unwrap();
     let fill = if hovered { theme.accent_hover } else { theme.accent };
     round_rect(hdc, rect, s(dpi, 7), fill, fill);
-    text(hdc, label, rect, rgb(255, 255, 255), /*ctx.fonts.body*/ CreateFontW(-(13 * dpi as i32) / 72, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, windows::core::w!("Segoe UI")), DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+    text(hdc, label, rect, rgb(255, 255, 255), font, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
 }
 
 /// Swatches 绘制。
@@ -2286,7 +2276,7 @@ unsafe fn draw_swatches_widget(w: &Widget, state: &WidgetState, hdc: HDC, dpi: u
 }
 
 /// MetricSwatches 绘制。
-unsafe fn draw_metric_swatches_widget(_w: &Widget, state: &WidgetState, hdc: HDC, dpi: u32, theme: &Theme, rect: RECT) {
+unsafe fn draw_metric_swatches_widget(_w: &Widget, state: &WidgetState, hdc: HDC, dpi: u32, theme: &Theme, rect: RECT, font: HFONT) {
     let sel = state.selected;
     let follow = state.value_f > 0.5;
     let d = dpi;
@@ -2311,7 +2301,7 @@ unsafe fn draw_metric_swatches_widget(_w: &Widget, state: &WidgetState, hdc: HDC
             round_rect(hdc, inner, s(d, 4), rgb(r, g, b), theme.card_stroke);
         } else {
             round_rect(hdc, inner, s(d, 4), theme.card, theme.secondary);
-            text(hdc, "≈", inner, theme.secondary, CreateFontW(-(11 * dpi as i32) / 72, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, windows::core::w!("Segoe UI")), DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+            text(hdc, "≈", inner, theme.secondary, font, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
         }
         let selected = (i == sel) || (i == SW_FOLLOW && follow && sel == SW_FOLLOW);
         if selected {
@@ -2322,7 +2312,7 @@ unsafe fn draw_metric_swatches_widget(_w: &Widget, state: &WidgetState, hdc: HDC
 }
 
 /// Slider 绘制。
-unsafe fn draw_slider_widget(_w: &Widget, state: &WidgetState, hdc: HDC, dpi: u32, theme: &Theme, rect: RECT, dp: u32) {
+unsafe fn draw_slider_widget(_w: &Widget, state: &WidgetState, hdc: HDC, dpi: u32, theme: &Theme, rect: RECT, dp: u32, font: HFONT) {
     let val = state.value_f as f32;
     let editing = state.editing;
     let t = theme;
@@ -2366,7 +2356,7 @@ unsafe fn draw_slider_widget(_w: &Widget, state: &WidgetState, hdc: HDC, dpi: u3
     } else {
         format!("{:.1}{}", val, "").encode_utf16().collect()
     };
-    text_utf16(hdc, &show, content, t.label, CreateFontW(-(11 * dpi as i32) / 72, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, windows::core::w!("Segoe UI")), DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    text_utf16(hdc, &show, content, t.label, font, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
 }
 
 fn pt_in(r: &RECT, p: POINT) -> bool {

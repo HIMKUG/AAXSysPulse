@@ -1,0 +1,2 @@
+   Compiling sysoverlay-win v2.0.0 (D:\code\sys-overlay-c-master\sysoverlay\crates\win)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.65s

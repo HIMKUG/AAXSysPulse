@@ -20,6 +20,8 @@
 //! `shape`/`vert`/`netunit` 的数值序与 `overlay.c` 完全一致，
 //! `zoom` 的档位集合就是 C 版 `ZOOM_PCT[5] = {75, 100, 125, 150, 200}`。
 
+use crate::color::Rgb;
+
 /// 卡片缩放档位。与 C 版 `ZOOM_PCT[5] = {75, 100, 125, 150, 200}` 一一对应。
 ///
 /// # Eco / Quality 档位差异（v2 Q9）
@@ -140,23 +142,25 @@ impl RenderMode {
 
 /// 悬浮窗渲染风格：双渲染器切换（v3 新增）。
 ///
-/// - [`RenderStyle::Classic`]：旧 C 版卡片（圆角背景 + 主机名 + 行布局 + 进度条），
-///   复用 [`crate::layout::compute`] 与 `ui::draw_card`，恢复透明度 / 形状 / 配色 / 悬停 /
-///   vert 布局等 C 版能力。
-/// - [`RenderStyle::Strip`]：v3 横向文字条（无背景、槽位右对齐、阴影/描边），默认。
+/// - `Strip`：横版条状（各指标横向一字排开，默认）
+/// - `Vertical`：竖版条状（同内容纵向排列，上下间距 = `metric_gap`）
+/// - `Classic`：旧 C 版卡片（v4 已删除；保留枚举值仅为旧配置无损读回，渲染时映射到 Strip）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum RenderStyle {
     Classic,
     #[default]
     Strip,
+    Vertical,
 }
 
 impl RenderStyle {
     /// 宽容解析：接受数值与字符串（新旧配置都读得动）。
     pub fn from_config(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "0" | "classic" | "card" | "cards" => Some(RenderStyle::Classic),
-            "1" | "strip" | "compact" => Some(RenderStyle::Strip),
+            // 旧卡片式配置迁移到横版条状（卡片渲染器已删除）
+            "0" | "classic" | "card" | "cards" => Some(RenderStyle::Strip),
+            "1" | "strip" | "horizontal" | "hstrip" => Some(RenderStyle::Strip),
+            "2" | "vertical" | "vert" | "vstrip" | "col" => Some(RenderStyle::Vertical),
             _ => None,
         }
     }
@@ -164,8 +168,56 @@ impl RenderStyle {
     /// 序列化（C 版没有此键，写字符串，C 版会静默忽略）。
     pub fn to_config(self) -> &'static str {
         match self {
-            RenderStyle::Classic => "classic",
+            RenderStyle::Classic => "strip", // 迁移：不再写回卡片
             RenderStyle::Strip => "strip",
+            RenderStyle::Vertical => "vertical",
+        }
+    }
+}
+
+/// 可逐项调色的指标。顺序即悬浮窗自左到右 / 自上而下的排列顺序。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Metric {
+    Cpu,
+    Mem,
+    Gpu,
+    Net,
+    Power,
+}
+
+impl Metric {
+    /// 所有合法值（顺序即排列顺序）。
+    pub const ALL: [Metric; 5] = [Metric::Cpu, Metric::Mem, Metric::Gpu, Metric::Net, Metric::Power];
+
+    /// 配置键里的短名：`mc_cpu_lbl` / `mc_mem_val` 等。
+    pub fn key_name(self) -> &'static str {
+        match self {
+            Metric::Cpu => "cpu",
+            Metric::Mem => "mem",
+            Metric::Gpu => "gpu",
+            Metric::Net => "net",
+            Metric::Power => "power",
+        }
+    }
+}
+
+/// 单个指标的名称/数值颜色色槽。
+///
+/// `None` = 跟随全局文字色（`Config::fg`），这是默认值；
+/// `Some(rgb)` = 该槽独立颜色。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetricColors {
+    /// 指标名称（如 "CPU"/"内存"）颜色。
+    pub label: Option<Rgb>,
+    /// 指标数值（如 "47%"）颜色。
+    pub value: Option<Rgb>,
+}
+
+impl Default for MetricColors {
+    fn default() -> Self {
+        Self {
+            label: None,
+            value: None,
         }
     }
 }
@@ -315,6 +367,36 @@ impl PowerDisplay {
     /// 该语义是否为**估算值**（需要 `~` 前缀标注）。
     pub fn is_estimated(self) -> bool {
         matches!(self, PowerDisplay::Estimated)
+    }
+}
+
+/// 界面语言。默认英语；中文为全界面双语切换的第二语言。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Lang {
+    /// English（默认）
+    #[default]
+    En,
+    /// 简体中文
+    Zh,
+}
+
+impl Lang {
+    /// 所有合法值（设置面板遍历用）。
+    pub const ALL: [Lang; 2] = [Lang::En, Lang::Zh];
+
+    pub fn from_config(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "0" | "en" | "english" => Some(Lang::En),
+            "1" | "zh" | "cn" | "chinese" => Some(Lang::Zh),
+            _ => None,
+        }
+    }
+
+    pub fn to_config(self) -> &'static str {
+        match self {
+            Lang::En => "en",
+            Lang::Zh => "zh",
+        }
     }
 }
 

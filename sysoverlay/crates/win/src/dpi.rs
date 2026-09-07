@@ -44,3 +44,15 @@ pub fn scale_logical(value: i32, dpi: u32) -> i32 {
     }
     (value as f32 * dpi as f32 / 96.0) as i32
 }
+
+/// 主显示器工作区宽度（像素）。
+pub fn screen_w() -> i32 {
+    unsafe { GetSystemMetrics(SM_CXSCREEN) as i32 }
+}
+
+/// 主显示器工作区高度（像素）。
+pub fn screen_h() -> i32 {
+    unsafe { GetSystemMetrics(SM_CYSCREEN) as i32 }
+}
+
+use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};

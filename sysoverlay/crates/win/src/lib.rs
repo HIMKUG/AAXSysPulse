@@ -40,6 +40,8 @@ pub mod history;
 pub mod graph;
 pub mod process;
 pub mod proc_list;
+pub mod i18n;
+pub mod titlebar;
 
 // Re-export core types for convenience
 pub use sysoverlay_core::config::Config;
