@@ -186,19 +186,6 @@ static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(-1);
 
 // ── 控件模型 ─────────────────────────────────────────────
 
-#[derive(Clone, Debug)]
-enum WKind {
-    Toggle { on: bool },
-    Segmented { labels: Box<[&'static str]>, sel: usize },
-    Button { label: String },
-    /// 预设色板（背景/前景 6 格）。
-    Swatches { sel: usize, palette: usize },
-    /// 指标配色色板（8 预设 + 跟随默认）。
-    MetricSwatches { follow: bool, sel: usize },
-    /// 滑杆 + 数值输入框一体控件。
-    Slider { val: f32, min: f32, max: f32, step: f32, unit: &'static str, dp: u32 },
-}
-
 struct Widget {
     id: i32,
     kind: Box<dyn IWidget>,
@@ -235,6 +222,50 @@ struct EditState {
     idx: usize,
     buf: Vec<u16>,
     caret: bool,
+}
+
+// ── 空间网格索引（O(1) 平均查找代替 O(n) 全表扫描）────────────
+
+/// 空间网格：把窗口分割成 cell_size 大小的格子，每个格子存控件下标。
+struct SpatialGrid {
+    cell_size: i32,
+    cols: i32,
+    rows: i32,
+    cells: Vec<Vec<usize>>, // flat vec, row * cols + col → cell widget list
+}
+
+impl SpatialGrid {
+    fn new(w: i32, h: i32, cell_size: i32) -> Self {
+        let cols = (w / cell_size).max(1);
+        let rows = (h / cell_size).max(1);
+        let cells = vec![Vec::new(); (cols * rows) as usize];
+        Self { cell_size, cols, rows, cells }
+    }
+
+    fn insert(&mut self, widget_idx: usize, rect: RECT) {
+        let min_c = (rect.left / self.cell_size).max(0).min(self.cols - 1) as usize;
+        let max_c = (rect.right / self.cell_size).max(0).min(self.cols - 1) as usize;
+        let min_r = (rect.top / self.cell_size).max(0).min(self.rows - 1) as usize;
+        let max_r = (rect.bottom / self.cell_size).max(0).min(self.rows - 1) as usize;
+        for r in min_r..=max_r {
+            for c in min_c..=max_c {
+                self.cells[(r as i32 * self.cols + c as i32) as usize].push(widget_idx);
+            }
+        }
+    }
+
+    /// 返回给定点的候选控件下标列表（可能含重复，去重调用方负责）。
+    fn query(&self, pt: POINT) -> Vec<usize> {
+        if pt.x < 0 || pt.y < 0 {
+            return Vec::new();
+        }
+        let c = (pt.x / self.cell_size) as i32;
+        let r = (pt.y / self.cell_size) as i32;
+        if c < 0 || c >= self.cols || r < 0 || r >= self.rows {
+            return Vec::new();
+        }
+        self.cells[(r * self.cols + c) as usize].clone()
+    }
 }
 
 // ── 统一交互状态机（替换 drag/edit/hover 三个独立字段）─────────────
@@ -392,7 +423,7 @@ impl IWidget for SwatchesWidget {
 /// MetricSwatches 逐指标颜色选择器。
 pub struct MetricSwatchesWidget {
     pub id: WidgetId,
-    metric: usize,  // 0=cpu, 1=mem, 2=gpu, 3=net
+    #[allow(dead_code)] metric: usize,  // 0=cpu, 1=mem, 2=gpu, 3=net
 }
 
 impl MetricSwatchesWidget {
@@ -434,7 +465,7 @@ pub struct SliderWidget {
     min: f32,
     max: f32,
     step: f32,
-    unit: &'static str,
+    #[allow(dead_code)] unit: &'static str,
     dp: u32,
 }
 
@@ -492,6 +523,8 @@ struct SettingsCtx {
     tb: TitleBarState,
     /// 待重绘的控件下标集合（None = 全量重绘）。
     dirty: Option<Vec<usize>>,
+    /// 空间网格索引：每页一个，用于 O(1) 平均查找代替 O(n) 全表扫描。
+    spatial_grids: Vec<SpatialGrid>,
 }
 
 // ── Interaction 辅助 ────────────────────────────────────────
@@ -511,10 +544,6 @@ impl SettingsCtx {
         matches!(&self.interaction, Interaction::Editing { .. })
     }
 
-    fn is_dragging(&self) -> bool {
-        matches!(&self.interaction, Interaction::Dragging { .. })
-    }
-
     /// 标记单个控件需要重绘。
     fn invalidate_widget(&mut self, idx: usize) {
         if let Some(ref mut v) = self.dirty {
@@ -523,21 +552,25 @@ impl SettingsCtx {
             self.dirty = Some(vec![idx]);
         }
     }
-
-    /// 标记整个当前页需要重绘。
-    fn invalidate_page(&mut self) {
-        self.dirty = None; // None = full page repaint
-    }
-
-    /// 取出 dirty list 并重置。
-    fn take_dirty(&mut self) -> Option<Vec<usize>> {
-        self.dirty.take()
-    }
 }
 
 /// 翻页动画：新页自右侧滑入同时淡入。
 struct PageAnim {
     t0: Instant,
+}
+
+/// 构建全部页的空间网格索引。
+fn build_spatial_grids(ctx: &SettingsCtx) -> Vec<SpatialGrid> {
+    ctx.pages
+        .iter()
+        .map(|page| {
+            let mut grid = SpatialGrid::new(s(ctx.dpi, CLIENT_W), s(ctx.dpi, 600), s(ctx.dpi, 30));
+            for (idx, w) in page.widgets.iter().enumerate() {
+                grid.insert(idx, w.rect);
+            }
+            grid
+        })
+        .collect()
 }
 
 /// DPI 缩放。
@@ -689,9 +722,11 @@ fn create_dialog(overlay: HWND) {
             tracking: false,
             tb: TitleBarState::default(),
             dirty: None,
+            spatial_grids: Vec::new(),
         };
         if let Some(cfg) = window::get_config_of(overlay) {
             build_pages(&mut ctx, &cfg);
+            ctx.spatial_grids = build_spatial_grids(&ctx);
         }
         SetWindowLongPtrW(hwnd, GWLP_UD, Box::into_raw(Box::new(ctx)) as isize);
 
@@ -893,7 +928,7 @@ fn build_pages(ctx: &mut SettingsCtx, cfg: &sysoverlay_core::config::Config) {
                     ("NET", "LblNet", IDC_M0_ON + 9, cfg.show_net, cfg.metric_colors[3], cfg.metric_font_sizes[3]),
                     ("PWR", "LblPower", IDC_M0_ON + 12, cfg.power_enabled, cfg.metric_colors[4], cfg.metric_font_sizes[4]),
                 ];
-                for (i, (_code, lbl_key, id_on, on, _colors, mfs)) in metrics.iter().enumerate() {
+                for (i, (_code, lbl_key, id_on, _on, _colors, _mfs)) in metrics.iter().enumerate() {
                     let base = i as i32 * 3;
                     let cfg_key = match i {
                         0 => "show_cpu", 1 => "show_mem", 2 => "show_gpu", 3 => "show_net", 4 => "power_enabled",
@@ -988,21 +1023,6 @@ fn page_footnote(p: usize, lang: Lang) -> Option<&'static str> {
         return Some(crate::i18n::t(lang, "FootnoteDebug"));
     }
     None
-}
-
-/// 在预设色板里找与当前配置颜色相等的下标（找不到取 0）。
-fn swatch_sel(palette: &[(u8, u8, u8)], color: Rgb) -> usize {
-    palette
-        .iter()
-        .position(|&(r, g, b)| Rgb::new(r, g, b) == color)
-        .unwrap_or(0)
-}
-
-fn metric_swatch_sel(color: Rgb) -> usize {
-    METRIC_SWATCHES
-        .iter()
-        .position(|&(r, g, b)| Rgb::new(r, g, b) == color)
-        .unwrap_or(SW_FOLLOW)
 }
 
 // ── 窗口过程 ─────────────────────────────────────────────
@@ -1336,6 +1356,7 @@ unsafe extern "system" fn settings_wndproc(
                 apply_window_chrome(hwnd, ctx.theme.dark);
                 if let Some(cfg) = window::get_config_of(ctx.overlay) {
                     build_pages(ctx, &cfg);
+                    ctx.spatial_grids = build_spatial_grids(ctx);
                 }
                 let _ = InvalidateRect(hwnd, None, false);
             }
@@ -1419,12 +1440,13 @@ fn nav_at(ctx: &SettingsCtx, pt: POINT) -> Option<usize> {
     if (i as i32) < n { Some(i) } else { None }
 }
 
-/// 控件命中（当前页）。
+/// 控件命中（当前页）：使用空间网格 O(1) 查找。
 fn widget_at(ctx: &SettingsCtx, pt: POINT) -> Option<usize> {
-    ctx.pages[ctx.page]
-        .widgets
+    let candidates = ctx.spatial_grids.get(ctx.page)?.query(pt);
+    candidates
         .iter()
-        .position(|w| pt_in(&w.rect, pt))
+        .copied()
+        .find(|&i| ctx.pages[ctx.page].widgets[i].kind.hit_test(ctx.pages[ctx.page].widgets[i].rect, pt))
 }
 
 /// 控件悬停（当前页）。
@@ -1851,8 +1873,6 @@ fn commit_change(overlay: HWND, cfg: &Config, modified: bool) {
     unsafe {
         let _ = PostMessageW(overlay, WM_RECONFIG, WPARAM(0), LPARAM(0));
     }
-    // 防抖：下次 save 在 500ms 后再执行，本次跳过
-    static LAST_SAVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     // config_io::save_config 本身已做原子写，外部防抖由调用方保证
     let _ = config_io::save_config(cfg);
 }
@@ -2119,203 +2139,33 @@ unsafe fn draw_widget(hdc: HDC, ctx: &SettingsCtx, idx: usize, state: &WidgetSta
     };
 
     // Type dispatch using as_any()
-    if let Some(toggle) = w.kind.as_any().downcast_ref::<ToggleWidget>() {
-        let on = state.value_f > 0.5;
-        draw_toggle(hdc, ctx, r, on);
-    } else if let Some(seg) = w.kind.as_any().downcast_ref::<SegmentedWidget>() {
+    if let Some(_toggle) = w.kind.as_any().downcast_ref::<ToggleWidget>() {
+        draw_toggle_widget(w, state, hdc, ctx.dpi, &ctx.theme, r);
+    } else if let Some(_seg) = w.kind.as_any().downcast_ref::<SegmentedWidget>() {
         draw_segmented_widget(w, state, hdc, ctx.dpi, &ctx.theme, r);
-    } else if let Some(btn) = w.kind.as_any().downcast_ref::<ButtonWidget>() {
+    } else if let Some(_btn) = w.kind.as_any().downcast_ref::<ButtonWidget>() {
         draw_button_widget(w, state, hdc, ctx.dpi, &ctx.theme, r);
-    } else if let Some(sw) = w.kind.as_any().downcast_ref::<SwatchesWidget>() {
+    } else if let Some(_sw) = w.kind.as_any().downcast_ref::<SwatchesWidget>() {
         draw_swatches_widget(w, state, hdc, ctx.dpi, &ctx.theme, r);
-    } else if let Some(ms) = w.kind.as_any().downcast_ref::<MetricSwatchesWidget>() {
+    } else if let Some(_ms) = w.kind.as_any().downcast_ref::<MetricSwatchesWidget>() {
         draw_metric_swatches_widget(w, state, hdc, ctx.dpi, &ctx.theme, r);
     } else if let Some(slider) = w.kind.as_any().downcast_ref::<SliderWidget>() {
         draw_slider_widget(w, state, hdc, ctx.dpi, &ctx.theme, r, slider.dp);
     }
 }
 
-/// 背景/前景色板。
-unsafe fn draw_swatches(hdc: HDC, ctx: &SettingsCtx, rect: RECT, palette: &[(u8, u8, u8)], sel: usize) {
-    let n = palette.len().max(1) as i32;
-    let wd = (rect.right - rect.left) / n;
-    let m = s(ctx.dpi, 3);
-    for (i, &(r, g, b)) in palette.iter().enumerate() {
-        let sw = RECT {
-            left: rect.left + i as i32 * wd,
-            top: rect.top,
-            right: rect.left + (i as i32 + 1) * wd,
-            bottom: rect.bottom,
-        };
-        let inner = RECT {
-            left: sw.left + m,
-            top: sw.top + m,
-            right: sw.right - m,
-            bottom: sw.bottom - m,
-        };
-        let stroke = if i == sel { ctx.theme.accent } else { ctx.theme.card_stroke };
-        round_rect(hdc, inner, s(ctx.dpi, 5), rgb(r, g, b), stroke);
-    }
-}
-
-/// 指标配色色板（8 预设 + 最后「默认」格）。
-unsafe fn draw_metric_swatches(hdc: HDC, ctx: &SettingsCtx, rect: RECT, follow: bool, sel: usize) {
-    let d = ctx.dpi;
-    let n = SW_N as i32;
-    let wd = (rect.right - rect.left) / n;
-    let m = s(d, 3);
-    for (i, _) in (0..SW_N).enumerate() {
-        let sw = RECT {
-            left: rect.left + i as i32 * wd,
-            top: rect.top,
-            right: rect.left + (i as i32 + 1) * wd,
-            bottom: rect.bottom,
-        };
-        let inner = RECT {
-            left: sw.left + m,
-            top: sw.top + m,
-            right: sw.right - m,
-            bottom: sw.bottom - m,
-        };
-        if i < SW_FOLLOW {
-            let (r, g, b) = METRIC_SWATCHES[i];
-            round_rect(hdc, inner, s(d, 4), rgb(r, g, b), ctx.theme.card_stroke);
-        } else {
-            // 「默认」格：虚线感 → 半色 + 斜线太复杂，用描边空心 + 小字
-            round_rect(hdc, inner, s(d, 4), ctx.theme.card, ctx.theme.secondary);
-            text(hdc, "≈", inner, ctx.theme.secondary, ctx.fonts.small, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
-        }
-        let selected = (i == sel) || (i == SW_FOLLOW && follow && sel == SW_FOLLOW);
-        if selected {
-            let outline = RECT { left: sw.left, top: sw.top, right: sw.right, bottom: sw.bottom };
-            round_rect(hdc, outline, s(d, 5), ctx.theme.card /*不着色*/, ctx.theme.accent);
-        }
-    }
-}
-
-unsafe fn draw_toggle(hdc: HDC, ctx: &SettingsCtx, rect: RECT, on: bool) {
-    let t = &ctx.theme;
+/// Toggle 绘制。
+unsafe fn draw_toggle_widget(_w: &Widget, state: &WidgetState, hdc: HDC, dpi: u32, theme: &Theme, rect: RECT) {
+    let on = state.value_f > 0.5;
+    let t = theme;
     let radius = (rect.bottom - rect.top) / 2;
-    let (fill, stroke) = if on {
-        (t.toggle_on, t.toggle_on)
-    } else {
-        (t.toggle_off, t.toggle_off_stroke)
-    };
+    let (fill, stroke) = if on { (t.toggle_on, t.toggle_on) } else { (t.toggle_off, t.toggle_off_stroke) };
     round_rect(hdc, rect, radius, fill, stroke);
-    let m = s(ctx.dpi, 3);
+    let m = s(dpi, 3);
     let d = (rect.bottom - rect.top) - 2 * m;
     let kx = if on { rect.right - m - d } else { rect.left + m };
     let kr = RECT { left: kx, top: rect.top + m, right: kx + d, bottom: rect.bottom - m };
     ellipse(hdc, kr, t.knob, t.knob_stroke);
-}
-
-unsafe fn draw_segmented(hdc: HDC, ctx: &SettingsCtx, rect: RECT, labels: &[&str], sel: usize) {
-    let t = &ctx.theme;
-    let n = labels.len().max(1) as i32;
-    let seg_w = (rect.right - rect.left) / n;
-    round_rect(hdc, rect, s(ctx.dpi, 7), t.segmented_bg, t.segmented_bg);
-    for (i, label) in labels.iter().enumerate() {
-        let r = RECT {
-            left: rect.left + i as i32 * seg_w,
-            top: rect.top,
-            right: rect.left + (i as i32 + 1) * seg_w,
-            bottom: rect.bottom,
-        };
-        if i == sel {
-            let m = s(ctx.dpi, 2);
-            let ir = RECT { left: r.left + m, top: r.top + m, right: r.right - m, bottom: r.bottom - m };
-            round_rect(hdc, ir, s(ctx.dpi, 5), t.seg_selected, t.seg_selected_stroke);
-        }
-        let color = if i == sel { t.label } else { t.secondary };
-        text(hdc, label, r, color, ctx.fonts.small, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
-    }
-}
-
-/// 滑杆 + 输入框：轨道 + 圆滑块 + 右端圆角值框。
-unsafe fn draw_slider(
-    hdc: HDC,
-    ctx: &SettingsCtx,
-    rect: RECT,
-    val: f32,
-    min: f32,
-    max: f32,
-    unit: &str,
-    dp: u32,
-    editing: bool,
-) {
-    let t = &ctx.theme;
-    let d = ctx.dpi;
-    let vb = value_box_rect(&rect, d);
-    let tr = track_rect(&rect, d);
-
-    // 轨道
-    let track_y = (tr.top + tr.bottom) / 2;
-    let pen = CreatePen(PS_SOLID, s(d, 2).max(1), COLORREF(t.segmented_bg));
-    let old_pen = SelectObject(hdc, pen);
-    let _ = MoveToEx(hdc, tr.left, track_y, None);
-    let _ = LineTo(hdc, tr.right, track_y);
-    let _ = SelectObject(hdc, old_pen);
-    let _ = DeleteObject(pen);
-
-    // 滑块
-    let tfrac = if max > min { ((val - min) / (max - min)).clamp(0.0, 1.0) } else { 0.0 };
-    let cx = tr.left + ((tr.right - tr.left) as f32 * tfrac).round() as i32;
-    let thumb_d = s(d, 13);
-    let thumb = RECT {
-        left: cx - thumb_d / 2,
-        top: track_y - thumb_d / 2,
-        right: cx + thumb_d / 2,
-        bottom: track_y + thumb_d / 2,
-    };
-    ellipse(hdc, thumb, t.accent, t.accent);
-
-    // 值框
-    let fill = if editing { t.button_bg_hover } else { t.button_bg };
-    round_rect(hdc, vb, s(d, 6), fill, fill);
-    let content = RECT { left: vb.left, top: vb.top, right: vb.right - s(d, 4), bottom: vb.bottom };
-
-    // 显示文本（编辑中显示缓冲）
-    let show: Vec<u16> = if editing {
-        if let Some(e) = &ctx.edit {
-            e.buf.clone()
-        } else {
-            Vec::new()
-        }
-    } else if dp == 0 {
-        format!("{}{}", val.round() as i64, unit).encode_utf16().collect()
-    } else {
-        format!("{:.1}{}", val, unit).encode_utf16().collect()
-    };
-    text_utf16(hdc, &show, content, t.label, ctx.fonts.small, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
-
-    // 光标
-    if editing {
-        if let Some(e) = &ctx.edit {
-            if e.caret {
-                let mut r = content;
-                r.left = r.right - s(d, 8);
-                draw_caret(hdc, r, t.label);
-            }
-        }
-    }
-}
-
-unsafe fn draw_caret(hdc: HDC, rect: RECT, color: u32) {
-    let pen = CreatePen(PS_SOLID, 1, COLORREF(color));
-    let old_pen = SelectObject(hdc, pen);
-    let y0 = rect.top + 2;
-    let y1 = rect.bottom - 2;
-    let _ = MoveToEx(hdc, rect.left, y0, None);
-    let _ = LineTo(hdc, rect.left, y1);
-    let _ = SelectObject(hdc, old_pen);
-    let _ = DeleteObject(pen);
-}
-
-unsafe fn draw_button(hdc: HDC, ctx: &SettingsCtx, rect: RECT, label: &str, hovered: bool) {
-    let t = &ctx.theme;
-    let fill = if hovered { t.accent_hover } else { t.accent };
-    round_rect(hdc, rect, s(ctx.dpi, 7), fill, fill);
-    text(hdc, label, rect, rgb(255, 255, 255), ctx.fonts.body, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
 }
 
 // ── GDI 基元 ─────────────────────────────────────────────
@@ -2436,7 +2286,7 @@ unsafe fn draw_swatches_widget(w: &Widget, state: &WidgetState, hdc: HDC, dpi: u
 }
 
 /// MetricSwatches 绘制。
-unsafe fn draw_metric_swatches_widget(w: &Widget, state: &WidgetState, hdc: HDC, dpi: u32, theme: &Theme, rect: RECT) {
+unsafe fn draw_metric_swatches_widget(_w: &Widget, state: &WidgetState, hdc: HDC, dpi: u32, theme: &Theme, rect: RECT) {
     let sel = state.selected;
     let follow = state.value_f > 0.5;
     let d = dpi;
@@ -2472,7 +2322,7 @@ unsafe fn draw_metric_swatches_widget(w: &Widget, state: &WidgetState, hdc: HDC,
 }
 
 /// Slider 绘制。
-unsafe fn draw_slider_widget(w: &Widget, state: &WidgetState, hdc: HDC, dpi: u32, theme: &Theme, rect: RECT, dp: u32) {
+unsafe fn draw_slider_widget(_w: &Widget, state: &WidgetState, hdc: HDC, dpi: u32, theme: &Theme, rect: RECT, dp: u32) {
     let val = state.value_f as f32;
     let editing = state.editing;
     let t = theme;
