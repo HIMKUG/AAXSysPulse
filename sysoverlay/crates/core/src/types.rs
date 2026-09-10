@@ -175,6 +175,35 @@ impl RenderStyle {
     }
 }
 
+/// 悬浮窗渲染引擎。
+///
+/// `Gdi` = 现有像素块软件光栅（最高效，默认）；`D2d` = 整帧 Direct2D + DirectWrite。
+/// 序列化写**数值**以兼容 C 版（C 版无此键，会静默忽略未知键）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RenderEngine {
+    #[default]
+    Gdi,
+    D2d,
+}
+
+impl RenderEngine {
+    /// 宽容解析：接受数值（0/1）与字符串。
+    pub fn from_config(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "0" | "gdi" | "perf" | "performance" | "software" => Some(RenderEngine::Gdi),
+            "1" | "d2d" | "dwrite" | "quality" | "hw" => Some(RenderEngine::D2d),
+            _ => None,
+        }
+    }
+
+    pub fn to_config(self) -> &'static str {
+        match self {
+            RenderEngine::Gdi => "0",
+            RenderEngine::D2d => "1",
+        }
+    }
+}
+
 /// 可逐项调色的指标。顺序即悬浮窗自左到右 / 自上而下的排列顺序。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Metric {
@@ -273,36 +302,39 @@ impl NetUnit {
     }
 }
 
-/// 卡片外形。C 版数值序：**0=圆角 1=直角 2=纯内容**。
+/// 网络栏显示模式：双向（默认）/ 仅下载 / 仅上传。
+///
+/// 背景：横条空间有限，双向时用户分不清 ↑↓ 各是哪个方向（且旧实现箭头
+/// 还标反了）；单显模式彻底消除歧义。C 版无此键。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Shape {
+pub enum NetMode {
+    /// 双向：↓下载 ↑上传。
     #[default]
-    Round,
-    Square,
-    Content,
+    Both,
+    /// 仅下载（接收，rx）。
+    Down,
+    /// 仅上传（发送，tx）。
+    Up,
 }
 
-impl Shape {
+impl NetMode {
+    /// 宽容解析：接受数值与字符串。
     pub fn from_config(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "0" | "round" => Some(Shape::Round),
-            "1" | "square" => Some(Shape::Square),
-            "2" | "content" => Some(Shape::Content),
+            "0" | "both" => Some(NetMode::Both),
+            "1" | "down" | "rx" => Some(NetMode::Down),
+            "2" | "up" | "tx" => Some(NetMode::Up),
             _ => None,
         }
     }
 
+    /// 序列化为数值（0/1/2）。
     pub fn to_config(self) -> u32 {
         match self {
-            Shape::Round => 0,
-            Shape::Square => 1,
-            Shape::Content => 2,
+            NetMode::Both => 0,
+            NetMode::Down => 1,
+            NetMode::Up => 2,
         }
-    }
-
-    /// 是否绘制背景板（`Content` 模式只画内容，不画底）。
-    pub fn has_background(self) -> bool {
-        !matches!(self, Shape::Content)
     }
 }
 
@@ -457,10 +489,6 @@ mod tests {
 
     #[test]
     fn c_enum_ordering_is_preserved() {
-        assert_eq!(Shape::from_config("0"), Shape::from_config("round"));
-        assert_eq!(Shape::from_config("1"), Shape::from_config("square"));
-        assert_eq!(Shape::from_config("2"), Shape::from_config("content"));
-
         assert_eq!(
             VertLayout::from_config("1"),
             VertLayout::from_config("single_col")
@@ -468,7 +496,6 @@ mod tests {
         assert_eq!(NetUnit::from_config("2"), NetUnit::from_config("GB"));
 
         // 未知值返回 None（交给调用方保留原值）
-        assert_eq!(Shape::from_config("7"), None);
         assert_eq!(NetUnit::from_config("tb"), None);
     }
 
@@ -485,12 +512,5 @@ mod tests {
         assert!(PowerDisplay::Estimated.is_estimated());
         assert!(!PowerDisplay::CpuPackage.is_estimated());
         assert!(!PowerDisplay::Battery.is_estimated());
-    }
-
-    #[test]
-    fn shape_has_background() {
-        assert!(Shape::Round.has_background());
-        assert!(Shape::Square.has_background());
-        assert!(!Shape::Content.has_background());
     }
 }

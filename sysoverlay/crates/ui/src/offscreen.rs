@@ -45,9 +45,9 @@ impl SoftwareSurface {
             self.pixels = vec![0u8; need];
             self.width = width;
             self.height = height;
-        } else {
-            self.pixels.fill(0);
         }
+        // 注：渲染器 draw() 入口统一 out.clear()（StripRenderer/VerticalRenderer），
+        // 此处不必再清零，避免每帧双 memset（P1-8）。
     }
 
     /// 在 (x, y) 处做**预乘 alpha 的 over 合成**：`out = src + dst * (1 - src_a)`。
@@ -85,6 +85,25 @@ impl SoftwareSurface {
         self.pixels.fill(0);
     }
 
+    /// 只清空一个子矩形（按行 `fill(0)`，A3：省掉整画布 187KB memset）。
+    ///
+    /// 负坐标/越界自动裁剪到画布范围，不 panic。
+    pub fn clear_rect(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        let x = x.max(0);
+        let y = y.max(0);
+        let w = w.max(0);
+        let h = h.max(0);
+        let x1 = (x + w).min(self.width);
+        let y1 = (y + h).min(self.height);
+        for yy in y..y1 {
+            let start = ((yy * self.width + x) * 4) as usize;
+            let end = ((yy * self.width + x1) * 4) as usize;
+            if let Some(row) = self.pixels.get_mut(start..end) {
+                row.fill(0);
+            }
+        }
+    }
+
     /// Converts the surface to a PNG-encoded byte vector.
     ///
     /// Uses the `png` crate.
@@ -110,20 +129,43 @@ impl SoftwareSurface {
 
 impl SoftwareSurface {
     /// Clears (sets to transparent) the four corner regions of a rounded rectangle.
+    ///
+    /// 填充矩形后再调用本函数，清除四个角的四分之一圆像素，实现圆角效果。
     fn clear_corners(&mut self, r: Rect, radius: i32, _color: Rgba) {
         if radius <= 0 {
             return;
         }
+        let radius = radius.min(r.w / 2).min(r.h / 2);
         let transparent = Rgba::transparent();
-        for y in r.y..r.bottom() {
-            for x in r.x..r.right() {
-                let in_tl = point_in_circle(x, y, r.x + radius, r.y + radius, radius);
-                let in_tr = point_in_circle(x, y, r.right() - radius, r.y + radius, radius);
-                let in_bl = point_in_circle(x, y, r.x + radius, r.bottom() - radius, radius);
-                let in_br = point_in_circle(x, y, r.right() - radius, r.bottom() - radius, radius);
-                if in_tl || in_tr || in_bl || in_br {
-                    self.blend_pixel(x, y, transparent);
-                }
+        let r_right = r.x + r.w;
+        let r_bottom = r.y + r.h;
+
+        // 左上角：圆心 (r.x, r.y)，清除圆内像素
+        for dy in 0..radius {
+            let dx_max = ((radius * radius - dy * dy) as f64).sqrt() as i32;
+            for dx in 0..=dx_max {
+                self.blend_pixel(r.x + dx, r.y + dy, transparent);
+            }
+        }
+        // 右上角：圆心 (r.x + r.w, r.y)
+        for dy in 0..radius {
+            let dx_max = ((radius * radius - dy * dy) as f64).sqrt() as i32;
+            for dx in 0..=dx_max {
+                self.blend_pixel(r_right - dx, r.y + dy, transparent);
+            }
+        }
+        // 左下角：圆心 (r.x, r.y + r.h)
+        for dy in 0..radius {
+            let dx_max = ((radius * radius - dy * dy) as f64).sqrt() as i32;
+            for dx in 0..=dx_max {
+                self.blend_pixel(r.x + dx, r_bottom - dy, transparent);
+            }
+        }
+        // 右下角：圆心 (r.x + r.w, r.y + r.h)
+        for dy in 0..radius {
+            let dx_max = ((radius * radius - dy * dy) as f64).sqrt() as i32;
+            for dx in 0..=dx_max {
+                self.blend_pixel(r_right - dx, r_bottom - dy, transparent);
             }
         }
     }

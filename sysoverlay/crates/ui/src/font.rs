@@ -6,6 +6,8 @@
 //! This is a placeholder implementation for the offscreen rasterizer.
 //! Phase 3 will integrate real GDI font rendering.
 
+use std::cell::Cell;
+
 /// 8x16 pixel bitmap for each ASCII character (16 bytes per char).
 /// Each bit represents a pixel: 1 = filled, 0 = transparent.
 /// Bits are organized left-to-right, top-to-bottom within each byte.
@@ -228,16 +230,82 @@ pub const FONT_HEIGHT: i32 = 16;
 /// Character spacing (horizontal gap between characters).
 pub const FONT_SPACING: i32 = 1;
 
-/// Gets the bitmap data for a character.
+/// 字形实际可见行数。
 ///
-/// Returns the bitmap bytes (16 bytes) for ASCII characters.
-/// Returns the replacement character bitmap for non-ASCII.
-pub fn get_char_bitmap(c: char) -> &'static [u8; 16] {
+/// 位图字体把 7~8 行高的字形塞进 16 行单元（单元下半部为空白），
+/// 因此行高/行距必须以可见行数为准。`render_char_scaled_f` 从 `y` 起逐行绘制，
+/// 可见墨迹落在 row 0..=`GLYPH_VISIBLE_ROWS`-1，单元余下行全空。若按
+/// `FONT_HEIGHT`(16) 预留行高，纵向会多出近一半死区——正是"间距为 0 时竖版
+/// 仍有较大间隙"的根因。
+pub const GLYPH_VISIBLE_ROWS: i32 = 8;
+pub const GLYPH_VISIBLE_ROWS_F: f32 = GLYPH_VISIBLE_ROWS as f32;
+
+/// 按字重覆盖的 8×16 字形表（win 层用 DWrite 栅格化 DIN 三版注入）。
+///
+/// 三张常驻 `[u8;16] × 96`（细/中/粗），`thread_local`：注入（`set_weight_glyph`，
+/// 由 win 层 `din_bitmap::ensure_loaded` 在首帧前调用）与读取（`get_char_bitmap`）
+/// 都发生在**同一个 UI 渲染线程**，因此零锁、无需原子、无 `unsafe`。
+/// 未注入的槽位保持内置 [`FONT_BITMAP`]（原样），任何失败都不影响渲染。
+///
+/// # 锁无关 / 性能
+///
+/// 旧版用全局 `Mutex<HashMap<(weight,idx), [u8;16]>>`，每画一个字符都要加锁查表。
+/// 本版在渲染热路径上是**纯数组读**：thread_local 直接下标，无锁、无哈希查找。
+/// 三张字重表初始化为内置点阵（未注入槽位回退 [`FONT_BITMAP`]）；
+/// DIN 三档栅格化会覆盖对应槽位。
+const fn weight_tables_init() -> [[[u8; 16]; 96]; 3] {
+    let mut t = [[[0u8; 16]; 96]; 3];
+    let mut w = 0;
+    while w < 3 {
+        let mut i = 0;
+        while i < 96 {
+            t[w][i] = FONT_BITMAP[i];
+            i += 1;
+        }
+        w += 1;
+    }
+    t
+}
+thread_local! {
+    static FONT_WEIGHT_TABLES: RefCell<[[[u8; 16]; 96]; 3]> = RefCell::new(weight_tables_init());
+}
+
+// 当前渲染生效的字重（0 细 / 1 中 / 2 粗）。默认粗 = 历史原样观感；
+// 由 win 层在性能模式整帧渲染前调用一次，正常工作流零读取开销（thread_local）。
+thread_local! {
+    static ACTIVE_WEIGHT: Cell<u8> = const { Cell::new(2) };
+}
+
+/// 设置当前帧生效的字重（win 层每帧调用一次）。
+///
+/// 只写 thread_local，不锁全局；渲染期由 `get_char_bitmap` 零锁读取。
+pub fn set_active_weight(weight: u8) {
+    ACTIVE_WEIGHT.with(|c| c.set(weight));
+}
+
+/// 安装某字重的 ASCII 字符 8×16 字形（win 层 DWrite 栅格化 DIN 三版后调用）。
+///
+/// 直接写进对应字重的常驻表，无锁、无 `unsafe`（与读取同线程）。
+pub fn set_weight_glyph(weight: u8, ascii_idx: usize, table: [u8; 16]) {
+    if weight < 3 && ascii_idx < 96 {
+        FONT_WEIGHT_TABLES.with(|t| t.borrow_mut()[weight as usize][ascii_idx] = table);
+    }
+}
+
+/// 当前字重下该字符的 8×16 点阵（16B 拷贝；无 `unsafe`、零锁）。
+///
+/// 直接读三张常驻表（细/中/粗，未注入即内置点阵），箭头/替代字回退各自静态表。
+#[inline]
+pub fn get_char_bitmap(c: char) -> [u8; 16] {
     match c {
-        '\u{2191}' => &GLYPH_UP,   // ↑
-        '\u{2193}' => &GLYPH_DOWN, // ↓
-        _ if (c as u32) >= 0x20 && (c as u32) <= 0x7E => &FONT_BITMAP[(c as usize) - 0x20],
-        _ => &REPLACEMENT_CHAR,
+        '\u{2191}' => GLYPH_UP,   // ↑
+        '\u{2193}' => GLYPH_DOWN, // ↓
+        _ if (c as u32) >= 0x20 && (c as u32) <= 0x7E => {
+            let idx = (c as usize) - 0x20;
+            let w = ACTIVE_WEIGHT.with(|x| x.get()) as usize;
+            FONT_WEIGHT_TABLES.with(|t| t.borrow()[if w < 3 { w } else { 2 }][idx])
+        }
+        _ => REPLACEMENT_CHAR,
     }
 }
 
@@ -556,9 +624,38 @@ pub fn render_char_scaled_f(
     if surface_w <= 0 || surface_h <= 0 || fg_color.a == 0 || scale <= 0.0 {
         return;
     }
+    // B1/B3/B4：不透明字形走「预渲染字形图集」快路径——
+    // 字形在 (char, scale, fg) 首次出现时只栅格化一次，之后每帧只做带裁剪的整块
+    // blit，不再逐像素解位图 / 做 f32 运算。不透明（a==255）时掩码 blit 与 over
+    // 合成逐像素等价（只覆盖不透明像素，透明像素跳过，不破坏目标已存在内容）。
+    if fg_color.a == 255 {
+        let tile = get_glyph_tile(c, scale, fg_color);
+        blit_tile_masked(pixels, surface_w, surface_h, &tile, x, y);
+    } else {
+        render_char_scaled_f_blend(pixels, surface_w, surface_h, c, x, y, scale, fg_color);
+    }
+}
+
+/// 浮点缩放的逐像素 over 合成路径——作为不透明图集快路径的**语义基准**。
+///
+/// 覆盖窗口的字形集合很小且稳定，UI 正文/阴影/描边用的都是不透明色，
+/// 所以真正进这条冷路径的只有半透明字（罕见）。它与图集快路径在 a<255 时
+/// 严格等价，是防快路径日后被改歪的护栏。
+fn render_char_scaled_f_blend(
+    pixels: &mut [u8],
+    surface_w: i32,
+    surface_h: i32,
+    c: char,
+    x: i32,
+    y: i32,
+    scale: f32,
+    fg_color: crate::render::Rgba,
+) {
+    if surface_w <= 0 || surface_h <= 0 || fg_color.a == 0 || scale <= 0.0 {
+        return;
+    }
 
     let bitmap = get_char_bitmap(c);
-    let (b, g, r) = (fg_color.b, fg_color.g, fg_color.r);
     let factor = 1.0 - fg_color.alpha_float();
 
     for row in 0..FONT_HEIGHT as usize {
@@ -597,23 +694,15 @@ pub fn render_char_scaled_f(
                     if idx + 3 >= pixels.len() {
                         continue;
                     }
-                    if fg_color.a == 255 {
-                        // 不透明快路径：直接写
-                        pixels[idx] = b;
-                        pixels[idx + 1] = g;
-                        pixels[idx + 2] = r;
-                        pixels[idx + 3] = 255;
-                    } else {
-                        // 半透明：预乘 over 合成
-                        let dst_r = pixels[idx + 2] as f32;
-                        let dst_g = pixels[idx + 1] as f32;
-                        let dst_b = pixels[idx] as f32;
-                        let dst_a = pixels[idx + 3] as f32;
-                        pixels[idx] = (fg_color.b as f32 + dst_b * factor) as u8;
-                        pixels[idx + 1] = (fg_color.g as f32 + dst_g * factor) as u8;
-                        pixels[idx + 2] = (fg_color.r as f32 + dst_r * factor) as u8;
-                        pixels[idx + 3] = (fg_color.a as f32 + dst_a * factor).min(255.0) as u8;
-                    }
+                    // 半透明：预乘 over 合成
+                    let dst_r = pixels[idx + 2] as f32;
+                    let dst_g = pixels[idx + 1] as f32;
+                    let dst_b = pixels[idx] as f32;
+                    let dst_a = pixels[idx + 3] as f32;
+                    pixels[idx] = (fg_color.b as f32 + dst_b * factor) as u8;
+                    pixels[idx + 1] = (fg_color.g as f32 + dst_g * factor) as u8;
+                    pixels[idx + 2] = (fg_color.r as f32 + dst_r * factor) as u8;
+                    pixels[idx + 3] = (fg_color.a as f32 + dst_a * factor).min(255.0) as u8;
                 }
             }
         }
@@ -636,6 +725,157 @@ pub fn render_str_scaled_f(
     for c in s.chars() {
         render_char_scaled_f(pixels, surface_w, surface_h, c, cursor as i32, y, scale, fg_color);
         cursor += step;
+    }
+}
+
+// ── 字形图集（B1/B3/B4） ──────────────────────────────────
+//
+// 把每个 (char, scale, fg) 的栅格化结果缓存进线程局部图集，后续同字形
+// 只做整块 blit。覆盖窗口的字形集合很小且稳定（数字/字母/单位符号），
+// 命中率接近 100%，每帧省掉全量逐像素栅格化。
+// 阴影/描边各自用 `shade` 不透明色，因此同一套图集天然覆盖它们（B2）。
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+/// 图集瓦片：一个字形放大后的 BGRA 预乘像素块（透明背景）。
+struct GlyphTile {
+    w: i32,
+    h: i32,
+    px: Vec<u8>,
+}
+
+/// 图集键：字符 + 缩放（精确 f32 bits）+ 字重 + 预乘前景色。
+/// 字重进键：不同字重的字形点阵不同，共键会串色。
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct TileKey {
+    ch: u32,
+    scale_bits: u32,
+    w: u8,
+    b: u8,
+    g: u8,
+    r: u8,
+    a: u8,
+}
+
+/// 图集容量：常见字形集合（~40 字符 × 1–2 档字号 × 2–4 色）约 120 条，取 256 留余量。
+/// 固定数组 + 开放寻址，零堆分配、零 HashMap 运行时（exe 体积敏感）。
+/// 极端配置写满时覆盖探测起点槽——只回退为「重建该字形」，不影响正确性。
+const ATLAS_CAP: usize = 256;
+
+struct AtlasSlot {
+    key: TileKey,
+    tile: Rc<GlyphTile>,
+}
+
+thread_local! {
+    static GLYPH_ATLAS: RefCell<[Option<AtlasSlot>; ATLAS_CAP]> =
+        RefCell::new(std::array::from_fn(|_| None));
+}
+
+/// 图集键散列（FNV-1a，无分配）。
+fn atlas_hash(key: &TileKey) -> usize {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let rgba = (key.b as u64)
+        | ((key.g as u64) << 8)
+        | ((key.r as u64) << 16)
+        | ((key.a as u64) << 24);
+    for x in [key.ch as u64, key.scale_bits as u64, key.w as u64, rgba] {
+        h ^= x;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    (h >> 8) as usize
+}
+
+/// 取（建或复用）一个字形瓦片。
+fn get_glyph_tile(c: char, scale: f32, fg: crate::render::Rgba) -> Rc<GlyphTile> {
+    let w = ACTIVE_WEIGHT.with(|x| x.get());
+    let key = TileKey {
+        ch: c as u32,
+        scale_bits: scale.to_bits(),
+        w,
+        b: fg.b,
+        g: fg.g,
+        r: fg.r,
+        a: fg.a,
+    };
+    let h = atlas_hash(&key);
+    GLYPH_ATLAS.with(|m| {
+        let mut slots = m.borrow_mut();
+        for probe in 0..ATLAS_CAP {
+            let idx = (h.wrapping_add(probe)) % ATLAS_CAP;
+            if let Some(s) = &slots[idx] {
+                if s.key == key {
+                    return Rc::clone(&s.tile);
+                }
+                continue; // 占位冲突，继续探查
+            }
+            // 空槽：构建并驻留
+            let tw = (FONT_WIDTH as f32 * scale).ceil() as i32;
+            let th = (FONT_HEIGHT as f32 * scale).ceil() as i32;
+            let mut px = vec![0u8; (tw * th * 4).max(0) as usize];
+            if tw > 0 && th > 0 {
+                // 在透明缓冲里用通用栅格器画一次字形（over 合成 over 0 == 直接预乘）
+                render_char_scaled_f_blend(&mut px, tw, th, c, 0, 0, scale, fg);
+            }
+            let tile = Rc::new(GlyphTile { w: tw, h: th, px });
+            slots[idx] = Some(AtlasSlot {
+                key,
+                tile: Rc::clone(&tile),
+            });
+            return tile;
+        }
+        // 全满（不应发生）：覆盖探测起点，重建该字形
+        let tw = (FONT_WIDTH as f32 * scale).ceil() as i32;
+        let th = (FONT_HEIGHT as f32 * scale).ceil() as i32;
+        let mut px = vec![0u8; (tw * th * 4).max(0) as usize];
+        if tw > 0 && th > 0 {
+            render_char_scaled_f_blend(&mut px, tw, th, c, 0, 0, scale, fg);
+        }
+        let tile = Rc::new(GlyphTile { w: tw, h: th, px });
+        slots[h % ATLAS_CAP] = Some(AtlasSlot {
+            key,
+            tile: Rc::clone(&tile),
+        });
+        tile
+    })
+}
+
+/// 带裁剪的掩码 blit：只写瓦片中不透明（a!=0）的像素，透明像素跳过
+/// （不破坏目标已存在的像素，等价于 over 合成）。行级整块拷贝 + 4 字节块写入（B3/B4）。
+#[inline]
+fn blit_tile_masked(dst: &mut [u8], sw: i32, sh: i32, tile: &GlyphTile, dx: i32, dy: i32) {
+    let tw = tile.w;
+    let th = tile.h;
+    if tw <= 0 || th <= 0 {
+        return;
+    }
+    let y0 = dy.max(0);
+    let y1 = (dy + th).min(sh);
+    if y1 <= y0 {
+        return;
+    }
+    let x0 = dx.max(0);
+    let x1 = (dx + tw).min(sw);
+    if x1 <= x0 {
+        return;
+    }
+    let tx0 = (x0 - dx) as usize;
+    let tx1 = (x1 - dx) as usize;
+    for yy in y0..y1 {
+        let ty = (yy - dy) as usize;
+        let s_row = (ty * tw as usize + tx0) * 4;
+        let d_row = ((yy * sw + x0) as usize) * 4;
+        for tx in tx0..tx1 {
+            let off = (tx - tx0) * 4;
+            let si = s_row + off;
+            if tile.px[si + 3] == 0 {
+                continue; // 透明：跳过（掩码）
+            }
+            let di = d_row + off;
+            // B4：4 字节整块写（编译器通常落为单条 u32 store）
+            dst[di..di + 4].copy_from_slice(&tile.px[si..si + 4]);
+        }
     }
 }
 

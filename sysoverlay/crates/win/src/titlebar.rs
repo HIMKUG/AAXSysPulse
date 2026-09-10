@@ -28,7 +28,7 @@ const BTN_W_UNLOCK: i32 = 60;
 const BTN_H: i32 = 20;
 const BTN_GAP: i32 = 4;
 const BTN_MARGIN_R: i32 = 6;
-const CAPTION_PAD_L: i32 = 12;
+pub const CAPTION_PAD_L: i32 = 12;
 
 fn s(dpi: u32, v: i32) -> i32 {
     v * dpi as i32 / 96
@@ -78,7 +78,7 @@ pub struct TitleBarState {
 }
 
 /// 按钮矩形（自右向左：…Pin / Min / Close；固定态：…Unlock）。
-fn btn_rects(dpi_value: u32, win_w: i32, pinned: bool) -> Vec<(TitleBtn, RECT)> {
+pub fn btn_rects(dpi_value: u32, win_w: i32, pinned: bool) -> Vec<(TitleBtn, RECT)> {
     let h = s(dpi_value, TB_H);
     let bw = s(dpi_value, BTN_W);
     let bh = s(dpi_value, BTN_H);

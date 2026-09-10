@@ -66,6 +66,17 @@ pub fn log(line: &str) {
     write_raw(&full);
 }
 
+/// 延迟格式化：仅在 [`enabled()`] 为真时才拼接字符串，关闭开关时零成本。
+///
+/// 用来替换 `log(&format!(...))`——后者在参数求值阶段就会白白构造字符串，
+/// 即使探针关闭也照付一次 `format!` + 堆分配开销（热路径每周期一次）。
+pub fn log_lazy<F: FnOnce() -> String>(f: F) {
+    if !enabled() {
+        return;
+    }
+    log(&f());
+}
+
 /// 启动头：版本 + 环境摘要，便于在日志里定位一次运行。
 pub fn log_startup() {
     if !enabled() {
@@ -77,6 +88,43 @@ pub fn log_startup() {
         pid,
         perf_flag()
     ));
+}
+
+/// 安装全局 panic hook：任何线程 panic 都把位置 + 消息写入 probe.log。
+///
+/// 为什么关键：wndproc 是 `extern "system"`，panic 一旦跨过该边界就是
+/// UB/abort——表现正是「点一下按钮整个界面冻结」。没有 hook，
+/// panic 消息只走 stderr（windows_subsystem 下不可见）。
+/// hook 内的日志写失败也无所谓（尽力而为），绝不二次 panic。
+pub fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".into());
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string payload>".into()
+        };
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("<unnamed>").to_string();
+        // 无条件写：panic 时 probe 开关多半没开，而 panic 正是最需要抓的现场；
+        // panic 极罕见，绕过 gate 的写盘成本可忽略。
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        write_raw(&format!(
+            "[{:013}] #{:06} PANIC thread={} loc={} msg={}\n",
+            now_ms, n, name, loc, msg
+        ));
+        default(info);
+    }));
 }
 
 fn perf_flag() -> bool {

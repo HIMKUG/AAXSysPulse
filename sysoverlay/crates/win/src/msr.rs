@@ -84,12 +84,15 @@ fn ring0() -> Option<&'static Ring0> {
             SERVICE_KERNEL_DRIVER,
         };
 
-        // 1. 驱动文件必须在 exe 同目录
+        // 1. 驱动文件**可选**：服务已安装（此前任一版本创建过）时直接复用——
+        //    SCM 用服务注册表里的 BinaryPath 启动驱动，与 exe 当前目录无关。
+        //    本地文件只在"服务不存在（首次部署）"时才是必需品。
+        //    （教训：exe 换目录会导致检查文件失败 → 整个 MSR 关闭 → Power 整行 --。）
         let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
         let sys_path = exe_dir.join("WinRing0x64.sys");
-        if !sys_path.exists() {
-            probe::log(&format!("msr driver missing: {:?}", sys_path));
-            return None;
+        let sys_exists = sys_path.exists();
+        if !sys_exists {
+            probe::log("msr driver not beside exe (will reuse installed service if present)");
         }
         let sys_wide: Vec<u16> = sys_path.to_string_lossy().encode_utf16().chain(Some(0)).collect();
 
@@ -109,6 +112,14 @@ fn ring0() -> Option<&'static Ring0> {
         let svc: SC_HANDLE = match OpenServiceW(scm, svc_name, SERVICE_ALL_ACCESS) {
             Ok(h) => h,
             Err(_) => {
+                // 服务不存在：首次部署，必须有本地驱动文件
+                if !sys_exists {
+                    probe::log(&format!(
+                        "msr driver missing: {:?}（服务未安装，无法首次部署）",
+                        sys_path
+                    ));
+                    return None;
+                }
                 match CreateServiceW(
                     scm,
                     svc_name,
@@ -197,21 +208,19 @@ fn read_msr(r: &Ring0, index: u32) -> Option<u64> {
     }
 }
 
-/// 在 **0 号逻辑核**上读 MSR，读完恢复原亲和掩码。
+/// 采样线程启动时调用一次：把当前线程（即采样线程）绑到 0 号逻辑核，
+/// 使后续所有 MSR 读数都在同一核上进行（RAPL 域语义一致，避免功耗毛刺）。
 ///
-/// RAPL 能量寄存器是 per-package/per-core 语义：读数线程迁移到其他核心
-/// 可能改变返回的域值（尤其 AMD 多 CCD / SMT 系统）。绑 0 号核对每次
-/// 采样给出**一致的语义**，避免功耗毛刺（scaphandre 同样绑核读 MSR）。
-fn read_msr_pinned(r: &Ring0, index: u32) -> Option<u64> {
+/// 相比 `read_msr` 在**每次读**都 `SetThreadAffinityMask`+还原
+/// （每帧 4 次系统调用 + 强制线程迁移，污染 wall-clock `dt` 并把负载堆到 CPU0），
+/// 一次性绑定后读数零迁移、零系统调用——`read_msr` 直接读即可。
+///
+/// `SetThreadAffinityMask` 失败（极少）不影响后续采样，仅退化回"不绑核"。
+pub fn pin_sampling_thread() {
     unsafe {
         use windows::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
         let cur = GetCurrentThread();
-        let old = SetThreadAffinityMask(cur, 1); // 位 0 = 0 号逻辑核
-        let v = read_msr(r, index);
-        if old != 0 {
-            let _ = SetThreadAffinityMask(cur, old);
-        }
-        v
+        let _ = SetThreadAffinityMask(cur, 1); // 位 0 = 0 号逻辑核
     }
 }
 
@@ -254,9 +263,9 @@ impl MsrPower {
         let r = ring0()?;
         let amd = cpuid_info().amd;
         let pkg_idx = if amd { MSR_AMD_PKG_ENERGY } else { MSR_INTEL_PKG_ENERGY };
-        let pkg = read_msr_pinned(r, pkg_idx)? as u64;
+        let pkg = read_msr(r, pkg_idx)? as u64;
         let dram = if self.dram_ok {
-            read_msr_pinned(r, MSR_INTEL_DRAM_ENERGY).unwrap_or(0) as u64
+            read_msr(r, MSR_INTEL_DRAM_ENERGY).unwrap_or(0) as u64
         } else {
             0
         };
@@ -329,12 +338,12 @@ impl MsrPower {
         let c = cpuid_info();
         let unit_idx = if c.amd { MSR_AMD_UNIT } else { MSR_INTEL_UNIT };
         let r = ring0()?;
-        let u = read_msr_pinned(r, unit_idx)?;
+        let u = read_msr(r, unit_idx)?;
         let n = (u >> 8) & 0x1F;
         self.unit_j = 1.0 / (1u64 << n) as f32;
         // DRAM 域：仅 Intel 探测（AMD 没有可公开读取的 DRAM 能量域）。
         if !c.amd {
-            self.dram_ok = read_msr_pinned(r, MSR_INTEL_DRAM_ENERGY).is_some();
+            self.dram_ok = read_msr(r, MSR_INTEL_DRAM_ENERGY).is_some();
         }
         probe::log(&format!(
             "msr unit msr=0x{unit_idx:x} raw=0x{u:x} n={n} unit_j={:.8} dram_ok={}",

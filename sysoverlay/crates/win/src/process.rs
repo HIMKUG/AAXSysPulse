@@ -18,12 +18,18 @@ use std::ptr;
 pub struct ProcEntry {
     pub pid: u32,
     pub name: String,
-    /// 全核归一后的占用率（0..=100×cores，见字段注释）。
+    /// **占总算力的百分比**（`0..=100`，与 Windows 任务管理器口径一致）。
+    ///
+    /// 单线程满载于 16 核机器 ≈ 6.25；全部核满载 = 100。
+    /// 注意不是「单核归一」的 `0..=100×cores`。
     pub cpu_pct: f32,
     /// 私有内存（字节）。
     pub mem_bytes: u64,
-    /// 功耗分摊（瓦）：整机 CPU 实测功率 × 该进程 CPU 占比（scaphandre 同思路）。
-    pub power_w: f32,
+    /// 功耗分摊（瓦）：整机 CPU 实测功率 × 该进程占总算力比例。
+    ///
+    /// `None` = **整机 CPU 实测不可用**（无管理员权限 / WinRing0 未加载 /
+    /// 首帧尚未建立 MSR 基线），与「实测为 0W」是两回事，UI 必须分别呈现。
+    pub power_w: Option<f32>,
 }
 
 /// 一帧进程快照（按 CPU 降序预排好）。
@@ -48,25 +54,51 @@ const SYSTEM_PROCESS_INFORMATION: u32 = 5;
 /// STATUS_INFO_LENGTH_MISMATCH。
 const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
 
-// ── SYSTEM_PROCESS_INFORMATION 关键字段偏移（文档版布局，Win11 x64 实测） ──
+// ── SYSTEM_PROCESS_INFORMATION 关键字段偏移（MSDN 文档布局，x64） ──
 //
-// 实测（探测到 System pid=4、名称 "System"）确认此系统用 wdm 文档布局：
-//   ImageName(UNICODE_STRING: len@56, buf@64) / pid@80 / WorkingSetSize@136
-//   线程数组 @192，步长 0x50（SYSTEM_THREAD_INFORMATION），
-//   进程级 kernel/user 时间 = Σ(线程的 KernelTime/UserTime)。
+// ⚠️ 2026-09-09 修正：此前 `OFF_THREAD_COUNT=184` / `OFF_THREADS=192` 是**错的**，
+// 实际读到的是 `PagefileUsage` / `PeakPagefileUsage`（见下方字段表 26/27 项），
+// 后果是「线程数」取到页文件用量的低 32 位（多半被 min(1024) 钳到 1024），
+// 线程数组基址指到页文件用量区，Σ(Kernel+User) 读的是垃圾值 →
+// CPU 差分恒为天文数字 → cpu_pct 全部钳到 100% →
+// 进程榜功耗列全部等于整机 CPU 功率（实测 31.0W 全行相同）。
+//
+// x64 字段布局（逐项累加，含对齐填充）：
+//   0   NextEntryOffset(4)      4   NumberOfThreads(4)
+//   8   WorkingSetPrivateSize   16  HardFaultCount(4)   20  ThreadsHighWatermark(4)
+//   24  CycleTime               32  CreateTime          40  UserTime   48 KernelTime
+//   56  ImageName.Length(u16)   58  MaximumLength(u16)  64  Buffer(ptr)
+//   72  BasePriority(4)+pad     80  UniqueProcessId     88  InheritedFromUniqueProcessId
+//   96  HandleCount(4)          100 SessionId(4)        104 UniqueProcessKey
+//   112 PeakVirtualSize         120 VirtualSize         128 PageFaultCount(4)
+//   136 PeakWorkingSetSize      144 WorkingSetSize  ← 当前工作集（此前误读 136 = 峰值）
+//   152 QuotaPeakPagedPoolUsage 160 QuotaPagedPoolUsage
+//   168 QuotaPeakNonPaged       176 QuotaNonPaged
+//   184 PagefileUsage           192 PeakPagefileUsage   200 PrivatePageCount
+//   208 ReadOperationCount      216 WriteOperationCount 224 OtherOperationCount
+//   232 ReadTransferCount       240 WriteTransferCount  248 OtherTransferCount
+//   256 Threads[1] ← SYSTEM_THREAD_INFORMATION 数组起点（0x100，结构体大小固定）
 const OFF_NAME_LEN: usize = 56;
 const OFF_NAME_BUF: usize = 64;
 const OFF_PID: usize = 80;
-const OFF_WS: usize = 136; // 工作集（字节）
-const OFF_THREAD_COUNT: usize = 184;
-const OFF_THREADS: usize = 192;
+const OFF_WS: usize = 144; // 当前工作集（字节）
+const OFF_THREAD_COUNT: usize = 4;
+const OFF_THREADS: usize = 256;
 const THREAD_STRIDE: usize = 0x50;
 const THREAD_KERNEL: usize = 0;
 const THREAD_USER: usize = 8;
+/// 单进程线程数上限（防越界；正常进程远小于此）。
+const MAX_THREADS: usize = 4096;
 
 /// 采样器：维护上一帧的 (pid → 累计 CPU 100ns) 映射算差分。
 pub struct ProcCollector {
+    /// 上一帧 (pid → 累计 CPU 100ns)，用于差分。
     prev: HashMap<u32, u64>,
+    /// 复用的临时映射：每帧清空后填充，再与 `prev` 交换，避免每帧新建 HashMap。
+    scratch: HashMap<u32, u64>,
+    /// 复用的 Nt 查询缓冲：首帧分配 256KiB，之后只在系统进程表增长时扩容，
+    /// 平时零分配（原实现每帧 `vec![0u8; 256KiB]` 重新分配+清零）。
+    buf: Vec<u8>,
     prev_ms: u64,
     cores: u32,
     ok: bool,
@@ -86,6 +118,8 @@ impl ProcCollector {
             .max(1);
         Self {
             prev: HashMap::new(),
+            scratch: HashMap::new(),
+            buf: vec![0u8; 256 * 1024],
             prev_ms: 0,
             cores,
             ok: true,
@@ -103,11 +137,34 @@ impl ProcCollector {
     pub fn sample(&mut self) -> ProcStats {
         let at = Self::now_ms();
         let mut entries = Vec::new();
+        let mut probe_dt_ms: u64 = 0;
         if self.ok {
-            if let Some(rows) = query_all() {
-                let mut cur: HashMap<u32, u64> = HashMap::with_capacity(rows.len());
+            // 复用缓冲拉取原始表（零分配热路径），解析出本帧进程行。
+            let rows = match self.query_raw() {
+                Some(buf) => parse_processes(buf),
+                None => {
+                    self.ok = false; // 接口失败则停用，不再每帧打空转
+                    Vec::new()
+                }
+            };
+            if self.ok {
+                // 首帧自检：偏移量一旦错位，这里立刻暴露（线程数/CPU 时间量级异常）。
+                static CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    crate::probe::log(&format!(
+                        "proc_offset_check (expect: pid=4 System, threads<512, cpu=O(1e9..1e13)): {}",
+                        rows.iter()
+                            .take(3)
+                            .map(|(pid, n, c, ws)| format!(
+                                "[pid={pid} name={n} cpu100ns={c} ws={ws}]"
+                            ))
+                            .collect::<String>()
+                    ));
+                }
                 let dt_ms = at.saturating_sub(self.prev_ms).max(1);
                 let dt_hundreds = dt_ms as f64 * 1e4; // 1ms = 10^4 个 100ns
+                // 复用 scratch 映射：清空后填充，再与 prev 交换，避免每帧新建 HashMap。
+                self.scratch.clear();
                 for (pid, name, cpu_100ns, mem_bytes) in rows {
                     let pct = if let Some(&p) = self.prev.get(&pid) {
                         let d = cpu_100ns.saturating_sub(p) as f64;
@@ -116,16 +173,15 @@ impl ProcCollector {
                     } else {
                         0.0
                     };
-                    cur.insert(pid, cpu_100ns);
+                    self.scratch.insert(pid, cpu_100ns);
                     if pid > 0 && !name.is_empty() {
-                        let pct_clamped = pct.clamp(0.0, 100.0 * self.cores as f32);
-                        // 功耗分摊：整机 CPU 实测功率（跨线程原子共享）× CPU 占比
-                        let power_w = match crate::power_system::cpu_watts_global() {
-                            Some(total_w) => {
-                                sysoverlay_core::power::share_cpu_power(total_w, pct_clamped, self.cores)
-                            }
-                            None => 0.0,
-                        };
+                        // pct 已是「占总算力」口径（0..100），上限就是 100。
+                        let pct_clamped = pct.clamp(0.0, 100.0);
+                        // 功耗分摊：整机 CPU 实测功率（跨线程原子共享）× 占总算力比例。
+                        // 无实测读数时为 None（UI 显示 "--"）——绝不能退化成 0，
+                        // 否则所有进程都显示同一个值，看起来像"分摊失效"。
+                        let power_w = crate::power_system::cpu_watts_global()
+                            .map(|tw| sysoverlay_core::power::share_cpu_power(tw, pct_clamped));
                         entries.push(ProcEntry {
                             pid,
                             name,
@@ -135,48 +191,80 @@ impl ProcCollector {
                         });
                     }
                 }
-                self.prev = cur;
+                std::mem::swap(&mut self.prev, &mut self.scratch);
                 self.prev_ms = at;
-            } else {
-                self.ok = false; // 连续失败则停用，不再每帧打空转
+                probe_dt_ms = dt_ms;
             }
         }
         // 按 CPU 降序（窗口直接取前 N）
         entries.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct));
+        // 功耗分摊探针（排序后取前 6，才有诊断意义）：
+        // 整机 CPU 实测瓦数 + 采样 dt + 核数 + 前几名的占比与分摊瓦数，
+        // 直接回答「为什么每个进程瓦数都一样」。
+        crate::probe::log_lazy(|| {
+            let total_w = crate::power_system::cpu_watts_global();
+            let mut top = String::new();
+            for e in entries.iter().take(6) {
+                top.push_str(&format!(
+                    " {}={:.2}%:{}W",
+                    e.name.trim_end_matches(".exe"),
+                    e.cpu_pct,
+                    e.power_w.map(|w| format!("{w:.2}")).unwrap_or_else(|| "--".into())
+                ));
+            }
+            format!(
+                "proc_power total_cpu_w={:?} dt_ms={} cores={} n={} top:{}",
+                total_w,
+                probe_dt_ms,
+                self.cores,
+                entries.len(),
+                top
+            )
+        });
         ProcStats { entries, at_ms: at }
     }
-}
 
-/// 拉取原始进程表缓冲（含扩容重试）。
-fn query_raw() -> Option<Vec<u8>> {
-    unsafe {
-        let mut size: u32 = 256 * 1024;
-        let mut buf: Vec<u8> = vec![0u8; size as usize];
-        loop {
-            let mut ret: u32 = 0;
-            let st = NtQuerySystemInformation(
-                SYSTEM_PROCESS_INFORMATION,
-                buf.as_mut_ptr() as *mut core::ffi::c_void,
-                size,
-                &mut ret,
-            );
-            if st == 0 {
-                return Some(buf);
+    /// 拉取原始进程表缓冲（复用 `self.buf`，含扩容重试）。
+    ///
+    /// 首帧分配 256KiB，之后只在系统进程表增长（STATUS_INFO_LENGTH_MISMATCH）
+    /// 时才扩容，平时零分配——相比每帧 `vec![0u8; 256KiB]` 省掉一次大块分配与清零。
+    /// 返回的切片借自 `self.buf`，调用方读完后才能再次改 `self`。
+    fn query_raw(&mut self) -> Option<&[u8]> {
+        unsafe {
+            let mut size: u32 = self.buf.len() as u32;
+            if size == 0 {
+                self.buf.resize(256 * 1024, 0);
+                size = self.buf.len() as u32;
             }
-            if st == STATUS_INFO_LENGTH_MISMATCH {
-                let need = (ret.max(1024) as usize).max(size as usize * 2);
-                buf = vec![0u8; need];
-                size = need as u32;
-                continue;
+            loop {
+                let mut ret: u32 = 0;
+                let st = NtQuerySystemInformation(
+                    SYSTEM_PROCESS_INFORMATION,
+                    self.buf.as_mut_ptr() as *mut core::ffi::c_void,
+                    size,
+                    &mut ret,
+                );
+                if st == 0 {
+                    return Some(&self.buf[..size as usize]);
+                }
+                if st == STATUS_INFO_LENGTH_MISMATCH {
+                    let need = (ret.max(1024) as usize).max(size as usize * 2);
+                    self.buf.resize(need, 0);
+                    size = need as u32;
+                    continue;
+                }
+                return None;
             }
-            return None;
         }
     }
 }
 
-/// 解析整张进程表。
+/// 测试/外部入口：用一次性收集器拉全量进程表（复用上面的方法）。
+#[cfg(test)]
 fn query_all() -> Option<Vec<(u32, String, u64, u64)>> {
-    Some(parse_processes(&query_raw()?))
+    let mut c = ProcCollector::new();
+    let buf = c.query_raw()?;
+    Some(parse_processes(buf))
 }
 
 unsafe fn rd_u16(p: *const u8, off: usize) -> u16 {
@@ -217,7 +305,7 @@ fn parse_processes(buf: &[u8]) -> Vec<(u32, String, u64, u64)> {
             let pid = rd_u64(p, OFF_PID) as u32;
             let ws = rd_u64(p, OFF_WS);
             // 进程级 CPU 时间 = Σ 线程（KernelTime+UserTime）
-            let thread_count = (rd_u32(p, OFF_THREAD_COUNT) as usize).min(1024);
+            let thread_count = (rd_u32(p, OFF_THREAD_COUNT) as usize).min(MAX_THREADS);
             let mut cpu_100ns: u64 = 0;
             for t in 0..thread_count {
                 let t_off = OFF_THREADS + t * THREAD_STRIDE;

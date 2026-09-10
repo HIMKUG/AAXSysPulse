@@ -12,7 +12,7 @@
 //!    往 `Config` 里加字段不会悄悄改变布局行为。
 
 use crate::snapshot::{Metric, Snapshot};
-use crate::types::{Shape, VertLayout, Zoom};
+use crate::types::{VertLayout, Zoom};
 
 /// 逻辑尺寸（96 DPI、100% 缩放下的像素）。与 C 版常量一致。
 const CARD_W_L: i32 = 268;
@@ -134,8 +134,6 @@ pub struct LayoutInput {
     pub zoom: Zoom,
     /// 当前 DPI（用于相对 96 DPI 的缩放系数）。
     pub dpi: u32,
-    /// 卡片外形（影响是否预留背景边距）。
-    pub shape: Shape,
     /// 哪些行参与布局。
     pub rows: RowsShown,
 }
@@ -147,7 +145,6 @@ impl Default for LayoutInput {
             vert: VertLayout::SingleRow,
             zoom: Zoom::Zoom100,
             dpi: 96,
-            shape: Shape::Round,
             rows: RowsShown::all(),
         }
     }
@@ -527,19 +524,6 @@ mod tests {
         // CPU 行有
         let cpu = layout.rows.iter().find(|r| r.kind == RowKind::Cpu).unwrap();
         assert!(cpu.track_rect.2 > 0, "CPU 行必须有进度条");
-    }
-
-    #[test]
-    fn shape_does_not_affect_geometry() {
-        // Shape 只影响渲染，不影响布局
-        let base = compute(&input());
-        for shape in [Shape::Round, Shape::Square, Shape::Content] {
-            let mut i = input();
-            i.shape = shape;
-            let l = compute(&i);
-            assert_eq!(l.width, base.width);
-            assert_eq!(l.height, base.height);
-        }
     }
 
     #[test]

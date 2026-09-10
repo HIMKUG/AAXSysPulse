@@ -35,17 +35,20 @@ pub fn watts_from_energy_delta(delta_joules: f64, dt_ms: u64) -> Option<f32> {
     (w >= 0.0 && w <= MAX_CPU_WATTS as f64).then_some(w as f32)
 }
 
-/// 进程级功耗分摊：整机 CPU 实测功率按"该进程 CPU 占用占比"分摊（瓦）。
+/// 进程级功耗分摊：整机 CPU 实测功率按「该进程占总算力比例」分摊（瓦）。
 ///
-/// `cpu_pct` 语义与 [`crate::metrics`] 保持一致：**全核归一**，
-/// 取值范围 `[0, cores*100]`（四分双核满载 = 100×cores）。因此
-/// 单进程占用量 = `cpu_pct / (cores*100)`，分摊功率 = `total_w × 占用量`。
-pub fn share_cpu_power(total_w: f32, cpu_pct: f32, cores: u32) -> f32 {
-    let share = if cores > 0 {
-        (cpu_pct / (cores as f32 * 100.0)).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
+/// `cpu_pct` 是**占总算力的百分比**，取值范围 `[0, 100]` —— 与 Windows
+/// 任务管理器口径一致（单线程满载于 16 核机器 ≈ 6.25，全部核满载 = 100）。
+/// 份额即 `cpu_pct / 100`，分摊功率 = `total_w × 份额`。
+///
+/// # 历史坑
+///
+/// 旧版要求传入「单核归一」的 `[0, cores*100]`，但 `win::process` 实际产出
+/// 的是 `[0, 100]`（已除过 `cores`）。两者混用使分摊结果整体偏小 `cores`
+/// 倍 —— 16 核机器上整整差 16 倍。统一到「占总算力」口径后不再需要
+/// `cores` 参数，调用方也不会再传错。
+pub fn share_cpu_power(total_w: f32, cpu_pct: f32) -> f32 {
+    let share = (cpu_pct / 100.0).clamp(0.0, 1.0);
     (total_w * share).clamp(0.0, MAX_CPU_WATTS)
 }
 
@@ -75,14 +78,17 @@ mod tests {
 
     #[test]
     fn share_cpu_power_division() {
-        // 8 核、整机 100W、某进程占 1 个核满载(cpu_pct=100) → 12.5W
-        let w = share_cpu_power(100.0, 100.0, 8);
+        // 整机 100W、进程占总算力 12.5%（16 核机上约等于占满 2 核）→ 12.5W
+        let w = share_cpu_power(100.0, 12.5);
         assert!((w - 12.5).abs() < 0.01);
-        // 双核各 100 → 单进程 100/200 = 半 → 50W
-        let w = share_cpu_power(100.0, 100.0, 2);
+        // 占总算力一半 → 50W
+        let w = share_cpu_power(100.0, 50.0);
         assert!((w - 50.0).abs() < 0.01);
+        // 全部核满载 → 吃掉整机全部功率
+        let w = share_cpu_power(100.0, 100.0);
+        assert!((w - 100.0).abs() < 0.01);
         // 越界值钳制
-        assert_eq!(share_cpu_power(100.0, 9999.0, 8), 100.0);
-        assert_eq!(share_cpu_power(100.0, -5.0, 8), 0.0);
+        assert_eq!(share_cpu_power(100.0, 9999.0), 100.0);
+        assert_eq!(share_cpu_power(100.0, -5.0), 0.0);
     }
 }

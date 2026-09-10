@@ -39,7 +39,12 @@ pub struct SystemSampler {
     power_interval_ms: u64,
     /// Power 上次采样时间（毫秒 tick）。
     last_power_ms: u64,
+    /// Net 上次采样时间（低频档分频用，v3 性能档）。
+    last_net_ms: u64,
 }
+
+/// Net 低频档采样间隔（ms）：速率按真实 Δt 计算，拉长间隔只影响粒度不失真。
+const NET_LOW_FREQ_MS: u64 = 2000;
 
 impl SystemSampler {
     /// `exclude_virtual` controls whether loopback/Hyper-V/WSL2 nics are counted.
@@ -58,6 +63,7 @@ impl SystemSampler {
             seq: 0,
             power_interval_ms: power_interval_ms.clamp(500, 60_000) as u64,
             last_power_ms: 0,
+            last_net_ms: 0,
         }
     }
 
@@ -95,23 +101,40 @@ impl SystemSampler {
             self.push_diag(SamplerId::Memory, SampleOutcome::Skipped, 0);
         }
 
-        // GPU：厂商模块优先（NVML/ADL/IGCL，用户拍板），失败回退 D3DKMT
+        // GPU：厂商模块优先（NVML/ADL/IGCL，用户拍板），成功时直接用，跳过 D3DKMT（省约 74ms）。
+        // vendor 失败则 D3DKMT 补充（首次或恢复时用一次，后续由 vendor 缓存覆盖）。
         if plan.gpu {
             let t = crate::perf::begin();
             let (v_util, v_watts) = gpu_vendor::sample();
             self.syspower.set_gpu_watts(v_watts);
-            let gpu_out = self.gpu.sample(prev, now_ms, &mut snap);
-            crate::perf::note_section("sample_gpu", t);
+            // vendor 有值：写入快照并缓存，短路 D3DKMT 调用
             if let Some(u) = v_util {
+                gpu_vendor::set_cached_util(u);
                 snap.gpu = Metric::Value(u.clamp(0.0, 100.0));
+                crate::perf::note_section("sample_gpu", t);
+                self.push_diag(SamplerId::Gpu, SampleOutcome::Ok, 0);
+            } else {
+                // vendor 不可用：从缓存恢复；若缓存也无则用 D3DKMT
+                let gpu_out = self.gpu.sample(prev, now_ms, &mut snap);
+                crate::perf::note_section("sample_gpu", t);
+                if let Some(u) = gpu_vendor::cached_util() {
+                    snap.gpu = Metric::Value(u.clamp(0.0, 100.0));
+                }
+                self.push_diag(SamplerId::Gpu, gpu_out, 0);
             }
-            self.push_diag(SamplerId::Gpu, gpu_out, 0);
         } else {
             self.push_diag(SamplerId::Gpu, SampleOutcome::Skipped, 0);
         }
 
-        // Network
-        if plan.net {
+        // Network：低频档（v3 性能档，默认开）独立 2s 分频；
+        // 速率 = Δbytes/Δms（真实间隔），拉长间隔只降粒度不失真。
+        // 内部已改为「拓扑缓存 + GetIfEntry2 增量查询」，每周期仅查缓存的活跃 NIC
+        // （本机实测 5 个，含 Hyper-V 虚拟交换机，<0.5ms），仅首次/全部掉线/10s 安全间隔
+        // 才跑一次 GetIfTable2（~28ms）。
+        let net_due = !crate::window::schedule_net_low()
+            || now_ms.saturating_sub(self.last_net_ms) >= NET_LOW_FREQ_MS;
+        if plan.net && net_due {
+            self.last_net_ms = now_ms;
             let t = crate::perf::begin();
             let net_out = self.net.sample(prev, now_ms, &mut snap);
             crate::perf::note_section("sample_net", t);

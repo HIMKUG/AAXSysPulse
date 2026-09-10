@@ -41,6 +41,8 @@ pub struct SystemPower {
     disks: usize,
     /// 最近一轮 GPU 功耗（厂商模块读数）。
     gpu_watts: Option<f32>,
+    /// GPU 功耗 EMA 平滑值（与 CPU 实测的窗口平均语义对齐，避免瞬时跳动）。
+    gpu_watts_ema: Option<f32>,
     /// 最近一轮 CPU 实测功率（供进程分摊）。
     last_cpu_w: Option<f32>,
 }
@@ -58,6 +60,7 @@ impl SystemPower {
             ram_est_w: ram_sticks as f32 * EST_RAM_W_PER_STICK,
             disks,
             gpu_watts: None,
+            gpu_watts_ema: None,
             last_cpu_w: None,
         };
         probe::log(&format!(
@@ -81,13 +84,25 @@ impl SystemPower {
     pub fn sample(&mut self, now_ms: u64) -> Option<f32> {
         let cpu = self.msr.sample(now_ms)?;
         self.last_cpu_w = Some(cpu);
-        // 惰性 DRAM 去重：首帧成功读 MSR 后才知道 DRAM 域是否可用。
-        // 可用 → 内存功耗已被 PKG+DRAM 实测覆盖，撤掉条数估算，避免双计。
-        if self.ram_est_w > 0.0 && self.msr.dram_available() {
-            self.ram_est_w = 0.0;
-            probe::log("syspower dram domain active -> ram_est_w zeroed (dedup)");
-        }
-        let gpu = self.gpu_watts.unwrap_or(0.0);
+        // 每帧重新评估内存估算（撤掉「一次性锁存」）：
+        // DRAM 域可用 → 内存功耗已被 PKG+DRAM 实测覆盖，撤掉条数估算避免双计；
+        // DRAM 域不可用（驱动未就绪 / MSR 读取失败 / 驱动重新加载）→ 回落条数估算，
+        // 保证内存功耗在实测缺失时仍不为零，且驱动恢复后不会永久漏算。
+        self.ram_est_w = if self.msr.dram_available() {
+            0.0
+        } else {
+            self.ram_sticks as f32 * EST_RAM_W_PER_STICK
+        };
+        // GPU 功耗与 CPU 实测的"窗口平均"语义对齐：厂商模块若返回瞬时读数，
+        // 用 EMA 平滑避免整机功耗随帧跳动（无读数时回落 0，并重置平滑器）。
+        let gpu = if let Some(w) = self.gpu_watts {
+            let ema = self.gpu_watts_ema.map(|p| p * 0.6 + w * 0.4).unwrap_or(w);
+            self.gpu_watts_ema = Some(ema);
+            ema
+        } else {
+            self.gpu_watts_ema = None;
+            0.0
+        };
         let total = cpu
             + gpu
             + self.ram_est_w

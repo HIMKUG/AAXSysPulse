@@ -258,12 +258,23 @@ fn main() {
     // ── 4c. Spawn scheduler-driven sampling thread ────────────────────────
     // 分频调度：GPU/Net 不快于 1s（计数器本身 1s 才更新），
     // Auto 档刷新上限 = 启用源的最大有效间隔，成本超标自动降档。
+    // 事件驱动 NIC 重枚举：注册一次网卡变更通知（取代 10s 轮询 GetIfTable2）。
+    sysoverlay_win::proc_net::init_net_notify();
     let cfg_for_thread = cfg.clone();
     let shared_seq = get_shared_seq();
     // HWND 不是 Send：跨线程只传裸地址，线程内重建
     let hwnd_addr = window.hwnd().0 as isize;
     let _sampling_thread = thread::spawn(move || {
         sysoverlay_win::probe::log_startup();
+        // P0-1：采样线程一次性绑到 0 号逻辑核，MSR 读数语义一致且零强制迁移。
+        sysoverlay_win::msr::pin_sampling_thread();
+        // P1-16：采样线程降优先级，后台采集不与前台交互抢 CPU。
+        unsafe {
+            use windows::Win32::System::Threading::{
+                GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+            };
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        }
         let exclude_virtual = cfg_for_thread.exclude_virtual_nic;
         let power_interval = cfg_for_thread.power_interval_ms;
         let mut sampler = SystemSampler::new(exclude_virtual, power_interval);
@@ -277,9 +288,12 @@ fn main() {
             unsafe {
                 use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
                 while !IsWindowVisible(overlay_hwnd).as_bool() {
-                    thread::sleep(Duration::from_secs(1));
-                    // 等待显示时用 resume 通知唤醒（系统唤醒/重新显示时发信号）
-                    let _ = resume_rx.recv_timeout(Duration::from_secs(5));
+                    // E1：事件驱动——挂起等待 resume 信号（托盘显示 / 系统唤醒），
+                    // 不再每 1s 轮询一次可见性。显示时 window 线程会发 resume。
+                    if resume_rx.recv().is_err() {
+                        // 通道已断开（应处在退出路径）：短暂让出后重查，避免忙等
+                        thread::sleep(Duration::from_millis(200));
+                    }
                 }
             }
 
@@ -295,45 +309,54 @@ fn main() {
             let now_ms = get_tick_count_ms();
             let plan = sched.plan(now_ms, &enabled);
 
-            let t0 = get_tick_count_ms();
             let power_on = schedule_power();
             let snap = sampler.sample(&plan, last.as_ref(), now_ms, power_on);
-            let cost_ms = (get_tick_count_ms() - t0) as u32;
+            // D4：每周期只取两次 tick（now / after），cost 与 wake/sleep 全部复用，
+            // 不再调 4~5 次 GetTickCount64。
+            let after_ms = get_tick_count_ms();
+            let cost_ms = after_ms.saturating_sub(now_ms) as u32;
             sched.record_cycle(cost_ms, &enabled);
 
             shared_seq.store(snap.seq, std::sync::atomic::Ordering::Relaxed);
             snap_store(snap.clone());
-            // 曲线窗口数据源：每轮追加 CPU/内存/网络时序点（ArcSwap 无锁）
+            // 曲线窗口数据源：每轮追加 CPU/内存/网络时序点（ArcSwap 无锁，窗口未开时内部跳过）
             sysoverlay_win::history::push(&snap);
+            // D5：只有「会显示到屏幕」的内容真的变了才唤醒 UI 线程；
+            // 指标静止时省掉一次消息循环唤醒（hover/动画/DPI/主题重绘由窗口线程自行投递）。
+            let content_changed = last.as_ref().map_or(true, |p| displayed_changed(&snap, p));
             last = Some(snap);
 
-            // 推送式渲染：UI 线程阻塞在 GetMessageW，收到才画
-            unsafe {
-                use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
-                use windows::Win32::Foundation::{LPARAM, WPARAM};
-                let _ = PostMessageW(
-                    overlay_hwnd,
-                    WM_NEW_SNAPSHOT,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
+            if content_changed {
+                unsafe {
+                    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+                    use windows::Win32::Foundation::{LPARAM, WPARAM};
+                    let _ = PostMessageW(
+                        overlay_hwnd,
+                        WM_NEW_SNAPSHOT,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
             }
 
             // 睡到最近的到期源，而不是固定间隔——分频调度的节能关键
-            let wake = sched.next_wake_ms(get_tick_count_ms(), &enabled);
-            let sleep_ms = wake.saturating_sub(get_tick_count_ms()).max(1).min(5000);
+            let wake = sched.next_wake_ms(after_ms, &enabled);
+            let sleep_ms = wake.saturating_sub(after_ms).max(1).min(5000);
             // 采样循环探针：记录每轮采样耗时与休眠时长（sched 忙等/采样超支一眼可见）
-            sysoverlay_win::probe::log(&format!(
-                "cycle cost_ms={} sleep_ms={} penalty={} auto={} plan={}{}{}{}",
-                cost_ms,
-                sleep_ms,
-                sched.penalty(),
-                auto as u8,
-                plan.cpu as u8,
-                plan.mem as u8,
-                plan.gpu as u8,
-                plan.net as u8,
-            ));
+            // P1-15：探针关闭时零成本——`log_lazy` 先判 enabled 再格式化。
+            sysoverlay_win::probe::log_lazy(|| {
+                format!(
+                    "cycle cost_ms={} sleep_ms={} penalty={} auto={} plan={}{}{}{}",
+                    cost_ms,
+                    sleep_ms,
+                    sched.penalty(),
+                    auto as u8,
+                    plan.cpu as u8,
+                    plan.mem as u8,
+                    plan.gpu as u8,
+                    plan.net as u8,
+                )
+            });
             sysoverlay_win::perf::note_cycle(cost_ms, sleep_ms);
             thread::sleep(Duration::from_millis(sleep_ms));
         }
@@ -347,6 +370,20 @@ fn main() {
     if !config_io::save_config(&final_cfg) {
         eprintln!("[SysOverlay] Warning: failed to save config on exit");
     }
+}
+
+/// 比较两个快照中「会显示到屏幕」的字段是否一致（D5 用）。
+///
+/// 注意：`seq`/`timestamp_ms`/`uptime_ms` 每轮都变，不能纳入比较——
+/// 否则静止指标也会被误判为「有变化」，D5 就失效了。
+fn displayed_changed(a: &sysoverlay_win::Snapshot, b: &sysoverlay_win::Snapshot) -> bool {
+    a.cpu != b.cpu
+        || a.gpu != b.gpu
+        || a.power != b.power
+        || a.memory.load_pct != b.memory.load_pct
+        || a.memory.used_gb != b.memory.used_gb
+        || a.net.rx_bps != b.net.rx_bps
+        || a.net.tx_bps != b.net.tx_bps
 }
 
 /// Returns the current tick count in milliseconds since system boot.

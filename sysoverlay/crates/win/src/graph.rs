@@ -5,7 +5,7 @@
 //! - 固定：置顶且不可拖动；最小化：隐藏并停用定时器；关闭：销毁（单例不留驻）
 //! - 数据来自采样线程维护的 [`crate::history`]（ArcSwap 无锁）
 
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -17,10 +17,12 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW, IsWindow,
-    KillTimer, LoadCursorW, RegisterClassExW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    IDC_ARROW, SW_HIDE, SW_SHOW, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, WINDOW_LONG_PTR_INDEX, WINDOW_EX_STYLE, WNDCLASSEXW, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
+    GetWindowLongPtrW, GetMessageW, IsWindow, KillTimer, LoadCursorW, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TranslateMessage, IDC_ARROW, MSG, SW_HIDE, SW_SHOW, HWND_NOTOPMOST, HWND_TOPMOST,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WINDOW_LONG_PTR_INDEX, WINDOW_EX_STYLE, WNDCLASSEXW,
+    WM_APP, WS_POPUP,
 };
 
 use crate::dpi;
@@ -52,8 +54,17 @@ const HTCLIENT: isize = 1;
 const HTTRANSPARENT: isize = -1;
 const GWLP_UD: i32 = -21;
 const TIMER_ID: usize = 1;
+/// 恢复显示 + 重挂定时器（最小化后再次 open）：交给窗口所属曲线线程处理，
+/// 不在调用线程跨线程直接 SetTimer/ShowWindow。
+const WM_APP_RESTORE: u32 = WM_APP + 1;
 
 static GRAPH_HWND: AtomicIsize = AtomicIsize::new(-1);
+/// 曲线窗口线程存活标志（含创建中）：防重复 spawn；线程退出时复位。
+static GRAPH_THREAD_ALIVE: AtomicBool = AtomicBool::new(false);
+/// 上次绘制的时序序号：定时器脏检查用（无变化不重绘）。
+static LAST_PAINT_SEQ: AtomicU64 = AtomicU64::new(0);
+/// 定时器连续跳过次数：每 5 拍强制重绘一次，保证主题/DPI 等非数据变化最终可见。
+static PAINT_SKIP_TICKS: AtomicU32 = AtomicU32::new(0);
 
 struct Ctx {
     tb: titlebar::TitleBarState,
@@ -72,22 +83,65 @@ pub fn open() {
         let hwnd = HWND(existing as *mut _);
         unsafe {
             if IsWindow(hwnd).as_bool() {
-                let _ = SetTimer(hwnd, TIMER_ID as usize, 1000, None);
-                let _ = ShowWindow(hwnd, SW_SHOW);
+                // 窗口由曲线线程创建与轮询：恢复动作经消息交给所属线程，
+                // 避免从 UI 线程跨线程直接操作。
+                let _ = PostMessageW(hwnd, WM_APP_RESTORE, WPARAM(0), LPARAM(0));
+                crate::history::set_graph_active(true);
             } else {
                 GRAPH_HWND.store(-1, Ordering::SeqCst);
+                spawn_thread();
             }
         }
         return;
     }
-    create();
+    spawn_thread();
 }
 
-fn create() {
+/// 在独立线程上创建曲线窗口并跑自己的消息泵（多核方案 #1）：
+/// 1s 定时重绘 + GDI 绘制全部发生在曲线线程，悬浮条 UI 线程不再被周期唤醒。
+/// 窗口销毁（WM_DESTROY→PostQuitMessage）后线程自然退出并复位 `GRAPH_THREAD_ALIVE`。
+fn spawn_thread() {
+    if GRAPH_THREAD_ALIVE.swap(true, Ordering::SeqCst) {
+        return; // 已有曲线线程（运行中或正在退出），下次 open 再试
+    }
+    if std::thread::Builder::new()
+        .name("sysoverlay-graph".into())
+        .spawn(graph_thread_main)
+        .is_err()
+    {
+        GRAPH_THREAD_ALIVE.store(false, Ordering::SeqCst);
+    }
+}
+
+fn graph_thread_main() {
+    if !create() {
+        GRAPH_THREAD_ALIVE.store(false, Ordering::SeqCst);
+        return;
+    }
+    unsafe {
+        let mut msg = MSG::default();
+        loop {
+            // GetMessageW 返回 0 = WM_QUIT，-1 = 错误——两者都结束曲线线程
+            let r = GetMessageW(&mut msg, None, 0, 0);
+            if r.0 <= 0 {
+                break;
+            }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    GRAPH_THREAD_ALIVE.store(false, Ordering::SeqCst);
+}
+
+/// 在**当前线程**（曲线线程）上创建窗口；成功返回 true。
+/// 修复原实现竞态：两个快速 open() 都看到 GRAPH_HWND==-1 会建出两个窗口，
+/// 第二个覆盖句柄、第一个成孤儿（其 WM_DESTROY 还会错误清掉有效句柄）。
+/// 现由 `spawn_thread` 的 `GRAPH_THREAD_ALIVE` CAS 保证进程内单窗口单线程。
+fn create() -> bool {
     unsafe {
         let hinst = match GetModuleHandleW(None) {
             Ok(h) => h,
-            Err(_) => return,
+            Err(_) => return false,
         };
         static REGISTERED: std::sync::Once = std::sync::Once::new();
         REGISTERED.call_once(|| {
@@ -118,7 +172,7 @@ fn create() {
             hinst,
             None,
         );
-        let Ok(hwnd) = hwnd else { return };
+        let Ok(hwnd) = hwnd else { return false };
         let ctx = Box::new(Ctx {
             tb: titlebar::TitleBarState::default(),
             font: titlebar::title_font(d),
@@ -128,6 +182,8 @@ fn create() {
         GRAPH_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
         let _ = SetTimer(hwnd, TIMER_ID, 1000, None);
         let _ = ShowWindow(hwnd, SW_SHOW);
+        crate::history::set_graph_active(true);
+        true
     }
 }
 
@@ -148,7 +204,22 @@ unsafe extern "system" fn graph_wndproc(
 ) -> LRESULT {
     match msg {
         WM_TIMER => {
-            let _ = InvalidateRect(hwnd, None, false);
+            // 脏检查：时序序号未变就跳过重绘（曲线线程独享此判断，跳过近乎零成本）。
+            // 每 5 拍强制一次，保证主题/DPI 等非数据变化最终可见。
+            let seq = history::peek_seq();
+            let last = LAST_PAINT_SEQ.load(Ordering::SeqCst);
+            let skips = PAINT_SKIP_TICKS.load(Ordering::SeqCst);
+            if seq != last || skips >= 4 {
+                PAINT_SKIP_TICKS.store(0, Ordering::SeqCst);
+                let _ = InvalidateRect(hwnd, None, false);
+            } else {
+                PAINT_SKIP_TICKS.store(skips + 1, Ordering::SeqCst);
+            }
+            LRESULT(0)
+        }
+        WM_APP_RESTORE => {
+            let _ = SetTimer(hwnd, TIMER_ID, 1000, None);
+            let _ = ShowWindow(hwnd, SW_SHOW);
             LRESULT(0)
         }
         WM_PAINT => {
@@ -295,6 +366,9 @@ unsafe extern "system" fn graph_wndproc(
                 let _ = SetWindowLongPtrW(hwnd, WINDOW_LONG_PTR_INDEX(GWLP_UD), 0);
             }
             GRAPH_HWND.store(-1, Ordering::SeqCst);
+            crate::history::set_graph_active(false);
+            // 曲线线程自己的消息泵靠 WM_QUIT 收尾（窗口已在本线程销毁完毕）
+            PostQuitMessage(0);
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -323,11 +397,10 @@ unsafe fn paint(hwnd: HWND) {
     let _ = FillRect(hdc, &rc, bg);
     let _ = DeleteObject(bg);
 
-    // 自绘标题栏
-    let font = ctx_of(hwnd).map(|c| c.font).unwrap_or_default();
-    let (tb_title, tb_state) = match ctx_of(hwnd) {
-        Some(c) => (Some("SysOverlay - Trends"), &c.tb),
-        None => (None, &titlebar::TitleBarState::default()),
+    // 自绘标题栏（单次借用 ctx：原实现两次 ctx_of 会同时产生两个 &mut 别名）
+    let (font, tb_title, tb_state) = match ctx_of(hwnd) {
+        Some(c) => (c.font, Some("SysOverlay - Trends") as Option<&'static str>, &c.tb),
+        None => (HFONT::default(), None, &titlebar::TitleBarState::default()),
     };
     titlebar::draw(hdc, &theme, d, w, tb_title, tb_state, font);
 
@@ -341,7 +414,9 @@ unsafe fn paint(hwnd: HWND) {
     let net: Vec<f32> = (0..cpu.len())
         .map(|i| rx.get(i).copied().unwrap_or(0.0) + tx.get(i).copied().unwrap_or(0.0))
         .collect();
-    let net_max = rx.iter().chain(tx.iter()).copied().fold(0.0f32, f32::max).max(1.0);
+    // 缩放基准用**合成后**的 rx+tx 序列：旧实现取 max(rx,tx)，上下行同时大时
+    // 合成值 > 基准被钳到 1.0，曲线顶格失真（bug 修复）
+    let net_max = net.iter().copied().fold(0.0f32, f32::max).max(1.0);
 
     let lanes = [
         ("CPU %", cpu.as_slice(), 100.0, theme.accent),
@@ -380,6 +455,8 @@ unsafe fn paint(hwnd: HWND) {
         draw_curve(hdc, s(d, PAD), cy, w - 2 * s(d, PAD), ch, data, *scale, *color);
     }
 
+    // 记录本次绘制覆盖到的时序序号，供 WM_TIMER 脏检查
+    LAST_PAINT_SEQ.store(tr.seq, Ordering::SeqCst);
     let _ = EndPaint(hwnd, &ps);
 }
 

@@ -28,7 +28,7 @@
 
 // 枚举与颜色的唯一真源在 `core::types` / `core::color`，此处重导出保持 API 稳定。
 pub use crate::color::Rgb;
-pub use crate::types::{Lang, Metric, MetricColors, NetUnit, PowerDisplay, RenderMode, RenderStyle, Shape, VertLayout, Zoom};
+pub use crate::types::{Lang, Metric, MetricColors, NetMode, NetUnit, PowerDisplay, RenderEngine, RenderMode, RenderStyle, VertLayout, Zoom};
 
 /// 配置文件格式版本。用于将来格式变更时的迁移锚点。
 pub const CONFIG_VERSION: u32 = 2;
@@ -48,7 +48,8 @@ pub struct Config {
     pub zoom: Zoom,
     pub hover: bool,
     pub net_unit: NetUnit,
-    pub shape: Shape,
+    /// 网络栏显示模式：双向/仅下载/仅上传（Rust 新增，默认双向）。
+    pub net_mode: NetMode,
     pub vert: VertLayout,
     pub bg: Rgb,
     pub fg: Rgb,
@@ -62,7 +63,16 @@ pub struct Config {
     pub topmost: bool,
     pub window_pos: Option<(i32, i32)>,
     /// Saved window size (w, h). None means use default CARD_W × CARD_H.
+    ///
+    /// ⚠️ 语义 = 「上次的窗口几何」（恢复用），**不等于**"锁定尺寸"。
+    /// 此前 `fit_window` 直接拿它当锁 —— C 版 `size` 键每次启动都会解析进
+    /// 来，导致任何一次重启后窗口尺寸被永久钉死：切竖版布局塞在 52px 高的
+    /// 横条窗口里（「竖版完全不生效」的根因之一），字号/间距改动也被裁切。
+    /// 真正的锁定语义由 [`Config::size_locked`] 承担，`fit_window` 只认它。
     pub window_size: Option<(i32, i32)>,
+    /// 尺寸锁定（设置页 LockSize 开关）：true 时 `fit_window` 沿用
+    /// `window_size`，false 时始终按内容自然尺寸自适应。C 版无此键（= false）。
+    pub size_locked: bool,
 
     // ── v3 横向条 ────────────────────────────────────────────
     /// 监控项开关（设置里可独立控制，至少保留一项由 UI 层保证）。
@@ -77,6 +87,12 @@ pub struct Config {
     /// 逐指标字号覆盖（None = 跟随全局 `font_size`）。
     /// 索引与 [`Metric`] 顺序一致：CPU/MEM/GPU/Net/Power。
     pub metric_font_sizes: [Option<f32>; 5],
+    /// 字重档位（0=细 / 1=中 / 2=粗，默认 2=粗）。
+    ///
+    /// 位图字体只有一套字形，三档以**笔画覆盖率**区分（alpha 调制：
+    /// 细 ≈ 45%、中 ≈ 70%、粗 = 100%）。高画质模式同样作用于 DWrite
+    /// 文字颜色 alpha，保证两引擎观感一致。
+    pub font_weight: u8,
     /// 指标与指标之间的间距（px，0..=64）。横版 = 水平空隙，竖版 = 上下空隙。
     pub metric_gap: u32,
     /// 每个指标「名称 ↔ 数值」之间的间距（px，0..=64）。
@@ -117,6 +133,23 @@ pub struct Config {
     /// 全屏游戏自动隐藏悬浮窗（根治 AFMF 合成层破坏）。
     /// 检测到全屏应用时隐藏，退出全屏自动恢复。默认开。
     pub afmf_auto_hide: bool,
+
+    // ── v3 性能档（默认全部最佳性能） ─────────────────────────
+    /// GPU 只查主适配器（节点数最大的 dGPU），跳过其余虚拟/副卡适配器。
+    /// 默认开（最佳性能）；关闭 = 跨全部适配器取 max（与任务管理器全卡口径一致）。
+    pub gpu_primary_only: bool,
+    /// GPU 只查 3D 引擎（节点 0），不再逐引擎取 max。
+    /// 默认开（最佳性能，与主适配器叠加时每周期仅 1 次内核查询）。
+    pub gpu_3d_only: bool,
+    /// 网络低频采样：与 Power 同机制独立分频（2s），速率按真实 Δt 计算、不失真。
+    /// 默认开（最佳性能）；关闭 = 跟随调度计划（~1s 档）。
+    pub net_low_freq: bool,
+
+    // ── 悬浮窗渲染引擎（性能 / 高画质） ──────────────────────
+    /// 悬浮窗渲染后端：Gdi = 现有像素块软件光栅（默认，最高效）；
+    /// D2d = 整帧 Direct2D + DirectWrite（高质量字体 / 圆角抗锯齿 / 半透明渐变）。
+    /// 设置页「窗口」页可切换，默认 Gdi 以保持升级后行为逐帧一致。
+    pub render_engine: RenderEngine,
 }
 
 impl Default for Config {
@@ -127,7 +160,7 @@ impl Default for Config {
             zoom: Zoom::Zoom100,
             hover: false,
             net_unit: NetUnit::MB,
-            shape: Shape::Round,
+            net_mode: NetMode::Both,
             vert: VertLayout::SingleRow,
             bg: Rgb::default(),
             fg: Rgb::new(238, 241, 244),
@@ -137,6 +170,7 @@ impl Default for Config {
             topmost: true,
             window_pos: None,
             window_size: None,
+            size_locked: false,
             show_cpu: true,
             show_mem: true,
             show_gpu: true,
@@ -145,6 +179,7 @@ impl Default for Config {
             // 32px ≈ 旧默认 font_scale 2（16px 基准 ×2）
             font_size: 32.0,
             metric_font_sizes: [None; 5],
+            font_weight: 2,
             metric_gap: 8,
             label_value_gap: 6,
             hover_opacity: 90,
@@ -163,6 +198,10 @@ impl Default for Config {
             render_style: RenderStyle::Strip,
             lang: Lang::En,
             afmf_auto_hide: true,
+            gpu_primary_only: true,
+            gpu_3d_only: true,
+            net_low_freq: true,
+            render_engine: RenderEngine::Gdi,
         }
     }
 }
@@ -217,7 +256,10 @@ impl Config {
                     let mut it = value.split_whitespace();
                     if let (Some(w), Some(h)) = (it.next(), it.next()) {
                         if let (Ok(w), Ok(h)) = (w.parse::<i32>(), h.parse::<i32>()) {
-                            if w >= 100 && h >= 60 {
+                            // ⚠️ 上限钳制：异常大尺寸（如历史摇杆无上限推出来的 65535）
+                            // 会让 render 每帧分配数百 MB DIB → D2D bind 失败 → 卡死。
+                            // 悬浮窗合理上限 2048px（>4K 屏宽度），多出即视为坏配置丢弃。
+                            if w >= 100 && h >= 60 && w <= 2048 && h <= 2048 {
                                 cfg.window_size = Some((w, h));
                             }
                         }
@@ -238,6 +280,12 @@ impl Config {
                 "font_scale" => {
                     if let Ok(v) = value.parse::<u32>() {
                         cfg.font_size = ((v.clamp(1, 4) as f32) * 16.0).clamp(8.0, 40.0);
+                    }
+                }
+                // 字重档位：0=细 / 1=中 / 2=粗（缺省 2=粗 = 位图字体原样）
+                "font_weight" => {
+                    if let Ok(v) = value.parse::<u32>() {
+                        cfg.font_weight = v.clamp(0, 2) as u8;
                     }
                 }
                 "metric_gap" | "mgap" => {
@@ -294,6 +342,8 @@ impl Config {
                 "outline" => cfg.text_outline = Self::parse_bool(value, cfg.text_outline),
                 "autostart" => cfg.autostart = Self::parse_bool(value, cfg.autostart),
                 "topmost" => cfg.topmost = Self::parse_bool(value, cfg.topmost),
+                // Rust 专属：尺寸锁定（C 版无此键，缺省 false = 自然自适应）。
+                "size_locked" => cfg.size_locked = Self::parse_bool(value, cfg.size_locked),
                 // C 版 interval 是 100ms 单位 → 换算为 ms 并吸附到允许档位。
                 "interval" => {
                     if let Ok(v) = value.parse::<u32>() {
@@ -318,10 +368,14 @@ impl Config {
                         cfg.net_unit = u;
                     }
                 }
-                "shape" => {
-                    if let Some(s) = Shape::from_config(value) {
-                        cfg.shape = s;
+                // Rust 专属：网络栏显示模式（0=双向 1=下载 2=上传）。
+                "net_mode" => {
+                    if let Some(m) = NetMode::from_config(value) {
+                        cfg.net_mode = m;
                     }
+                }
+                "shape" => {
+                    // 旧版遗留键：外形(currently dead code)已移除，忽略以免破坏旧配置。
                 }
                 "vert" => {
                     if let Some(v) = VertLayout::from_config(value) {
@@ -367,6 +421,11 @@ impl Config {
                         cfg.render_style = s;
                     }
                 }
+                "render_engine" => {
+                    if let Some(s) = RenderEngine::from_config(value) {
+                        cfg.render_engine = s;
+                    }
+                }
                 "lang" | "language" => {
                     if let Some(l) = Lang::from_config(value) {
                         cfg.lang = l;
@@ -374,6 +433,15 @@ impl Config {
                 }
                 "afmf_auto_hide" | "fullscreen_hide" => {
                     cfg.afmf_auto_hide = Self::parse_bool(value, cfg.afmf_auto_hide);
+                }
+                "gpu_primary_only" => {
+                    cfg.gpu_primary_only = Self::parse_bool(value, cfg.gpu_primary_only);
+                }
+                "gpu_3d_only" => {
+                    cfg.gpu_3d_only = Self::parse_bool(value, cfg.gpu_3d_only);
+                }
+                "net_low_freq" => {
+                    cfg.net_low_freq = Self::parse_bool(value, cfg.net_low_freq);
                 }
                 // 未知键静默忽略：C 版或更新版本的配置文件都能安全加载。
                 _ => {}
@@ -398,6 +466,8 @@ impl Config {
         if let Some((w, h)) = self.window_size {
             s.push_str(&format!("size {} {}\n", w, h));
         }
+        // Rust 专属键：尺寸锁定。`size` 只是几何恢复，不再承担锁定语义。
+        s.push_str(&format!("size_locked {}\n", self.size_locked as u32));
         // v3 横向条
         s.push_str(&format!("show_cpu {}\n", self.show_cpu as u32));
         s.push_str(&format!("show_mem {}\n", self.show_mem as u32));
@@ -405,6 +475,8 @@ impl Config {
         s.push_str(&format!("show_net {}\n", self.show_net as u32));
         s.push_str(&format!("mem_gb {}\n", self.mem_show_gb as u32));
         s.push_str(&format!("font_size {:.1}\n", self.font_size));
+        // Rust 专属键：字重档位（0=细 / 1=中 / 2=粗）。C 版忽略未知键。
+        s.push_str(&format!("font_weight {}\n", self.font_weight));
         s.push_str(&format!("metric_gap {}\n", self.metric_gap));
         s.push_str(&format!("label_value_gap {}\n", self.label_value_gap));
         s.push_str(&format!("shadow {}\n", self.text_shadow as u32));
@@ -422,8 +494,9 @@ impl Config {
         s.push_str(&format!("zoom {}\n", self.zoom.to_config()));
         s.push_str(&format!("hover {}\n", self.hover as u32));
         s.push_str(&format!("netunit {}\n", self.net_unit.to_config()));
-        s.push_str(&format!("shape {}\n", self.shape.to_config()));
+        s.push_str(&format!("net_mode {}\n", self.net_mode.to_config()));
         s.push_str(&format!("vert {}\n", self.vert.to_config()));
+        s.push_str(&format!("render_engine {}\n", self.render_engine.to_config()));
         s.push_str(&format!("bg {:06X}\n", self.bg.to_colorref()));
         s.push_str(&format!("fg {:06X}\n", self.fg.to_colorref()));
         // v2 新增字段（C 版忽略，不影响降级回 C 版）
@@ -439,6 +512,10 @@ impl Config {
         s.push_str(&format!("render_style {}\n", self.render_style.to_config()));
         s.push_str(&format!("lang {}\n", self.lang.to_config()));
         s.push_str(&format!("afmf_auto_hide {}\n", self.afmf_auto_hide as u32));
+        // v3 性能档开关（C 版忽略）
+        s.push_str(&format!("gpu_primary_only {}\n", self.gpu_primary_only as u32));
+        s.push_str(&format!("gpu_3d_only {}\n", self.gpu_3d_only as u32));
+        s.push_str(&format!("net_low_freq {}\n", self.net_low_freq as u32));
         // 逐项配色：只有非跟随全局的色槽才落盘
         for (i, metric) in Metric::ALL.iter().enumerate() {
             let mc = &self.metric_colors[i];
@@ -618,7 +695,6 @@ fg F4F1EE
         assert_eq!(cfg.zoom, Zoom::Zoom100);
         assert!(!cfg.hover);
         assert_eq!(cfg.net_unit, NetUnit::MB, "C 版 netunit 1 = MB/s");
-        assert_eq!(cfg.shape, Shape::Round, "C 版 shape 0 = 圆角");
         assert_eq!(cfg.vert, VertLayout::SingleCol, "C 版 vert 1 = 单列");
         // COLORREF(BBGGRR)：0x1B1614 → R=0x14=20, G=0x16=22, B=0x1B=27
         assert_eq!(cfg.bg, Rgb::new(20, 22, 27), "bg 必须按 COLORREF 解析，不能 R/B 互换");
@@ -633,7 +709,6 @@ fg F4F1EE
         // 空格分隔、数值枚举、COLORREF、100ms 间隔
         assert!(s.contains("topmost 1\n"), "必须是空格分隔，实际:\n{}", s);
         assert!(s.contains("interval 10\n"), "interval 必须是 100ms 单位");
-        assert!(s.contains("shape 0\n"), "shape 必须是数值");
         assert!(s.contains("vert 0\n"), "vert 必须是数值");
         assert!(s.contains("netunit 1\n"), "netunit 必须是数值");
         assert!(s.contains("bg 1B1614\n"), "bg 必须是 COLORREF(BBGGRR)");
@@ -658,7 +733,6 @@ fg F4F1EE
         cfg.zoom = Zoom::Zoom150;
         cfg.hover = true;
         cfg.net_unit = NetUnit::GB;
-        cfg.shape = Shape::Content;
         cfg.vert = VertLayout::SplitCol;
         cfg.bg = Rgb::new(0x1A, 0x2B, 0x3C);
         cfg.fg = Rgb::new(0xF0, 0xF1, 0xF2);
@@ -669,6 +743,9 @@ fg F4F1EE
         cfg.power_interval_ms = 5000;
         cfg.exclude_virtual_nic = false;
         cfg.render_style = RenderStyle::Vertical;
+        cfg.render_engine = RenderEngine::D2d;
+        cfg.net_mode = NetMode::Down;
+        cfg.size_locked = true;
         cfg.metric_colors[0] = MetricColors {
             label: Some(Rgb::new(0x12, 0x34, 0x56)),
             value: None,
@@ -684,18 +761,32 @@ fg F4F1EE
     }
 
     #[test]
-    fn test_roundtrip_all_zoom_and_shapes() {
+    fn test_render_engine_roundtrip_and_default() {
+        // 默认 Gdi（性能模式，升级后行为逐帧一致）
+        assert_eq!(Config::default().render_engine, RenderEngine::Gdi);
+        // 数值与字符串都读得动
+        assert_eq!(Config::parse("render_engine 1\n").render_engine, RenderEngine::D2d);
+        assert_eq!(Config::parse("render_engine quality\n").render_engine, RenderEngine::D2d);
+        assert_eq!(Config::parse("render_engine 0\n").render_engine, RenderEngine::Gdi);
+        // 序列化写数值（C 版兼容）
+        let mut cfg = Config::default();
+        cfg.render_engine = RenderEngine::D2d;
+        assert!(cfg.serialize().contains("render_engine 1\n"));
+        // 往返
+        let parsed = Config::parse(&cfg.serialize());
+        assert_eq!(parsed.render_engine, RenderEngine::D2d);
+    }
+
+    #[test]
+    fn test_roundtrip_all_zoom() {
         for zoom in Zoom::ALL {
-            for shape in [Shape::Round, Shape::Square, Shape::Content] {
-                for vert in [VertLayout::SingleRow, VertLayout::SingleCol, VertLayout::SplitCol] {
-                    for unit in [NetUnit::KB, NetUnit::MB, NetUnit::GB] {
-                        let mut cfg = Config::default();
-                        cfg.zoom = zoom;
-                        cfg.shape = shape;
-                        cfg.vert = vert;
-                        cfg.net_unit = unit;
-                        assert_eq!(cfg, Config::parse(&cfg.serialize()));
-                    }
+            for vert in [VertLayout::SingleRow, VertLayout::SingleCol, VertLayout::SplitCol] {
+                for unit in [NetUnit::KB, NetUnit::MB, NetUnit::GB] {
+                    let mut cfg = Config::default();
+                    cfg.zoom = zoom;
+                    cfg.vert = vert;
+                    cfg.net_unit = unit;
+                    assert_eq!(cfg, Config::parse(&cfg.serialize()));
                 }
             }
         }
@@ -778,15 +869,13 @@ fg F4F1EE
         let cfg = Config::parse("topmost=0\nopacity=70\nshape=square\nnetunit=gb\nvert=splitcol\n");
         assert!(!cfg.topmost);
         assert_eq!(cfg.hover_opacity, 70);
-        assert_eq!(cfg.shape, Shape::Square);
+        // shape 是旧版遗留键（已移除）：应被静默忽略，不影响其它解析
         assert_eq!(cfg.net_unit, NetUnit::GB);
         assert_eq!(cfg.vert, VertLayout::SplitCol);
     }
 
     #[test]
     fn test_enums_accept_both_numeric_and_string() {
-        assert_eq!(Shape::from_config("0"), Shape::from_config("round"));
-        assert_eq!(Shape::from_config("2"), Shape::from_config("Content"));
         assert_eq!(VertLayout::from_config("2"), VertLayout::from_config("split_col"));
         assert_eq!(NetUnit::from_config("2"), NetUnit::from_config("GB"));
         assert_eq!(RenderMode::from_config("0"), RenderMode::from_config("eco"));
@@ -938,7 +1027,8 @@ fg F4F1EE
         assert_eq!(cfg.font_size, 32.0);
         assert_eq!(cfg.metric_gap, 8);
         assert_eq!(cfg.label_value_gap, 6);
-        assert_eq!(cfg.anim_ms, 150);
+        // Default impl(300) 与 settings 动画兜底值(300) 三处必须同步
+        assert_eq!(cfg.anim_ms, 300);
         assert!(cfg.topmost);
         assert_eq!(cfg.version, CONFIG_VERSION);
         assert!(!cfg.power_enabled, "功耗默认关闭（零开销原则）");
@@ -1031,5 +1121,20 @@ fg F4F1EE
     fn test_metric_font_size_unknown_ignored() {
         let cfg = Config::parse("mfs_xxx 20.0\nmfs");
         assert_eq!(cfg.metric_font_sizes, [None; 5]);
+    }
+
+    #[test]
+    fn test_font_weight_parse_serialize_roundtrip() {
+        // 缺省 = 粗（位图字体原样观感）
+        let cfg = Config::parse("");
+        assert_eq!(cfg.font_weight, 2, "缺省字重 = 粗");
+        // 合法档位 + 越界钳位 + roundtrip
+        let mut cfg = Config::parse("font_weight 0\n");
+        assert_eq!(cfg.font_weight, 0, "细");
+        cfg.font_weight = 1;
+        let parsed = Config::parse(&cfg.serialize());
+        assert_eq!(parsed.font_weight, 1, "写读 roundtrip");
+        let cfg = Config::parse("font_weight 9\n");
+        assert_eq!(cfg.font_weight, 2, "越界 clamp 到粗");
     }
 }

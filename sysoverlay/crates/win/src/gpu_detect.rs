@@ -85,15 +85,18 @@ pub fn enum_adapters() -> Vec<GpuInfo> {
     out
 }
 
-/// 选出独显：三家厂商卡里专用显存最大且 ≥4 GiB 的那块。
-pub fn pick_dgpu() -> Option<GpuInfo> {
-    let adapters = enum_adapters();
-    let best = adapters
-        .iter()
+/// 列出全部独显：三家厂商卡里专用显存 ≥4 GiB 的那几块（多卡都算）。
+pub fn list_dgpu() -> Vec<GpuInfo> {
+    enum_adapters()
+        .into_iter()
         .filter(|a| matches!(a.vendor_id, VENDOR_AMD | VENDOR_NVIDIA | VENDOR_INTEL))
         .filter(|a| a.dedicated_mem >= DEDICATED_MEM_DGPU)
-        .max_by_key(|a| a.dedicated_mem)?
-        .clone();
+        .collect()
+}
+
+/// 选出独显：三家厂商卡里专用显存最大且 ≥4 GiB 的那块。
+pub fn pick_dgpu() -> Option<GpuInfo> {
+    let best = list_dgpu().into_iter().max_by_key(|a| a.dedicated_mem)?;
     if probe::enabled() {
         probe::log(&format!(
             "gpudetect dgpu picked vendor={} device=0x{:04x} name={:?}",

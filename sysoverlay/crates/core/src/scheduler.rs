@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn test_auto_caps_at_slowest_enabled_source() {
-        let mut s = Scheduler::new(100, true);
+        let s = Scheduler::new(100, true);
         assert_eq!(
             s.base_interval_ms(&ALL_ON),
             2_000,
@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     fn test_auto_with_no_enabled_sources_falls_back() {
-        let mut s = Scheduler::new(100, true);
+        let s = Scheduler::new(100, true);
         assert_eq!(s.base_interval_ms(&[false; 4]), IDLE_INTERVAL_MS);
     }
 
@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn test_manual_respects_user_interval_for_cpu() {
-        let mut s = Scheduler::new(100, false); // 10fps
+        let s = Scheduler::new(100, false); // 10fps
         assert_eq!(s.base_interval_ms(&ALL_ON), 100);
         assert_eq!(
             s.source_interval_ms(Source::Cpu, &ALL_ON),
@@ -327,16 +327,16 @@ mod tests {
 
     #[test]
     fn test_manual_slow_interval_propagates_to_all_sources() {
-        let mut s = Scheduler::new(5_000, false); // 0.2fps
+        let s = Scheduler::new(5_000, false); // 0.2fps
         assert_eq!(s.source_interval_ms(Source::Cpu, &ALL_ON), 5_000);
         assert_eq!(s.source_interval_ms(Source::Gpu, &ALL_ON), 5_000);
     }
 
     #[test]
     fn test_user_interval_is_clamped() {
-        let mut s = Scheduler::new(1, false);
+        let s = Scheduler::new(1, false);
         assert_eq!(s.base_interval_ms(&ALL_ON), 100, "下限 100ms");
-        let mut s2 = Scheduler::new(999_999, false);
+        let s2 = Scheduler::new(999_999, false);
         assert_eq!(s2.base_interval_ms(&ALL_ON), MAX_INTERVAL_MS, "封顶 5s");
     }
 

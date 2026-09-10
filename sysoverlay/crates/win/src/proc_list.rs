@@ -185,7 +185,9 @@ fn create() {
                     LPARAM(0),
                 );
                 procs_push(snap);
-                thread::sleep(Duration::from_secs(1));
+                // 进程榜独立分频：2s 足够 Top 榜可读性，且仅为「打开面板时」才跑，
+                // 不计入悬浮条稳态开销（与主刷新 2s 节奏一致，性能档默认）。
+                thread::sleep(Duration::from_secs(2));
             }
             PROCS_SAMPLE_THREAD.store(-1, Ordering::SeqCst);
         });
@@ -396,7 +398,11 @@ fn sort_entries(ctx: &mut Ctx) {
         let ord = match by {
             SortBy::Cpu => b.cpu_pct.total_cmp(&a.cpu_pct),
             SortBy::Mem => b.mem_bytes.cmp(&a.mem_bytes),
-            SortBy::Watt => b.power_w.total_cmp(&a.power_w),
+            // None（无读数）视为 -1，降序时自然沉到末尾，不干扰真实读数排序
+            SortBy::Watt => b
+                .power_w
+                .unwrap_or(-1.0)
+                .total_cmp(&a.power_w.unwrap_or(-1.0)),
         };
         ord.then_with(|| b.mem_bytes.cmp(&a.mem_bytes))
     });
@@ -474,7 +480,26 @@ unsafe fn paint(hwnd: HWND) {
     };
 
     let row_h = ((h - header_y - header_h) / TOP_N as i32).max(18);
-    crate::probe::log("[procs] paint step4 rows");
+    crate::probe::log_lazy(|| {
+        // 渲染侧快照：确认「画出来的瓦数」与采集侧一致（排查 UI 层串列/取错字段）。
+        let mut snap = String::new();
+        for e in entries.iter().take(6) {
+            snap.push_str(&format!(
+                " {}={:.2}%:{}",
+                e.name.trim_end_matches(".exe"),
+                e.cpu_pct,
+                e.power_w.map(|x| format!("{x:.2}W")).unwrap_or_else(|| "--".into())
+            ));
+        }
+        let sort = ctx_of(hwnd)
+            .map(|c| match c.sort {
+                SortBy::Cpu => "cpu",
+                SortBy::Mem => "mem",
+                SortBy::Watt => "watt",
+            })
+            .unwrap_or("?");
+        format!("[procs] rows n={} sort={} top:{}", entries.len(), sort, snap)
+    });
     for (i, e) in entries.iter().take(TOP_N).enumerate() {
         let y = header_y + header_h + i as i32 * row_h;
         let name_r = RECT { left: s(d, 12), top: y, right: w / 2 - s(d, 8), bottom: y + row_h };
@@ -482,10 +507,13 @@ unsafe fn paint(hwnd: HWND) {
         let cpu_r = RECT { left: w / 2, top: y, right: w - s(d, 240), bottom: y + row_h };
         txt(hdc, &format!("{:.0}%", e.cpu_pct), cpu_r, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
         let watt_r = RECT { left: w - s(d, 240), top: y, right: w - s(d, 150), bottom: y + row_h };
-        let watt_label = if e.power_w > 0.05 {
-            format!("{:.1}W", e.power_w)
-        } else {
-            String::new()
+        // 无实测读数（无管理员 / 驱动未加载 / 首帧基线未就绪）显示 "--"，
+        // 与「实测 0W」区分开。此前两者都退化成空白，
+        // 看上去就是「所有进程功耗一模一样」。
+        let watt_label = match e.power_w {
+            Some(w) if w > 0.05 => format!("{:.1}W", w),
+            Some(_) => "0W".to_string(),
+            None => "--".to_string(),
         };
         txt(hdc, &watt_label, watt_r, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
         let mem_r = RECT { left: w - s(d, 150), top: y, right: w - s(d, 12), bottom: y + row_h };

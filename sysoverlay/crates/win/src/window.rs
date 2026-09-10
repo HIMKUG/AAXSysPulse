@@ -44,6 +44,10 @@ struct ThreadState {
     resize_mode: bool,
     /// 鼠标是否在窗口内（hover 模式点亮用）。
     hovered: bool,
+    /// 缓存的窗口像素尺寸（P1-10）：尺寸变化（WM_SIZE/WM_DISPLAYCHANGE）时更新，
+    /// 渲染每帧读缓存而非跨进程 `GetWindowRect`。0 表示尚未缓存。
+    win_w: i32,
+    win_h: i32,
 }
 
 impl ThreadState {
@@ -57,6 +61,8 @@ impl ThreadState {
             size_dirty: false,
             resize_mode: false,
             hovered: false,
+            win_w: 0,
+            win_h: 0,
         }
     }
 }
@@ -70,12 +76,15 @@ static SHARED_SNAP: OnceLock<ArcSwap<Snapshot>> = OnceLock::new();
 pub(crate) static SHARED_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Returns the current snapshot, or a placeholder if not yet initialized.
-fn snap_get() -> Snapshot {
+///
+/// D3/E3：直接返回 `Arc<Snapshot>`（无锁 `load_full`），调用方经 `&*snap` 取
+/// `&Snapshot` 即可，**不再每帧深拷贝整份快照**（共享 Arc 仅在最后一次写后
+/// 才被采样线程 `store` 替换）。Snap 本身是 POD，这主要省掉每帧一次 Arc 强引用
+/// 计数抖动与整结构体 memcpy。
+fn snap_get() -> Arc<Snapshot> {
     SHARED_SNAP
         .get_or_init(|| ArcSwap::from_pointee(Snapshot::placeholder(0)))
         .load_full()
-        .as_ref()
-        .clone()
 }
 
 /// Stores a new snapshot into the shared atomic (called from app sampling thread).
@@ -101,6 +110,8 @@ static SCHED_INTERVAL_MS: AtomicU32 = AtomicU32::new(1000);
 static SCHED_ENABLED: AtomicU32 = AtomicU32::new(0b1111);
 /// Power 开关（独立于 SamplePlan，采样器自己按 power_interval_ms 分频）。
 static SCHED_POWER: AtomicBool = AtomicBool::new(false);
+/// Net 低频采样开关（独立分频 2s，速率按真实 Δt 计算不失真）。
+static SCHED_NET_LOW: AtomicBool = AtomicBool::new(true);
 
 /// 把当前配置发布给采样线程（启动与每次设置改动后调用）。
 pub fn publish_schedule_cfg(cfg: &Config) {
@@ -112,6 +123,9 @@ pub fn publish_schedule_cfg(cfg: &Config) {
         | ((cfg.show_net as u32) << 3);
     SCHED_ENABLED.store(mask, Ordering::Relaxed);
     SCHED_POWER.store(cfg.power_enabled, Ordering::Relaxed);
+    SCHED_NET_LOW.store(cfg.net_low_freq, Ordering::Relaxed);
+    // GPU 查询范围（主适配器/3D 引擎 only）随配置即时生效
+    crate::proc_gpu::set_gpu_scope(cfg.gpu_primary_only, cfg.gpu_3d_only);
 }
 
 /// 采样线程读取当前调度参数：(interval_ms, auto, [cpu, mem, gpu, net])。
@@ -127,6 +141,11 @@ pub fn schedule_cfg() -> (u32, bool, [bool; 4]) {
 /// 采样线程读取 Power 开关（设置页改动即时生效）。
 pub fn schedule_power() -> bool {
     SCHED_POWER.load(Ordering::Relaxed)
+}
+
+/// 采样线程读取 Net 低频开关（设置页改动即时生效）。
+pub fn schedule_net_low() -> bool {
+    SCHED_NET_LOW.load(Ordering::Relaxed)
 }
 
 // ─── Error type ────────────────────────────────────────────────────────
@@ -263,7 +282,7 @@ unsafe extern "system" fn wndproc(
                     if state.cfg.hover {
                         track_mouse_leave(hwnd);
                         let snap = snap_get();
-                        crate::gdi::render(hwnd, &snap, &state.cfg);
+                        crate::gdi::render(hwnd, &*snap, &state.cfg);
                     }
                 }
 
@@ -302,7 +321,7 @@ unsafe extern "system" fn wndproc(
                 if !state.dragging {
                     state.hovered = false;
                     let snap = snap_get();
-                    crate::gdi::render(hwnd, &snap, &state.cfg);
+                    crate::gdi::render(hwnd, &*snap, &state.cfg);
                 }
             }
             LRESULT(0)
@@ -334,7 +353,7 @@ unsafe extern "system" fn wndproc(
             // 此时 hovered 状态与"光标是否还在窗口上"一致，光标脱窗则自动回到半透明。
             if let Some(state) = get_state_ptr(hwnd).as_ref() {
                 let snap = snap_get();
-                crate::gdi::render(hwnd, &snap, &state.cfg);
+                crate::gdi::render(hwnd, &*snap, &state.cfg);
             }
             LRESULT(0)
         }
@@ -359,7 +378,7 @@ unsafe extern "system" fn wndproc(
                         track_mouse_leave(hwnd);
                     }
                     let snap = snap_get();
-                    crate::gdi::render(hwnd, &snap, &state.cfg);
+                    crate::gdi::render(hwnd, &*snap, &state.cfg);
                 }
             }
             LRESULT(0)
@@ -371,6 +390,12 @@ unsafe extern "system" fn wndproc(
                 // wParam == SIZE_RESTORED(0), SIZE_MAXIMIZED(1), SIZE_MINIMIZED(2)
                 if _wparam.0 != 2 {
                     state.size_dirty = true;
+                }
+                // 缓存窗口尺寸，省去每帧 GetWindowRect（P1-10）
+                let mut r = RECT::default();
+                if GetWindowRect(hwnd, &mut r).as_bool() {
+                    state.win_w = (r.right - r.left).max(1) as i32;
+                    state.win_h = (r.bottom - r.top).max(1) as i32;
                 }
                 let _ = InvalidateRect(hwnd, None, true);
             }
@@ -387,7 +412,7 @@ unsafe extern "system" fn wndproc(
             if !dragging && IsWindowVisible(hwnd).as_bool() {
                 if let Some(state) = get_state_ptr(hwnd).as_mut() {
                     let snap = snap_get();
-                    crate::gdi::render(hwnd, &snap, &state.cfg);
+                    crate::gdi::render(hwnd, &*snap, &state.cfg);
                 }
             }
             LRESULT(0)
@@ -415,7 +440,7 @@ unsafe extern "system" fn wndproc(
             if !is_dragging {
                 if let Some(state) = get_state_ptr(hwnd).as_mut() {
                     let snap = snap_get();
-                    crate::gdi::render(hwnd, &snap, &state.cfg);
+                    crate::gdi::render(hwnd, &*snap, &state.cfg);
                 }
             }
             let _ = unsafe { EndPaint(hwnd, &ps) };
@@ -431,9 +456,13 @@ unsafe extern "system" fn wndproc(
                     let _ = ShowWindow(hwnd, if visible { SW_HIDE } else { SW_SHOW });
                     // 重新显示时立即画一帧（推送模式下不轮询，不画会空白）
                     if !visible {
+                        // E1：唤醒采样线程（事件驱动，不再依赖其隐藏轮询）
+                        if let Some(tx) = RESUME_NOTIFY.get() {
+                            let _ = tx.send(());
+                        }
                         if let Some(state) = get_state_ptr(hwnd).as_ref() {
                             let snap = snap_get();
-                            crate::gdi::render(hwnd, &snap, &state.cfg);
+                            crate::gdi::render(hwnd, &*snap, &state.cfg);
                         }
                     }
                 }
@@ -455,14 +484,21 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
 
-        // ── 设置面板改动：重排版 + 自适应窗口尺寸 + 发布调度配置 ──
+        // ── 设置面板改动：重排版 + 强制整窗刷新 + 发布调度配置 ──
         WM_RECONFIG => {
             let r0 = crate::perf::begin();
             if let Some(state) = get_state_ptr(hwnd).as_mut() {
+                // ⚠️ 强制整窗刷新（用户实测：像素类设置——颜色/字体粗细——变更后，
+                // 局部脏区 ULW 在其系统合成器上不生效 → 画面「看起来没刷新」；
+                // 布局类变更因 resize 触发 Full 才生效。设置触发的重绘一律 Full。）
+                crate::gdi::invalidate_frame_hash();
+                crate::gdi::force_full_refresh();
+                crate::probe::log("WM_RECONFIG processed (invalidated + force-full)");
                 publish_schedule_cfg(&state.cfg);
-                crate::gdi::fit_window(hwnd, &state.cfg);
                 let snap = snap_get();
-                crate::gdi::render(hwnd, &snap, &state.cfg);
+                crate::gdi::render(hwnd, &*snap, &state.cfg);
+            } else {
+                crate::probe::log("WM_RECONFIG: no state");
             }
             crate::perf::note_section("wnd_reconfig", r0);
             LRESULT(0)
@@ -472,14 +508,11 @@ unsafe extern "system" fn wndproc(
         WM_NEW_SNAPSHOT => {
             // 拖动期间同样不渲染（见 WM_TIMER/WM_PAINT 注释）：采样线程每帧
             // 都会推一帧，若在拖动中渲染会把消失的悬停态/过期帧提交上去。
-            let dragging = get_state_ptr(hwnd)
-                .as_ref()
-                .map(|s| s.dragging)
-                .unwrap_or(false);
-            if !dragging && IsWindowVisible(hwnd).as_bool() {
-                if let Some(state) = get_state_ptr(hwnd).as_ref() {
+            // 合并冗余调用：一次取状态指针同时判断拖动与可见性（P2-20）。
+            if let Some(state) = get_state_ptr(hwnd).as_ref() {
+                if !state.dragging && IsWindowVisible(hwnd).as_bool() {
                     let snap = snap_get();
-                    crate::gdi::render(hwnd, &snap, &state.cfg);
+                    crate::gdi::render(hwnd, &*snap, &state.cfg);
                 }
             }
             LRESULT(0)
@@ -487,11 +520,17 @@ unsafe extern "system" fn wndproc(
 
         // 自愈：显示变化 → 重建 DIB 缓存（屏幕 DC 可能改变）+ 直接重画一帧
         WM_DISPLAYCHANGE => {
+            crate::proc_gpu::invalidate_topology();
             crate::gdi::invalidate_dib_cache();
+            // 显示器变化可能改变窗口尺寸/位置 → 使尺寸缓存失效，下次渲染重新取（P1-10）
+            if let Some(state) = get_state_ptr(hwnd).as_mut() {
+                state.win_w = 0;
+                state.win_h = 0;
+            }
             if IsWindowVisible(hwnd).as_bool() {
                 if let Some(state) = get_state_ptr(hwnd).as_ref() {
                     let snap = snap_get();
-                    crate::gdi::render(hwnd, &snap, &state.cfg);
+                    crate::gdi::render(hwnd, &*snap, &state.cfg);
                 }
             }
             LRESULT(1)
@@ -549,6 +588,34 @@ pub fn modify_config(hwnd: HWND, f: impl FnOnce(&mut Config)) {
     if !p.is_null() {
         unsafe { f(&mut (*p).cfg) };
     }
+}
+
+/// 读取悬浮窗当前尺寸（缓存；未缓存或窗口未就绪时回退到 `GetWindowRect` 并写回缓存）。
+///
+/// 渲染每帧都需窗口尺寸；缓存避免每帧一次跨进程 `GetWindowRect` 系统调用（P1-10）。
+pub(crate) fn get_window_size(hwnd: HWND) -> (i32, i32) {
+    let p = unsafe { get_state_ptr(hwnd) };
+    if !p.is_null() {
+        let s = unsafe { &*p };
+        if s.win_w > 0 && s.win_h > 0 {
+            return (s.win_w, s.win_h);
+        }
+    }
+    let mut rect = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut rect) }.as_bool() {
+        let w = (rect.right - rect.left).unsigned_abs() as i32;
+        let h = (rect.bottom - rect.top).unsigned_abs() as i32;
+        if w > 0 && h > 0 {
+            if !p.is_null() {
+                unsafe {
+                    (*p).win_w = w;
+                    (*p).win_h = h;
+                }
+            }
+            return (w, h);
+        }
+    }
+    (0, 0)
 }
 
 /// 「调整大小」模式是否开启。

@@ -14,30 +14,29 @@
 //! 三次方缓出（`1-(1-t)^3`，非线性：起步快、收尾慢）。动画期间用
 //! `SetTimer(16ms)` 驱动逐帧重绘，到达目标后 `KillTimer` 归零开销。
 
-use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicU32, Ordering as AtomicOrdering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Instant;
 
-use windows::Win32::Foundation::{BOOL, COLORREF, HWND, POINT, RECT, SIZE};
+use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     BLENDFUNCTION, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, DIB_RGB_COLORS,
     GetDC, ReleaseDC, SelectObject, BI_RGB, BITMAPINFO, HBITMAP, HDC,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    KillTimer, SetTimer, SetWindowPos, UpdateLayeredWindow, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOZORDER,
+    KillTimer, PostMessageW, SetTimer, SetWindowPos, UpdateLayeredWindow, UpdateLayeredWindowIndirect,
+    UPDATELAYEREDWINDOWINFO, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
 };
 
-#[link(name = "user32")]
-extern "system" {
-    fn GetWindowRect(hwnd: HWND, lpRect: *mut RECT) -> BOOL;
-}
-
 use sysoverlay_ui::offscreen::SoftwareSurface;
-use sysoverlay_ui::{Renderer, StripRenderer, VerticalRenderer};
+use sysoverlay_ui::renderer::CellSig;
+use sysoverlay_ui::{RenderTarget as _, Renderer, StripRenderer, VerticalRenderer};
+
+use sysoverlay_core::config::RenderEngine;
 
 use crate::Config;
 use crate::perf;
+use crate::render_d2d::{paint_cells, D2DSurface, ENGINE_HASH_XOR};
 use crate::Snapshot;
 
 /// 悬浮窗透明度动画定时器 ID（仅本窗口使用；graph/procs 的定时器在各自窗口互不干扰）。
@@ -87,7 +86,10 @@ fn ease_out_cubic(t: f32) -> f32 {
 
 /// 计算本帧 alpha 百分比；动画进行中返回 true（调用方应确保后续帧继续到来）。
 fn compute_alpha_pct(hwnd: HWND, cfg: &Config) -> (f32, bool) {
-    let hovered = crate::window::is_window_hovered(hwnd);
+    // hover 开关语义（2026-09-09）：开 → 悬停时显示（normal→hover_opacity）；
+    // 关 → 窗口固定为常态透明度（normal_opacity），完全不响应悬停（仅可拖动）。
+    // 因此关时忽略 hovered，避免悬停把窗口点亮。
+    let hovered = cfg.hover && crate::window::is_window_hovered(hwnd);
     let desired = if hovered {
         cfg.hover_opacity as f32
     } else {
@@ -130,6 +132,97 @@ fn compute_alpha_pct(hwnd: HWND, cfg: &Config) -> (f32, bool) {
 static LAST_FRAME_HASH: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(u64::MAX);
 
+/// 脏矩形上屏开关：`SYSOVERLAY_NODIRTY=1` 时退回经典整窗上传（A1 回退）。
+static DIRTY_DISABLED: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("SYSOVERLAY_NODIRTY").map(|v| v == "1").unwrap_or(false));
+
+/// 脏矩形追踪：上一帧各文字 cell 的几何 + 内容指纹（A1 比对源）。
+static PREV_CELLS: OnceLock<Mutex<Vec<CellSig>>> = OnceLock::new();
+
+/// 高画质（D2D）路径的上一帧 cell 快照（与性能模式独立）。
+static PREV_CELLS_D2D: OnceLock<Mutex<Vec<CellSig>>> = OnceLock::new();
+
+/// 脏矩形追踪：上一帧送屏的全局 alpha（alpha 变化必须整窗重画，否则残留）。
+static PREV_ALPHA: AtomicU8 = AtomicU8::new(0);
+
+/// 高画质（D2D）路径的上一帧 alpha（与性能模式独立）。
+static PREV_ALPHA_D2D: AtomicU8 = AtomicU8::new(0);
+
+/// 设置变更后强制下一帧**整窗刷新**（dirty=Full，整窗 ULW）。
+///
+/// 背景（2026-09-09 用户实测定位）：颜色/字体粗细等「像素类」设置变更后，帧指纹
+/// 变了 → render 正常执行 → 但脏区是**局部 Rect**（仅变化的 cell）→ 局部
+/// UpdateLayeredWindowIndirect 在部分系统/驱动合成器上**不生效** → 画面看起来
+/// 「没刷新」；而字号/间距等「布局类」变更触发窗口 resize → dirty=Full → 整窗
+/// ULW → 立即生效；「等下一次数值刷新」也是因数值文本变宽触发布局变化才 Full。
+/// 结论：凡是设置面板触发的重绘，一律整窗上传（设置操作低频，Full 开销可忽略）。
+static FORCE_FULL_REFRESH: AtomicBool = AtomicBool::new(false);
+
+/// 设置面板调用：下一次 render 强制整窗刷新。
+pub fn force_full_refresh() {
+    FORCE_FULL_REFRESH.store(true, AtomicOrdering::Relaxed);
+}
+
+/// 消费强制整窗标志（render 每帧调用；true 则本帧整窗重绘）。
+fn take_force_full() -> bool {
+    FORCE_FULL_REFRESH.swap(false, AtomicOrdering::Relaxed)
+}
+
+/// 上一帧**实际送屏**的窗口尺寸（高 32 位 = w，低 32 位 = h；0 = 从未送屏）。
+///
+/// ⚠️ 脏区 Rect 上传的前提是「DIB 里非脏区域像素 == 窗口当前显示像素」。
+/// 窗口尺寸一变，`SoftwareSurface::resize` 与 `DibCache::get` 都会**清零重建**，
+/// 该前提即被破坏——此时若仍按 Rect 只上传脏子矩形，窗口其余部分会变全透明
+/// （实测症状：上半部分和左侧消失，悬停改变 alpha 触发 Full 后才恢复）。
+/// 因此：尺寸与上次送屏不同（或 DIB 缓存被废弃）→ 本帧强制整窗。
+static LAST_PRESENT_SIZE: AtomicU64 = AtomicU64::new(0);
+
+/// 使「上次送屏尺寸」记录失效（DIB 缓存被废弃 / 显示器变化时调用），
+/// 下一帧强制整窗上传。
+fn invalidate_present_size() {
+    LAST_PRESENT_SIZE.store(0, AtomicOrdering::Relaxed);
+}
+
+/// D2D 高画质路径本会话是否仍可用。一旦 D2D 渲染 panic / 失败即置 false
+/// 并回退 Gdi——否则配置持久为 `render_engine=D2d` 时重启也会进 D2D 卡死，
+/// 用户无法从设置里改回来（「设置也打不开」）。
+static D2D_BROKEN: AtomicBool = AtomicBool::new(false);
+
+/// D2D 渲染失败后的自愈合：本会话禁用 D2D，并把持久配置回退为 Gdi。
+fn mark_d2d_broken_and_persist_gdi(hwnd: HWND) {
+    D2D_BROKEN.store(true, AtomicOrdering::Relaxed);
+    if let Some(mut cfg) = crate::window::get_config_of(hwnd) {
+        if cfg.render_engine == RenderEngine::D2d {
+            cfg.render_engine = RenderEngine::Gdi;
+            crate::window::modify_config(hwnd, |c| *c = cfg.clone());
+            let _ = crate::config_io::save_config(&cfg);
+            crate::probe::log("d2d disabled (session) + persisted render_engine=Gdi");
+        }
+    }
+}
+
+/// 本帧是否必须整窗重绘+整窗上传（尺寸相对上次送屏发生了变化）。
+fn present_size_changed(width: i32, height: i32) -> bool {
+    let cur = ((width as u64) << 32) | (height as u32 as u64);
+    let prev = LAST_PRESENT_SIZE.swap(cur, AtomicOrdering::Relaxed);
+    prev != cur
+}
+
+/// 脏区：整窗或子矩形。
+enum Dirty {
+    Full,
+    Rect(RECT),
+}
+
+impl Dirty {
+    fn is_full(&self) -> bool {
+        matches!(self, Dirty::Full)
+    }
+}
+
+/// 悬浮窗合理尺寸上限（px，>4K 屏宽度无意义；防异常尺寸导致 DIB 分配爆炸卡死）。
+const MAX_WIN: i32 = 2048;
+
 /// 渲染一帧到窗口（WM_NEW_SNAPSHOT / 尺寸变化 / 设置变化 入口）。
 ///
 /// **脏检查**：内容与上一帧完全一致时整帧跳过——不建画布、不建 DIB、
@@ -137,25 +230,99 @@ static LAST_FRAME_HASH: std::sync::atomic::AtomicU64 =
 pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
     let t0 = perf::begin();
     unsafe {
-        let mut rect = RECT::default();
-        if !GetWindowRect(hwnd, &mut rect).as_bool() {
+        // 尺寸走缓存（P1-10）：避免每帧一次跨进程 GetWindowRect 系统调用。
+        let (width, height) = crate::window::get_window_size(hwnd);
+        if width == 0 || height == 0 {
             return;
         }
-        let width = (rect.right - rect.left).unsigned_abs() as i32;
-        let height = (rect.bottom - rect.top).unsigned_abs() as i32;
-        if width == 0 || height == 0 {
+        if width > MAX_WIN || height > MAX_WIN {
+            crate::probe::log(&format!(
+                "render: 异常窗口尺寸 ({width}x{height}) > {MAX_WIN} -> 回到自然尺寸"
+            ));
+            force_fit_natural(hwnd, cfg);
+            let _ = PostMessageW(
+                hwnd,
+                crate::window::WM_NEW_SNAPSHOT,
+                windows::Win32::Foundation::WPARAM(0),
+                windows::Win32::Foundation::LPARAM(0),
+            );
             return;
         }
 
         let renderer = renderer_for(cfg.render_style);
+
+        // 引擎切换检测：性能 ↔ 高画质 切换后强制整窗重绘。
+        // 两引擎的 cell 内容指纹完全相同（文本/几何/颜色一致），只有像素外观
+        // 不同 → 脏区比对结果为「无变化」→ Rect(空) 上传等于什么都没上传，
+        // 画面停留在旧引擎像素，直到悬停改变 alpha 触发整窗重画
+        // （实测症状：切引擎后必须鼠标悬停才生效）。这里在指纹层面强制失效。
+        static LAST_ENGINE: AtomicU8 = AtomicU8::new(u8::MAX);
+        let engine_id = match cfg.render_engine {
+            RenderEngine::Gdi => 0u8,
+            RenderEngine::D2d => 1u8,
+        };
+        if LAST_ENGINE.swap(engine_id, AtomicOrdering::Relaxed) != engine_id {
+            LAST_FRAME_HASH.store(u64::MAX, AtomicOrdering::Relaxed);
+            invalidate_present_size();
+            crate::probe::log("render engine switched → force full repaint");
+        }
 
         // 全局 alpha：悬停/非悬停两档透明度，切换时三次方缓出过渡。
         // 动画进行中 → SetTimer 逐帧推进；结束后 KillTimer 归零开销。
         let (alpha_pct_f, animating) = compute_alpha_pct(hwnd, cfg);
         let src_alpha = ((alpha_pct_f.clamp(1.0, 100.0) / 100.0) * 255.0).round() as u8;
 
-        // 脏检查：指纹未变 → 什么都不做
-        let sig = renderer.frame_hash(snap, cfg, width, height, src_alpha);
+        // 高画质模式：整帧 Direct2D + DirectWrite（性能模式路径原样走下方 GDI 分支）。
+        // ⚠️ 自愈合：D2D 绑 DIB 内存 DC 在部分驱动/显卡上可能死锁或 panic（见
+        // render_d2d 注释）。用 catch_unwind 兜住 panic；一旦失败本会话禁用 D2D
+        // 并回退 Gdi（否则下次启动仍进 D2D → 卡死，用户无法自救）。
+        if cfg.render_engine == RenderEngine::D2d && !D2D_BROKEN.load(AtomicOrdering::Relaxed) {
+            static ANNOUNCED: AtomicBool = AtomicBool::new(false);
+            if !ANNOUNCED.swap(true, AtomicOrdering::Relaxed) {
+                crate::probe::log("engine=D2d (high quality) — first frame");
+            }
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                render_d2d(hwnd, snap, cfg, renderer, width, height, src_alpha, alpha_pct_f, animating);
+            }))
+            .is_err();
+            if !panicked {
+                return;
+            }
+            // D2D 渲染 panic：禁用并回退 Gdi，本帧改走性能路径（下方 GDI 分支）。
+            crate::probe::log("engine=D2d PANICKED → fall back to Gdi this session");
+            mark_d2d_broken_and_persist_gdi(hwnd);
+            // 继续往下走 GDI 分支
+        }
+
+        // 布局（build_rows 只跑一次，C1）→ cell 指纹 → 门面指纹（脏检查）
+        // 先定字重：性能路径的字形源按字重切换（DIN 三版注入位图表），
+        // 必须在 paint 前设好；帧指纹另经 hash_cells 纳入 cfg.font_weight。
+        // ensure_loaded 幂等（内部 OnceLock），首帧前把三档 DIN 栅格化并原子发布，
+        // 此后渲染期零锁纯数组读 → 不引入逐帧开销。
+        crate::din_bitmap::ensure_loaded();
+        sysoverlay_ui::font::set_active_weight(cfg.font_weight);
+        // 诊断探针：悬浮窗渲染侧实际读到的指标颜色（对照设置页写入前后）。
+        crate::probe::log_lazy(|| {
+            format!(
+                "render cfg: cpu_label={:?} cpu_value={:?} gpu_label={:?} fw={} engine={} sized={}",
+                cfg.metric_colors[0].label,
+                cfg.metric_colors[0].value,
+                cfg.metric_colors[2].label,
+                cfg.font_weight,
+                if cfg.render_engine == RenderEngine::D2d { "d2d" } else { "gdi" },
+                cfg.size_locked,
+            )
+        });
+        let (nat_w, nat_h, cells) = renderer.layout(snap, cfg, width, height);
+
+        // A-自愈：内容放不下窗口时按运行时自然尺寸扩宽 + 续帧（两引擎共用）。
+        // ⚠️ 只扩不缩：窗口比内容大时保持（用户可能手动拉宽过；且与 D2D
+        // self-heal 组合时双向收窄会造成"缩→扩→缩"死循环——实测 282↔298）。
+        if ensure_content_fits(hwnd, cfg, nat_w, nat_h, width, height) {
+            return;
+        }
+
+        let sig = renderer.hash_from_cells(&cells, cfg, width, height, src_alpha);
         if LAST_FRAME_HASH.load(std::sync::atomic::Ordering::Relaxed) == sig {
             perf::note_skipped();
             // 动画未走完但帧被跳过（理论上只在末帧重复时发生）：继续驱动定时器
@@ -171,10 +338,33 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
         let Ok(mut surface) = surface.lock() else { return };
         surface.resize(width.max(1), height.max(1));
 
-        // 渲染器负责具体排布；返回自然尺寸（当前窗口尺寸不符时以画布为准）
-        let (nat_w, nat_h) = renderer.draw(&mut surface, snap, cfg);
+        // 脏区（A1）：alpha / cell 数 / cell 位置变化 → 整窗；否则内容变更的 cell 并集。
+        // changed 位图供 paint 跳过未变化 cell（标签不重画，v3 性能档）。
+        // ⚠️ 尺寸相对上次送屏有变 → 画布与 DIB 都被清零重建，必须整窗重画+整窗上传，
+        // 否则 Rect 上传会让非脏区域变全透明（实测：上半部分和左侧消失）。
+        let (mut dirty, mut changed) = compute_dirty(&cells, src_alpha);
+        // 设置面板触发的重绘：强制整窗（局部 ULW 在部分合成器上不生效 → 颜色/粗细
+        // 「看起来没刷新」，实测证据见 force_full_refresh 注释）。
+        if take_force_full() || present_size_changed(width, height) {
+            dirty = Dirty::Full;
+            changed = vec![true; cells.len()];
+        }
 
-        update_layered(hwnd, &surface, width, height, src_alpha);
+        // 绘制（A3：仅首帧/alpha/布局变化才整画布清零，否则只清脏区 cell）
+        renderer.paint(
+            &mut surface,
+            snap,
+            cfg,
+            &cells,
+            dirty.is_full(),
+            if dirty.is_full() { None } else { Some(&changed) },
+        );
+
+        if !present(hwnd, &surface, width, height, src_alpha, &dirty) {
+            // 上屏失败（GetDC/DIB 分配/ULW 失败）：回滚指纹，让下一帧重试，
+            // 否则相同内容的帧会被指纹跳过 → 窗口永久冻结在旧帧。
+            LAST_FRAME_HASH.store(u64::MAX, AtomicOrdering::Relaxed);
+        }
 
         // 记录本帧实际送屏的 alpha 作为下一次过渡的起点
         RENDERED_PCT_X100.store((alpha_pct_f.clamp(1.0, 100.0) * 100.0) as u32, AtomicOrdering::Relaxed);
@@ -193,6 +383,106 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
         }
     }
     perf::end_render(t0);
+}
+
+/// 比对当前帧 cell 与上一帧，求出 `UpdateLayeredWindow` 的脏区（A1）+
+/// 每 cell 内容变化位图（v3 性能档：paint 跳过未变化 cell）。
+///
+/// - alpha 变化：整窗（SourceConstantAlpha 重混全窗，子区上传会残留）。
+/// - cell 数或某个 cell 位置漂移：整窗（旧位置像素需清掉，避免残影）。
+/// - 否则：内容指纹变化的 cell 包围盒并集（只上传真正变了的子矩形）。
+/// - 邻接传播：变化 cell 的包围盒（已含阴影/描边 pad）若与未变化 cell 相交，
+///   后者也标记为变化——否则清 pad 时会擦掉邻居边缘像素且不重画（1-2px 残缺）。
+fn compute_dirty(cells: &[CellSig], src_alpha: u8) -> (Dirty, Vec<bool>) {
+    compute_dirty_in(&PREV_CELLS, &PREV_ALPHA, cells, src_alpha)
+}
+
+/// [`compute_dirty`] 的存储参数化版本：GDI 与高画质 D2D 路径各持独立的
+/// prev-cell 状态（两引擎画出的像素不同，跳过/脏区判定互不共享）。
+fn compute_dirty_in(
+    prev_cells: &OnceLock<Mutex<Vec<CellSig>>>,
+    prev_alpha: &AtomicU8,
+    cells: &[CellSig],
+    src_alpha: u8,
+) -> (Dirty, Vec<bool>) {
+    let n = cells.len();
+    let all = || vec![true; n];
+    let prev_alpha_v = prev_alpha.load(AtomicOrdering::Relaxed);
+    let prev = prev_cells.get_or_init(|| Mutex::new(Vec::new()));
+    let Ok(mut prev) = prev.lock() else {
+        return (Dirty::Full, all());
+    };
+    if prev_alpha_v != src_alpha || prev.len() != n {
+        *prev = cells.to_vec();
+        prev_alpha.store(src_alpha, AtomicOrdering::Relaxed);
+        return (Dirty::Full, all());
+    }
+    let mut union: Option<RECT> = None;
+    let mut force_full = false;
+    let mut changed = vec![false; n];
+    for (i, (a, b)) in cells.iter().zip(prev.iter()).enumerate() {
+        if a.x != b.x || a.y != b.y {
+            // 布局漂移：旧位置像素必须随整窗上传清掉
+            force_full = true;
+            break;
+        }
+        if a.hash != b.hash {
+            changed[i] = true;
+            let r = RECT {
+                left: a.x,
+                top: a.y,
+                right: a.x + a.w,
+                bottom: a.y + a.h,
+            };
+            union = Some(match union {
+                Some(u) => RECT {
+                    left: u.left.min(r.left),
+                    top: u.top.min(r.top),
+                    right: u.right.max(r.right),
+                    bottom: u.bottom.max(r.bottom),
+                },
+                None => r,
+            });
+        }
+    }
+    *prev = cells.to_vec();
+    prev_alpha.store(src_alpha, AtomicOrdering::Relaxed);
+    if force_full {
+        return (Dirty::Full, all());
+    }
+    match union {
+        Some(_) => {
+            // 邻接传播至不动点（cell ≤ 10，代价可忽略）
+            loop {
+                let mut grew = false;
+                for i in 0..n {
+                    if !changed[i] {
+                        continue;
+                    }
+                    for j in 0..n {
+                        if changed[j] || i == j {
+                            continue;
+                        }
+                        if cells_intersect(&cells[i], &cells[j]) {
+                            changed[j] = true;
+                            grew = true;
+                        }
+                    }
+                }
+                if !grew {
+                    break;
+                }
+            }
+            (Dirty::Rect(union.unwrap()), changed)
+        }
+        // 有 cell 内容变化 → 上传其并集；否则（理论不可达）保守整窗
+        None => (Dirty::Full, all()),
+    }
+}
+
+/// cell 包围盒（已含阴影/描边外扩）相交测试。
+fn cells_intersect(a: &CellSig, b: &CellSig) -> bool {
+    a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
 }
 
 /// 逐帧复用的离屏画布（P2）。
@@ -219,6 +509,8 @@ static DIB: OnceLock<Mutex<DibCache>> = OnceLock::new();
 
 /// 释放 DIB 缓存（窗口销毁 / DPI 变化时调用）。
 pub fn invalidate_dib_cache() {
+    // DIB 已销毁：下次 present 面对的是全新清零 DIB，必须整窗上传
+    invalidate_present_size();
     if let Some(c) = DIB.get() {
         if let Ok(mut c) = c.lock() {
             unsafe { c.free() };
@@ -291,43 +583,49 @@ impl DibCache {
     }
 }
 
-/// 把 SoftwareSurface 上屏（DIB + UpdateLayeredWindow）。
+/// 把 SoftwareSurface 上屏（DIB + UpdateLayeredWindow / UpdateLayeredWindowIndirect）。
 ///
 /// `src_alpha` 为全局恒定 alpha（透明度 × 悬停系数，0..=255）。
+/// `dirty` 决定整窗上传还是只上传脏区子矩形（A1/A2）：
+/// - `Dirty::Full` 或 `SYSOVERLAY_NODIRTY=1` → 经典 `UpdateLayeredWindow`。
+/// - `Dirty::Rect` → `UpdateLayeredWindowIndirect` + `prcDirty`，只上传该子区。
 #[allow(clippy::too_many_arguments)]
-fn update_layered(hwnd: HWND, surface: &SoftwareSurface, width: i32, height: i32, src_alpha: u8) {
+fn present(
+    hwnd: HWND,
+    surface: &SoftwareSurface,
+    width: i32,
+    height: i32,
+    src_alpha: u8,
+    dirty: &Dirty,
+) -> bool {
     unsafe {
         let screen_dc = GetDC(hwnd);
         if screen_dc.is_invalid() {
-            return;
+            return false;
         }
 
         let dib = DIB.get_or_init(|| Mutex::new(DibCache::default()));
         let Ok(mut dib) = dib.lock() else {
             let _ = ReleaseDC(hwnd, screen_dc);
-            return;
+            return false;
         };
         let Some((mem_dc, bits)) = dib.get(screen_dc, width, height) else {
             drop(dib);
             let _ = ReleaseDC(hwnd, screen_dc);
-            return;
+            return false;
         };
 
-        if !bits.is_null() && !surface.pixels.is_empty() {
-            // 画布由 renderer 保证与窗口同尺寸（render 中 resize 过）
-            let dst_len = (width * height * 4) as usize;
-            if surface.pixels.len() >= dst_len {
-                let dst = std::slice::from_raw_parts_mut(bits, dst_len);
-                dst.copy_from_slice(&surface.pixels[..dst_len]);
-            }
-        }
+        // A2：只拷脏区子矩形（Full 则整窗），省掉整窗 187KB 中间拷贝
+        let rect = match dirty {
+            Dirty::Full => RECT { left: 0, top: 0, right: width, bottom: height },
+            Dirty::Rect(r) => *r,
+        };
+        copy_rect_to_dib(bits, surface, &rect, width, height);
 
-        // pptDst 传 None：保持窗口当前位置。
-        // 若传 Some((0,0)) 之类的值，UpdateLayeredWindow 会把窗口挪到该坐标——
+        // pptDst 传 NULL：保持窗口当前位置。
+        // 若传 Some((0,0))，UpdateLayeredWindow 会把窗口挪到该坐标——
         // 这正是旧版"一拖动就弹回原位"的元凶（每帧渲染都重置位置）。
         let mut sz = SIZE { cx: width, cy: height };
-        let mut src_pt = POINT::default();
-
         let bf = BLENDFUNCTION {
             BlendOp: windows::Win32::Graphics::Gdi::AC_SRC_OVER as u8,
             BlendFlags: 0,
@@ -335,7 +633,88 @@ fn update_layered(hwnd: HWND, surface: &SoftwareSurface, width: i32, height: i32
             AlphaFormat: windows::Win32::Graphics::Gdi::AC_SRC_ALPHA as u8,
         };
 
-        let _ = UpdateLayeredWindow(
+        let ok = if *DIRTY_DISABLED || matches!(dirty, Dirty::Full) {
+            let mut src_pt = POINT::default();
+            UpdateLayeredWindow(
+                hwnd,
+                screen_dc,
+                None,
+                Some(&mut sz),
+                mem_dc,
+                Some(&mut src_pt),
+                COLORREF(0),
+                Some(&bf as *const BLENDFUNCTION),
+                windows::Win32::UI::WindowsAndMessaging::ULW_ALPHA,
+            )
+            .is_ok()
+        } else if let Dirty::Rect(r) = dirty {
+            // 脏矩形上传：只更新 r 对应子区，DWM 只重混这一小块。
+            // ppsrc = 子区在 DIB 中的源起点；prcDirty = 窗口客户区的脏区（同坐标）。
+            // prcDirty 非空时 psize/pptDst 被忽略；psize 给整窗尺寸是规范姿势。
+            let psize = SIZE { cx: width, cy: height };
+            let ppsrc = POINT { x: r.left, y: r.top };
+            let prc = RECT {
+                left: r.left,
+                top: r.top,
+                right: r.right,
+                bottom: r.bottom,
+            };
+            let info = UPDATELAYEREDWINDOWINFO {
+                cbSize: std::mem::size_of::<UPDATELAYEREDWINDOWINFO>() as u32,
+                hdcDst: screen_dc,
+                pptDst: std::ptr::null(),
+                psize: &psize as *const SIZE,
+                hdcSrc: mem_dc,
+                pptSrc: &ppsrc as *const POINT,
+                crKey: COLORREF(0),
+                pblend: &bf as *const BLENDFUNCTION,
+                dwFlags: windows::Win32::UI::WindowsAndMessaging::ULW_ALPHA,
+                prcDirty: &prc as *const RECT,
+            };
+            UpdateLayeredWindowIndirect(hwnd, &info).as_bool()
+        } else {
+            false
+        };
+        if !ok {
+            crate::probe::log("present: UpdateLayeredWindow failed");
+        }
+
+        // P2：不删除 mem_dc / bitmap —— 它们留在 DIB 缓存里逐帧复用。
+        let _ = ReleaseDC(hwnd, screen_dc);
+        ok
+    }
+}
+
+/// 把已绘制好的 DIB（mem_dc）上传到分层窗口（高画质 D2D 路径用）。
+///
+/// D2D 直接写进 DIB 的预乘 BGRA 比特，所以无需 `copy_rect_to_dib`——
+/// 只需把 DIB 上屏。`dirty` 决定整窗上传还是只上传脏子矩形（A1/A2 同性能模式）。
+/// 返回 false = 上屏失败（调用方应回滚帧指纹，否则相同内容帧会被跳过 → 冻结）。
+unsafe fn upload_dib(hwnd: HWND, width: i32, height: i32, src_alpha: u8, dirty: &Dirty) -> bool {
+    let screen_dc = GetDC(hwnd);
+    if screen_dc.is_invalid() {
+        return false;
+    }
+    let dib = DIB.get_or_init(|| Mutex::new(DibCache::default()));
+    let Ok(mut dib) = dib.lock() else {
+        let _ = ReleaseDC(hwnd, screen_dc);
+        return false;
+    };
+    let Some((mem_dc, _bits)) = dib.get(screen_dc, width, height) else {
+        drop(dib);
+        let _ = ReleaseDC(hwnd, screen_dc);
+        return false;
+    };
+    let bf = BLENDFUNCTION {
+        BlendOp: windows::Win32::Graphics::Gdi::AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: src_alpha,
+        AlphaFormat: windows::Win32::Graphics::Gdi::AC_SRC_ALPHA as u8,
+    };
+    let ok = if *DIRTY_DISABLED || matches!(dirty, Dirty::Full) {
+        let mut sz = SIZE { cx: width, cy: height };
+        let mut src_pt = POINT::default();
+        UpdateLayeredWindow(
             hwnd,
             screen_dc,
             None,
@@ -345,10 +724,200 @@ fn update_layered(hwnd: HWND, surface: &SoftwareSurface, width: i32, height: i32
             COLORREF(0),
             Some(&bf as *const BLENDFUNCTION),
             windows::Win32::UI::WindowsAndMessaging::ULW_ALPHA,
-        );
+        )
+        .is_ok()
+    } else if let Dirty::Rect(r) = dirty {
+        // prcDirty 非空时 psize/pptDst 被忽略；psize 给整窗尺寸是规范姿势。
+        let psize = SIZE { cx: width, cy: height };
+        let ppsrc = POINT { x: r.left, y: r.top };
+        let prc = RECT { left: r.left, top: r.top, right: r.right, bottom: r.bottom };
+        let info = UPDATELAYEREDWINDOWINFO {
+            cbSize: std::mem::size_of::<UPDATELAYEREDWINDOWINFO>() as u32,
+            hdcDst: screen_dc,
+            pptDst: std::ptr::null(),
+            psize: &psize as *const SIZE,
+            hdcSrc: mem_dc,
+            pptSrc: &ppsrc as *const POINT,
+            crKey: COLORREF(0),
+            pblend: &bf as *const BLENDFUNCTION,
+            dwFlags: windows::Win32::UI::WindowsAndMessaging::ULW_ALPHA,
+            prcDirty: &prc as *const RECT,
+        };
+        UpdateLayeredWindowIndirect(hwnd, &info).as_bool()
+    } else {
+        false
+    };
+    if !ok {
+        crate::probe::log("upload_dib: UpdateLayeredWindow failed");
+    }
+    let _ = ReleaseDC(hwnd, screen_dc);
+    ok
+}
 
-        // P2：不删除 mem_dc / bitmap —— 它们留在 DIB 缓存里逐帧复用。
+/// 高画质模式整帧渲染：复用引擎无关的 `layout` 取 cell，用 `D2DSurface`（DWrite 画字）
+/// 绑到 DIB 内存 DC 并行绘制，再整窗上传。性能模式路径完全不进入本函数。
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+fn render_d2d(
+    hwnd: HWND,
+    snap: &Snapshot,
+    cfg: &Config,
+    renderer: &'static dyn Renderer,
+    width: i32,
+    height: i32,
+    src_alpha: u8,
+    alpha_pct_f: f32,
+    animating: bool,
+) {
+    unsafe {
+        // 布局（与性能模式同一套 cell 几何/文字）→ 门面指纹；
+        // 异或 ENGINE_HASH_XOR 让引擎切换强制整窗重绘（同内容不同像素不能共享跳过）。
+        let (nat_w, nat_h, cells) = renderer.layout(snap, cfg, width, height);
+        // 诊断探针（D2D 侧）：悬浮窗渲染实际读到的指标颜色。
+        crate::probe::log_lazy(|| {
+            format!(
+                "d2d render cfg: cpu_label={:?} cpu_value={:?} gpu_label={:?} fw={}",
+                cfg.metric_colors[0].label,
+                cfg.metric_colors[0].value,
+                cfg.metric_colors[2].label,
+                cfg.font_weight,
+            )
+        });
+
+        // A-自愈（D2D 前置版）：内容放不下窗口 → 扩宽 + 续帧 + 本帧不画。
+        // ⚠️ 只扩不缩（与 GDI 分支共用 ensure_content_fits），避免与下方
+        // self-heal 互相拉锯死循环（实测 282↔298 每帧抖动、418 被压回 282）。
+        if ensure_content_fits(hwnd, cfg, nat_w, nat_h, width, height) {
+            return;
+        }
+
+        let base = renderer.frame_hash(snap, cfg, width, height, src_alpha);
+        let sig = base ^ ENGINE_HASH_XOR;
+        if LAST_FRAME_HASH.load(std::sync::atomic::Ordering::Relaxed) == sig {
+            perf::note_skipped();
+            crate::probe::log_lazy(|| format!("d2d HASH-SKIP sig={sig:x}"));
+            if animating {
+                let _ = SetTimer(hwnd, ANIM_TIMER_ID, 16, None);
+            }
+            return;
+        }
+        LAST_FRAME_HASH.store(sig, std::sync::atomic::Ordering::Relaxed);
+
+        // 脏区（独立 prev 状态）：alpha 变化/布局漂移/尺寸变化 → 整窗；否则变化 cell 并集。
+        // 尺寸检查放在跳过检查之后：跳过帧不得消费「尺寸变化」标记。
+        let (mut dirty, _changed) = compute_dirty_in(&PREV_CELLS_D2D, &PREV_ALPHA_D2D, &cells, src_alpha);
+        // 设置面板触发的重绘：强制整窗（局部 ULW 在部分合成器上不生效 → 颜色/粗细
+        // 「看起来没刷新」，实测证据见 force_full_refresh 注释）。
+        if take_force_full() || present_size_changed(width, height) {
+            dirty = Dirty::Full;
+        }
+        crate::probe::log_lazy(|| {
+            let kind = match &dirty {
+                Dirty::Full => "Full".to_string(),
+                Dirty::Rect(r) => format!("Rect({},{},{},{})", r.left, r.top, r.right, r.bottom),
+            };
+            format!("d2d render {}x{} cells={} dirty={} alpha={}", width, height, cells.len(), kind, src_alpha)
+        });
+
+        let screen_dc = GetDC(hwnd);
+        if screen_dc.is_invalid() {
+            return;
+        }
+        let dib = DIB.get_or_init(|| Mutex::new(DibCache::default()));
+        let Ok(mut dib) = dib.lock() else {
+            let _ = ReleaseDC(hwnd, screen_dc);
+            return;
+        };
+        let Some((mem_dc, _bits)) = dib.get(screen_dc, width, height) else {
+            drop(dib);
+            let _ = ReleaseDC(hwnd, screen_dc);
+            return;
+        };
+
+        // 绑 D2D 到 DIB 内存 DC，整帧重绘（上屏按脏区子矩形，DWrite 确定性渲染
+        // 保证同输入同像素，未上传区域与窗口显示一致）。
+        let mut surface = match D2DSurface::bind(mem_dc, width, height) {
+            Some(s) => s,
+            None => {
+                crate::probe::log("d2d bind FAILED (no RT) — fallback skipped frame");
+                drop(dib);
+                let _ = ReleaseDC(hwnd, screen_dc);
+                LAST_FRAME_HASH.store(u64::MAX, AtomicOrdering::Relaxed);
+                return;
+            }
+        };
+        surface.begin_draw();
+        surface.clear();
+        paint_cells(&mut surface, &cells, cfg.font_weight);
+        // 自愈扩窗（D2D 右缘裁切根治）：绘制完成后用 DWrite 实测最右文本右缘。
+        // 布局按位图度量推算 cell，DIN 真字形更宽 → 右缘可能超出窗口被裁。
+        // 若超出，立即按实测右缘扩宽窗口并续帧重画，直到收敛（无需估算余量）。
+        let text_right = surface.max_text_right;
+        if !surface.end_draw() {
+            // 设备丢失/状态错误：本帧跳过上屏并回滚指纹，下帧 bind 会重建 RT 重试。
+            drop(dib);
+            let _ = ReleaseDC(hwnd, screen_dc);
+            LAST_FRAME_HASH.store(u64::MAX, AtomicOrdering::Relaxed);
+            return;
+        }
+        let need_w = (text_right + 12.0).ceil() as i32;
+        // 仅当确实超出且未达上限才扩；超过上限（内容本身超宽）放弃扩避免死循环。
+        if !cfg.size_locked && need_w > width && need_w <= MAX_WIN {
+            crate::probe::log(&format!(
+                "d2d self-heal width: text_right={text_right:.1} need={need_w} win={width} -> widen + retry"
+            ));
+            drop(dib);
+            let _ = ReleaseDC(hwnd, screen_dc);
+            LAST_FRAME_HASH.store(u64::MAX, AtomicOrdering::Relaxed);
+            fit_window_to(hwnd, cfg, need_w, height);
+            let _ = PostMessageW(
+                hwnd,
+                crate::window::WM_NEW_SNAPSHOT,
+                windows::Win32::Foundation::WPARAM(0),
+                windows::Win32::Foundation::LPARAM(0),
+            );
+            return;
+        }
+        crate::probe::log_lazy(|| format!("d2d PAINT-DONE -> upload {}x{} dirty={:?}", width, height, match &dirty { Dirty::Full => "Full".into(), Dirty::Rect(r) => format!("Rect({},{},{},{})", r.left, r.top, r.right, r.bottom) }));
+
+        // 释放 DIB 锁再上屏：upload_dib 内部会重新加锁取同一份 mem_dc。
+        // std Mutex 不可重入——上一轮补 begin_draw 后 end_draw 成功、执行流抵达
+        // upload_dib，若仍持有锁即同线程死锁（悬浮窗线程卡死 → 重启仍卡 → 设置打不开）。
+        drop(dib);
+        if !upload_dib(hwnd, width, height, src_alpha, &dirty) {
+            LAST_FRAME_HASH.store(u64::MAX, AtomicOrdering::Relaxed);
+        }
+
+        RENDERED_PCT_X100.store((alpha_pct_f.clamp(1.0, 100.0) * 100.0) as u32, AtomicOrdering::Relaxed);
+        if animating {
+            let _ = SetTimer(hwnd, ANIM_TIMER_ID, 16, None);
+        } else {
+            let _ = KillTimer(hwnd, ANIM_TIMER_ID);
+        }
         let _ = ReleaseDC(hwnd, screen_dc);
+    }
+}
+
+/// 把画布脏区子矩形直拷进 DIB 比特（A2：跳过整窗 187KB 拷贝）。
+///
+/// DIB 与画布同尺寸、同为 top-down BGRA，所以目标偏移 = 源偏移。
+unsafe fn copy_rect_to_dib(bits: *mut u8, surface: &SoftwareSurface, r: &RECT, width: i32, height: i32) {
+    let x0 = r.left.max(0);
+    let y0 = r.top.max(0);
+    let x1 = r.right.min(width);
+    let y1 = r.bottom.min(height);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    for yy in y0..y1 {
+        let s_start = ((yy * width + x0) * 4) as usize;
+        let s_end = ((yy * width + x1) * 4) as usize;
+        if s_end > surface.pixels.len() {
+            continue;
+        }
+        let src = &surface.pixels[s_start..s_end];
+        let dst = std::slice::from_raw_parts_mut(bits.add(s_start), s_end - s_start);
+        dst.copy_from_slice(src);
     }
 }
 
@@ -357,20 +926,98 @@ pub fn natural_size(cfg: &Config) -> (i32, i32) {
     renderer_for(cfg.render_style).natural_size(cfg)
 }
 
-/// 让窗口自适应尺寸：手动设置过宽高（`window_size = Some`）时沿用用户尺寸，
-/// 否则按内容自然尺寸（保持左上角位置）。
+/// 让窗口自适应尺寸：**仅在尺寸锁定**（`size_locked`，设置页 LockSize）时沿用
+/// 自定义尺寸，否则按内容自然尺寸（保持左上角位置）。
 /// 设置项变化（项开关 / 风格 / 字号）后由 WM_RECONFIG 调用。
+///
+/// ⚠️ 2026-09-09 修复：此前直接用 `window_size`（它其实是"上次几何"，C 版
+/// `size` 键每次启动都会填）→ 任何重启后尺寸被永久钉死，竖版/字号/间距全部
+/// 失效。现在锁定语义由 `size_locked` 单独承担。
 pub fn fit_window(hwnd: HWND, cfg: &Config) {
     let (nx, ny) = natural_size(cfg);
-    let (w, h) = cfg
-        .window_size
-        .filter(|&(w, h)| w >= 60 && h >= 40)
-        .unwrap_or((nx, ny));
-    let w = w.max(60);
-    let h = h.max(40);
+    fit_window_to(hwnd, cfg, nx, ny);
+}
+
+/// 把窗口设置为指定尺寸（`nx/ny` 传入**运行时自然尺寸**），保持左上角与层级。
+///
+/// 与 [`fit_window`] 的区别：后者用 placeholder 快照估算自然宽度（"0%" 等短样例），
+/// 在字号/数值较长时**低估**真实内容宽度 → 窗口恒偏窄 → 右侧字体被裁且
+/// fit guard 反复触发死循环。guard 路径改用运行时 `Renderer::layout` 实测的
+/// (nat_w, nat_h)，一次设到位、内容与窗口完全匹配。
+fn fit_window_to(hwnd: HWND, cfg: &Config, nx: i32, ny: i32) {
+    let nx = natural_w_oversized(nx, cfg);
+    let (w, h) = if cfg.size_locked {
+        cfg.window_size
+            .filter(|&(w, h)| w >= 60 && h >= 40 && w <= MAX_WIN && h <= MAX_WIN)
+            .unwrap_or((nx.max(60), ny.max(40)))
+    } else {
+        (nx.max(60), ny.max(40))
+    };
+    let w = w.clamp(60, MAX_WIN);
+    let h = h.clamp(40, MAX_WIN);
     unsafe {
         let _ = SetWindowPos(hwnd, None, 0, 0, w, h, SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOMOVE);
-        // 不调 InvalidateRect：尺寸变化后由调用方（WM_RECONFIG）直接 render 一帧，
-        // 避免触发 WM_PAINT 忙循环。
+        // 不调 InvalidateRect：调用方（fit guard / WM_RECONFIG）随后会续一帧渲染。
     }
+}
+
+/// 强制回到自然尺寸（忽略 size_locked）：用于检测到异常窗口尺寸（坏配置/历史
+/// 无上限值）时兜底，避免超大 DIB 分配导致渲染卡死。
+fn force_fit_natural(hwnd: HWND, cfg: &Config) {
+    let (nx, ny) = natural_size(cfg);
+    let w = nx.clamp(60, MAX_WIN);
+    let h = ny.clamp(40, MAX_WIN);
+    unsafe {
+        let _ = SetWindowPos(hwnd, None, 0, 0, w, h, SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOMOVE);
+    }
+}
+
+/// D2D 高画质引擎宽度补偿。
+///
+/// layout 的自然宽度按**位图字体度量**（8×16 等宽 cell）累加，而 D2D 引擎用 DIN
+/// 真字形的 DWrite 渲染（字宽通常 > 位图度量，尤其 DIN-Black 偏宽）→ 自然宽度
+/// 低估真实内容宽度 → 窗口恒窄、右侧文本（如双向 Net 的 "↓xx/s ↑xx/s" 后半段
+/// 上传值）落在窗口外被"裁掉"，观感即"双向只显示一个数值"。给 D2D 下自然宽度
+/// 加 +15% 安全余量；GDI 性能档度量同源（渲染即位图旁路），不加余量不失真。
+fn natural_w_oversized(nat_w: i32, cfg: &Config) -> i32 {
+    let v = if cfg.render_engine == RenderEngine::D2d {
+        ((nat_w as f32) * 1.4).ceil() as i32
+    } else {
+        nat_w
+    };
+    // 上限钳制：guard 比较与 fit 共用此值，超限会造成"扩→clamp→再扩"死循环。
+    v.clamp(60, MAX_WIN)
+}
+
+/// 尺寸自愈（**GDI/D2D 两引擎共用**，杜绝双分支各自维护 guard 导致逻辑漂移）：
+/// 内容放不下窗口时按运行时自然尺寸扩宽并续帧。返回 true = 调用方本帧应跳过。
+///
+/// ⚠️ 只扩不缩：窗口比内容大时保持（用户可能手动拉宽过；且与 D2D self-heal
+/// 组合时，双向收窄会造成"缩→扩→缩"死循环——实测 282↔298 每帧抖动）。
+fn ensure_content_fits(hwnd: HWND, cfg: &Config, nat_w: i32, nat_h: i32, width: i32, height: i32) -> bool {
+    let fit_w = natural_w_oversized(nat_w, cfg);
+    if !cfg.size_locked && (fit_w > width + 8 || nat_h > height + 8) {
+        crate::probe::log(&format!(
+            "fit guard(expand): nat=({nat_w},{nat_h}) fit_w={fit_w} win=({width},{height}) -> expand"
+        ));
+        fit_window_to(hwnd, cfg, nat_w.max(width), nat_h.max(height));
+        unsafe {
+            let _ = PostMessageW(
+                hwnd,
+                crate::window::WM_NEW_SNAPSHOT,
+                windows::Win32::Foundation::WPARAM(0),
+                windows::Win32::Foundation::LPARAM(0),
+            );
+        }
+        return true;
+    }
+    false
+}
+///
+/// 背景：`render` 的脏检查在「帧指纹相同」时跳过整帧。字体粗细/颜色/阴影等设置
+/// 只改变 D2D 的**像素外观**（字形档/描边/alpha），不改变 cell 几何/文本/颜色值
+/// → 指纹不变 → 重绘被跳过 → 悬浮窗要等下一次采样内容变化（最长 2s）才更新，
+/// 用户观感即"设置改了不立刻刷新"。WM_RECONFIG 前调用本函数强制失效。
+pub fn invalidate_frame_hash() {
+    LAST_FRAME_HASH.store(u64::MAX, AtomicOrdering::Relaxed);
 }

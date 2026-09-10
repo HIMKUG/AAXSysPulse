@@ -42,6 +42,9 @@ pub mod process;
 pub mod proc_list;
 pub mod i18n;
 pub mod titlebar;
+pub mod gfx_d2d;
+pub mod render_d2d;
+pub mod din_bitmap;
 
 // Re-export core types for convenience
 pub use sysoverlay_core::config::Config;
