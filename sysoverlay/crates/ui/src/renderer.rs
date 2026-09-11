@@ -191,8 +191,8 @@ impl MetricRow {
     }
 }
 
-/// 固定容量（最多 5 个指标）的栈上指标列表（C2：零堆分配）。
-const MAX_METRICS: usize = 5;
+/// 固定容量（最多 6 项：CPU/Mem/GPU/Net/Power/Time）的栈上指标列表（C2：零堆分配）。
+const MAX_METRICS: usize = 6;
 pub struct RowList {
     items: [MetricRow; MAX_METRICS],
     count: usize,
@@ -202,6 +202,7 @@ impl RowList {
     fn new() -> Self {
         Self {
             items: [
+                MetricRow::empty(),
                 MetricRow::empty(),
                 MetricRow::empty(),
                 MetricRow::empty(),
@@ -310,7 +311,7 @@ fn cell_sig(
         bbox_x,
         right_align,
         hash: acc,
-        text: text.clone(),
+        text: *text,
         color,
         shade,
         shadow,
@@ -346,6 +347,7 @@ fn metric_index(m: MetricEnum) -> usize {
         MetricEnum::Gpu => 2,
         MetricEnum::Net => 3,
         MetricEnum::Power => 4,
+        MetricEnum::Time => 5,
     }
 }
 
@@ -414,162 +416,249 @@ fn font_scale_of(size: f32) -> f32 {
     crate::font::scale_of_font(size)
 }
 
-/// 汇总按 cfg 的所有指标单元（顺序即悬浮窗的显示顺序）。单次构建（C1/C2）。
+/// 汇总按 cfg 的所有指标单元。**显示顺序 = `cfg.metric_order`**（设置页可拖动排序）；
+/// 关闭的项（含时钟行）不产出行。单次构建（C1/C2）。
 fn build_rows(snap: &Snapshot, cfg: &Config) -> RowList {
     let style = Style::derive(Rgb::default(), cfg.fg);
     let mut rows = RowList::new();
-
-    if cfg.show_cpu {
-        let (v, stale, ok) = metric_parts(&snap.cpu);
-        let mut b = StrBuf::new();
-        if ok {
-            fmt_pct(&mut b, v);
-        } else {
-            b.push_str("--");
+    for &m_idx in cfg.metric_order.iter() {
+        let Some(m) = MetricEnum::ALL.get(m_idx as usize) else { continue };
+        if let Some(row) = build_row(*m, snap, cfg, style) {
+            rows.push(row);
         }
-        let color = if stale {
-            style.ui.value_stale
-        } else {
-            style.accent(v)
-        };
-        rows.push(new_row(
-            MetricEnum::Cpu,
-            "CPU",
-            b.clone(),
-            SLOT_PCT,
-            cfg,
-            style.ui.name,
-            color,
-        ));
     }
-
-    if cfg.show_mem {
-        let mut b = StrBuf::new();
-        let slot = if cfg.mem_show_gb {
-            // 实际占用量，不显示总量：如 `8.5GB`
-            fmt_gb(&mut b, snap.memory.used_gb);
-            SLOT_GB
-        } else {
-            fmt_pct(&mut b, snap.memory.load_pct);
-            SLOT_PCT
-        };
-        let color = if cfg.mem_show_gb {
-            style.ui.value
-        } else {
-            style.accent(snap.memory.load_pct)
-        };
-        rows.push(new_row(
-            MetricEnum::Mem,
-            "Mem",
-            b,
-            slot,
-            cfg,
-            style.ui.name,
-            color,
-        ));
-    }
-
-    if cfg.show_gpu {
-        let (v, stale, ok) = metric_parts(&snap.gpu);
-        let mut b = StrBuf::new();
-        if ok {
-            fmt_pct(&mut b, v);
-        } else {
-            b.push_str("--");
-        }
-        let color = if stale {
-            style.ui.value_stale
-        } else {
-            style.accent(v)
-        };
-        rows.push(new_row(
-            MetricEnum::Gpu,
-            "GPU",
-            b,
-            SLOT_PCT,
-            cfg,
-            style.ui.name,
-            color,
-        ));
-    }
-
-    if cfg.show_net {
-        // 方向语义：rx = 接收 = 下载 = ↓；tx = 发送 = 上传 = ↑。
-        // 标题按模式区分方向：双向 Net / 上传 NetU / 下载 NetD（单行），
-        // 双向单行双值（↓下载 ↑上传）；单向只显对应速率，不再靠箭头猜方向。
-        let mut b = StrBuf::new();
-        let slot;
-        let label;
-        match cfg.net_mode {
-            NetMode::Down => {
-                label = "NetD";
-                fmt_rate(&mut b, snap.net.rx_bps, cfg.net_unit);
-                b.push_str("/s");
-                slot = SLOT_RATE;
-            }
-            NetMode::Up => {
-                label = "NetU";
-                fmt_rate(&mut b, snap.net.tx_bps, cfg.net_unit);
-                b.push_str("/s");
-                slot = SLOT_RATE;
-            }
-            NetMode::Both => {
-                label = "Net";
-                // ⚠️ `fmt_rate` 内部会 `buf.clear()`。若直接在 b 上连续调用两次，
-                // 第二次会把刚拼好的「↓下载值/s ↑」整段清空，最终只剩上传值/s
-                // ——直接表现为"双向只显示一个值，且与 NetU 相同"。
-                // 必须先把 rx/tx 各自格式化到独立缓冲，再拼进 b。
-                let mut rx = StrBuf::new();
-                let mut tx = StrBuf::new();
-                fmt_rate(&mut rx, snap.net.rx_bps, cfg.net_unit);
-                fmt_rate(&mut tx, snap.net.tx_bps, cfg.net_unit);
-                b.push_str("\u{2193}");
-                b.push_str(rx.as_str());
-                b.push_str("/s \u{2191}");
-                b.push_str(tx.as_str());
-                b.push_str("/s");
-                slot = SLOT_RATE * 2 + 3;
-            }
-        }
-        let net_row = new_row(
-            MetricEnum::Net,
-            label,
-            b,
-            slot,
-            cfg,
-            style.ui.name,
-            style.ui.value,
-        );
-        rows.push(net_row);
-    }
-
-    if cfg.power_enabled {
-        let (v, stale, ok) = metric_parts(&snap.power);
-        let mut b = StrBuf::new();
-        if ok {
-            // 整机功耗 = 实测(CPU/GPU) + 估算(内存/主板/硬盘)
-            fmt_power(&mut b, v, false);
-        } else {
-            b.push_str("--");
-        }
-        let color = if stale {
-            style.ui.value_stale
-        } else {
-            style.ui.value
-        };
-        let power_row = new_row(
-            MetricEnum::Power,
-            "Power",
-            b,
-            SLOT_POWER,
-            cfg,
-            style.ui.name,
-            color,
-        );
-        rows.push(power_row);
-    }
-
     rows
+}
+
+/// 时间行数值文本：`HH:MM:SS`（show_seconds）或 `HH:MM`。
+/// 时间来自 [`crate::clock`]（平台层每次渲染前写入本地时间），
+/// 帧指纹随秒变化 → 平台层脏检查只重绘时间 cell（脏渲染）。
+pub const TIME_SLOT_WITH_SEC: u32 = 8; // "HH:MM:SS"
+pub const TIME_SLOT_NO_SEC: u32 = 5; // "HH:MM"
+
+fn time_value(cfg: &Config) -> (StrBuf, u32) {
+    let (h, m, s) = crate::clock::get();
+    let mut b = StrBuf::new();
+    push_two_digits(&mut b, h);
+    b.push_str(":");
+    push_two_digits(&mut b, m);
+    let slot = if cfg.time_show_seconds {
+        b.push_str(":");
+        push_two_digits(&mut b, s);
+        TIME_SLOT_WITH_SEC
+    } else {
+        TIME_SLOT_NO_SEC
+    };
+    (b, slot)
+}
+
+/// 写两位十进制数（补零；值 > 99 截断高位，时钟值域内不会发生）。
+fn push_two_digits(b: &mut StrBuf, v: u32) {
+    let v = v % 100;
+    let tens = b'0' + (v / 10) as u8;
+    let ones = b'0' + (v % 10) as u8;
+    b.push_str(core::str::from_utf8(&[tens, ones]).unwrap_or("00"));
+}
+
+/// 构建单个指标的行；该项关闭 / 数据缺失时返回 None。
+fn build_row(m: MetricEnum, snap: &Snapshot, cfg: &Config, style: Style) -> Option<MetricRow> {
+    match m {
+        MetricEnum::Cpu => {
+            if !cfg.show_cpu {
+                return None;
+            }
+            let (v, stale, ok) = metric_parts(&snap.cpu);
+            let mut b = StrBuf::new();
+            if ok {
+                fmt_pct(&mut b, v);
+            } else {
+                b.push_str("--");
+            }
+            let color = if stale {
+                style.ui.value_stale
+            } else {
+                style.accent(v)
+            };
+            let label = metric_label(cfg, 0, "CPU", "C");
+            Some(new_row(
+                MetricEnum::Cpu,
+                label,
+                b,
+                SLOT_PCT,
+                cfg,
+                style.ui.name,
+                color,
+            ))
+        }
+        MetricEnum::Mem => {
+            if !cfg.show_mem {
+                return None;
+            }
+            let mut b = StrBuf::new();
+            let slot = if cfg.mem_show_gb {
+                // 实际占用量，不显示总量：如 `8.5GB`
+                fmt_gb(&mut b, snap.memory.used_gb);
+                SLOT_GB
+            } else {
+                fmt_pct(&mut b, snap.memory.load_pct);
+                SLOT_PCT
+            };
+            let color = if cfg.mem_show_gb {
+                style.ui.value
+            } else {
+                style.accent(snap.memory.load_pct)
+            };
+            let label = metric_label(cfg, 1, "Mem", "M");
+            Some(new_row(
+                MetricEnum::Mem,
+                label,
+                b,
+                slot,
+                cfg,
+                style.ui.name,
+                color,
+            ))
+        }
+        MetricEnum::Gpu => {
+            if !cfg.show_gpu {
+                return None;
+            }
+            let (v, stale, ok) = metric_parts(&snap.gpu);
+            let mut b = StrBuf::new();
+            if ok {
+                fmt_pct(&mut b, v);
+            } else {
+                b.push_str("--");
+            }
+            let color = if stale {
+                style.ui.value_stale
+            } else {
+                style.accent(v)
+            };
+            let label = metric_label(cfg, 2, "GPU", "G");
+            Some(new_row(
+                MetricEnum::Gpu,
+                label,
+                b,
+                SLOT_PCT,
+                cfg,
+                style.ui.name,
+                color,
+            ))
+        }
+        MetricEnum::Net => {
+            if !cfg.show_net {
+                return None;
+            }
+            // 方向语义：rx = 接收 = 下载 = ↓；tx = 发送 = 上传 = ↑。
+            // 标题按模式区分方向：双向 Net / 上传 NetU / 下载 NetD（单行），
+            // 双向单行双值（↓下载 ↑上传）；单向只显对应速率，不再靠箭头猜方向。
+            let mut b = StrBuf::new();
+            let slot;
+            let label_long;
+            match cfg.net_mode {
+                NetMode::Down => {
+                    label_long = "NetD";
+                    fmt_rate(&mut b, snap.net.rx_bps, cfg.net_unit);
+                    b.push_str("/s");
+                    slot = SLOT_RATE;
+                }
+                NetMode::Up => {
+                    label_long = "NetU";
+                    fmt_rate(&mut b, snap.net.tx_bps, cfg.net_unit);
+                    b.push_str("/s");
+                    slot = SLOT_RATE;
+                }
+                NetMode::Both => {
+                    label_long = "Net";
+                    // ⚠️ `fmt_rate` 内部会 `buf.clear()`。若直接在 b 上连续调用两次，
+                    // 第二次会把刚拼好的「↓下载值/s ↑」整段清空，最终只剩上传值/s
+                    // ——直接表现为"双向只显示一个值，且与 NetU 相同"。
+                    // 必须先把 rx/tx 各自格式化到独立缓冲，再拼进 b。
+                    let mut rx = StrBuf::new();
+                    let mut tx = StrBuf::new();
+                    fmt_rate(&mut rx, snap.net.rx_bps, cfg.net_unit);
+                    fmt_rate(&mut tx, snap.net.tx_bps, cfg.net_unit);
+                    b.push_str("\u{2193}");
+                    b.push_str(rx.as_str());
+                    b.push_str("/s \u{2191}");
+                    b.push_str(tx.as_str());
+                    b.push_str("/s");
+                    slot = SLOT_RATE * 2 + 3;
+                }
+            };
+            let label = metric_label(cfg, 3, label_long, "N");
+            Some(new_row(
+                MetricEnum::Net,
+                label,
+                b,
+                slot,
+                cfg,
+                style.ui.name,
+                style.ui.value,
+            ))
+        }
+        MetricEnum::Power => {
+            if !cfg.power_enabled {
+                return None;
+            }
+            let (v, stale, ok) = metric_parts(&snap.power);
+            let mut b = StrBuf::new();
+            if ok {
+                // 整机功耗 = 实测(CPU/GPU) + 估算(内存/主板/硬盘)
+                fmt_power(&mut b, v, false);
+            } else {
+                b.push_str("--");
+            }
+            let color = if stale {
+                style.ui.value_stale
+            } else {
+                style.ui.value
+            };
+            let label = metric_label(cfg, 4, "Power", "P");
+            Some(new_row(
+                MetricEnum::Power,
+                label,
+                b,
+                SLOT_POWER,
+                cfg,
+                style.ui.name,
+                color,
+            ))
+        }
+        MetricEnum::Time => {
+            if !cfg.show_time {
+                return None;
+            }
+            // 时钟标签用 "Time"：DIN 位图字体仅覆盖 ASCII（含 D2D 引擎的
+            // 字体回退行为差异），中文标签交给设置页 i18n（DWrite）。
+            let (b, slot) = time_value(cfg);
+            let label = metric_label(cfg, 5, "Time", "T");
+            Some(new_row(
+                MetricEnum::Time,
+                label,
+                b,
+                slot,
+                cfg,
+                style.ui.name,
+                style.ui.value,
+            ))
+        }
+    }
+}
+
+///  Resolve the display label for metric at index `mi`:
+///  - if `metric_show_labels[mi]` is false → empty string (label hidden)
+///  - else if `short_names` is true → use short form (e.g. "C", "M")
+///  - else → use full form (e.g. "CPU", "Mem")
+fn metric_label(cfg: &Config, mi: usize, full: &'static str, short: &'static str) -> &'static str {
+    if !cfg.metric_show_labels.get(mi).copied().unwrap_or(true) {
+        ""
+    } else if cfg.short_names {
+        short
+    } else {
+        full
+    }
 }
 
 /// 组装一行：字号/配色槽位 + 实测宽度在此统一解析（C3：宽度只算一次）。
@@ -589,6 +678,8 @@ fn new_row(
     let slot_w = measure_scaled_f("0", scale) * slot as i32;
     // 字重（细/中/粗）：对名称/数值色做 alpha 弱化（预乘），粗 = 原样。
     let wf = font_weight_factor(cfg.font_weight);
+    // 名称隐藏时：标签宽度归零、间距归零（数值紧贴左侧起始位置）。
+    let label_value_gap = if label.is_empty() { 0 } else { cfg.label_value_gap as i32 };
     MetricRow {
         metric,
         label: label_buf(label),
@@ -598,7 +689,7 @@ fn new_row(
         label_color: weight_faded(slot_color(cfg, metric, true, name_fallback), wf),
         value_color: weight_faded(slot_color(cfg, metric, false, value_fallback), wf),
         value,
-        label_value_gap: cfg.label_value_gap as i32,
+        label_value_gap,
         label_w,
         value_w,
         slot_w,
@@ -746,8 +837,15 @@ impl Renderer for StripRenderer {
             let row_h = (16.0 * row.scale).ceil() as i32;
             let dy = (glyph_h - row_h) / 2;
             let ly = y + dy;
-            cells.push(cell_sig(&row.label, x, ly, ink_rows, row.scale, row.label_color, shade, cfg.text_shadow, cfg.text_outline, 0));
-            let vx = x + row.label_w + row.label_value_gap + if row.value_w < row.slot_w { row.slot_w - row.value_w } else { 0 };
+            // 名称隐藏时跳过标签 cell（value 直接顶左对齐位置）。
+            if !row.label.is_empty() {
+                cells.push(cell_sig(&row.label, x, ly, ink_rows, row.scale, row.label_color, shade, cfg.text_shadow, cfg.text_outline, 0));
+            }
+            let vx = if row.label.is_empty() {
+                x
+            } else {
+                x + row.label_w + row.label_value_gap + if row.value_w < row.slot_w { row.slot_w - row.value_w } else { 0 }
+            };
             cells.push(cell_sig(&row.value, vx, ly, ink_rows, row.scale, row.value_color, shade, cfg.text_shadow, cfg.text_outline, row.slot_w));
             // 超宽值（Net 双向速率）按实测宽度推进，避免与下一项重叠
             x += row.label_w + row.label_value_gap + row.value_w.max(row.slot_w);
@@ -820,8 +918,11 @@ impl Renderer for VerticalRenderer {
             // 行高用引擎墨迹行数（位图字体 8 行 / DWrite 16 行），
             // 间距为 0 时性能模式各行墨迹紧贴。
             let row_h = (line_h * row.scale).ceil() as i32;
-            cells.push(cell_sig(&row.label, PAD_X, y, line_h, row.scale, row.label_color, shade, cfg.text_shadow, cfg.text_outline, 0));
-            let min_x = PAD_X + row.label_w + row.label_value_gap;
+            // 名称隐藏时跳过标签 cell（数值顶左对齐）。
+            if !row.label.is_empty() {
+                cells.push(cell_sig(&row.label, PAD_X, y, line_h, row.scale, row.label_color, shade, cfg.text_shadow, cfg.text_outline, 0));
+            }
+            let min_x = if row.label.is_empty() { PAD_X } else { PAD_X + row.label_w + row.label_value_gap };
             let dx = (value_right - row.value_w).max(min_x);
             cells.push(cell_sig(&row.value, dx, y, line_h, row.scale, row.value_color, shade, cfg.text_shadow, cfg.text_outline, row.slot_w));
             y += row_h + cfg.metric_gap as i32;
@@ -1110,5 +1211,72 @@ mod tests {
             1,
             "所有数值 cell 必须共享同一右对齐锚点，实际 {anchors:?}"
         );
+    }
+
+    #[test]
+    fn time_row_renders_clock_text() {
+        // 时钟行：默认显示，标签 "Time"，数值 = HH:MM:SS（槽位 8）。
+        crate::clock::set_local(22, 12, 36);
+        let cfg = demo_cfg();
+        let rows = build_rows(&Snapshot::placeholder(0), &cfg);
+        let t = rows
+            .as_slice()
+            .iter()
+            .find(|r| matches!(r.metric, MetricEnum::Time))
+            .expect("默认配置必须包含 Time 行");
+        assert_eq!(t.label.as_str(), "Time");
+        assert_eq!(t.value.as_str(), "22:12:36");
+        assert_eq!(t.slot, TIME_SLOT_WITH_SEC);
+
+        // 关闭秒 → HH:MM（槽位 5）
+        let mut cfg2 = cfg;
+        cfg2.time_show_seconds = false;
+        let rows = build_rows(&Snapshot::placeholder(0), &cfg2);
+        let t = rows
+            .as_slice()
+            .iter()
+            .find(|r| matches!(r.metric, MetricEnum::Time))
+            .expect("show_time=true 时必须有 Time 行");
+        assert_eq!(t.value.as_str(), "22:12");
+        assert_eq!(t.slot, TIME_SLOT_NO_SEC);
+
+        // 完全关闭 → 无 Time 行
+        let mut cfg3 = cfg;
+        cfg3.show_time = false;
+        let rows = build_rows(&Snapshot::placeholder(0), &cfg3);
+        assert!(
+            !rows.as_slice().iter().any(|r| matches!(r.metric, MetricEnum::Time)),
+            "show_time=false 时不得出现 Time 行"
+        );
+    }
+
+    #[test]
+    fn metric_order_drives_display_order() {
+        // 顺序必须真实生效：把 Time 排到最前，行序随之改变。
+        crate::clock::set_local(1, 2, 3);
+        let mut cfg = demo_cfg();
+        cfg.metric_order = [5, 0, 1, 2, 3, 4];
+        let rows = build_rows(&Snapshot::placeholder(0), &cfg);
+        let seq: Vec<MetricEnum> = rows.as_slice().iter().map(|r| r.metric).collect();
+        assert_eq!(
+            seq,
+            vec![
+                MetricEnum::Time,
+                MetricEnum::Cpu,
+                MetricEnum::Mem,
+                MetricEnum::Gpu,
+                MetricEnum::Net
+            ],
+            "metric_order 必须决定显示顺序"
+        );
+
+        // 时间文本变化 → 帧指纹必须变化（脏渲染依赖此性质）
+        let h1 = StripRenderer.frame_hash(&Snapshot::placeholder(0), &cfg, 400, 36, 90);
+        crate::clock::set_local(1, 2, 4);
+        let h2 = StripRenderer.frame_hash(&Snapshot::placeholder(0), &cfg, 400, 36, 90);
+        assert_ne!(h1, h2, "秒数变化必须改变帧指纹");
+        // 同一秒内 → 指纹稳定（跳帧省渲染的前提）
+        let h3 = StripRenderer.frame_hash(&Snapshot::placeholder(0), &cfg, 400, 36, 90);
+        assert_eq!(h2, h3, "同一秒内指纹必须稳定");
     }
 }

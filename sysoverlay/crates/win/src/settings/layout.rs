@@ -6,13 +6,14 @@
 //!
 //! # 折叠卡展开动画
 //! `expand[i]` 是 0..1 的**动画展开度**（由 `mod.rs` 的弹簧每帧推进）：
-//! 监控项 i 的行数 = 1 + 4·expand[i]（小数行），因此卡片高度连续变化；
-//! 卡内内容行始终按展开后的固定位置排布，由 `paint_page` 按卡片矩形**裁剪**露出。
+//! 展开行在 `expand[i] > 0.001` 时即参与布局（卡片一次长到位），
+//! 展开态标记（箭头朝向）按 `expand[i] > 0.5` 判定；
+//! 卡内内容行按展开后的固定位置排布，由 `paint_page` 按卡片矩形**裁剪**露出。
 
 use sysoverlay_core::config::Config;
 use sysoverlay_core::types::Lang;
 
-use super::cfg_ref::CfgRef;
+use super::cfg_ref::{CfgRef, Value};
 use super::state::{Card, Page, Row, Widget};
 use super::widget::{
     AboutHeaderWidget, ButtonAction, ButtonKind, ButtonWidget, DisclosureWidget,
@@ -45,6 +46,8 @@ pub const CONTENT_PAD_TOP: i32 = 20;
 pub const CONTENT_MAX_W: i32 = 620;
 /// 卡片间距（用户反馈：加大 CPU/内存/GPU 各栏之间的间距）。
 pub const CARD_GAP: i32 = 24;
+/// 监控项独立卡之间的间距（每项一张卡，紧凑排列）。
+pub const METRIC_CARD_GAP: i32 = 12;
 
 /// 页标题 / 副标题（报告 §11 每页 h5 + p）。
 pub const TITLE_H: i32 = 26;
@@ -61,6 +64,8 @@ pub const CAPTION_GAP: i32 = 6;
 pub const ROW_H: i32 = 28;
 /// 滑杆行高（额外容纳 min/max 端点标注，报告 B-05）。
 pub const ROW_SLIDER_H: i32 = 40;
+/// 折叠头行高（监控项卡首行）：比基础行高更松，给放大后的抓手/标题留呼吸。
+pub const ROW_HEADER_H: i32 = 48;
 /// 行内说明（hint）每行附加高度。
 pub const HINT_EXTRA: i32 = 20;
 pub const WIDGET_H: i32 = 24;
@@ -75,8 +80,8 @@ pub const SCROLLBAR_INSET: i32 = 4;
 /// **统一控件列**：分段 / 滑杆 / 色板等「大控件」右对齐到同一条右边缘（操作边缘），
 /// 且左侧只在必要时向左扩（窗口变宽时控件不跟着无限拉长）。
 pub const CTRL_W: i32 = 300;
-/// 行尾圆形图标按钮边长。
-pub const ICON_BTN: i32 = 24;
+/// 行尾圆形图标按钮边长（监控项折叠头的展开按钮）。
+pub const ICON_BTN: i32 = 28;
 /// 步进器「−」/「＋」按钮宽（总宽 = 28 + 40 + 28 = 96）。
 pub const STEPPER_BTN_W: i32 = 28;
 pub const STEPPER_W: i32 = 96;
@@ -154,14 +159,22 @@ struct RowDef {
     divider: bool,
     /// 整行是小字说明（无控件、无标签列）。
     hint_only: bool,
+    /// 折叠头行（监控项卡首行）：独占更高的行高，容纳放大后的图标与标题。
+    header: bool,
     items: Vec<ItemDef>,
 }
 
 impl RowDef {
-    /// 行高（逻辑像素）：滑杆行 40；行内 hint 每行 +15。
+    /// 行高（逻辑像素）：折叠头行 48；滑杆行 40；行内 hint 每行 +15。
     fn height(&self) -> f32 {
         let has_slider = self.items.iter().any(|it| it.tall);
-        let mut h = if has_slider { ROW_SLIDER_H as f32 } else { ROW_H as f32 };
+        let mut h = if self.header {
+            ROW_HEADER_H as f32
+        } else if has_slider {
+            ROW_SLIDER_H as f32
+        } else {
+            ROW_H as f32
+        };
         let lines = self.hint_text.map(|t| !t.is_empty() as u32).unwrap_or(0)
             + self.hint2.map(|t| !t.is_empty() as u32).unwrap_or(0);
         h += HINT_EXTRA as f32 * lines as f32;
@@ -170,23 +183,35 @@ impl RowDef {
 }
 
 fn row_def(label: &'static str, hint: Option<&'static str>, items: Vec<ItemDef>) -> RowDef {
-    RowDef { label, hint_text: hint, hint2: None, divider: false, hint_only: false, items }
+    RowDef { label, hint_text: hint, hint2: None, divider: false, hint_only: false, header: false, items }
 }
 
 fn hint_row_def(text: &'static str) -> RowDef {
-    RowDef { label: text, hint_text: None, hint2: None, divider: false, hint_only: true, items: Vec::new() }
+    RowDef {
+        label: text,
+        hint_text: None,
+        hint2: None,
+        divider: false,
+        hint_only: true,
+        header: false,
+        items: Vec::new(),
+    }
 }
 
 // ── 页面构建（纯函数） ───────────────────────────────────
 
-/// 依据 (cfg, lang, dpi, client_w, expand) 重建全部 6 页布局。
+/// 依据 (cfg, lang, dpi, client_w, expand, order) 重建全部 6 页布局。
+///
+/// `order`：监控项显示顺序（第 k 位 = 指标下标），监控项页按它排列卡片；
+/// 拖动排序期间由调用方传入拖动中的临时顺序实现实时预览。
 pub fn build_pages(
     pages: &mut [Page; 6],
     cfg: &Config,
     lang: Lang,
     dpi: u32,
     client_w: i32,
-    expand: &[f32; 5],
+    expand: &[f32; 6],
+    order: &[u8; 6],
 ) {
     let tr = |k: &'static str| crate::i18n::t(lang, k);
 
@@ -251,8 +276,8 @@ pub fn build_pages(
             _ => tr("AboutDesc"),
         };
 
-        // 每页 = [(分组标题, 行列表, 脚注)]。
-        let mut groups: Vec<(&'static str, Vec<RowDef>, Option<&'static str>)> = Vec::new();
+        // 每页 = [(分组标题, 行列表, 脚注, 卡后间距)]；空标题分组跳过标题带。
+        let mut groups: Vec<(&'static str, Vec<RowDef>, Option<&'static str>, i32)> = Vec::new();
 
         match p {
             0 => {
@@ -278,6 +303,7 @@ pub fn build_pages(
                         ),
                     ],
                     None,
+                    CARD_GAP,
                 ));
                 groups.push((
                     tr("GrpStartup"),
@@ -287,6 +313,7 @@ pub fn build_pages(
                         vec![toggle_item(231, CfgRef::AutoStart)],
                     )],
                     None,
+                    CARD_GAP,
                 ));
                 groups.push((
                     tr("GrpDiagnostics"),
@@ -311,6 +338,7 @@ pub fn build_pages(
                         ),
                     ],
                     None,
+                    CARD_GAP,
                 ));
             }
             1 => {
@@ -348,6 +376,7 @@ pub fn build_pages(
                         ),
                     ],
                     None,
+                    CARD_GAP,
                 ));
                 groups.push((
                     tr("GrpDataFormat"),
@@ -364,6 +393,7 @@ pub fn build_pages(
                         ),
                     ],
                     None,
+                    CARD_GAP,
                 ));
                 groups.push((
                     tr("GrpTextEffects"),
@@ -385,56 +415,86 @@ pub fn build_pages(
                         ),
                     ],
                     None,
+                    CARD_GAP,
                 ));
             }
             2 => {
-                // ── 监控项：折叠列表（两级字号，报告 §5/§11 w3） ──
-                let metric_cfg: [CfgRef; 5] = [
+                // ── 监控项：每项一张**独立卡**（按 metric_order 排列，可拖动排序） ──
+                let metric_cfg: [CfgRef; 6] = [
                     CfgRef::ShowCpu,
                     CfgRef::ShowMem,
                     CfgRef::ShowGpu,
                     CfgRef::ShowNet,
                     CfgRef::PowerEnabled,
+                    CfgRef::ShowTime,
                 ];
-                let mut rows: Vec<RowDef> = Vec::new();
-                // 开关紧邻名称（用户反馈：如「CPU」右侧空三格即开关），
-                // 展开/收起圆形按钮贴最右缘。
-                let tog_l = rows_l + s(dpi, 100) as f32; // 名称列(88) + 间距(12)
-                let tog_r = tog_l + TOGGLE_W as f32;
-                for i in 0..5 {
-                    let e = expand[i].clamp(0.0, 1.0);
+                // 折叠头只保留 抓手 + 名称 + 贴右缘的圆形展开按钮；
+                // 总开关移入展开菜单首行（「显示」）。
+                // 位置 k ← order[k] = 指标下标。控件 id 跟随**指标下标**（不随
+                // 位置变化），过渡弹簧按 (页, id) 键控 → 重排不串动画。
+                for &mi in order.iter() {
+                    let i = mi as usize;
+                    if i >= metric_cfg.len() {
+                        continue;
+                    }
+                    let e = expand.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
                     let expanded = e > 0.5;
-                    // 折叠头：徽标 + 标题（折叠态无状态摘要）+ 开关（紧邻名称）
+                    // 该指标是否显示：折叠头据此画「已关闭」标记（开关本身在展开区）。
+                    let on = matches!(metric_cfg[i].get(cfg), Value::Bool(true));
+                    let mut rows: Vec<RowDef> = Vec::new();
+                    // 折叠头：抓手点阵 + 标题（画在 MetricHeaderWidget 内）
                     // + 圆形展开按钮（贴右缘）。
-                    let head: Vec<ItemDef> = vec![
-                        item(
-                            208 + i as i32 * 10,
-                            Box::new(MetricHeaderWidget { index: i, expanded, lang }),
-                            rows_l,
-                            tog_l - 8.0,
-                            false,
-                        ),
-                        item(
-                            200 + i as i32 * 10,
-                            Box::new(ToggleWidget { cfg: metric_cfg[i] }),
-                            tog_l,
-                            tog_r,
-                            false,
-                        ),
-                        item(
-                            207 + i as i32 * 10,
-                            Box::new(DisclosureWidget {
-                                expanded,
-                                action: ButtonAction::ToggleMetricExpand(i),
-                            }),
-                            widget_r - ICON_BTN as f32,
-                            widget_r,
-                            false,
-                        ),
-                    ];
-                    rows.push(RowDef { label: "", hint_text: None, hint2: None, divider: i > 0, hint_only: false, items: head });
+                    // 两项都置 tall：矩形纵跨整行 → 头部拖动热区 = 100% 行高，
+                    // 展开按钮 28×48 → 圆形按短边取半径、垂直居中于行。
+                    rows.push(RowDef {
+                        label: "",
+                        hint_text: None,
+                        hint2: None,
+                        divider: false,
+                        hint_only: false,
+                        header: true,
+                        items: vec![
+                            item(
+                                208 + i as i32 * 10,
+                                Box::new(MetricHeaderWidget { index: i, on, lang }),
+                                rows_l,
+                                widget_r - ICON_BTN as f32,
+                                true,
+                            ),
+                            item(
+                                207 + i as i32 * 10,
+                                Box::new(DisclosureWidget {
+                                    expanded,
+                                    action: ButtonAction::ToggleMetricExpand(i),
+                                }),
+                                widget_r - ICON_BTN as f32,
+                                widget_r,
+                                true,
+                            ),
+                        ],
+                    });
 
                     if e > 0.001 {
+                        // 首行 = 总开关（用户反馈：开关从折叠头移入展开菜单，命名「显示」）。
+                        rows.push(row_def(
+                            tr("LblShow"),
+                            None,
+                            vec![toggle_item(200 + i as i32 * 10, metric_cfg[i])],
+                        ));
+                        // Time 卡：显示秒开关紧随总开关（该卡最常用的选项）。
+                        if i == 5 {
+                            rows.push(row_def(
+                                tr("LblTimeSeconds"),
+                                Some(tr("HintTimeSeconds")),
+                                vec![toggle_item(252, CfgRef::TimeSeconds)],
+                            ));
+                        }
+                        // 显示名称开关（隐藏后只显示数值，如"111W"）。
+                        rows.push(row_def(
+                            tr("LblShowLabel"),
+                            Some(tr("HintShowLabel")),
+                            vec![toggle_item(260 + i as i32 * 10, CfgRef::MetricShowLabel(i))],
+                        ));
                         let _overridden = cfg.metric_font_sizes.get(i).copied().flatten().is_some();
                         // 字号滑杆：理想布局中独占整行，数值纯文本、绿填充、白圈滑块。
                         rows.push(RowDef {
@@ -443,6 +503,7 @@ pub fn build_pages(
                             hint2: None,
                             divider: false,
                             hint_only: false,
+                            header: false,
                             items: vec![font_slider_item(
                                 201 + i as i32 * 10,
                                 CfgRef::MetricFont(i),
@@ -458,6 +519,7 @@ pub fn build_pages(
                             hint2: None,
                             divider: false,
                             hint_only: false,
+                            header: false,
                             items: vec![item(
                                 206 + i as i32 * 10,
                                 Box::new(MetricFontStatusWidget { index: i, lang }),
@@ -478,28 +540,44 @@ pub fn build_pages(
                             vec![ctrl_item(205 + i as i32 * 10, Box::new(MetricSwatchesWidget { cfg: CfgRef::MetricValue(i), auto_cfg: Some(CfgRef::MetricValueAuto(i)) }))],
                         ));
                     }
+                    // 每个指标 = 一张独立卡，卡间小间距（拖动排序的视觉分区）。
+                    groups.push(("", rows, None, METRIC_CARD_GAP));
                 }
-                // 页脚：全部重置 + 即时生效提示。
-                rows.push(RowDef {
-                    label: "",
-                    hint_text: None,
-                    hint2: None,
-                    divider: false,
-                    hint_only: false,
-                    items: vec![item(
-                        209,
-                        Box::new(ButtonWidget {
-                            label: tr("LblResetAll").to_string(),
-                            action: ButtonAction::ResetAllColors,
-                            kind: ButtonKind::Secondary,
-                        }),
-                        widget_r - 96.0,
-                        widget_r,
-                        false,
-                    )],
-                });
-                rows.push(hint_row_def(tr("MetricsFoot")));
-                groups.push(("", rows, None));
+                // 页脚卡：全部重置 + 拖动排序提示 + 即时生效提示。
+                groups.push((
+                    "",
+                    vec![
+                        RowDef {
+                            label: "",
+                            hint_text: None,
+                            hint2: None,
+                            divider: false,
+                            hint_only: false,
+                            header: false,
+                            items: vec![item(
+                                209,
+                                Box::new(ButtonWidget {
+                                    label: tr("LblResetAll").to_string(),
+                                    action: ButtonAction::ResetAllColors,
+                                    kind: ButtonKind::Secondary,
+                                }),
+                                widget_r - 96.0,
+                                widget_r,
+                                false,
+                            )],
+                        },
+                        hint_row_def(tr("HintDragReorder")),
+                        hint_row_def(tr("MetricsFoot")),
+                        // 简化名称：CPU→C、Mem→M、GPU→G、Net→N、Power→P、Time→T。
+                        row_def(
+                            tr("LblShortNames"),
+                            Some(tr("HintShortNames")),
+                            vec![toggle_item(261, CfgRef::ShortNames)],
+                        ),
+                    ],
+                    None,
+                    CARD_GAP,
+                ));
             }
             3 => {
                 // ── 窗口：层级与交互 / 位置与外观（报告 §11 w4） ──
@@ -513,6 +591,7 @@ pub fn build_pages(
                             hint2: Some(tr("HintAlwaysTop2")),
                             divider: false,
                             hint_only: false,
+                            header: false,
                             items: vec![toggle_item(244, CfgRef::Topmost)],
                         },
                         row_def(
@@ -522,6 +601,7 @@ pub fn build_pages(
                         ),
                     ],
                     None,
+                    CARD_GAP,
                 ));
                 groups.push((
                     tr("GrpPosLook"),
@@ -558,6 +638,7 @@ pub fn build_pages(
                         ),
                     ],
                     None,
+                    CARD_GAP,
                 ));
             }
             4 => {
@@ -577,6 +658,7 @@ pub fn build_pages(
                         ),
                     ],
                     None,
+                    CARD_GAP,
                 ));
                 groups.push((
                     tr("GrpRefresh"),
@@ -586,6 +668,7 @@ pub fn build_pages(
                         vec![toggle_item(265, CfgRef::NetLowFreq)],
                     )],
                     None,
+                    CARD_GAP,
                 ));
                 groups.push((
                     tr("GrpPicture"),
@@ -595,6 +678,7 @@ pub fn build_pages(
                         vec![ctrl_item(266, Box::new(seg(&["SegSmooth", "SegFine"], CfgRef::RenderEngine)))],
                     )],
                     None,
+                    CARD_GAP,
                 ));
             }
             _ => {
@@ -608,6 +692,7 @@ pub fn build_pages(
                             hint2: None,
                             divider: false,
                             hint_only: false,
+                            header: false,
                             items: vec![item(270, Box::new(AboutHeaderWidget { lang }), rows_l, widget_r, false)],
                         },
                         RowDef {
@@ -616,6 +701,7 @@ pub fn build_pages(
                             hint2: None,
                             divider: false,
                             hint_only: false,
+                            header: false,
                             items: vec![
                                 item(
                                     271,
@@ -644,6 +730,7 @@ pub fn build_pages(
                         hint_row_def(tr("AboutLinks")),
                     ],
                     page_footnote(5, lang),
+                    CARD_GAP,
                 ));
             }
         }
@@ -651,9 +738,14 @@ pub fn build_pages(
         // ── 组装：页标题块 + 分组卡（浮点逻辑 y 游标） ──
         let mut y: f32 =
             CONTENT_PAD_TOP as f32 + (TITLE_H + TITLE_SUB_GAP + SUB_H + SUB_CARD_GAP) as f32;
-        for (caption, rows, foot) in groups {
-            // 分组标题带（画在卡顶上方，见 paint_page）。
-            y += (CAPTION_H + CAPTION_GAP) as f32;
+        // 上一张卡与本次累计的间距（page.h 计算时扣除，避免尾部多留一个间距）。
+        let mut last_gap: i32 = 0;
+        for (caption, rows, foot, gap) in groups {
+            // 分组标题带（画在卡顶上方，见 paint_page）；
+            // 无标题分组（监控项独立卡 / 关于页）跳过标题带，卡间只用组内 gap。
+            if !caption.is_empty() {
+                y += (CAPTION_H + CAPTION_GAP) as f32;
+            }
             let card_top = y;
             let rows_top = card_top + CARD_PAD as f32;
             let mut ry: f32 = 0.0;
@@ -661,12 +753,19 @@ pub fn build_pages(
             for rd in rows {
                 let rh = rd.height();
                 let band_top = rows_top + ry;
+                // 控件垂直定位带：无 hint 的行用整行高（真居中，折叠头行 48 时
+                // 展开按钮/图标才不会顶在上缘）；有 hint 的行控件与首行标签对齐。
+                let band_h = if rd.hint_text.is_some() || rd.hint2.is_some() {
+                    ROW_H as f32
+                } else {
+                    rh
+                };
                 let mut idxs = Vec::with_capacity(rd.items.len());
                 for it in rd.items {
                     let (wtop, wbot) = if it.tall {
                         (sf(dpi, band_top), sf(dpi, band_top + rh))
                     } else {
-                        let t = sf(dpi, band_top + (ROW_H - WIDGET_H) as f32 / 2.0);
+                        let t = sf(dpi, band_top + (band_h - WIDGET_H as f32) / 2.0);
                         (t, t + s(dpi, WIDGET_H))
                     };
                     let wrect = windows::Win32::Foundation::RECT {
@@ -704,8 +803,9 @@ pub fn build_pages(
                 rows_h,
                 footnote: foot,
             });
-            y = card_bottom + CARD_GAP as f32;
+            y = card_bottom + gap as f32;
+            last_gap = gap;
         }
-        page.h = sf(dpi, y - CARD_GAP as f32 + BOTTOM_MARGIN as f32);
+        page.h = sf(dpi, y - last_gap as f32 + BOTTOM_MARGIN as f32);
     }
 }

@@ -83,8 +83,8 @@ pub struct Config {
     /// 正文字号（像素，8.0..=40.0，0.5 步进）。旧键 `font_scale` 迁移为 ×16。
     pub font_size: f32,
     /// 逐指标字号覆盖（None = 跟随全局 `font_size`）。
-    /// 索引与 [`Metric`] 顺序一致：CPU/MEM/GPU/Net/Power。
-    pub metric_font_sizes: [Option<f32>; 5],
+    /// 索引与 [`Metric`] 顺序一致：CPU/MEM/GPU/Net/Power/Time。
+    pub metric_font_sizes: [Option<f32>; 6],
     /// 字重档位（0=细 / 1=中 / 2=粗，默认 2=粗）。
     ///
     /// 位图字体只有一套字形，三档以**笔画覆盖率**区分（alpha 调制：
@@ -100,7 +100,7 @@ pub struct Config {
     /// 窗口翻页的过渡动画时长（ms，100..=2000，默认 300）。
     pub anim_ms: u32,
     /// 逐项配色：每个指标的名称/数值色槽，None = 跟随 `fg`。
-    pub metric_colors: [MetricColors; 5],
+    pub metric_colors: [MetricColors; 6],
     /// 文字阴影（颜色自动取字体反色：白字黑影 / 黑字白影）。
     pub text_shadow: bool,
     /// 文字描边（1px 四向，颜色同阴影规则）。
@@ -168,6 +168,19 @@ pub struct Config {
     pub admin_check_last_date: u32,
     /// 上次驱动加载检测的日期（YYYYMMDD格式），每周检测一次。
     pub driver_check_last_date: u32,
+
+    // ── 时间项（v6 新增） ─────────────────────────────────────
+    /// 悬浮窗显示时间项（24 小时制，HH:MM[:SS]）。默认开。
+    pub show_time: bool,
+    /// 时间显示秒（HH:MM:SS）；关闭 = 仅 HH:MM。默认开。
+    pub time_show_seconds: bool,
+    /// 逐指标名称显示开关（默认全开）。索引与 [`Metric`] 顺序一致：CPU/MEM/GPU/Net/Power/Time。
+    pub metric_show_labels: [bool; 6],
+    /// 简化名称：CPU→C、Mem→M、GPU→G、Net→N、Power→P、Time→T（默认关）。
+    pub short_names: bool,
+    /// 监控项显示顺序：第 k 位元素 = 显示在第 k 位的指标下标（0..=5 排列）。
+    /// 下标序与 [`Metric`] 枚举序一致：CPU/MEM/GPU/Net/Power/Time。
+    pub metric_order: [u8; 6],
 }
 
 /// 未贴角标记值（自由定位）。
@@ -198,13 +211,13 @@ impl Default for Config {
             mem_show_gb: false,
             // 32px ≈ 旧默认 font_scale 2（16px 基准 ×2）
             font_size: 32.0,
-            metric_font_sizes: [None; 5],
+            metric_font_sizes: [None; 6],
             font_weight: 2,
             metric_gap: 8,
             label_value_gap: 6,
             normal_opacity: 35,
             anim_ms: 300,
-            metric_colors: [MetricColors::default(); 5],
+            metric_colors: [MetricColors::default(); 6],
             text_shadow: true,
             text_outline: false,
             autostart: false,
@@ -229,6 +242,11 @@ impl Default for Config {
             driver_check_continue_count: 0,
             admin_check_last_date: 0,
             driver_check_last_date: 0,
+            show_time: true,
+            time_show_seconds: true,
+            metric_show_labels: [true; 6],
+            short_names: false,
+            metric_order: [0, 1, 2, 3, 4, 5],
         }
     }
 }
@@ -359,6 +377,7 @@ impl Config {
                             Metric::Gpu => 2,
                             Metric::Net => 3,
                             Metric::Power => 4,
+                            Metric::Time => 5,
                         };
                         let mc = &mut cfg.metric_colors[idx];
                         if slot.1 {
@@ -380,6 +399,24 @@ impl Config {
                 "topmost" => cfg.topmost = Self::parse_bool(value, cfg.topmost),
                 // Rust 专属：尺寸锁定（C 版无此键，缺省 false = 自然自适应）。
                 "size_locked" => cfg.size_locked = Self::parse_bool(value, cfg.size_locked),
+                // 时间项：显示开关 + 是否带秒。
+                "show_time" => cfg.show_time = Self::parse_bool(value, cfg.show_time),
+                "time_seconds" => {
+                    cfg.time_show_seconds = Self::parse_bool(value, cfg.time_show_seconds);
+                }
+                // 逐指标名称显示开关：msl_<metric> 0|1（0 = 隐藏名称，1 = 显示名称）。
+                _ if key.starts_with("msl_") => {
+                    if let Some(idx) = parse_metric_show_label(&key) {
+                        cfg.metric_show_labels[idx] = Self::parse_bool(value, cfg.metric_show_labels[idx]);
+                    }
+                }
+                "short_names" => cfg.short_names = Self::parse_bool(value, cfg.short_names),
+                // 监控项显示顺序：6 个 0..=5 的排列，非法值整体回落默认。
+                "morder" | "metric_order" => {
+                    if let Some(order) = parse_metric_order(value) {
+                        cfg.metric_order = order;
+                    }
+                }
                 // C 版 interval 是 100ms 单位 → 换算为 ms 并吸附到允许档位。
                 "interval" => {
                     if let Ok(v) = value.parse::<u32>() {
@@ -554,6 +591,24 @@ impl Config {
         s.push_str(&format!("show_mem {}\n", self.show_mem as u32));
         s.push_str(&format!("show_gpu {}\n", self.show_gpu as u32));
         s.push_str(&format!("show_net {}\n", self.show_net as u32));
+        s.push_str(&format!("show_time {}\n", self.show_time as u32));
+        s.push_str(&format!("time_seconds {}\n", self.time_show_seconds as u32));
+        for (i, &v) in self.metric_show_labels.iter().enumerate() {
+            if !v {
+                let metric = Metric::ALL.get(i).map(|m| m.key_name()).unwrap_or("");
+                s.push_str(&format!("msl_{} 0\n", metric));
+            }
+        }
+        s.push_str(&format!("short_names {}\n", self.short_names as u32));
+        s.push_str(&format!(
+            "morder {} {} {} {} {} {}\n",
+            self.metric_order[0],
+            self.metric_order[1],
+            self.metric_order[2],
+            self.metric_order[3],
+            self.metric_order[4],
+            self.metric_order[5]
+        ));
         s.push_str(&format!("mem_gb {}\n", self.mem_show_gb as u32));
         s.push_str(&format!("font_size {:.1}\n", self.font_size));
         // Rust 专属键：字重档位（0=细 / 1=中 / 2=粗）。C 版忽略未知键。
@@ -682,7 +737,7 @@ fn snap_interval_ms(ms: u32) -> u32 {
     let mut best = INTERVAL_MS_ALLOWED[0];
     let mut best_dist = u32::MAX;
     for &allowed in &INTERVAL_MS_ALLOWED {
-        let dist = if ms > allowed { ms - allowed } else { allowed - ms };
+        let dist = ms.abs_diff(allowed);
         if dist < best_dist {
             best_dist = dist;
             best = allowed;
@@ -707,6 +762,7 @@ fn parse_metric_color(key: &str, value: &str) -> Option<((Metric, bool), Option<
         "gpu" => Metric::Gpu,
         "net" => Metric::Net,
         "power" => Metric::Power,
+        "time" => Metric::Time,
         _ => return None,
     };
     let slot = match slot_part {
@@ -725,6 +781,23 @@ fn parse_metric_color(key: &str, value: &str) -> Option<((Metric, bool), Option<
     Some(((metric, slot), color))
 }
 
+/// 解析逐指标名称显示开关的键。
+///
+/// 键形如 `msl_<metric>`（metric ∈ cpu/mem/gpu/net/power/time）。
+/// 返回索引下标；未知指标名返回 `None`（静默忽略）。
+fn parse_metric_show_label(key: &str) -> Option<usize> {
+    let rest = key.strip_prefix("msl_")?;
+    match rest {
+        "cpu" => Some(0),
+        "mem" => Some(1),
+        "gpu" => Some(2),
+        "net" => Some(3),
+        "power" => Some(4),
+        "time" => Some(5),
+        _ => None,
+    }
+}
+
 /// 解析逐指标字号覆盖的键与值。
 ///
 /// 键形如 `mfs_<metric>`（metric ∈ cpu/mem/gpu/net/power）。
@@ -739,6 +812,7 @@ fn parse_metric_font_size(key: &str, value: &str) -> Option<(usize, Option<f32>)
         "gpu" => 2,
         "net" => 3,
         "power" => 4,
+        "time" => 5,
         _ => return None,
     };
     let v = value.trim();
@@ -750,6 +824,33 @@ fn parse_metric_font_size(key: &str, value: &str) -> Option<(usize, Option<f32>)
         }
     };
     Some((idx, size))
+}
+
+/// 解析监控项显示顺序（`morder a b c d e f`）。
+///
+/// 须恰好 6 个、彼此不重复且都在 0..=5 内的值（空格/逗号/Tab 分隔），
+/// 任何违规整体返回 None（调用方回落默认恒等排列，永不部分应用）。
+fn parse_metric_order(value: &str) -> Option<[u8; 6]> {
+    let mut seen = [false; 6];
+    let mut out = [0u8; 6];
+    let mut n = 0usize;
+    for tok in value.split(|c: char| c.is_ascii_whitespace() || c == ',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        let v: u8 = tok.parse().ok()?;
+        if v > 5 || seen[v as usize] {
+            return None;
+        }
+        seen[v as usize] = true;
+        out[n] = v;
+        n += 1;
+    }
+    if n != 6 {
+        return None;
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -834,6 +935,9 @@ fg F4F1EE
         cfg.render_engine = RenderEngine::D2d;
         cfg.net_mode = NetMode::Down;
         cfg.size_locked = true;
+        cfg.show_time = true;
+        cfg.time_show_seconds = false;
+        cfg.metric_order = [3, 4, 5, 0, 1, 2];
         cfg.metric_colors[0] = MetricColors {
             label: Some(Rgb::new(0x12, 0x34, 0x56)),
             value: None,
@@ -1202,7 +1306,7 @@ fg F4F1EE
     #[test]
     fn test_metric_font_size_default_follows_global() {
         let cfg = Config::default();
-        assert_eq!(cfg.metric_font_sizes, [None; 5], "默认全部跟随全局字号");
+        assert_eq!(cfg.metric_font_sizes, [None; 6], "默认全部跟随全局字号");
     }
 
     #[test]
@@ -1230,6 +1334,76 @@ fg F4F1EE
         assert_eq!(cfg.metric_font_sizes[3], None, "未指定的槽保持跟随");
     }
 
+    // ── 时间项与显示顺序 ─────────────────────────────────────
+
+    #[test]
+    fn test_time_defaults_on() {
+        let cfg = Config::parse(C_REAL_CONFIG);
+        assert!(cfg.show_time, "时间项默认显示");
+        assert!(cfg.time_show_seconds, "默认显示秒");
+        assert_eq!(cfg.metric_order, [0, 1, 2, 3, 4, 5], "默认恒等排列");
+    }
+
+    #[test]
+    fn test_time_and_order_roundtrip() {
+        let mut cfg = Config::default();
+        cfg.show_time = true;
+        cfg.time_show_seconds = false;
+        cfg.metric_order = [3, 4, 5, 0, 1, 2];
+        let text = cfg.serialize();
+        let parsed = Config::parse(&text);
+        assert_eq!(parsed, cfg, "时间/顺序往返失败，实际输出:\n{}", text);
+        assert!(text.contains("show_time 1\n"));
+        assert!(text.contains("time_seconds 0\n"));
+        assert!(text.contains("morder 3 4 5 0 1 2\n"));
+    }
+
+    #[test]
+    fn test_metric_order_validation() {
+        // 非法输入一律整体回落默认恒等排列（永不部分应用）。
+        for bad in [
+            "0 1 2 3 4",       // 缺一个
+            "0 1 2 3 4 5 6",   // 越界值
+            "0 1 2 3 4 5 5",   // 重复
+            "0 1 2 3 4 x",     // 非数字
+            "",                // 空
+            "9 9 9 9 9 9",     // 全越界
+        ] {
+            let cfg = Config::parse(&format!("morder {bad}"));
+            assert_eq!(
+                cfg.metric_order,
+                [0, 1, 2, 3, 4, 5],
+                "非法 morder {:?} 应回落默认",
+                bad
+            );
+        }
+        // 合法：逗号分隔也接受
+        let cfg = Config::parse("morder 5,4,3,2,1,0");
+        assert_eq!(cfg.metric_order, [5, 4, 3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn test_metric_time_slot_in_per_metric_arrays() {
+        let mut cfg = Config::default();
+        cfg.metric_font_sizes[5] = Some(14.0);
+        cfg.metric_colors[5] = MetricColors {
+            label: Some(Rgb::new(0xAA, 0xBB, 0xCC)),
+            value: None,
+            value_auto: false,
+        };
+        let text = cfg.serialize();
+        let parsed = Config::parse(&text);
+        assert_eq!(parsed.metric_font_sizes[5], Some(14.0), "Time 字号槽位 = 5");
+        assert_eq!(
+            parsed.metric_colors[5].label,
+            Some(Rgb::new(0xAA, 0xBB, 0xCC)),
+            "Time 配色槽位 = 5"
+        );
+        assert!(text.contains("mfs_time 14.0\n"));
+        // COLORREF = BBGGRR：Rgb(0xAA,0xBB,0xCC) → 0xCCBBAA
+        assert!(text.contains("mc_time_lbl CCBBAA\n"));
+    }
+
     #[test]
     fn test_font_size_clamp_widened_to_72() {
         // 报告 §11：字号滑杆 12..72。旧上限 40 会让 72 在重启后丢值。
@@ -1250,11 +1424,11 @@ fg F4F1EE
         cfg.click_through = true;
         cfg.snap_corner = 2;
         let parsed = Config::parse(&cfg.serialize());
-        assert_eq!(parsed.click_through, true);
+        assert!(parsed.click_through);
         assert_eq!(parsed.snap_corner, 2);
         // 越界角标回落自由定位，不 panic
         assert_eq!(Config::parse("snap_corner 7").snap_corner, SNAP_CORNER_FREE);
-        assert_eq!(Config::parse("click_through yes").click_through, true);
+        assert!(Config::parse("click_through yes").click_through);
         // 旧配置无这两个键 → 语义不变
         assert_eq!(Config::parse(C_REAL_CONFIG).snap_corner, SNAP_CORNER_FREE);
     }
@@ -1262,7 +1436,7 @@ fg F4F1EE
     #[test]
     fn test_metric_font_size_unknown_ignored() {
         let cfg = Config::parse("mfs_xxx 20.0\nmfs");
-        assert_eq!(cfg.metric_font_sizes, [None; 5]);
+        assert_eq!(cfg.metric_font_sizes, [None; 6]);
     }
 
     #[test]

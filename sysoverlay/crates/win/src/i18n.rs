@@ -22,7 +22,7 @@ pub fn global_lang() -> Lang {
 }
 
 /// 翻译：按当前语言取文案。英文为默认（与 C 版一致）。
-pub fn t<'a>(lang: Lang, key: &'a str) -> &'a str {
+pub fn t(lang: Lang, key: &str) -> &str {
     let zh = lang == Lang::Zh;
     match (key, zh) {
         // ── 悬浮窗主界面标签 ────────────────────────────
@@ -68,6 +68,17 @@ pub fn t<'a>(lang: Lang, key: &'a str) -> &'a str {
         ("LblNet", true) => "网络",
         ("LblPower", false) => "Power",
         ("LblPower", true) => "功耗",
+        ("LblTime", false) => "Time",
+        ("LblTime", true) => "时间",
+        ("LblTimeSeconds", false) => "Show Seconds",
+        ("LblTimeSeconds", true) => "显示秒",
+        // 监控项总开关（展开菜单首行；原先放在折叠头，用户反馈移入展开区）。
+        ("LblShow", false) => "Show",
+        ("LblShow", true) => "显示",
+        ("HintTimeSeconds", false) => "Show the clock as HH:MM:SS. Turn off to display HH:MM only.",
+        ("HintTimeSeconds", true) => "时间以 时:分:秒 显示；关闭后仅显示 时:分。",
+        ("HintDragReorder", false) => "Drag the icon/name area of a card to reorder the items.",
+        ("HintDragReorder", true) => "按住卡片左侧的图标与名称区域上下拖动，即可调整监控项顺序。",
         ("LblMemUnit", false) => "Memory Unit",
         ("LblMemUnit", true) => "内存单位",
         ("LblShadow", false) => "Text Shadow",
@@ -248,6 +259,14 @@ pub fn t<'a>(lang: Lang, key: &'a str) -> &'a str {
         ("LblAnimMs", true) => "过渡时长",
         ("LblNameColor", false) => "Name Color",
         ("LblNameColor", true) => "名称色",
+        ("LblShowLabel", false) => "Show Name",
+        ("LblShowLabel", true) => "显示名称",
+        ("HintShowLabel", false) => "Show or hide the metric name label (e.g. CPU, Mem).",
+        ("HintShowLabel", true) => "显示或隐藏监控项的名称标签（如 CPU、Mem）。",
+        ("LblShortNames", false) => "Short Names",
+        ("LblShortNames", true) => "简化名称",
+        ("HintShortNames", false) => "Shorten labels: CPU→C, Mem→M, GPU→G, Net→N, Power→P, Time→T.",
+        ("HintShortNames", true) => "简化标签：CPU→C、Mem→M、GPU→G、Net→N、Power→P、Time→T。",
         ("LblValueColor", false) => "Value Color",
         ("LblValueColor", true) => "数值色",
         ("BtnReset", false) => "Reset",
@@ -377,14 +396,10 @@ pub fn t<'a>(lang: Lang, key: &'a str) -> &'a str {
         // 监控项页：两级字号语义
         ("MtrFollow", false) => "Follows global",
         ("MtrFollow", true) => "跟随全局",
-        ("MtrStatusFollowHint", false) => "Changes with the global size on the Layout page.",
-        ("MtrStatusFollowHint", true) => "随「布局」页的全局字号变化",
         ("MtrCustomized", false) => "Custom",
         ("MtrCustomized", true) => "已自定义",
         ("ActRestoreGlobal", false) => "Follow global",
         ("ActRestoreGlobal", true) => "恢复跟随全局",
-        ("HintFontSizeOverride", false) => "Set individually — no longer follows the global size on the Layout page.",
-        ("HintFontSizeOverride", true) => "已单独设置，不再跟随「布局」页的全局字号。",
         // 监控项页：逐控件 hint（报告 V03）
         ("HintFontSizeMetric", false) => "Affects the text size of this metric in the overlay.",
         ("HintFontSizeMetric", true) => "影响该监控项在悬浮窗中的文字大小。",
@@ -436,6 +451,6 @@ pub fn t<'a>(lang: Lang, key: &'a str) -> &'a str {
         ("HintRenderMode", false) => "Smooth favors lower cost; Fine favors animation quality.",
         ("HintRenderMode", true) => "流畅优先降低绘制开销，精细优先保证动画细腻",
 
-        _ => return key,
+        _ => key,
     }
 }

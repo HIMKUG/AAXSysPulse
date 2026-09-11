@@ -45,6 +45,14 @@ pub enum CfgRef {
     ShowGpu,
     ShowNet,
     PowerEnabled,
+    /// 时钟行显示开关（监控项页 Time 卡）。
+    ShowTime,
+    /// 时钟是否显示秒（HH:MM:SS / HH:MM）。
+    TimeSeconds,
+    /// 逐指标名称显示开关（默认开；关闭后只显示数值）。
+    MetricShowLabel(usize),
+    /// 简化名称：CPU→C、Mem→M、GPU→G、Net→N、Power→P、Time→T。
+    ShortNames,
     TextShadow,
     TextOutline,
     Topmost,
@@ -102,6 +110,12 @@ impl CfgRef {
             CfgRef::ShowGpu => Value::Bool(cfg.show_gpu),
             CfgRef::ShowNet => Value::Bool(cfg.show_net),
             CfgRef::PowerEnabled => Value::Bool(cfg.power_enabled),
+            CfgRef::ShowTime => Value::Bool(cfg.show_time),
+            CfgRef::TimeSeconds => Value::Bool(cfg.time_show_seconds),
+            CfgRef::MetricShowLabel(i) => {
+                Value::Bool(*cfg.metric_show_labels.get(i).unwrap_or(&true))
+            }
+            CfgRef::ShortNames => Value::Bool(cfg.short_names),
             CfgRef::TextShadow => Value::Bool(cfg.text_shadow),
             CfgRef::TextOutline => Value::Bool(cfg.text_outline),
             CfgRef::Topmost => Value::Bool(cfg.topmost),
@@ -157,6 +171,16 @@ impl CfgRef {
             (CfgRef::ShowGpu, Value::Bool(x)) => cfg.show_gpu = x,
             (CfgRef::ShowNet, Value::Bool(x)) => cfg.show_net = x,
             (CfgRef::PowerEnabled, Value::Bool(x)) => cfg.power_enabled = x,
+            (CfgRef::ShowTime, Value::Bool(x)) => cfg.show_time = x,
+            (CfgRef::TimeSeconds, Value::Bool(x)) => cfg.time_show_seconds = x,
+            (CfgRef::MetricShowLabel(i), Value::Bool(x)) => {
+                if let Some(v) = cfg.metric_show_labels.get_mut(i) {
+                    *v = x;
+                } else {
+                    return false;
+                }
+            }
+            (CfgRef::ShortNames, Value::Bool(x)) => cfg.short_names = x,
             (CfgRef::TextShadow, Value::Bool(x)) => cfg.text_shadow = x,
             (CfgRef::TextOutline, Value::Bool(x)) => cfg.text_outline = x,
             (CfgRef::Topmost, Value::Bool(x)) => cfg.topmost = x,
@@ -286,6 +310,15 @@ mod tests {
             (CfgRef::ShowMem, Value::Bool(false)),
             (CfgRef::ShowGpu, Value::Bool(false)),
             (CfgRef::ShowNet, Value::Bool(false)),
+            (CfgRef::ShowTime, Value::Bool(true)),
+            (CfgRef::ShowTime, Value::Bool(false)),
+            (CfgRef::TimeSeconds, Value::Bool(true)),
+            (CfgRef::TimeSeconds, Value::Bool(false)),
+            (CfgRef::MetricShowLabel(0), Value::Bool(false)),
+            (CfgRef::MetricShowLabel(3), Value::Bool(false)),
+            (CfgRef::MetricShowLabel(5), Value::Bool(true)),
+            (CfgRef::ShortNames, Value::Bool(true)),
+            (CfgRef::ShortNames, Value::Bool(false)),
             (CfgRef::PowerEnabled, Value::Bool(true)),
             (CfgRef::TextShadow, Value::Bool(false)),
             (CfgRef::TextOutline, Value::Bool(false)),

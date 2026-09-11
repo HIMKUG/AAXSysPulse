@@ -3,11 +3,11 @@
 //! # 过渡（H2 扩展）
 //! 每个控件有一组弹簧（hover / press / val，见 `mod.rs::Transition`）。
 //! `WidgetState::anim_v` 携带 `val` 弹簧的当前值：
-//! - Toggle → 0..1（旋钮滑动 + 轨道渐变）
-//! - Segmented / Swatches → 选中下标（指示条 / 选中环滑动）
-//! - Slider → 数值（滑块滑动）
-//! - Disclosure → 0..1（箭头展开角度）
-//! 因此**所有可切换控件都是「滑过去」而非「跳过去」**。
+//!   - Toggle → 0..1（旋钮滑动 + 轨道渐变）
+//!   - Segmented / Swatches → 选中下标（指示条 / 选中环滑动）
+//!   - Slider → 数值（滑块滑动）
+//!   - Disclosure → 0..1（箭头展开角度）
+//!   因此**所有可切换控件都是「滑过去」而非「跳过去」**。
 
 use windows::Win32::Foundation::RECT;
 
@@ -18,6 +18,7 @@ use crate::gfx_d2d::{ColorF, Gfx, HAlign, RectF};
 use crate::theme::Theme;
 
 use super::cfg_ref::{CfgRef, Value};
+use super::layout::s;
 use super::state::{sync_via_cfg, EditState, IWidget, Widget, WidgetState};
 
 // ── 色板常量 ─────────────────────────────────────────────
@@ -101,13 +102,14 @@ pub struct DisclosureWidget {
     pub action: ButtonAction,
 }
 
-/// 指标折叠头（个性化页）：字母徽标 + 标题 + 状态/副标题。
-/// 折叠态显示「已启用 · 40 px / 已关闭」，展开态显示静态副标题；
-/// 整体可点击（展开/收起），开关与箭头是行内独立控件、不与其重叠。
+/// 指标折叠头（个性化页）：字母徽标 + 标题 + （关闭时）状态标记。
+/// 总开关已移入展开菜单（首行「显示」），因此折叠态用一枚「已关闭」弱化标签
+/// 承担状态指示（开启时不画，保持折叠行安静）。
+/// 整行可点击（展开/收起）；箭头是行内独立控件、不与其重叠。
 pub struct MetricHeaderWidget {
     pub index: usize,
-    /// 构建时的展开状态（布局随弹簧每帧重建，值保持新鲜）。
-    pub expanded: bool,
+    /// 该指标当前是否显示（构建时从 cfg 读取；关闭时折叠头显示「已关闭」）。
+    pub on: bool,
     /// 构建时语言（跟随 cfg.lang，不依赖全局态时序）。
     pub lang: Lang,
 }
@@ -372,44 +374,6 @@ pub fn slider_value_from_x(x: f32, track: RectF, min: f64, max: f64, step: f64) 
     snapped.clamp(min, max)
 }
 
-#[cfg(test)]
-mod slider_tests {
-    use super::*;
-
-    #[test]
-    fn t_maps_value_range_to_unit() {
-        assert_eq!(slider_t_from_value(8.0, 8.0, 256.0), 0.0);
-        assert_eq!(slider_t_from_value(256.0, 8.0, 256.0), 1.0);
-        assert!((slider_t_from_value(132.0, 8.0, 256.0) - 0.5).abs() < 1e-4);
-    }
-
-    #[test]
-    fn t_clamps_out_of_range() {
-        assert_eq!(slider_t_from_value(-100.0, 8.0, 256.0), 0.0);
-        assert_eq!(slider_t_from_value(9999.0, 8.0, 256.0), 1.0);
-    }
-
-    #[test]
-    fn value_from_x_snaps_to_step_and_clamps() {
-        let track = RectF::new(100.0, 0.0, 300.0, 24.0);
-        assert!((slider_value_from_x(200.0, track, 8.0, 256.0, 0.5) - 132.0).abs() < 1e-3);
-        assert_eq!(slider_value_from_x(0.0, track, 8.0, 256.0, 0.5), 8.0);
-        assert_eq!(slider_value_from_x(9999.0, track, 8.0, 256.0, 0.5), 256.0);
-        let v = slider_value_from_x(201.0, track, 8.0, 256.0, 0.5);
-        assert!((v * 2.0).fract().abs() < 1e-6, "必须吸附到 0.5 步进，实际 {v}");
-    }
-
-    #[test]
-    fn lerp_color_midpoint_and_clamp() {
-        let a = ColorF::rgba(0, 0, 0, 1.0);
-        let b = ColorF::rgba(255, 255, 255, 1.0);
-        let m = lerp_color(a, b, 0.5).d2d();
-        assert!((m.r - 0.5).abs() < 0.01 && (m.g - 0.5).abs() < 0.01);
-        assert_eq!(lerp_color(a, b, -1.0).d2d().r, 0.0);
-        assert_eq!(lerp_color(a, b, 2.0).d2d().r, 1.0);
-    }
-}
-
 // ── D2D 绘制 ─────────────────────────────────────────────
 
 fn c(_t: &Theme, v: u32) -> ColorF {
@@ -488,9 +452,7 @@ pub fn paint_widget(
     } else if let Some(ab) = w.kind.as_any().downcast_ref::<AboutHeaderWidget>() {
         paint_about_header(rt, gfx, dpi, theme, r, ab.lang);
     } else if let Some(mh) = w.kind.as_any().downcast_ref::<MetricHeaderWidget>() {
-        paint_metric_header(
-            rt, gfx, dpi, theme, r, cfg, mh.index, mh.expanded, mh.lang, body_px, small_px,
-        );
+        paint_metric_header(rt, gfx, dpi, theme, r, mh.index, mh.on, mh.lang, body_px, small_px);
     } else if let Some(ms) = w.kind.as_any().downcast_ref::<MetricFontStatusWidget>() {
         paint_metric_font_status(
             rt, gfx, state, dpi, theme, r, cfg, ms.index, ms.lang, body_px, small_px,
@@ -889,6 +851,7 @@ fn paint_disclosure(
     r: RectF,
 ) {
     // 圆形按钮（用户反馈：展开/收起应为圆形按钮，符号居中）。
+    // 矩形纵跨整行（tall）：半径按短边（= ICON_BTN）取，圆心即行中心。
     let cx = (r.l + r.r) / 2.0;
     let cy = (r.t + r.b) / 2.0;
     let rad = (r.w().min(r.h())) / 2.0 - super::layout::s(dpi, 3) as f32;
@@ -896,7 +859,7 @@ fn paint_disclosure(
     let er = RectF::new(cx - rad, cy - rad, cx + rad, cy + rad);
     gfx.fill_ellipse(rt, er, bg);
     let color = if state.hovered { c(t, t.label) } else { c(t, t.secondary) };
-    let k = super::layout::s(dpi, 4) as f32;
+    let k = super::layout::s(dpi, 5) as f32;
     let st = super::layout::s(dpi, 1).max(1) as f32 * 1.5;
     let a = state.anim_v.clamp(0.0, 1.0);
     // 朝右：(-0.5k,-k) (0.5k,0) (-0.5k,k)；朝下：(-k,-0.5k) (0,0.5k) (k,-0.5k)
@@ -908,9 +871,9 @@ fn paint_disclosure(
 }
 
 /// 字号状态条（理想布局）：字号滑杆下方的一行。
-/// - 未覆盖：「跟随全局  随「布局」页的全局字号变化」
-/// - 已覆盖：「已自定义」标签 + 说明文字 + 右侧「恢复跟随全局」链接。
-/// 整行可点（命中右侧链接区域即重置）。
+///   - 未覆盖：「跟随全局」药丸（右侧「恢复跟随全局」按钮）。
+///   - 已覆盖：「已自定义」标签（右侧「恢复跟随全局」按钮）。
+///   整行可点（命中右侧链接区域即重置）。
 #[allow(clippy::too_many_arguments)]
 fn paint_metric_font_status(
     rt: &windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget,
@@ -953,15 +916,6 @@ fn paint_metric_font_status(
                 rt, crate::i18n::t(lang, "ActRestoreGlobal"), body_px, 400,
                 HAlign::Center, btn, c(t, t.accent), true,
             );
-
-            // 中间说明文字：位于药丸与按钮之间。
-            let msg_l = tag_r.r + gap;
-            let msg_r = (btn.l - gap).max(msg_l);
-            if msg_r > msg_l {
-                let msg = crate::i18n::t(lang, "HintFontSizeOverride");
-                let msg_rect = RectF::new(msg_l, r.t, msg_r, r.b);
-                gfx.text(rt, msg, body_px, 400, HAlign::Leading, msg_rect, c(t, t.secondary), true);
-            }
         }
     } else {
         // 未覆盖：灰色「跟随全局」药丸 + 说明。
@@ -974,22 +928,13 @@ fn paint_metric_font_status(
         let tag_r = RectF::new(r.l, by - tag_h / 2.0, r.l + tag_w, by + tag_h / 2.0);
         gfx.fill_round(rt, tag_r, tag_h / 2.0, c(t, t.secondary).with_alpha(0.12));
         gfx.text(rt, tag_text, caption_px, 600, HAlign::Center, tag_r, c(t, t.secondary), true);
-
-        let msg_l = tag_r.r + gap;
-        let hint = crate::i18n::t(lang, "MtrStatusFollowHint");
-        if r.r > msg_l {
-            let msg_rect = RectF::new(msg_l, r.t, r.r, r.b);
-            gfx.text(rt, hint, body_px, 400, HAlign::Leading, msg_rect, c(t, t.secondary), true);
-        }
     }
 }
 
-/// 指标折叠头：字母徽标 + 标题 + 状态摘要（报告 L03/L08、C-05/C-06）。
-/// 折叠态/展开态均为状态摘要：
-/// - 关闭：`已关闭`
-/// - 开启且未覆盖字号：`已启用 · 40 px · 跟随全局`
-/// - 开启且已覆盖：`已启用 · 42 px` + 「已自定义」标记
-/// 硬约束（B-07）：折叠头不含任何可调参数控件，仅图标 + 名称 + 状态 + 开关 + 箭头。
+/// 指标折叠头：抓手点阵 + 标题 + （关闭时）「已关闭」标记（报告 L03/L08）。
+///   字母徽标已移除（用户反馈无信息量）；总开关在展开菜单首行（「显示」），
+///   因此这里仅在关闭态补一枚弱化标签，避免折叠列表出现「看不出已关」的死角。
+///   硬约束（B-07）：折叠头不含任何可调参数控件，仅抓手 + 名称 + 状态 + 箭头。
 #[allow(clippy::too_many_arguments)]
 fn paint_metric_header(
     rt: &windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget,
@@ -997,33 +942,55 @@ fn paint_metric_header(
     dpi: u32,
     t: &Theme,
     r: RectF,
-    _cfg: Option<&Config>,
     index: usize,
-    _expanded: bool,
+    on: bool,
     lang: Lang,
     body_px: f32,
     caption_px: f32,
 ) {
-    const LETTERS: [char; 5] = ['C', 'M', 'G', 'N', 'P'];
-    const KEYS: [&str; 5] = ["LblCpu", "LblMem", "LblGpu", "LblNet", "LblPower"];
-    let name = crate::i18n::t(lang, KEYS[index.min(4)]);
+    const KEYS: [&str; 6] = ["LblCpu", "LblMem", "LblGpu", "LblNet", "LblPower", "LblTime"];
+    let name = crate::i18n::t(lang, KEYS[index.min(5)]);
+    // 折叠头标题比正文大一档（用户反馈：字号偏小）。
+    let title_px = body_px * 1.2;
 
-    let badge = super::layout::s(dpi, 20) as f32;
-    let by = (r.t + r.b) / 2.0;
-    // 徽标：accent 12% 底 + accent 字母（唯一的强调色派生，C05）。
-    let brect = RectF::new(r.l, by - badge / 2.0, r.l + badge, by + badge / 2.0);
-    gfx.fill_round(rt, brect, super::layout::s(dpi, 5) as f32, c(t, t.accent).with_alpha(0.12));
-    gfx.text(
-        rt, &LETTERS[index.min(4)].to_string(), caption_px, 600, HAlign::Center, brect,
-        c(t, t.accent), true,
-    );
+    // 拖动抓手点阵（2×3）：矩形纵跨整行（tall）→ gy 即行几何中心，上下居中；
+    // 左侧内缩 + 与标题保持间距，左右都有呼吸感，不贴卡片边缘。
+    let gy = (r.t + r.b) / 2.0;
+    let dot = s(dpi, 2) as f32;
+    let gap = s(dpi, 5) as f32;
+    let gx0 = r.l + s(dpi, 6) as f32;
+    let grip_col = c(t, t.secondary).with_alpha(0.6);
+    for row in -1..=1i32 {
+        for col in 0..2i32 {
+            let cx = gx0 + col as f32 * gap;
+            let cy = gy + row as f32 * gap;
+            gfx.fill_ellipse(rt, RectF::new(cx - dot, cy - dot, cx + dot, cy + dot), grip_col);
+        }
+    }
 
-    // 标题（600 字重）+ 定宽名称列（报告 size::MONITOR_NAME_W = 58，跨项左对齐）。
-    // 折叠态不显示「已启用 · N px / 已关闭」——开关本身即状态（报告用户反馈）。
-    let title_l = r.l + badge + super::layout::s(dpi, 10) as f32;
-    let sub_l = title_l + super::layout::s(dpi, 58) as f32;
-    let tr = RectF::new(title_l, r.t, sub_l, r.b);
-    gfx.text(rt, name, body_px, 600, HAlign::Leading, tr, c(t, t.label), true);
+    // 标题（600 字重）：紧接抓手之后，与抓手留 16 呼吸间距；关闭态降为次级色。
+    let title_l = gx0 + gap + dot + s(dpi, 16) as f32;
+    let tr = RectF::new(title_l, r.t, r.r, r.b);
+    let title_col = if on { c(t, t.label) } else { c(t, t.secondary) };
+    let mw = gfx.text(rt, name, title_px, 600, HAlign::Leading, tr, title_col, true);
+
+    // 关闭态：名称右侧补一枚「已关闭」（开启时不画，保持折叠列表安静）。
+    if !on {
+        let tag_l = title_l + mw.map(|(w, _)| w).unwrap_or(0.0) + s(dpi, 12) as f32;
+        if tag_l < r.r {
+            let tag_r = RectF::new(tag_l, r.t, r.r, r.b);
+            gfx.text(
+                rt,
+                crate::i18n::t(lang, "MtrOff"),
+                caption_px,
+                400,
+                HAlign::Leading,
+                tag_r,
+                c(t, t.secondary),
+                true,
+            );
+        }
+    }
 }
 
 /// 关于页头部：Logo 方块 + 应用名 + 版本（报告 §11 关于页布局）。
@@ -1071,4 +1038,42 @@ fn body_px(dpi: u32) -> f32 {
 
 fn caption_px(dpi: u32) -> f32 {
     11.0 * dpi as f32 / 72.0
+}
+
+#[cfg(test)]
+mod slider_tests {
+    use super::*;
+
+    #[test]
+    fn t_maps_value_range_to_unit() {
+        assert_eq!(slider_t_from_value(8.0, 8.0, 256.0), 0.0);
+        assert_eq!(slider_t_from_value(256.0, 8.0, 256.0), 1.0);
+        assert!((slider_t_from_value(132.0, 8.0, 256.0) - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn t_clamps_out_of_range() {
+        assert_eq!(slider_t_from_value(-100.0, 8.0, 256.0), 0.0);
+        assert_eq!(slider_t_from_value(9999.0, 8.0, 256.0), 1.0);
+    }
+
+    #[test]
+    fn value_from_x_snaps_to_step_and_clamps() {
+        let track = RectF::new(100.0, 0.0, 300.0, 24.0);
+        assert!((slider_value_from_x(200.0, track, 8.0, 256.0, 0.5) - 132.0).abs() < 1e-3);
+        assert_eq!(slider_value_from_x(0.0, track, 8.0, 256.0, 0.5), 8.0);
+        assert_eq!(slider_value_from_x(9999.0, track, 8.0, 256.0, 0.5), 256.0);
+        let v = slider_value_from_x(201.0, track, 8.0, 256.0, 0.5);
+        assert!((v * 2.0).fract().abs() < 1e-6, "必须吸附到 0.5 步进，实际 {v}");
+    }
+
+    #[test]
+    fn lerp_color_midpoint_and_clamp() {
+        let a = ColorF::rgba(0, 0, 0, 1.0);
+        let b = ColorF::rgba(255, 255, 255, 1.0);
+        let m = lerp_color(a, b, 0.5).d2d();
+        assert!((m.r - 0.5).abs() < 0.01 && (m.g - 0.5).abs() < 0.01);
+        assert_eq!(lerp_color(a, b, -1.0).d2d().r, 0.0);
+        assert_eq!(lerp_color(a, b, 2.0).d2d().r, 1.0);
+    }
 }
