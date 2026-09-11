@@ -23,6 +23,7 @@ use windows::Win32::Graphics::Gdi::{
     BLENDFUNCTION, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, DIB_RGB_COLORS,
     GetDC, ReleaseDC, SelectObject, BI_RGB, BITMAPINFO, HBITMAP, HDC,
 };
+use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::WindowsAndMessaging::{
     KillTimer, PostMessageW, SetTimer, SetWindowPos, UpdateLayeredWindow, UpdateLayeredWindowIndirect,
     UPDATELAYEREDWINDOWINFO, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
@@ -41,6 +42,37 @@ use crate::Snapshot;
 
 /// 悬浮窗透明度动画定时器 ID（仅本窗口使用；graph/procs 的定时器在各自窗口互不干扰）。
 pub const ANIM_TIMER_ID: usize = 7;
+
+/// 时钟行定时器 ID：250ms 触发一次 render，秒变化经帧指纹驱动脏区重绘。
+/// window.rs 的 WM_TIMER 不区分 ID（一律 render），本表复用该路径。
+pub const CLOCK_TIMER_ID: usize = 8;
+/// 时钟行刷新周期（ms）。250ms 保证秒跳变最多延迟 1/4 秒上屏。
+pub const CLOCK_TIMER_MS: u32 = 250;
+
+/// CLOCK 定时器启停守卫：`SetTimer` 同 ID 会**重置到期时间**，
+/// 采样推送（最快 100ms 一帧）若每帧都 SetTimer，250ms 时钟表永远到不了期
+/// （饿死）。因此只在 `show_time` 状态切换的那一刻 SetTimer/KillTimer 一次。
+static CLOCK_TIMER_ON: AtomicBool = AtomicBool::new(false);
+
+/// 最近一次成功整窗上传时的时钟秒值。局部脏区上传（UpdateLayeredWindowIndirect
+/// + prcDirty）在部分合成器（本机实测）上不会触发该子区重混 → 时间单元格每秒
+/// 都上传了但屏幕不更新，只有等下一次整窗重绘机会才"攒着一起显现"——视觉上
+/// 就是时间跟着调度器几秒一跳。秒变化时强制 Full 上传（每秒 1 次），其余帧
+/// 仍走脏区优化。
+static LAST_PRESENTED_SEC: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// 按 `show_time` 同步 CLOCK 定时器启停（render 每帧调用；swap 保证只切一次）。
+fn sync_clock_timer(hwnd: HWND, want: bool) {
+    if want != CLOCK_TIMER_ON.swap(want, AtomicOrdering::Relaxed) {
+        unsafe {
+            if want {
+                let _ = SetTimer(hwnd, CLOCK_TIMER_ID, CLOCK_TIMER_MS, None);
+            } else {
+                let _ = KillTimer(hwnd, CLOCK_TIMER_ID);
+            }
+        }
+    }
+}
 
 /// 按配置选择渲染器实例（'static，零分配）。旧卡片式（Classic）折入横版条。
 fn renderer_for(style: sysoverlay_core::types::RenderStyle) -> &'static dyn Renderer {
@@ -186,7 +218,7 @@ fn mark_d2d_broken_and_persist_gdi(hwnd: HWND) {
     if let Some(mut cfg) = crate::window::get_config_of(hwnd) {
         if cfg.render_engine == RenderEngine::D2d {
             cfg.render_engine = RenderEngine::Gdi;
-            crate::window::modify_config(hwnd, |c| *c = cfg.clone());
+            crate::window::modify_config(hwnd, |c| *c = cfg);
             let _ = crate::config_io::save_config(&cfg);
             crate::probe::log("d2d disabled (session) + persisted render_engine=Gdi");
         }
@@ -222,6 +254,14 @@ const MAX_WIN: i32 = 2048;
 pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
     let t0 = perf::begin();
     unsafe {
+        // 本地时钟 → ui::clock（时间行数据源）。每次渲染前同步；
+        // 时间文本进 cell 指纹，秒变化经脏检查只重绘时间 cell（脏渲染）。
+        // windows 0.58：GetLocalTime() 无参、返回 SYSTEMTIME（Foundation 模块）。
+        let st = GetLocalTime();
+        sysoverlay_ui::clock::set_local(st.wHour as u32, st.wMinute as u32, st.wSecond as u32);
+        // 时钟定时器仅在 show_time 切换时启停（SetTimer 重置问题见 CLOCK_TIMER_ON）。
+        sync_clock_timer(hwnd, cfg.show_time);
+
         // 尺寸走缓存（P1-10）：避免每帧一次跨进程 GetWindowRect 系统调用。
         let (width, height) = crate::window::get_window_size(hwnd);
         if width == 0 || height == 0 {
@@ -362,6 +402,13 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
             dirty = Dirty::Full;
             changed = vec![true; cells.len()];
         }
+        // 时钟秒变化 → 强制整窗（原因见 LAST_PRESENTED_SEC 注释：局部 ULW 在
+        // 部分合成器上不重混，时间会"跟调度器几秒一跳"）。 Full 后 paint 收到
+        // None 即整画布重画，无需再动 changed。
+        let present_sec = sysoverlay_ui::clock::get().2;
+        if cfg.show_time && LAST_PRESENTED_SEC.load(AtomicOrdering::Relaxed) != present_sec {
+            dirty = Dirty::Full;
+        }
 
         // 绘制（A3：仅首帧/alpha/布局变化才整画布清零，否则只清脏区 cell）
         renderer.paint(
@@ -373,7 +420,9 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
             if dirty.is_full() { None } else { Some(&changed) },
         );
 
-        if !present(hwnd, &surface, width, height, src_alpha, &dirty) {
+        if present(hwnd, &surface, width, height, src_alpha, &dirty) {
+            LAST_PRESENTED_SEC.store(present_sec, AtomicOrdering::Relaxed);
+        } else {
             // 上屏失败（GetDC/DIB 分配/ULW 失败）：回滚指纹，让下一帧重试，
             // 否则相同内容的帧会被指纹跳过 → 窗口永久冻结在旧帧。
             LAST_FRAME_HASH.store(u64::MAX, AtomicOrdering::Relaxed);
@@ -640,7 +689,7 @@ fn present(
         // pptDst 传 NULL：保持窗口当前位置。
         // 若传 Some((0,0))，UpdateLayeredWindow 会把窗口挪到该坐标——
         // 这正是旧版"一拖动就弹回原位"的元凶（每帧渲染都重置位置）。
-        let mut sz = SIZE { cx: width, cy: height };
+        let sz = SIZE { cx: width, cy: height };
         let bf = BLENDFUNCTION {
             BlendOp: windows::Win32::Graphics::Gdi::AC_SRC_OVER as u8,
             BlendFlags: 0,
@@ -649,14 +698,14 @@ fn present(
         };
 
         let ok = if *DIRTY_DISABLED || matches!(dirty, Dirty::Full) {
-            let mut src_pt = POINT::default();
+            let src_pt = POINT::default();
             UpdateLayeredWindow(
                 hwnd,
                 screen_dc,
                 None,
-                Some(&mut sz),
+                Some(&sz),
                 mem_dc,
-                Some(&mut src_pt),
+                Some(&src_pt),
                 COLORREF(0),
                 Some(&bf as *const BLENDFUNCTION),
                 windows::Win32::UI::WindowsAndMessaging::ULW_ALPHA,
@@ -727,15 +776,15 @@ unsafe fn upload_dib(hwnd: HWND, width: i32, height: i32, src_alpha: u8, dirty: 
         AlphaFormat: windows::Win32::Graphics::Gdi::AC_SRC_ALPHA as u8,
     };
     let ok = if *DIRTY_DISABLED || matches!(dirty, Dirty::Full) {
-        let mut sz = SIZE { cx: width, cy: height };
-        let mut src_pt = POINT::default();
+        let sz = SIZE { cx: width, cy: height };
+        let src_pt = POINT::default();
         UpdateLayeredWindow(
             hwnd,
             screen_dc,
             None,
-            Some(&mut sz),
+            Some(&sz),
             mem_dc,
-            Some(&mut src_pt),
+            Some(&src_pt),
             COLORREF(0),
             Some(&bf as *const BLENDFUNCTION),
             windows::Win32::UI::WindowsAndMessaging::ULW_ALPHA,
@@ -771,7 +820,6 @@ unsafe fn upload_dib(hwnd: HWND, width: i32, height: i32, src_alpha: u8, dirty: 
 
 /// 高画质模式整帧渲染：复用引擎无关的 `layout` 取 cell，用 `D2DSurface`（DWrite 画字）
 /// 绑到 DIB 内存 DC 并行绘制，再整窗上传。性能模式路径完全不进入本函数。
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn render_d2d(
     hwnd: HWND,
@@ -826,6 +874,12 @@ fn render_d2d(
         // 设置面板触发的重绘：强制整窗（局部 ULW 在部分合成器上不生效 → 颜色/粗细
         // 「看起来没刷新」，实测证据见 force_full_refresh 注释）。
         if take_force_full() || present_size_changed(width, height) {
+            dirty = Dirty::Full;
+        }
+        // 时钟秒变化 → 强制整窗（同下方 GDI 分支：局部 ULW 在部分合成器上
+        // 不重混该子区，时间会"跟调度器几秒一跳"）。
+        let present_sec = sysoverlay_ui::clock::get().2;
+        if cfg.show_time && LAST_PRESENTED_SEC.load(AtomicOrdering::Relaxed) != present_sec {
             dirty = Dirty::Full;
         }
         crate::probe::log_lazy(|| {
@@ -905,6 +959,8 @@ fn render_d2d(
         drop(dib);
         if !upload_dib(hwnd, width, height, src_alpha, &dirty) {
             LAST_FRAME_HASH.store(u64::MAX, AtomicOrdering::Relaxed);
+        } else {
+            LAST_PRESENTED_SEC.store(present_sec, AtomicOrdering::Relaxed);
         }
 
         RENDERED_PCT_X100.store((alpha_pct_f.clamp(1.0, 100.0) * 100.0) as u32, AtomicOrdering::Relaxed);
