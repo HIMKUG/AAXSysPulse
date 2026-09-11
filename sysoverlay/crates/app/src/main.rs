@@ -17,7 +17,7 @@ use std::time::Duration;
 use sysoverlay_core::cadence::{DELTA_ENTER, DELTA_EXIT, EXIT_TICKS, IDLE_MAX_MS, REFRESH_FLOOR_MS, TICK_MS, ACTIVE_CPU_PCT, ACTIVE_NET_BPS};
 use sysoverlay_core::scheduler::Scheduler;
 use sysoverlay_core::scheduler::Source;
-use sysoverlay_win::window::{get_shared_seq, publish_schedule_cfg, schedule_cfg, schedule_power, setup_resume_channel, snap_store, WM_NEW_SNAPSHOT};
+use sysoverlay_win::window::{get_shared_seq, publish_schedule_cfg, schedule_cfg, schedule_power, setup_resume_channel, snap_store};
 use sysoverlay_win::OverlayWindow;
 use sysoverlay_win::SystemSampler;
 use sysoverlay_win::dpi;
@@ -223,7 +223,9 @@ fn main() {
     let resume_rx = setup_resume_channel();
 
     // ── 4. Create overlay window（先于采样线程：线程需要 hwnd 推送消息）────
-    let window = match OverlayWindow::new(cfg.clone()) {
+    // P1：渲染线程必须先于窗口创建启动，否则首帧渲染请求无人消费。
+    sysoverlay_win::render_thread::start();
+    let window = match OverlayWindow::new(cfg) {
         Ok(w) => w,
         Err(e) => {
             eprintln!("[SysOverlay] Failed to create overlay window: {}", e);
@@ -269,7 +271,7 @@ fn main() {
     // Auto 档刷新上限 = 启用源的最大有效间隔，成本超标自动降档。
     // 事件驱动 NIC 重枚举：注册一次网卡变更通知（取代 10s 轮询 GetIfTable2）。
     sysoverlay_win::proc_net::init_net_notify();
-    let cfg_for_thread = cfg.clone();
+    let cfg_for_thread = cfg;
     let shared_seq = get_shared_seq();
     // HWND 不是 Send：跨线程只传裸地址，线程内重建
     let hwnd_addr = window.hwnd().0 as isize;
@@ -415,16 +417,9 @@ fn main() {
                         max_delta,
                         mode_active as u32,
                     );
-                    unsafe {
-                        use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
-                        use windows::Win32::Foundation::{LPARAM, WPARAM};
-                        let _ = PostMessageW(
-                            overlay_hwnd,
-                            WM_NEW_SNAPSHOT,
-                            WPARAM(0),
-                            LPARAM(0),
-                        );
-                    }
+                    // 快照推送 = 确有新内容：走 request_render（自增渲染纪元），
+                    // 悬浮窗快速跳过路径据此区分新快照与时钟例行唤醒。
+                    sysoverlay_win::gdi::request_render(overlay_hwnd);
                 }
             }
 

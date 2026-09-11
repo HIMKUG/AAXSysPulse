@@ -9,6 +9,7 @@
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
+use std::sync::mpsc;
 use sysoverlay_core::config::Config;
 
 /// Returns the config directory path: `%APPDATA%\SysOverlayC\`
@@ -30,8 +31,8 @@ pub fn load_config() -> Config {
 
     match std::fs::read_to_string(&path) {
         Ok(text) => {
-            let cfg = Config::parse(&text);
-            cfg
+            
+            Config::parse(&text)
         }
         Err(_) => Config::default(),
     }
@@ -40,6 +41,31 @@ pub fn load_config() -> Config {
 /// Save configuration to persistent storage atomically.
 /// Returns `true` on success.
 pub fn save_config(cfg: &Config) -> bool {
+    write_config_text(&cfg.serialize())
+}
+
+/// 异步落盘（P2）：UI 线程只做序列化 + 入队，磁盘 I/O 在专职写线程执行，
+/// 拖动设置项时不再被磁盘写毛刺卡顿。防抖已把频率限制在 ~2s 一次，
+/// 单线程串行写足够。返回 `true` = 已成功入队。
+/// ⚠️ 进程退出路径（关窗/隐藏 flush）请用 [`save_config`] 同步落盘保数据。
+pub fn save_config_async(cfg: &Config) -> bool {
+    static WRITER: std::sync::OnceLock<mpsc::Sender<String>> = std::sync::OnceLock::new();
+    let tx = WRITER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<String>();
+        let _ = std::thread::Builder::new()
+            .name("config-writer".into())
+            .spawn(move || {
+                for text in rx.iter() {
+                    write_config_text(&text);
+                }
+            });
+        tx
+    });
+    tx.send(cfg.serialize()).is_ok()
+}
+
+/// 把序列化文本原子落盘（临时文件 + MoveFileExW 替换）。返回 `true` 成功。
+fn write_config_text(serialized: &str) -> bool {
     let dir = match appdata_dir() {
         Some(d) => d,
         None => return false,
@@ -53,8 +79,6 @@ pub fn save_config(cfg: &Config) -> bool {
 
     let target = dir.join("config.txt");
     let temp = dir.join("config.txt.tmp");
-
-    let serialized = cfg.serialize();
 
     // Write to temp file
     if let Err(e) = std::fs::write(&temp, serialized.as_bytes()) {

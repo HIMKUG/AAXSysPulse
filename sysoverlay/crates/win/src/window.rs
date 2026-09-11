@@ -80,7 +80,7 @@ pub(crate) static SHARED_SEQ: AtomicU64 = AtomicU64::new(0);
 /// `&Snapshot` 即可，**不再每帧深拷贝整份快照**（共享 Arc 仅在最后一次写后
 /// 才被采样线程 `store` 替换）。Snap 本身是 POD，这主要省掉每帧一次 Arc 强引用
 /// 计数抖动与整结构体 memcpy。
-fn snap_get() -> Arc<Snapshot> {
+pub fn snap_get() -> Arc<Snapshot> {
     SHARED_SNAP
         .get_or_init(|| ArcSwap::from_pointee(Snapshot::placeholder(0)))
         .load_full()
@@ -211,7 +211,7 @@ pub const WM_NEW_SNAPSHOT: u32 = 0x8000 + 3;
 /// 调用方用 `if let Some(state) = ...` 跳过即可——**绝不**在此处
 /// PostQuitMessage，否则窗口创建阶段就会把整个应用静默杀死。
 unsafe fn get_state_ptr(hwnd: HWND) -> *mut ThreadState {
-    GetWindowLongPtrW(hwnd, GWLP_USERDATA.0 as i32) as *mut ThreadState
+    GetWindowLongPtrW(hwnd, GWLP_USERDATA.0) as *mut ThreadState
 }
 
 /// 登记 WM_MOUSELEAVE（TME_LEAVE 只来一次，进窗后需重新登记）。
@@ -227,7 +227,7 @@ fn track_mouse_leave(hwnd: HWND) {
 
 /// 鼠标是否在窗口内（hover 渲染由 gdi::render 读取）。
 pub fn is_window_hovered(hwnd: HWND) -> bool {
-    let p = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA.0 as i32) };
+    let p = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA.0) };
     if p == 0 {
         false
     } else {
@@ -279,8 +279,7 @@ unsafe extern "system" fn wndproc(
                 if !state.hovered {
                     state.hovered = true;
                     track_mouse_leave(hwnd);
-                    let snap = snap_get();
-                    crate::gdi::render(hwnd, &*snap, &state.cfg);
+                    crate::render_thread::request(hwnd, &state.cfg);
                 }
 
                 if state.dragging {
@@ -312,8 +311,7 @@ unsafe extern "system" fn wndproc(
             if let Some(state) = get_state_ptr(hwnd).as_mut() {
                 if !state.dragging {
                     state.hovered = false;
-                    let snap = snap_get();
-                    crate::gdi::render(hwnd, &*snap, &state.cfg);
+                    crate::render_thread::request(hwnd, &state.cfg);
                 }
             }
             LRESULT(0)
@@ -344,8 +342,7 @@ unsafe extern "system" fn wndproc(
             // 拖动模式已结束，立即提交一帧权威画面（而非沿用拖动前的旧帧/悬停帧），
             // 此时 hovered 状态与"光标是否还在窗口上"一致，光标脱窗则自动回到半透明。
             if let Some(state) = get_state_ptr(hwnd).as_ref() {
-                let snap = snap_get();
-                crate::gdi::render(hwnd, &*snap, &state.cfg);
+                crate::render_thread::request(hwnd, &state.cfg);
             }
             LRESULT(0)
         }
@@ -371,8 +368,7 @@ unsafe extern "system" fn wndproc(
                 state.dragging = false;
                 if was_dragging {
                     track_mouse_leave(hwnd);
-                    let snap = snap_get();
-                    crate::gdi::render(hwnd, &*snap, &state.cfg);
+                    crate::render_thread::request(hwnd, &state.cfg);
                 }
             }
             LRESULT(0)
@@ -388,8 +384,8 @@ unsafe extern "system" fn wndproc(
                 // 缓存窗口尺寸，省去每帧 GetWindowRect（P1-10）
                 let mut r = RECT::default();
                 if GetWindowRect(hwnd, &mut r).as_bool() {
-                    state.win_w = (r.right - r.left).max(1) as i32;
-                    state.win_h = (r.bottom - r.top).max(1) as i32;
+                    state.win_w = (r.right - r.left).max(1);
+                    state.win_h = (r.bottom - r.top).max(1);
                 }
                 let _ = InvalidateRect(hwnd, None, true);
             }
@@ -397,6 +393,12 @@ unsafe extern "system" fn wndproc(
         }
 
         WM_TIMER => {
+            // CLOCK 定时器到点：先重对齐到下一个秒边界（秒对齐唤醒，1 次/秒），
+            // 再走统一渲染入口。例行唤醒不自增渲染纪元——无新请求且秒未变时
+            // render 顶部的快速路径会直接返回。
+            if _wparam.0 == crate::gdi::CLOCK_TIMER_ID {
+                crate::gdi::rearm_clock_timer(hwnd);
+            }
             // 拖动期间不渲染：随时可能已被 SetWindowPos 刷新过几何，渲染只会
             // 提交过期/悬停帧；等 WM_LBUTTONUP/WM_EXITSIZEMOVE 统一补一帧。
             let dragging = get_state_ptr(hwnd)
@@ -405,8 +407,7 @@ unsafe extern "system" fn wndproc(
                 .unwrap_or(false);
             if !dragging && IsWindowVisible(hwnd).as_bool() {
                 if let Some(state) = get_state_ptr(hwnd).as_mut() {
-                    let snap = snap_get();
-                    crate::gdi::render(hwnd, &*snap, &state.cfg);
+                    crate::render_thread::request(hwnd, &state.cfg);
                 }
             }
             LRESULT(0)
@@ -433,8 +434,7 @@ unsafe extern "system" fn wndproc(
                 .unwrap_or(false);
             if !is_dragging {
                 if let Some(state) = get_state_ptr(hwnd).as_mut() {
-                    let snap = snap_get();
-                    crate::gdi::render(hwnd, &*snap, &state.cfg);
+                    crate::render_thread::request(hwnd, &state.cfg);
                 }
             }
             let _ = unsafe { EndPaint(hwnd, &ps) };
@@ -455,8 +455,7 @@ unsafe extern "system" fn wndproc(
                             let _ = tx.send(());
                         }
                         if let Some(state) = get_state_ptr(hwnd).as_ref() {
-                            let snap = snap_get();
-                            crate::gdi::render(hwnd, &*snap, &state.cfg);
+                            crate::render_thread::request(hwnd, &state.cfg);
                         }
                     }
                 }
@@ -487,8 +486,7 @@ unsafe extern "system" fn wndproc(
                 crate::gdi::force_full_refresh();
                 crate::probe::log("WM_RECONFIG processed (invalidated + force-full)");
                 publish_schedule_cfg(&state.cfg);
-                let snap = snap_get();
-                crate::gdi::render(hwnd, &*snap, &state.cfg);
+                crate::render_thread::request(hwnd, &state.cfg);
             } else {
                 crate::probe::log("WM_RECONFIG: no state");
             }
@@ -504,8 +502,7 @@ unsafe extern "system" fn wndproc(
             // 合并冗余调用：一次取状态指针同时判断拖动与可见性（P2-20）。
             if let Some(state) = get_state_ptr(hwnd).as_ref() {
                 if !state.dragging && IsWindowVisible(hwnd).as_bool() {
-                    let snap = snap_get();
-                    crate::gdi::render(hwnd, &*snap, &state.cfg);
+                    crate::render_thread::request(hwnd, &state.cfg);
                 }
             }
             crate::perf::note_section("msg_newsnap", t0);
@@ -523,8 +520,7 @@ unsafe extern "system" fn wndproc(
             }
             if IsWindowVisible(hwnd).as_bool() {
                 if let Some(state) = get_state_ptr(hwnd).as_ref() {
-                    let snap = snap_get();
-                    crate::gdi::render(hwnd, &*snap, &state.cfg);
+                    crate::render_thread::request(hwnd, &state.cfg);
                 }
             }
             LRESULT(1)
@@ -572,7 +568,7 @@ pub fn get_config_of(hwnd: HWND) -> Option<Config> {
     if p.is_null() {
         None
     } else {
-        Some(unsafe { (*p).cfg.clone() })
+        Some(unsafe { (*p).cfg })
     }
 }
 
@@ -825,7 +821,7 @@ impl OverlayWindow {
         let hwnd = hwnd.unwrap();
 
         unsafe {
-            let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA.0 as i32, state_ptr);
+            let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA.0, state_ptr);
         }
 
         // v5 窗口页新增：启动时应用贴角与鼠标穿透（报告 §5）。
@@ -863,7 +859,7 @@ impl OverlayWindow {
 
     /// Returns the current config (cloned).
     pub fn get_config(&self) -> Config {
-        self.state.cfg.clone()
+        self.state.cfg
     }
 
     /// Updates the config in-place (used by menu commands).
@@ -880,7 +876,7 @@ impl Drop for OverlayWindow {
     fn drop(&mut self) {
         // Clear GWLP_USERDATA so wndproc can't access freed memory after we drop state.
         unsafe {
-            let _ = SetWindowLongPtrW(self.hwnd, GWLP_USERDATA.0 as i32, 0);
+            let _ = SetWindowLongPtrW(self.hwnd, GWLP_USERDATA.0, 0);
         }
         // state Box drops here automatically
     }

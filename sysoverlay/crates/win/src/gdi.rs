@@ -43,14 +43,13 @@ use crate::Snapshot;
 /// 悬浮窗透明度动画定时器 ID（仅本窗口使用；graph/procs 的定时器在各自窗口互不干扰）。
 pub const ANIM_TIMER_ID: usize = 7;
 
-/// 时钟行定时器 ID：250ms 触发一次 render，秒变化经帧指纹驱动脏区重绘。
-/// window.rs 的 WM_TIMER 不区分 ID（一律 render），本表复用该路径。
+/// 时钟行定时器 ID：**秒对齐**触发 render（唤醒时刻 = 下一个秒边界 +8ms），
+/// 秒变化经帧指纹驱动脏区重绘。window.rs 的 WM_TIMER 不区分 ID（一律 render），
+/// 但 wParam==CLOCK_TIMER_ID 时会调用 [`rearm_clock_timer`] 重对齐下一次到期。
 pub const CLOCK_TIMER_ID: usize = 8;
-/// 时钟行刷新周期（ms）。250ms 保证秒跳变最多延迟 1/4 秒上屏。
-pub const CLOCK_TIMER_MS: u32 = 250;
 
 /// CLOCK 定时器启停守卫：`SetTimer` 同 ID 会**重置到期时间**，
-/// 采样推送（最快 100ms 一帧）若每帧都 SetTimer，250ms 时钟表永远到不了期
+/// 采样推送（最快 100ms 一帧）若每帧都 SetTimer，秒对齐时钟表永远到不了期
 /// （饿死）。因此只在 `show_time` 状态切换的那一刻 SetTimer/KillTimer 一次。
 static CLOCK_TIMER_ON: AtomicBool = AtomicBool::new(false);
 
@@ -61,16 +60,31 @@ static CLOCK_TIMER_ON: AtomicBool = AtomicBool::new(false);
 /// 仍走脏区优化。
 static LAST_PRESENTED_SEC: AtomicU32 = AtomicU32::new(u32::MAX);
 
+/// 距下一个秒边界的毫秒数（+8ms 余量保证醒来时秒已翻转）。
+fn ms_to_next_second() -> u32 {
+    use windows::Win32::System::SystemInformation::GetTickCount64;
+    let t = (unsafe { GetTickCount64() } % 1000) as u32;
+    (1000 - t).max(1) + 8
+}
+
 /// 按 `show_time` 同步 CLOCK 定时器启停（render 每帧调用；swap 保证只切一次）。
 fn sync_clock_timer(hwnd: HWND, want: bool) {
     if want != CLOCK_TIMER_ON.swap(want, AtomicOrdering::Relaxed) {
         unsafe {
             if want {
-                let _ = SetTimer(hwnd, CLOCK_TIMER_ID, CLOCK_TIMER_MS, None);
+                let _ = SetTimer(hwnd, CLOCK_TIMER_ID, ms_to_next_second(), None);
             } else {
                 let _ = KillTimer(hwnd, CLOCK_TIMER_ID);
             }
         }
+    }
+}
+
+/// CLOCK 定时器到点后的重对齐（UI 线程 WM_TIMER wParam==CLOCK_TIMER_ID 时调用）。
+/// 此处重设不会饿死：此刻正是它自己的到期处理中，采样推送不参与 SetTimer。
+pub fn rearm_clock_timer(hwnd: HWND) {
+    unsafe {
+        let _ = SetTimer(hwnd, CLOCK_TIMER_ID, ms_to_next_second(), None);
     }
 }
 
@@ -192,6 +206,27 @@ fn take_force_full() -> bool {
     FORCE_FULL_REFRESH.swap(false, AtomicOrdering::Relaxed)
 }
 
+/// 渲染请求纪元：每次 [`request_render`] 自增；render 真正处理到帧时记录
+/// 已消费值（[`HANDLED_EPOCH`]）。render 顶部的快速跳过路径据此区分
+/// 「确有新请求」与「秒对齐时钟的例行唤醒」——后者若无事可做直接返回。
+static RENDER_EPOCH: AtomicU64 = AtomicU64::new(0);
+static HANDLED_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// 请求悬浮窗重绘：纪元自增 + 消息唤醒。
+/// 所有非时钟驱动的重绘请求（快照推送 / 设置变更 / 自愈扩缩窗）都必须走
+/// 这里；秒对齐 CLOCK 定时器的例行唤醒**不得**自增纪元（否则快速路径失效）。
+pub fn request_render(hwnd: HWND) {
+    RENDER_EPOCH.fetch_add(1, AtomicOrdering::Relaxed);
+    unsafe {
+        let _ = PostMessageW(
+            hwnd,
+            crate::window::WM_NEW_SNAPSHOT,
+            windows::Win32::Foundation::WPARAM(0),
+            windows::Win32::Foundation::LPARAM(0),
+        );
+    }
+}
+
 /// 上一帧**实际送屏**的窗口尺寸（高 32 位 = w，低 32 位 = h；0 = 从未送屏）。
 ///
 /// ⚠️ 脏区 Rect 上传的前提是「DIB 里非脏区域像素 == 窗口当前显示像素」。
@@ -262,6 +297,29 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
         // 时钟定时器仅在 show_time 切换时启停（SetTimer 重置问题见 CLOCK_TIMER_ON）。
         sync_clock_timer(hwnd, cfg.show_time);
 
+        // ── P0 快速跳过：例行唤醒无事可做时 ~0.1µs 返回，连布局/指纹都不建。
+        // 旧 250ms 时钟每秒 4 次唤醒，其中 3 次做完整 layout + FNV 全帧指纹
+        // 后才发现"秒没变"。条件覆盖所有会改变画面的输入：请求纪元 / 时钟秒 /
+        // 强制整窗 / alpha 过渡动画 / 渲染引擎切换 / alpha 与上次上屏值。
+        let (alpha_pct_f, animating) = compute_alpha_pct(hwnd, cfg);
+        let engine_id = match cfg.render_engine {
+            RenderEngine::Gdi => 0u8,
+            RenderEngine::D2d => 1u8,
+        };
+        let alpha_pct_x100 = (alpha_pct_f.clamp(1.0, 100.0) * 100.0) as u32;
+        if !animating
+            && HANDLED_EPOCH.load(AtomicOrdering::Relaxed)
+                == RENDER_EPOCH.load(AtomicOrdering::Relaxed)
+            && sysoverlay_ui::clock::get().2 == LAST_PRESENTED_SEC.load(AtomicOrdering::Relaxed)
+            && !FORCE_FULL_REFRESH.load(AtomicOrdering::Relaxed)
+            && engine_id == LAST_ENGINE.load(AtomicOrdering::Relaxed)
+            && alpha_pct_x100 == RENDERED_PCT_X100.load(AtomicOrdering::Relaxed)
+        {
+            perf::note_skipped();
+            perf::end_render(t0);
+            return;
+        }
+
         // 尺寸走缓存（P1-10）：避免每帧一次跨进程 GetWindowRect 系统调用。
         let (width, height) = crate::window::get_window_size(hwnd);
         if width == 0 || height == 0 {
@@ -273,12 +331,7 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
                 "render: 异常窗口尺寸 ({width}x{height}) > {MAX_WIN} -> 回到自然尺寸"
             ));
             force_fit_natural(hwnd, cfg);
-            let _ = PostMessageW(
-                hwnd,
-                crate::window::WM_NEW_SNAPSHOT,
-                windows::Win32::Foundation::WPARAM(0),
-                windows::Win32::Foundation::LPARAM(0),
-            );
+            request_render(hwnd);
             crate::perf::note_section("render_early_big", t0);
             return;
         }
@@ -291,10 +344,6 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
         // 画面停留在旧引擎像素，直到悬停改变 alpha 触发整窗重画
         // （实测症状：切引擎后必须鼠标悬停才生效）。这里在指纹层面强制失效。
         static LAST_ENGINE: AtomicU8 = AtomicU8::new(u8::MAX);
-        let engine_id = match cfg.render_engine {
-            RenderEngine::Gdi => 0u8,
-            RenderEngine::D2d => 1u8,
-        };
         if LAST_ENGINE.swap(engine_id, AtomicOrdering::Relaxed) != engine_id {
             LAST_FRAME_HASH.store(u64::MAX, AtomicOrdering::Relaxed);
             invalidate_present_size();
@@ -303,7 +352,7 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
 
         // 全局 alpha：悬停/非悬停两档透明度，切换时三次方缓出过渡。
         // 动画进行中 → SetTimer 逐帧推进；结束后 KillTimer 归零开销。
-        let (alpha_pct_f, animating) = compute_alpha_pct(hwnd, cfg);
+        // （已在快速路径处计算，这里直接复用。）
         let src_alpha = ((alpha_pct_f.clamp(1.0, 100.0) / 100.0) * 255.0).round() as u8;
 
         // 高画质模式：整帧 Direct2D + DirectWrite（性能模式路径原样走下方 GDI 分支）。
@@ -376,6 +425,8 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
         }
 
         let sig = renderer.hash_from_cells(&cells, cfg, width, height, src_alpha);
+        // 本帧已受理当前纪元（无论后续绘制还是指纹跳过，画面都已是最新）。
+        HANDLED_EPOCH.store(RENDER_EPOCH.load(AtomicOrdering::Relaxed), AtomicOrdering::Relaxed);
         if LAST_FRAME_HASH.load(std::sync::atomic::Ordering::Relaxed) == sig {
             perf::note_skipped();
             // 动画未走完但帧被跳过（理论上只在末帧重复时发生）：继续驱动定时器
@@ -856,6 +907,8 @@ fn render_d2d(
         }
 
         let base = renderer.frame_hash(snap, cfg, width, height, src_alpha);
+        // 本帧已受理当前纪元（见 GDI 分支同名注释）。
+        HANDLED_EPOCH.store(RENDER_EPOCH.load(AtomicOrdering::Relaxed), AtomicOrdering::Relaxed);
         let sig = base ^ ENGINE_HASH_XOR;
         if LAST_FRAME_HASH.load(std::sync::atomic::Ordering::Relaxed) == sig {
             perf::note_skipped();
@@ -946,12 +999,7 @@ fn render_d2d(
             let _ = ReleaseDC(hwnd, screen_dc);
             LAST_FRAME_HASH.store(u64::MAX, AtomicOrdering::Relaxed);
             fit_window_to(hwnd, cfg, need_w, height);
-            let _ = PostMessageW(
-                hwnd,
-                crate::window::WM_NEW_SNAPSHOT,
-                windows::Win32::Foundation::WPARAM(0),
-                windows::Win32::Foundation::LPARAM(0),
-            );
+            request_render(hwnd);
             perf::note_section("render_d2d_heal", t0);
             return true; // 扩窗续帧（非失败）
         }
@@ -966,12 +1014,7 @@ fn render_d2d(
             let _ = ReleaseDC(hwnd, screen_dc);
             LAST_FRAME_HASH.store(u64::MAX, AtomicOrdering::Relaxed);
             fit_window_to(hwnd, cfg, fit_w, height);
-            let _ = PostMessageW(
-                hwnd,
-                crate::window::WM_NEW_SNAPSHOT,
-                windows::Win32::Foundation::WPARAM(0),
-                windows::Win32::Foundation::LPARAM(0),
-            );
+            request_render(hwnd);
             perf::note_section("render_d2d_shrink", t0);
             return true; // 缩窗续帧（非失败）
         }
@@ -1115,14 +1158,7 @@ fn ensure_content_fits(hwnd: HWND, cfg: &Config, nat_w: i32, nat_h: i32, width: 
             "fit guard(expand): nat=({nat_w},{nat_h}) win=({width},{height}) -> expand"
         ));
         fit_window_to(hwnd, cfg, nat_w.max(width), nat_h.max(height));
-        unsafe {
-            let _ = PostMessageW(
-                hwnd,
-                crate::window::WM_NEW_SNAPSHOT,
-                windows::Win32::Foundation::WPARAM(0),
-                windows::Win32::Foundation::LPARAM(0),
-            );
-        }
+        request_render(hwnd);
         return true;
     }
     false
@@ -1134,4 +1170,7 @@ fn ensure_content_fits(hwnd: HWND, cfg: &Config, nat_w: i32, nat_h: i32, width: 
 /// 用户观感即"设置改了不立刻刷新"。WM_RECONFIG 前调用本函数强制失效。
 pub fn invalidate_frame_hash() {
     LAST_FRAME_HASH.store(u64::MAX, AtomicOrdering::Relaxed);
+    // 快速跳过路径同步失效：设置变更（指纹失效）必须立即重绘，
+    // 不能被"秒未变 ∧ 纪元未变"的快速路径吞掉。
+    RENDER_EPOCH.fetch_add(1, AtomicOrdering::Relaxed);
 }

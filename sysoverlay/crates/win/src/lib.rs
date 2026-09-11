@@ -16,6 +16,7 @@
 
 pub mod window;
 pub mod gdi;
+pub mod render_thread;
 pub mod sampler;
 pub mod proc_cpu;
 pub mod proc_mem;
