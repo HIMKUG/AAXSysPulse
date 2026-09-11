@@ -36,6 +36,18 @@ pub const CONFIG_VERSION: u32 = 2;
 /// 对应：0.2fps / 0.5fps / 1fps / 5fps / 10fps。
 pub const INTERVAL_MS_ALLOWED: [u32; 5] = [5000, 2000, 1000, 200, 100];
 
+/// 字号可调区间（px，0.5 步进）。
+///
+/// 设置页滑杆（`win::settings::layout::FONT_MIN/FONT_MAX`）与本文件的落盘钳位
+/// **必须共用同一份区间** —— 否则滑杆能拉到 128 但重启后被 clamp 回旧上限，
+/// 表现为「改了字号重启就变回去」。
+pub const FONT_PX_MIN: f32 = 4.0;
+pub const FONT_PX_MAX: f32 = 128.0;
+
+/// 不透明度可调区间（%）。设置页滑杆与落盘钳位共用。
+pub const OPACITY_PCT_MIN: u32 = 15;
+pub const OPACITY_PCT_MAX: u32 = 100;
+
 /// 用户配置。
 ///
 /// 字段语义与 C 版 `overlay.c` 的全局变量一一对应；v2 新增字段集中在末尾。
@@ -112,6 +124,10 @@ pub struct Config {
     pub render_mode: RenderMode,
     /// 功耗监控开关。关闭时 PowerSampler 根本不构造（零开销）。
     pub power_enabled: bool,
+    /// 功耗查询开关（性能页）：false 时采样线程跳过 MSR 内核级功耗查询
+    /// （省 CPU），功耗行仍显示但数值为 `--`。与 [`Self::power_enabled`]
+    /// 正交：后者管"行显不显示"，本字段管"查不查"。
+    pub power_query: bool,
     pub power_display: PowerDisplay,
     /// 功耗采样间隔（毫秒，绝对值）。实际生效值 = max(本值, interval_ms)。
     pub power_interval_ms: u32,
@@ -223,6 +239,7 @@ impl Default for Config {
             autostart: false,
             render_mode: RenderMode::Quality,
             power_enabled: false,
+            power_query: true,
             power_display: PowerDisplay::CpuPackage,
             power_interval_ms: 3000,
             exclude_virtual_nic: true,
@@ -315,17 +332,18 @@ impl Config {
                 "show_gpu" => cfg.show_gpu = Self::parse_bool(value, cfg.show_gpu),
                 "show_net" => cfg.show_net = Self::parse_bool(value, cfg.show_net),
                 "mem_gb" => cfg.mem_show_gb = Self::parse_bool(value, cfg.mem_show_gb),
-                // 新字号（px，0.5 步进）。上限 72（报告 §11 滑杆范围 12..72；
-                // 下限保留 8 兼容旧配置的小字号，UI 端再按 12..72 展示）。
+                // 新字号（px，0.5 步进）。区间见 [`FONT_PX_MIN`]/[`FONT_PX_MAX`]
+                // （4..128；下限兼顾极小字号，上限给大屏留足空间）。
                 "font_size" | "fontsize" => {
                     if let Ok(v) = value.parse::<f32>() {
-                        cfg.font_size = (v.clamp(8.0, 72.0) * 2.0).round() / 2.0;
+                        cfg.font_size = (v.clamp(FONT_PX_MIN, FONT_PX_MAX) * 2.0).round() / 2.0;
                     }
                 }
                 // 旧字号（bitmap 缩放倍数）迁移：×16 像素，再钳位到合法范围
                 "font_scale" => {
                     if let Ok(v) = value.parse::<u32>() {
-                        cfg.font_size = ((v.clamp(1, 4) as f32) * 16.0).clamp(8.0, 72.0);
+                        cfg.font_size = ((v.clamp(1, 4) as f32) * 16.0)
+                            .clamp(FONT_PX_MIN, FONT_PX_MAX);
                     }
                 }
                 // 字重档位：0=细 / 1=中 / 2=粗（缺省 2=粗 = 位图字体原样）
@@ -471,6 +489,10 @@ impl Config {
                 }
                 "power" | "power_enabled" => {
                     cfg.power_enabled = Self::parse_bool(value, cfg.power_enabled);
+                }
+                // 功耗查询开关（性能页）：0 = 跳过 MSR 内核查询，功耗行显示 --
+                "power_query" => {
+                    cfg.power_query = Self::parse_bool(value, cfg.power_query);
                 }
                 "power_display" => {
                     if let Some(d) = PowerDisplay::from_config(value) {
@@ -635,6 +657,7 @@ impl Config {
         // v2 新增字段（C 版忽略，不影响降级回 C 版）
         s.push_str(&format!("render_mode {}\n", self.render_mode.to_config()));
         s.push_str(&format!("power {}\n", self.power_enabled as u32));
+        s.push_str(&format!("power_query {}\n", self.power_query as u32));
         s.push_str(&format!("power_display {}\n", self.power_display.to_config()));
         s.push_str(&format!("power_interval_ms {}\n", self.power_interval_ms));
         s.push_str(&format!(
@@ -819,7 +842,7 @@ fn parse_metric_font_size(key: &str, value: &str) -> Option<(usize, Option<f32>)
     let size = match v.to_ascii_lowercase().as_str() {
         "0" | "off" | "none" | "follow" | "default" => None,
         _ => {
-            let s = (v.parse::<f32>().ok()?.clamp(8.0, 72.0) * 2.0).round() / 2.0;
+            let s = (v.parse::<f32>().ok()?.clamp(FONT_PX_MIN, FONT_PX_MAX) * 2.0).round() / 2.0;
             Some(s)
         }
     };
@@ -928,6 +951,7 @@ fg F4F1EE
         cfg.window_pos = Some((800, 600));
         cfg.render_mode = RenderMode::Eco;
         cfg.power_enabled = true;
+        cfg.power_query = false;
         cfg.power_display = PowerDisplay::Battery;
         cfg.power_interval_ms = 5000;
         cfg.exclude_virtual_nic = false;
@@ -1329,7 +1353,7 @@ fg F4F1EE
     fn test_metric_font_size_accepts_follow_and_clamps() {
         let cfg = Config::parse("mfs_cpu follow\nmfs_gpu 999\nmfs_mem 12.25");
         assert_eq!(cfg.metric_font_sizes[0], None, "follow → None");
-        assert_eq!(cfg.metric_font_sizes[2], Some(72.0), "越界 clamp 到 72");
+        assert_eq!(cfg.metric_font_sizes[2], Some(FONT_PX_MAX), "越界 clamp 到上限 128");
         assert_eq!(cfg.metric_font_sizes[1], Some(12.5), "0.5 步进四舍五入 (12.25→12.5)");
         assert_eq!(cfg.metric_font_sizes[3], None, "未指定的槽保持跟随");
     }
@@ -1405,12 +1429,14 @@ fg F4F1EE
     }
 
     #[test]
-    fn test_font_size_clamp_widened_to_72() {
-        // 报告 §11：字号滑杆 12..72。旧上限 40 会让 72 在重启后丢值。
+    fn test_font_size_clamp_widened_to_128() {
+        // 用户要求：滑杆区间由 12..72 拓宽到 4..128。
+        // 钳位必须同步放宽，否则滑杆拉到 100 重启后被截回旧上限。
         let cfg = Config::parse("font_size 60\n");
         assert_eq!(cfg.font_size, 60.0, "60 在放宽后的合法范围内应保留");
-        assert_eq!(Config::parse("font_size 5").font_size, 8.0, "下限仍为 8（旧数据兼容）");
-        assert_eq!(Config::parse("font_size 999").font_size, 72.0);
+        assert_eq!(Config::parse("font_size 100").font_size, 100.0, "100 不再是越界值");
+        assert_eq!(Config::parse("font_size 1").font_size, FONT_PX_MIN, "下限 4");
+        assert_eq!(Config::parse("font_size 999").font_size, FONT_PX_MAX, "上限 128");
     }
 
     #[test]

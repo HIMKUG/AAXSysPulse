@@ -53,6 +53,8 @@ pub enum CfgRef {
     MetricShowLabel(usize),
     /// 简化名称：CPU→C、Mem→M、GPU→G、Net→N、Power→P、Time→T。
     ShortNames,
+    /// 功耗查询开关（性能页）：false 跳过 MSR 内核查询，功耗行显示 --。
+    PowerQuery,
     TextShadow,
     TextOutline,
     Topmost,
@@ -116,6 +118,7 @@ impl CfgRef {
                 Value::Bool(*cfg.metric_show_labels.get(i).unwrap_or(&true))
             }
             CfgRef::ShortNames => Value::Bool(cfg.short_names),
+            CfgRef::PowerQuery => Value::Bool(cfg.power_query),
             CfgRef::TextShadow => Value::Bool(cfg.text_shadow),
             CfgRef::TextOutline => Value::Bool(cfg.text_outline),
             CfgRef::Topmost => Value::Bool(cfg.topmost),
@@ -181,6 +184,7 @@ impl CfgRef {
                 }
             }
             (CfgRef::ShortNames, Value::Bool(x)) => cfg.short_names = x,
+            (CfgRef::PowerQuery, Value::Bool(x)) => cfg.power_query = x,
             (CfgRef::TextShadow, Value::Bool(x)) => cfg.text_shadow = x,
             (CfgRef::TextOutline, Value::Bool(x)) => cfg.text_outline = x,
             (CfgRef::Topmost, Value::Bool(x)) => cfg.topmost = x,
@@ -319,6 +323,8 @@ mod tests {
             (CfgRef::MetricShowLabel(5), Value::Bool(true)),
             (CfgRef::ShortNames, Value::Bool(true)),
             (CfgRef::ShortNames, Value::Bool(false)),
+            (CfgRef::PowerQuery, Value::Bool(false)),
+            (CfgRef::PowerQuery, Value::Bool(true)),
             (CfgRef::PowerEnabled, Value::Bool(true)),
             (CfgRef::TextShadow, Value::Bool(false)),
             (CfgRef::TextOutline, Value::Bool(false)),

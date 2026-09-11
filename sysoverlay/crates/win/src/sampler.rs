@@ -161,6 +161,10 @@ impl SystemSampler {
             crate::perf::note_section("sample_power", t);
             // 发布 CPU 实测功率（供进程榜做功耗分摊，跨线程原子共享）
             crate::power_system::store_cpu_watts(self.syspower.cpu_watts());
+        } else if !power_enabled {
+            // 查询被禁用（性能页 power_query 关 / 行开关关）：显式置 Unavailable，
+            // 覆盖 prev 带来的旧值 → 功耗行显示 `--` 而非冻结的旧瓦数。
+            snap.power = Metric::Unavailable;
         }
 
         self.seq += 1;

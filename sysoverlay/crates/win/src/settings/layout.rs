@@ -1,8 +1,19 @@
 //! 布局：常量、DPI 缩放与**纯函数**页面构建（v5 设置页规范重写）。
 //!
 //! # 结构（报告 §11 目标形态）
-//! 每页 = 页标题 + 副标题 + 若干**分组卡**；行高可变：
-//! 基础行 28、滑杆行 40（容纳 min/max 端点标注）、行内说明 +15（多行按行数累加）。
+//! 每页 = 页标题 + 副标题 + 若干**分组卡**。
+//!
+//! 行高 = **控件带** + 说明带：控件带 34（折叠头 52 / 滑杆 48），
+//! 说明带 = 22 × hint 行数。行与行之间另有统一的 `ROW_GAP`（12），
+//! 分隔线画在它的正中。
+//!
+//! # 间距刻度
+//! 全页只用一组 4px 基准的刻度（见下方常量注释）：4 / 8 / 12 / 16 / 24。
+//! 相邻量级至少差 1.5 倍，视觉上才能读出「谁和谁是一组」——
+//! 改任何间距都必须从这里取值，不要就地写数字。
+//!
+//! 有标题的分组卡内部画行间分隔线（`want_div`）；无标题分组 =
+//! 监控项独立卡，不画内部分隔。
 //!
 //! # 折叠卡展开动画
 //! `expand[i]` 是 0..1 的**动画展开度**（由 `mod.rs` 的弹簧每帧推进）：
@@ -47,27 +58,50 @@ pub const CONTENT_MAX_W: i32 = 620;
 /// 卡片间距（用户反馈：加大 CPU/内存/GPU 各栏之间的间距）。
 pub const CARD_GAP: i32 = 24;
 /// 监控项独立卡之间的间距（每项一张卡，紧凑排列）。
-pub const METRIC_CARD_GAP: i32 = 12;
+pub const METRIC_CARD_GAP: i32 = 14;
 
 /// 页标题 / 副标题（报告 §11 每页 h5 + p）。
-pub const TITLE_H: i32 = 26;
+pub const TITLE_H: i32 = 30;
 pub const TITLE_SUB_GAP: i32 = 4;
 pub const SUB_H: i32 = 16;
-pub const SUB_CARD_GAP: i32 = 10;
+/// 副标题 → 第一张卡（或其分组标题）。
+pub const SUB_CARD_GAP: i32 = 14;
+
+// ── 间距刻度（4px 基准，全页统一取用） ───────────────────
+//
+// 设计意图（用户反馈「间距要大且一致」）：
+//   4   标签 ↔ 它自己的说明（同属一行，必须紧）
+//   8   分组标题 ↔ 卡片顶缘
+//   12  行 ↔ 行（卡片内部；分隔线居中于此）
+//   16  卡片四周内边距
+//   24  卡片 ↔ 卡片
+// 相邻量级至少差 1.5 倍，视觉上才能读出「谁和谁是一组」。
+
+/// 卡片四周内边距（上下左右同值）。
+pub const CARD_PAD: i32 = 16;
+/// 分组标题带高度（≥ 标题字号 14.67，否则字会被下一条挤住）。
+pub const CAPTION_H: i32 = 18;
+/// 分组标题 → 卡片顶缘（小间距，标题属于下面的卡片）。
+pub const CAPTION_GAP: i32 = 8;
+
+/// 基础行高 = **控件带**高度（标签 + 控件垂直居中于其中）。
+pub const ROW_H: i32 = 34;
+/// 行内说明（hint）每行附加高度。
+/// 22 > 说明字号 14.67，行盒上下各留 ~3.7px，与标签之间自然形成 ~12px 视觉间距
+/// （旧值 20 与标签几乎贴住）。
+pub const HINT_EXTRA: i32 = 22;
+/// 行与行之间的空隙（卡片内部）。分隔线画在空隙正中。
+pub const ROW_GAP: i32 = 12;
+/// 滑杆行控件带高度：控件线（居中于首 ROW_H）+ 下方 min/max 端点标注。
+/// 48 = 17(控件线) + 11(数值框下半) + 2 + 17(端点标注)。
+pub const ROW_SLIDER_H: i32 = 48;
+/// 滑杆数值框高度（控件线上下各一半）。
+pub const VALUEBOX_H: i32 = 22;
+/// 折叠头行控件带高度（监控项卡首行）：比基础行高更松，给抓手/标题留呼吸。
+pub const ROW_HEADER_H: i32 = 52;
 
 /// 下列沿用：
-pub const BOTTOM_MARGIN: i32 = 16;
-pub const CARD_PAD: i32 = 10;
-pub const CAPTION_H: i32 = 14;
-pub const CAPTION_GAP: i32 = 6;
-/// 基础行高。
-pub const ROW_H: i32 = 28;
-/// 滑杆行高（额外容纳 min/max 端点标注，报告 B-05）。
-pub const ROW_SLIDER_H: i32 = 40;
-/// 折叠头行高（监控项卡首行）：比基础行高更松，给放大后的抓手/标题留呼吸。
-pub const ROW_HEADER_H: i32 = 48;
-/// 行内说明（hint）每行附加高度。
-pub const HINT_EXTRA: i32 = 20;
+pub const BOTTOM_MARGIN: i32 = 20;
 pub const WIDGET_H: i32 = 24;
 pub const CARD_RADIUS: i32 = 10;
 pub const LABEL_W: i32 = 120;
@@ -86,15 +120,63 @@ pub const ICON_BTN: i32 = 28;
 pub const STEPPER_BTN_W: i32 = 28;
 pub const STEPPER_W: i32 = 96;
 
-/// 滑杆范围（报告 §11：字号 12..72；间距沿用配置钳位 0..64）。
-pub const FONT_MIN: f32 = 12.0;
-pub const FONT_MAX: f32 = 72.0;
+/// 滑杆范围（用户要求拓宽：字号 4..128；间距沿用配置钳位 0..64）。
+/// 字号区间直接引用 core 的落盘钳位常量 —— 两处必须同源，否则「滑杆能拉、
+/// 重启被截断」。
+pub const FONT_MIN: f32 = sysoverlay_core::config::FONT_PX_MIN;
+pub const FONT_MAX: f32 = sysoverlay_core::config::FONT_PX_MAX;
 pub const GAP_MIN: f32 = 0.0;
 pub const GAP_MAX: f32 = 64.0;
 
 /// DPI 缩放（逻辑像素 → 物理像素）。
 pub fn s(dpi: u32, v: i32) -> i32 {
     v * dpi as i32 / 96
+}
+
+/// 标签所在的**文字带**高度（物理像素）。
+///
+/// 正文标签始终按 `ROW_H` 居中 —— 滑杆行的控件线就取 `ROW_H/2`，标签必须与它同线；
+/// 小字说明行（`base_h` = `HINT_EXTRA`）则按自身行高居中即可。
+pub fn label_band(base_h: i32, dpi: u32) -> i32 {
+    base_h.min(s(dpi, ROW_H))
+}
+
+// ── 字号（DIP；全设置页唯一来源，mod/widget 一律从这里取） ──
+
+/// 正文字号（13pt @ 96dpi）。
+pub fn body_px(dpi: u32) -> f32 {
+    13.0 * dpi as f32 / 72.0
+}
+
+/// 说明 / 次级字号（11pt @ 96dpi）。
+pub fn caption_px(dpi: u32) -> f32 {
+    11.0 * dpi as f32 / 72.0
+}
+
+/// 分隔线相对下一行顶缘的**上移量**（物理像素）。
+///
+/// 分隔线要和文字一样参与纵向节奏，所以按**墨迹等距**定位，而不是按行盒等距：
+/// 线上方是上一行的最后一行字、下方是下一行的标签，两侧视觉距离必须相等。
+///
+/// 行盒都是 vcenter 的，墨迹上下各留 `(盒高 − 字号) / 2`：
+///   - 上方有说明 = 说明行盒 `HINT_EXTRA`(22) 与说明字号(14.67) → 3.7
+///   - 上方无说明 = 控件带 `ROW_H`(34) 与标签字号(17.33) → 8.3
+///   - 下方恒为 控件带 `ROW_H` 与标签字号 → 8.3
+///
+/// 在 ROW_GAP 中点的基础上再补两侧留白差值的一半：
+/// `rise = ROW_GAP/2 − (pad_below − pad_above)/2`。
+///
+/// 当前字号下（96 dpi）说明在上方时 rise = 3.67，于是
+/// 「说明墨迹底 → 线」=「线 → 标签墨迹顶」=「标签墨迹底 → 说明墨迹顶」= **12**，
+/// 全页每一个纵向间隔都相等 —— 这才叫「间距相同」。
+pub fn divider_rise(dpi: u32, above_has_hint: bool) -> f32 {
+    let pad_below = (s(dpi, ROW_H) as f32 - body_px(dpi)) / 2.0;
+    let pad_above = if above_has_hint {
+        (s(dpi, HINT_EXTRA) as f32 - caption_px(dpi)) / 2.0
+    } else {
+        pad_below
+    };
+    s(dpi, ROW_GAP) as f32 / 2.0 - (pad_below - pad_above) / 2.0
 }
 
 /// 浮点逻辑坐标缩放（行高可变，布局在浮点逻辑坐标上累积）。
@@ -165,20 +247,32 @@ struct RowDef {
 }
 
 impl RowDef {
-    /// 行高（逻辑像素）：折叠头行 48；滑杆行 40；行内 hint 每行 +15。
-    fn height(&self) -> f32 {
-        let has_slider = self.items.iter().any(|it| it.tall);
-        let mut h = if self.header {
+    /// 行内 hint 行数（主句 + 弱化补充句；空串不算）。
+    fn hint_lines(&self) -> u32 {
+        self.hint_text.map(|t| !t.is_empty() as u32).unwrap_or(0)
+            + self.hint2.map(|t| !t.is_empty() as u32).unwrap_or(0)
+    }
+
+    /// **控件带**高度（逻辑像素）。不包含 hint 带 —— hint 从控件带之后起画。
+    ///
+    /// 小字说明行（`hint_only`）按说明行高给足即可：旧实现套用 `ROW_H`(34)，
+    /// 12px 的字待在 34 的行盒里，上下各空 11px —— 就是用户圈出来的「有点空」。
+    fn base_h(&self) -> f32 {
+        if self.header {
             ROW_HEADER_H as f32
-        } else if has_slider {
+        } else if self.hint_only {
+            HINT_EXTRA as f32
+        } else if self.items.iter().any(|it| it.tall) {
             ROW_SLIDER_H as f32
         } else {
             ROW_H as f32
-        };
-        let lines = self.hint_text.map(|t| !t.is_empty() as u32).unwrap_or(0)
-            + self.hint2.map(|t| !t.is_empty() as u32).unwrap_or(0);
-        h += HINT_EXTRA as f32 * lines as f32;
-        h
+        }
+    }
+
+
+    /// 行高（逻辑像素）= 控件带 + 行内 hint 每行 +15。
+    fn height(&self) -> f32 {
+        self.base_h() + HINT_EXTRA as f32 * self.hint_lines() as f32
     }
 }
 
@@ -228,8 +322,8 @@ pub fn build_pages(
     // 卡内行区左右。
     let rows_l = card_l + CARD_PAD as f32;
     let rows_r = card_r - CARD_PAD as f32;
-    // 标签列 / 控件列。
-    let widget_r = rows_r - 8.0; // 操作边缘
+    // 标签列 / 控件列。控件右缘 = 行区右缘 → 与左侧标签内缩同值（左右对称）。
+    let widget_r = rows_r;
     let widget_l = rows_l + LABEL_W as f32;
     let ctrl_l = widget_l.max(widget_r - CTRL_W as f32);
 
@@ -342,7 +436,9 @@ pub fn build_pages(
                 ));
             }
             1 => {
-                // ── 布局：排列 / 数据格式 / 文字效果（报告 §11 w2） ──
+                // ── 布局：排列 / 文字效果（报告 §11 w2） ──
+                // 「数据格式」（内存单位 / 网络显示）已下放到「监控项」页对应卡片，
+                // 就近配置（用户反馈：与内存/网络无关的页放这些选项很跳）。
                 groups.push((
                     tr("GrpArrange"),
                     vec![
@@ -373,23 +469,6 @@ pub fn build_pages(
                             tr("LblGapLabel"),
                             Some(tr("HintNvGap")),
                             vec![stepper_item(154, CfgRef::LabelValueGap)],
-                        ),
-                    ],
-                    None,
-                    CARD_GAP,
-                ));
-                groups.push((
-                    tr("GrpDataFormat"),
-                    vec![
-                        row_def(
-                            tr("LblMemUnit"),
-                            Some(tr("HintMemUnit")),
-                            vec![ctrl_item(155, Box::new(seg(&["SegPercent", "SegGb"], CfgRef::MemUnit)))],
-                        ),
-                        row_def(
-                            tr("LblNetMode"),
-                            Some(tr("HintNetDisplay")),
-                            vec![ctrl_item(167, Box::new(seg(&["SegBoth", "SegDown", "SegUp"], CfgRef::NetMode)))],
                         ),
                     ],
                     None,
@@ -495,6 +574,21 @@ pub fn build_pages(
                             Some(tr("HintShowLabel")),
                             vec![toggle_item(260 + i as i32 * 10, CfgRef::MetricShowLabel(i))],
                         ));
+                        // 数据格式：内存单位 / 网络显示（用户反馈：从「布局」页并入
+                        // 对应卡片，就近配置；与字号/配色一样只影响这一项）。
+                        if i == 1 {
+                            rows.push(row_def(
+                                tr("LblMemUnit"),
+                                Some(tr("HintMemUnit")),
+                                vec![ctrl_item(155, Box::new(seg(&["SegPercent", "SegGb"], CfgRef::MemUnit)))],
+                            ));
+                        } else if i == 3 {
+                            rows.push(row_def(
+                                tr("LblNetMode"),
+                                Some(tr("HintNetDisplay")),
+                                vec![ctrl_item(167, Box::new(seg(&["SegBoth", "SegDown", "SegUp"], CfgRef::NetMode)))],
+                            ));
+                        }
                         let _overridden = cfg.metric_font_sizes.get(i).copied().flatten().is_some();
                         // 字号滑杆：理想布局中独占整行，数值纯文本、绿填充、白圈滑块。
                         rows.push(RowDef {
@@ -539,6 +633,17 @@ pub fn build_pages(
                             Some(tr("HintValueColor")),
                             vec![ctrl_item(205 + i as i32 * 10, Box::new(MetricSwatchesWidget { cfg: CfgRef::MetricValue(i), auto_cfg: Some(CfgRef::MetricValueAuto(i)) }))],
                         ));
+                        // 展开态同样要分隔线（用户反馈：展开页也要分割线与呼吸感）。
+                        // 位置 = 本行顶（画在 ROW_GAP 正中，见 paint_page）。
+                        // 例外：字号状态条是字号滑杆的注解，二者之间不画线，
+                        // 否则注解被从它解释的那一行上切下来。
+                        for (k, rd) in rows.iter_mut().enumerate() {
+                            let is_annotation = rd
+                                .items
+                                .iter()
+                                .any(|it| it.kind.as_any().is::<MetricFontStatusWidget>());
+                            rd.divider = k > 0 && !rd.hint_only && !is_annotation;
+                        }
                     }
                     // 每个指标 = 一张独立卡，卡间小间距（拖动排序的视觉分区）。
                     groups.push(("", rows, None, METRIC_CARD_GAP));
@@ -603,40 +708,29 @@ pub fn build_pages(
                     None,
                     CARD_GAP,
                 ));
+                // 「显示位置（贴角）」已删除（用户反馈：意义不大，窗口可以直接手拖）。
+                // 配置字段 snap_corner 保留（首次启动的落位仍用它），只是不再暴露到 UI。
                 groups.push((
                     tr("GrpPosLook"),
-                    vec![
-                        row_def(
-                            tr("LblCorner"),
-                            Some(tr("HintCorner")),
-                            vec![ctrl_item(
-                                246,
-                                Box::new(seg(
-                                    &["SegCornerRT", "SegCornerRB", "SegCornerLT", "SegCornerLB"],
-                                    CfgRef::SnapCorner,
-                                )),
-                            )],
-                        ),
-                        row_def(
-                            tr("LblOpacity"),
-                            Some(tr("HintOpacity")),
-                            vec![ItemDef {
-                                id: 247,
-                                kind: Box::new(SliderWidget {
-                                    min: 40.0,
-                                    max: 100.0,
-                                    step: 1.0,
-                                    dp: 0,
-                                    unit: "%",
-                                    cfg: CfgRef::Opacity,
-                                    metric_style: false,
-                                }),
-                                l: ctrl_l,
-                                r: widget_r,
-                                tall: true,
-                            }],
-                        ),
-                    ],
+                    vec![row_def(
+                        tr("LblOpacity"),
+                        Some(tr("HintOpacity")),
+                        vec![ItemDef {
+                            id: 247,
+                            kind: Box::new(SliderWidget {
+                                min: sysoverlay_core::config::OPACITY_PCT_MIN as f32,
+                                max: sysoverlay_core::config::OPACITY_PCT_MAX as f32,
+                                step: 1.0,
+                                dp: 0,
+                                unit: "%",
+                                cfg: CfgRef::Opacity,
+                                metric_style: false,
+                            }),
+                            l: ctrl_l,
+                            r: widget_r,
+                            tall: true,
+                        }],
+                    )],
                     None,
                     CARD_GAP,
                 ));
@@ -655,6 +749,12 @@ pub fn build_pages(
                             tr("LblGpu3D"),
                             Some(tr("HintGpu3D")),
                             vec![toggle_item(264, CfgRef::Gpu3dOnly)],
+                        ),
+                        // 功耗查询：关闭跳过 MSR 内核查询（省 CPU），功耗行显示 --。
+                        row_def(
+                            tr("LblPowerQuery"),
+                            Some(tr("HintPowerQuery")),
+                            vec![toggle_item(267, CfgRef::PowerQuery)],
                         ),
                     ],
                     None,
@@ -750,20 +850,35 @@ pub fn build_pages(
             let rows_top = card_top + CARD_PAD as f32;
             let mut ry: f32 = 0.0;
             let mut out_rows: Vec<Row> = Vec::with_capacity(rows.len());
-            for rd in rows {
+            // 行间分隔线：**有标题的分组卡**内部，行与行之间画一条细线（用户反馈：
+            // 各行的说明文字与下一行标签粘在一起，加线后工整）。
+            // 无标题分组 = 监控项独立卡（每项一卡），不画内部分隔；
+            // 小字说明行（hint_only）与其上一行是一体，两侧都不画线。
+            let want_div: Vec<bool> = rows
+                .iter()
+                .enumerate()
+                .map(|(ri, rd)| {
+                    let prev_hint = ri == 0 || rows[ri - 1].hint_only;
+                    !caption.is_empty() && ri > 0 && !rd.hint_only && !prev_hint
+                })
+                .collect();
+            for (ri, rd) in rows.into_iter().enumerate() {
+                // 行与行之间留出统一的 ROW_GAP（第一行不留）。
+                if ri > 0 {
+                    ry += ROW_GAP as f32;
+                }
                 let rh = rd.height();
+                let base_h = rd.base_h();
                 let band_top = rows_top + ry;
                 // 控件垂直定位带：无 hint 的行用整行高（真居中，折叠头行 48 时
                 // 展开按钮/图标才不会顶在上缘）；有 hint 的行控件与首行标签对齐。
-                let band_h = if rd.hint_text.is_some() || rd.hint2.is_some() {
-                    ROW_H as f32
-                } else {
-                    rh
-                };
+                let band_h = if rd.hint_lines() > 0 { ROW_H as f32 } else { rh };
                 let mut idxs = Vec::with_capacity(rd.items.len());
                 for it in rd.items {
                     let (wtop, wbot) = if it.tall {
-                        (sf(dpi, band_top), sf(dpi, band_top + rh))
+                        // 纵跨**控件带**（不含下方 hint 带）：滑杆的基准线由控件带
+                        // 顶部推得，且点在下方的说明文字上不会误触发拖拽/编辑。
+                        (sf(dpi, band_top), sf(dpi, band_top + base_h))
                     } else {
                         let t = sf(dpi, band_top + (band_h - WIDGET_H as f32) / 2.0);
                         (t, t + s(dpi, WIDGET_H))
@@ -780,17 +895,19 @@ pub fn build_pages(
                 out_rows.push(Row {
                     label: rd.label,
                     widgets: idxs,
-                    divider: rd.divider,
+                    divider: rd.divider || want_div[ri],
                     hint: rd.hint_only,
                     hint_text: rd.hint_text,
                     hint2: rd.hint2,
                     y_off: sf(dpi, ry),
+                    base_h: sf(dpi, base_h),
                 });
                 ry += rh;
             }
             let rows_h = sf(dpi, ry);
             let foot_h = if foot.is_some() { s(dpi, FOOTNOTE_H) } else { 0 };
-            let card_bottom = rows_top + rows_h as f32 + 2.0 * CARD_PAD as f32 + foot_h as f32;
+            // 上下内边距**同值**（旧实现底部多留 1×CARD_PAD，卡片看着「下坠」）。
+            let card_bottom = rows_top + rows_h as f32 + CARD_PAD as f32 + foot_h as f32;
             page.cards.push(Card {
                 caption,
                 rect: windows::Win32::Foundation::RECT {
@@ -807,5 +924,206 @@ pub fn build_pages(
             last_gap = gap;
         }
         page.h = sf(dpi, y - last_gap as f32 + BOTTOM_MARGIN as f32);
+    }
+}
+
+#[cfg(test)]
+mod spacing_tests {
+    use super::*;
+
+    /// 测试用 DPI（100%，`s()` 恒等，断言里的数字即逻辑像素）。
+    const D: u32 = 96;
+
+    fn build_all(expand: f32) -> [Page; 6] {
+        let cfg = Config::default();
+        let mut pages: [Page; 6] = Default::default();
+        build_pages(&mut pages, &cfg, Lang::Zh, D, 900, &[expand; 6], &[0, 1, 2, 3, 4, 5]);
+        pages
+    }
+
+    /// 行高 = 控件带 + 说明带（与 `RowDef::height` 同源，这里按 Row 的数据复算）。
+    fn row_h(r: &Row) -> i32 {
+        let lines = r.hint_text.map(|t| !t.is_empty() as i32).unwrap_or(0)
+            + r.hint2.map(|t| !t.is_empty() as i32).unwrap_or(0);
+        r.base_h + s(D, HINT_EXTRA) * lines
+    }
+
+    /// 卡片内的行必须首尾相接：第 i 行 y = 第 i-1 行 y + 高 + ROW_GAP。
+    /// 这条断言直接锁住「行与行间距统一」，任何把间距写死/漏加都会红。
+    #[test]
+    fn rows_are_spaced_by_exactly_row_gap() {
+        for (pi, page) in build_all(1.0).iter().enumerate() {
+            for card in &page.cards {
+                let mut expect = 0i32;
+                for (i, r) in card.rows.iter().enumerate() {
+                    if i > 0 {
+                        expect += s(D, ROW_GAP);
+                    }
+                    assert_eq!(
+                        r.y_off, expect,
+                        "第 {pi} 页、标题「{}」的卡片：第 {i} 行 y_off 与「上一行底 + ROW_GAP」不符",
+                        card.caption
+                    );
+                    expect += row_h(r);
+                }
+                // rows_h 必须等于累计高度（含行间距），否则卡片高与内容对不上。
+                assert_eq!(card.rows_h, expect, "第 {pi} 页卡片 rows_h 与行累计高度不符");
+            }
+        }
+    }
+
+    /// 卡片上下内边距必须同值（旧实现底部多留 1×CARD_PAD，卡片看着「下坠」）。
+    #[test]
+    fn card_padding_is_symmetric() {
+        for (pi, page) in build_all(1.0).iter().enumerate() {
+            for card in &page.cards {
+                if card.footnote.is_some() {
+                    continue; // 有脚注的卡片底部由 FOOTNOTE_H 另行占位
+                }
+                let bottom = card.rect.bottom - (card.rect.top + s(D, CARD_PAD) + card.rows_h);
+                assert_eq!(bottom, s(D, CARD_PAD), "第 {pi} 页卡片上下内边距不等");
+            }
+        }
+    }
+
+    /// 控件带高度只能取刻度值，防止有人就地写魔法数字。
+    #[test]
+    fn control_band_uses_scale_only() {
+        let allowed = [
+            s(D, ROW_H),
+            s(D, ROW_SLIDER_H),
+            s(D, ROW_HEADER_H),
+            s(D, HINT_EXTRA),
+        ];
+        for page in build_all(1.0).iter() {
+            for card in &page.cards {
+                for r in &card.rows {
+                    assert!(
+                        allowed.contains(&r.base_h),
+                        "控件带高度 {} 不在刻度 {} 内",
+                        r.base_h,
+                        allowed.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("/")
+                    );
+                }
+            }
+        }
+    }
+
+    /// 分隔线只能在「行与行之间」出现（不能出现在首行，也不能切在标签与它的说明之间）。
+    #[test]
+    fn dividers_only_between_rows() {
+        for page in build_all(1.0).iter() {
+            for card in &page.cards {
+                for (i, r) in card.rows.iter().enumerate() {
+                    if r.divider {
+                        assert!(i > 0, "首行不应有分隔线");
+                        assert!(!card.rows[i - 1].hint, "分隔线不能切在说明行与上一行之间");
+                        assert!(!r.hint, "分隔线不能切在说明行与其上一行之间");
+                    }
+                }
+            }
+        }
+    }
+
+    /// 监控项独立卡（无标题分组）：不画内部分隔，且首行是折叠头行高。
+    /// 判定方式 = 首行含 `MetricHeaderWidget`（页脚卡不含，需排除）。
+    fn is_metric_card(page: &Page, card: &Card) -> bool {
+        card.rows
+            .first()
+            .map(|r| {
+                r.widgets
+                    .iter()
+                    .any(|&i| page.widgets[i].kind.as_any().is::<MetricHeaderWidget>())
+            })
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn metric_cards_have_no_inner_dividers_and_tall_header() {
+        let mut checked = 0;
+        for expand in [0.0f32, 1.0] {
+            let pages = build_all(expand);
+            let page = &pages[2];
+            for card in &page.cards {
+                assert!(card.caption.is_empty(), "监控项卡应为无标题分组");
+                if !is_metric_card(page, card) {
+                    continue;
+                }
+                checked += 1;
+                assert_eq!(
+                    card.rows[0].base_h,
+                    s(D, ROW_HEADER_H),
+                    "监控项卡首行应为折叠头行高"
+                );
+                for (k, r) in card.rows.iter().enumerate() {
+                    // 折叠态只有折叠头一行，不需要内部分隔线；
+                    // 展开态除「字号注解行」外，每行都要有分隔线（用户反馈：展开页也要）。
+                    let annotation = r
+                        .widgets
+                        .iter()
+                        .any(|&wi| page.widgets[wi].kind.as_any().is::<MetricFontStatusWidget>());
+                    let want = expand > 0.5 && k > 0 && !annotation;
+                    assert_eq!(r.divider, want, "展开度 {expand}：第 {k} 行分隔线不符预期");
+                }
+            }
+        }
+        assert_eq!(checked, 12, "两种展开态 × 6 张监控项卡");
+    }
+
+    /// 折叠（未展开）时监控项卡只有一行（就是折叠头）。
+    #[test]
+    fn collapsed_metric_card_has_single_row() {
+        let pages = build_all(0.0);
+        let page = &pages[2];
+        for card in &page.cards {
+            if !is_metric_card(page, card) {
+                continue;
+            }
+            assert_eq!(card.rows.len(), 1, "折叠态监控项卡应只有折叠头一行");
+            assert_eq!(card.rows[0].base_h, s(D, ROW_HEADER_H));
+        }
+    }
+
+    /// 纵向节奏：分隔线要当成一行字参与。
+    /// 「标签墨迹底 → 说明墨迹顶」「说明墨迹底 → 分隔线」「分隔线 → 下一标签墨迹顶」
+    /// 三者必须相等 —— 用户反馈「字到分隔线的距离也应该相同」。
+    #[test]
+    fn vertical_rhythm_includes_the_divider() {
+        let label_pad = (s(D, ROW_H) as f32 - body_px(D)) / 2.0;
+        let hint_pad = (s(D, HINT_EXTRA) as f32 - caption_px(D)) / 2.0;
+        // 行 0 顶 = 0，控件带 ROW_H，带一条说明；行 1 顶 = 行高 + ROW_GAP。
+        let label_ink_b = s(D, ROW_H) as f32 - label_pad;
+        let hint_ink_t = s(D, ROW_H) as f32 + hint_pad;
+        let hint_ink_b = s(D, ROW_H) as f32 + s(D, HINT_EXTRA) as f32 - hint_pad;
+        let row1_top = s(D, ROW_H + HINT_EXTRA + ROW_GAP) as f32;
+        let label1_ink_t = row1_top + label_pad;
+        let div = row1_top - divider_rise(D, true);
+
+        let g1 = hint_ink_t - label_ink_b;
+        let g2 = div - hint_ink_b;
+        let g3 = label1_ink_t - div;
+        assert!((g1 - g2).abs() < 0.05, "说明↔分隔线 与 标签↔说明 不等距：{g1} vs {g2}");
+        assert!((g2 - g3).abs() < 0.05, "分隔线两侧不等距：{g2} vs {g3}");
+
+        // 上一行无说明时，两侧也必须等距（rise 退化为 ROW_GAP/2）。
+        let row1_top2 = s(D, ROW_H + ROW_GAP) as f32;
+        let div2 = row1_top2 - divider_rise(D, false);
+        let above = div2 - (s(D, ROW_H) as f32 - label_pad);
+        let below = (row1_top2 + label_pad) - div2;
+        assert!((above - below).abs() < 0.05, "无说明行：分隔线两侧不等距：{above} vs {below}");
+        assert!((divider_rise(D, false) - s(D, ROW_GAP) as f32 / 2.0).abs() < 0.05);
+    }
+
+    /// 相邻量级必须拉开：分组标题↔卡片(8) < 行↔行(12) < 卡片内边距(16)
+    /// < 卡片↔卡片(24)。否则视觉上读不出分组关系。
+    #[test]
+    fn spacing_scale_is_monotonic_with_contrast() {
+        assert!(CAPTION_GAP > 0 && CAPTION_GAP < ROW_GAP);
+        assert!(ROW_GAP < CARD_PAD);
+        assert!(CARD_PAD < CARD_GAP);
+        // 行盒必须放得下自己的字号，否则字会被行盒挤住（「贴到一起」的根因之一）。
+        assert!((HINT_EXTRA as f32) > 14.67, "说明行高放不下说明字号");
+        assert!((CAPTION_H as f32) > 14.67, "分组标题带放不下标题字号");
+        assert!((ROW_H as f32) > 17.34, "基础行高放不下正文标签");
     }
 }

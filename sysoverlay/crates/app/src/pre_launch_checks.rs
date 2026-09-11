@@ -68,7 +68,7 @@ fn current_date() -> u32 {
 }
 
 fn is_leap_year(year: u32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 /// Get elapsed time since last check in milliseconds
@@ -174,7 +174,9 @@ pub fn run_pre_launch_checks(cfg: &mut sysoverlay_core::config::Config) -> bool 
     }
 
     // Check 2: Driver loaded
-    if !is_driver_loaded() {
+    // 功耗查询关闭（power_enabled/power_query 任一关）时完全不读 MSR，
+    // 无需驱动 → 跳过每周一次的驱动检查弹窗，不打扰用户。
+    if cfg.power_enabled && cfg.power_query && !is_driver_loaded() {
         // Check if we should show the dialog
         let should_check = cfg.driver_check_continue_count < CONTINUE_LIMIT
             && (cfg.driver_check_last_date == 0 || week_passed_driver);

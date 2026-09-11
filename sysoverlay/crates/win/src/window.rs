@@ -121,7 +121,9 @@ pub fn publish_schedule_cfg(cfg: &Config) {
         | ((cfg.show_gpu as u32) << 2)
         | ((cfg.show_net as u32) << 3);
     SCHED_ENABLED.store(mask, Ordering::Relaxed);
-    SCHED_POWER.store(cfg.power_enabled, Ordering::Relaxed);
+    // 功耗采样门 = 行开关 ∧ 查询开关（性能页）：query 关 → 跳过 MSR 内核查询，
+    // 采样器把 Snapshot.power 显式置 Unavailable（功耗行显示 --）。
+    SCHED_POWER.store(cfg.power_enabled && cfg.power_query, Ordering::Relaxed);
     SCHED_NET_LOW.store(cfg.net_low_freq, Ordering::Relaxed);
     // GPU 查询范围（主适配器/3D 引擎 only）随配置即时生效
     crate::proc_gpu::set_gpu_scope(cfg.gpu_primary_only, cfg.gpu_3d_only);
