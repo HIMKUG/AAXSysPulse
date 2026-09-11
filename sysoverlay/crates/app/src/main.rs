@@ -336,19 +336,26 @@ fn main() {
             if plan.cpu {
                 if let Some(v) = snap.cpu.value() {
                     sched.update_ema(Source::Cpu, v);
+                    sched.commit_ema(Source::Cpu, v);
+                } else if let Some(v) = pending.cpu.value() {
+                    // 采样失败但 pending 有旧值：用旧值推进 EMA，避免卡在 0.0
+                    sched.update_ema(Source::Cpu, v);
                 }
             }
             if plan.mem {
                 sched.update_ema(Source::Mem, snap.memory.load_pct);
+                sched.commit_ema(Source::Mem, snap.memory.load_pct);
             }
             if plan.gpu {
                 if let Some(v) = snap.gpu.value() {
                     sched.update_ema(Source::Gpu, v);
+                    sched.commit_ema(Source::Gpu, v);
                 }
             }
             if plan.net {
                 let v = (snap.net.rx_bps.saturating_add(snap.net.tx_bps)) as f32;
                 sched.update_ema(Source::Net, v);
+                sched.commit_ema(Source::Net, v);
             }
 
             pending = snap;

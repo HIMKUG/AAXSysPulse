@@ -172,10 +172,12 @@ impl Scheduler {
 
             // EMA 变化检测：即使时间到期，如果 EMA 变化小于阈值也跳过采样
             // 这样可以避免在数值稳定时频繁采样（节省 OS 系统调用开销）
+            // 但首次采样（has_sampled[idx]=false）必须执行，否则 EMA 永远无法初始化
             let ema = self.ema(src);
             let ema_committed = self.ema_committed(src);
             let ema_delta = (ema - ema_committed).abs();
-            let ema_significant = ema_delta >= Self::SAMPLE_DELTA_THRESHOLD || !self.has_sampled[idx];
+            let is_first_sample = !self.has_sampled[idx];
+            let ema_significant = is_first_sample || ema_delta >= Self::SAMPLE_DELTA_THRESHOLD;
 
             if time_due && ema_significant {
                 self.last_sample_ms[idx] = now_ms;
@@ -213,6 +215,12 @@ impl Scheduler {
             Source::Net => &mut self.ema_net,
         };
         *ema = *ema + EMA_ALPHA * (raw - *ema);
+    }
+
+    /// 提交 EMA 值到 committed 状态（在采样成功后调用）
+    pub fn commit_ema(&mut self, src: Source, value: f32) {
+        self.update_ema(src, value);
+        self.set_ema_committed(src, self.ema(src));
     }
 
     pub fn ema(&self, src: Source) -> f32 {
