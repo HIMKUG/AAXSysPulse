@@ -1,7 +1,7 @@
 //! CPU 实测功耗：WinRing0x64.sys 驱动 + RAPL MSR（用户拍板方案）。
 //!
 //! # 链路
-//! 1. `WinRing0x64.sys`（exe 同目录，来源 OpenHardwareMonitor 官方仓库）
+//! 1. `WinRing0x64.sys`（固定路径 `C:\Windows\SysOverlay\`，来源 OpenHardwareMonitor 官方仓库）
 //!    → SCM 创建/启动内核服务（**需要管理员权限**）；
 //! 2. 打开设备 `\\.\WinRing0_1_2_0`（驱动源码 OpenLibSys.h 固定名）；
 //! 3. `DeviceIoControl(IOCTL_OLS_READ_MSR=0x9C402084, &msr_index)` 读寄存器。
@@ -88,8 +88,11 @@ fn ring0() -> Option<&'static Ring0> {
         //    SCM 用服务注册表里的 BinaryPath 启动驱动，与 exe 当前目录无关。
         //    本地文件只在"服务不存在（首次部署）"时才是必需品。
         //    （教训：exe 换目录会导致检查文件失败 → 整个 MSR 关闭 → Power 整行 --。）
-        let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-        let sys_path = exe_dir.join("WinRing0x64.sys");
+        //
+        //    驱动固定重定向到 C:\Windows\SysOverlay\（需手动放置或首次部署时拷贝）。
+        //    这样即使用户把 exe 移到其他目录，首次部署时仍能正确找到驱动。
+        let driver_dir = std::path::PathBuf::from(r"C:\Windows\SysOverlay");
+        let sys_path = driver_dir.join("WinRing0x64.sys");
         let sys_exists = sys_path.exists();
         if !sys_exists {
             probe::log("msr driver not beside exe (will reuse installed service if present)");
