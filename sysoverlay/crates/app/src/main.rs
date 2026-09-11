@@ -24,6 +24,9 @@ use sysoverlay_win::dpi;
 use sysoverlay_win::config_io;
 use sysoverlay_win::{tray, autostart};
 
+mod pre_launch_checks;
+use pre_launch_checks::run_pre_launch_checks;
+
 /// Enables the panic hook that writes a minidump before aborting.
 fn setup_panic_hook() {
     std::panic::set_hook(Box::new(|panic_info| {
@@ -195,7 +198,17 @@ fn main() {
         ));
     }
 
-    // ── 2b. 管理员权限（用户拍板：无权限提示+runas 重启，拒绝则关闭 Power 行）──
+    // ── 2b. Pre-launch checks: admin & driver status ──────────────────────
+    // Shows warning dialogs for admin/driver status.
+    // User can click Continue (up to 3 times per check) or Exit.
+    // Each check is only shown once per week.
+    let config_changed = run_pre_launch_checks(&mut cfg);
+    if config_changed {
+        // Save updated continue counts and dates
+        let _ = config_io::save_config(&cfg);
+    }
+
+    // ── 2c. 管理员权限（用户拍板：无权限提示+runas 重启，拒绝则关闭 Power 行）──
     if cfg.power_enabled && !sysoverlay_win::elevate::is_admin() {
         if sysoverlay_win::elevate::prompt_and_relaunch() {
             // 已发起管理员重启：立即退出让位（新进程带 --elevated 重试抢互斥体）

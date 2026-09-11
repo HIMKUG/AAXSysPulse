@@ -158,6 +158,16 @@ pub struct Config {
     /// 贴靠屏幕的哪个角：0=右上 1=右下 2=左上 3=左下；
     /// 255 = 未贴角（自由定位，兼容既有 window_pos 用户）。默认 255。
     pub snap_corner: u8,
+
+    // ── Pre-launch checks (admin & driver) ──────────────────────────────────
+    /// 管理员权限检测：用户累计点击"继续"的次数。达到 3 次后永久跳过此检测。
+    pub admin_check_continue_count: u8,
+    /// 驱动加载检测：用户累计点击"继续"的次数。达到 3 次后永久跳过此检测。
+    pub driver_check_continue_count: u8,
+    /// 上次管理员权限检测的日期（YYYYMMDD格式），每周检测一次。
+    pub admin_check_last_date: u32,
+    /// 上次驱动加载检测的日期（YYYYMMDD格式），每周检测一次。
+    pub driver_check_last_date: u32,
 }
 
 /// 未贴角标记值（自由定位）。
@@ -215,6 +225,10 @@ impl Default for Config {
             settings_size: (720, 560),
             click_through: false,
             snap_corner: SNAP_CORNER_FREE,
+            admin_check_continue_count: 0,
+            driver_check_continue_count: 0,
+            admin_check_last_date: 0,
+            driver_check_last_date: 0,
         }
     }
 }
@@ -479,6 +493,27 @@ impl Config {
                         cfg.snap_corner = if v <= 3 { v as u8 } else { SNAP_CORNER_FREE };
                     }
                 }
+                // Pre-launch check tracking
+                "admin_check_continue_count" => {
+                    if let Ok(v) = value.parse::<u32>() {
+                        cfg.admin_check_continue_count = v.min(3) as u8;
+                    }
+                }
+                "driver_check_continue_count" => {
+                    if let Ok(v) = value.parse::<u32>() {
+                        cfg.driver_check_continue_count = v.min(3) as u8;
+                    }
+                }
+                "admin_check_last_date" => {
+                    if let Ok(v) = value.parse::<u32>() {
+                        cfg.admin_check_last_date = v;
+                    }
+                }
+                "driver_check_last_date" => {
+                    if let Ok(v) = value.parse::<u32>() {
+                        cfg.driver_check_last_date = v;
+                    }
+                }
                 "set_size" => {
                     let mut it = value.split_whitespace();
                     if let (Some(w), Some(h)) = (it.next(), it.next()) {
@@ -564,6 +599,11 @@ impl Config {
         // v5 窗口页新增（C 版忽略）
         s.push_str(&format!("click_through {}\n", self.click_through as u32));
         s.push_str(&format!("snap_corner {}\n", self.snap_corner));
+        // Pre-launch check tracking
+        s.push_str(&format!("admin_check_continue_count {}\n", self.admin_check_continue_count));
+        s.push_str(&format!("driver_check_continue_count {}\n", self.driver_check_continue_count));
+        s.push_str(&format!("admin_check_last_date {}\n", self.admin_check_last_date));
+        s.push_str(&format!("driver_check_last_date {}\n", self.driver_check_last_date));
         // 逐项配色：只有非跟随全局的色槽才落盘
         for (i, metric) in Metric::ALL.iter().enumerate() {
             let mc = &self.metric_colors[i];
