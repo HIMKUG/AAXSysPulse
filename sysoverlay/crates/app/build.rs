@@ -3,7 +3,6 @@
 //! Embeds the driver-installer binary as a resource.
 
 use std::env;
-use std::fs;
 use std::path::Path;
 
 fn main() {
@@ -29,8 +28,10 @@ fn main() {
         // For now, we just check the file exists. The actual embedding
         // happens via the include_bytes! macro in the Rust code.
     } else {
-        println!("cargo:warning=Driver installer not found at {}. "
-                 "Run 'D:\\code\\sys-overlay-c-master\\sysoverlay\\driver-installer\\build.bat' to build it.",
-                 driver_installer_path.display());
+        eprintln!(
+            "cargo:warning=Driver installer not found at {}. \
+             Run 'D:\\code\\sys-overlay-c-master\\sysoverlay\\driver-installer\\build.bat' to build it.",
+            driver_installer_path.display()
+        );
     }
 }

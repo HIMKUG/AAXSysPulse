@@ -100,6 +100,11 @@ pub struct Scheduler {
     pub ema_mem: f32,
     pub ema_gpu: f32,
     pub ema_net: f32,
+    /// EMA 值上次提交时的快照（用于采样决策：EMA 无显著变化则跳过采样）
+    ema_cpu_committed: f32,
+    ema_mem_committed: f32,
+    ema_gpu_committed: f32,
+    ema_net_committed: f32,
 }
 
 impl Scheduler {
@@ -113,6 +118,10 @@ impl Scheduler {
             ema_mem: 0.0,
             ema_gpu: 0.0,
             ema_net: 0.0,
+            ema_cpu_committed: 0.0,
+            ema_mem_committed: 0.0,
+            ema_gpu_committed: 0.0,
+            ema_net_committed: 0.0,
         }
     }
 
@@ -147,6 +156,9 @@ impl Scheduler {
         self.effective_interval_ms(enabled).max(MIN_EFFECTIVE_MS[src as usize])
     }
 
+    /// 采样 EMA 变化阈值（百分比）：EMA 与上次采样值的差值小于此值时跳过采样
+    const SAMPLE_DELTA_THRESHOLD: f32 = 1.0;
+
     pub fn plan(&mut self, now_ms: u64, enabled: &EnabledMask) -> SamplePlan {
         let mut plan = SamplePlan::default();
         for &src in Source::ALL.iter() {
@@ -155,15 +167,42 @@ impl Scheduler {
                 continue;
             }
             let interval = self.source_interval_ms(src, enabled) as u64;
-            let due = !self.has_sampled[idx]
+            let time_due = !self.has_sampled[idx]
                 || now_ms.saturating_sub(self.last_sample_ms[idx]) >= interval;
-            if due {
+
+            // EMA 变化检测：即使时间到期，如果 EMA 变化小于阈值也跳过采样
+            // 这样可以避免在数值稳定时频繁采样（节省 OS 系统调用开销）
+            let ema = self.ema(src);
+            let ema_committed = self.ema_committed(src);
+            let ema_delta = (ema - ema_committed).abs();
+            let ema_significant = ema_delta >= Self::SAMPLE_DELTA_THRESHOLD || !self.has_sampled[idx];
+
+            if time_due && ema_significant {
                 self.last_sample_ms[idx] = now_ms;
                 self.has_sampled[idx] = true;
+                self.set_ema_committed(src, ema);
                 plan.set(src, true);
             }
         }
         plan
+    }
+
+    fn ema_committed(&self, src: Source) -> f32 {
+        match src {
+            Source::Cpu => self.ema_cpu_committed,
+            Source::Mem => self.ema_mem_committed,
+            Source::Gpu => self.ema_gpu_committed,
+            Source::Net => self.ema_net_committed,
+        }
+    }
+
+    fn set_ema_committed(&mut self, src: Source, value: f32) {
+        match src {
+            Source::Cpu => self.ema_cpu_committed = value,
+            Source::Mem => self.ema_mem_committed = value,
+            Source::Gpu => self.ema_gpu_committed = value,
+            Source::Net => self.ema_net_committed = value,
+        }
     }
 
     pub fn update_ema(&mut self, src: Source, raw: f32) {
