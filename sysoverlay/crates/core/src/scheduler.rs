@@ -156,9 +156,6 @@ impl Scheduler {
         self.effective_interval_ms(enabled).max(MIN_EFFECTIVE_MS[src as usize])
     }
 
-    /// 采样 EMA 变化阈值（百分比）：EMA 与上次采样值的差值小于此值时跳过采样
-    const SAMPLE_DELTA_THRESHOLD: f32 = 1.0;
-
     pub fn plan(&mut self, now_ms: u64, enabled: &EnabledMask) -> SamplePlan {
         let mut plan = SamplePlan::default();
         for &src in Source::ALL.iter() {
@@ -170,32 +167,13 @@ impl Scheduler {
             let time_due = !self.has_sampled[idx]
                 || now_ms.saturating_sub(self.last_sample_ms[idx]) >= interval;
 
-            // EMA 变化检测：即使时间到期，如果 EMA 变化小于阈值也跳过采样
-            // 这样可以避免在数值稳定时频繁采样（节省 OS 系统调用开销）
-            // 但首次采样（has_sampled[idx]=false）必须执行，否则 EMA 永远无法初始化
-            let ema = self.ema(src);
-            let ema_committed = self.ema_committed(src);
-            let ema_delta = (ema - ema_committed).abs();
-            let is_first_sample = !self.has_sampled[idx];
-            let ema_significant = is_first_sample || ema_delta >= Self::SAMPLE_DELTA_THRESHOLD;
-
-            if time_due && ema_significant {
+            if time_due {
                 self.last_sample_ms[idx] = now_ms;
                 self.has_sampled[idx] = true;
-                self.set_ema_committed(src, ema);
                 plan.set(src, true);
             }
         }
         plan
-    }
-
-    fn ema_committed(&self, src: Source) -> f32 {
-        match src {
-            Source::Cpu => self.ema_cpu_committed,
-            Source::Mem => self.ema_mem_committed,
-            Source::Gpu => self.ema_gpu_committed,
-            Source::Net => self.ema_net_committed,
-        }
     }
 
     fn set_ema_committed(&mut self, src: Source, value: f32) {
