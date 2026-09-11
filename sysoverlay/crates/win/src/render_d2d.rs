@@ -63,16 +63,16 @@ struct RtCache {
 }
 
 thread_local! {
-    static RT_CACHE: RefCell<RtCache> = RefCell::new(RtCache {
+    static RT_CACHE: RefCell<RtCache> = const { RefCell::new(RtCache {
         rt: None,
         w: 0,
         h: 0,
         mem_dc: HDC(std::ptr::null_mut()),
-    });
+    }) };
 }
 
 thread_local! {
-    static RT_DEVICE_LOST: RefCell<bool> = RefCell::new(false);
+    static RT_DEVICE_LOST: RefCell<bool> = const { RefCell::new(false) };
 }
 
 /// 将文本编码为 UTF16，返回 Vec。
@@ -447,7 +447,7 @@ impl D2DSurface {
     /// 22 次 "end_draw FAILED"），叠加引擎切换后的尺寸清零 → 窗口直接消失。
     pub fn begin_draw(&self) {
         unsafe {
-            let _ = self.rt.BeginDraw();
+            self.rt.BeginDraw();
         }
     }
 
@@ -467,8 +467,11 @@ impl D2DSurface {
 impl RenderTarget for D2DSurface {
     fn clear(&mut self) {
         unsafe {
+            // ⚠️ alpha = 1/255 而非 0：分层窗口对 alpha=0 像素点击穿透，
+            // 全透明底导致悬浮窗只能按在文字上拖动。alpha=1 不可见但可命中，
+            // 整个窗口矩形都能拖拽/悬停（与 GDI 软件光栅底色保持一致）。
             self.rt
-                .Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+                .Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 / 255.0 }));
         }
     }
 

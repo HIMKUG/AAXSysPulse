@@ -933,6 +933,10 @@ fn render_d2d(
             return false;
         }
         let need_w = (text_right + 12.0).ceil() as i32;
+        // 收缩目标取 max(DWrite 实测, 布局自然宽)：扩（guard 用 nat_w）与缩
+        // （此处用 need_w）的目标若互相错开 8~32px 会形成扩缩循环，取 max
+        // 保证收缩终点 ≥ guard 的扩窗终点 → 单向收敛。
+        let fit_w = need_w.max(nat_w);
         // 仅当确实超出且未达上限才扩；超过上限（内容本身超宽）放弃扩避免死循环。
         if !cfg.size_locked && need_w > width && need_w <= MAX_WIN {
             crate::probe::log(&format!(
@@ -950,6 +954,26 @@ fn render_d2d(
             );
             perf::note_section("render_d2d_heal", t0);
             return true; // 扩窗续帧（非失败）
+        }
+        // 收缩回精确内容宽度（滞后带 32px 防抖动）。此前"只扩不缩"叠加
+        // fit_window_to 内部的 ×1.4 复利，把窗口一路顶到 MAX_WIN(2048)——
+        // 每秒一次的时钟整窗上传白白多拷近 10 倍内存。size_locked 尊重用户锁定。
+        if !cfg.size_locked && width > fit_w + 32 {
+            crate::probe::log(&format!(
+                "d2d self-heal shrink: fit_w={fit_w} win={width} -> shrink + retry"
+            ));
+            drop(dib);
+            let _ = ReleaseDC(hwnd, screen_dc);
+            LAST_FRAME_HASH.store(u64::MAX, AtomicOrdering::Relaxed);
+            fit_window_to(hwnd, cfg, fit_w, height);
+            let _ = PostMessageW(
+                hwnd,
+                crate::window::WM_NEW_SNAPSHOT,
+                windows::Win32::Foundation::WPARAM(0),
+                windows::Win32::Foundation::LPARAM(0),
+            );
+            perf::note_section("render_d2d_shrink", t0);
+            return true; // 缩窗续帧（非失败）
         }
         crate::probe::log_lazy(|| format!("d2d PAINT-DONE -> upload {}x{} dirty={:?}", width, height, match &dirty { Dirty::Full => "Full".into(), Dirty::Rect(r) => format!("Rect({},{},{},{})", r.left, r.top, r.right, r.bottom) }));
 
@@ -1011,6 +1035,14 @@ pub fn natural_size(cfg: &Config) -> (i32, i32) {
 /// 失效。现在锁定语义由 `size_locked` 单独承担。
 pub fn fit_window(hwnd: HWND, cfg: &Config) {
     let (nx, ny) = natural_size(cfg);
+    // D2D 的自然宽度按位图字体度量估算、偏窄（DIN 真字形更宽）→ 估算路径
+    // 给 D2D 加安全余量；GDI 度量与渲染同源（精确），不加不失真。
+    // 渲染路径（guard/self-heal/收缩）一律用精确实测值，见 fit_window_to 注释。
+    let nx = if cfg.render_engine == RenderEngine::D2d {
+        natural_w_oversized(nx, cfg)
+    } else {
+        nx
+    };
     fit_window_to(hwnd, cfg, nx, ny);
 }
 
@@ -1021,7 +1053,10 @@ pub fn fit_window(hwnd: HWND, cfg: &Config) {
 /// fit guard 反复触发死循环。guard 路径改用运行时 `Renderer::layout` 实测的
 /// (nat_w, nat_h)，一次设到位、内容与窗口完全匹配。
 fn fit_window_to(hwnd: HWND, cfg: &Config, nx: i32, ny: i32) {
-    let nx = natural_w_oversized(nx, cfg);
+    // ⚠️ 此处**不得**再套 natural_w_oversized：nx/ny 就是最终目标尺寸。
+    // 余量只允许由调用方从内容自然宽度计算一次（fit_window），若在这里对
+    // "当前窗口宽度"再乘 1.4，self-heal 每触发一次就复利放大一次
+    // （591→827→1158→1621→2048 触顶 MAX_WIN，实测窗口被顶到上限）。
     let (w, h) = if cfg.size_locked {
         cfg.window_size
             .filter(|&(w, h)| w >= 60 && h >= 40 && w <= MAX_WIN && h <= MAX_WIN)
@@ -1071,10 +1106,13 @@ fn natural_w_oversized(nat_w: i32, _cfg: &Config) -> i32 {
 /// ⚠️ 只扩不缩：窗口比内容大时保持（用户可能手动拉宽过；且与 D2D self-heal
 /// 组合时，双向收窄会造成"缩→扩→缩"死循环——实测 282↔298 每帧抖动）。
 fn ensure_content_fits(hwnd: HWND, cfg: &Config, nat_w: i32, nat_h: i32, width: i32, height: i32) -> bool {
-    let fit_w = natural_w_oversized(nat_w, cfg);
-    if !cfg.size_locked && (fit_w > width + 8 || nat_h > height + 8) {
+    // 渲染期一律用**原始自然宽度**比较：D2D 的精确定宽由 render_d2d 的
+    // DWrite 实测（text_right）self-heal 承担，GDI 的位图度量与渲染同源、
+    // 本身精确。余量（natural_w_oversized）若参与渲染期比较，会与「收缩回
+    // 精确尺寸」互相拉扯 → 扩缩死循环；余量只保留在 fit_window 估算路径。
+    if !cfg.size_locked && (nat_w > width + 8 || nat_h > height + 8) {
         crate::probe::log(&format!(
-            "fit guard(expand): nat=({nat_w},{nat_h}) fit_w={fit_w} win=({width},{height}) -> expand"
+            "fit guard(expand): nat=({nat_w},{nat_h}) win=({width},{height}) -> expand"
         ));
         fit_window_to(hwnd, cfg, nat_w.max(width), nat_h.max(height));
         unsafe {

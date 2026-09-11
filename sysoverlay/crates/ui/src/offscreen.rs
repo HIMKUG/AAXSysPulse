@@ -80,14 +80,19 @@ impl SoftwareSurface {
         self.pixels[idx + 3] = out_a as u8; // A
     }
 
-    /// Clears the surface to transparent.
+    /// Clears the surface to "transparent".
+    ///
+    /// ⚠️ 底色 alpha = 1 而非 0：分层窗口对 alpha=0 的像素**点击穿透**，
+    /// 全透明底会让悬浮窗只能"按在文字上"才能拖动。alpha=1（1/255，配合
+    /// 全局不透明度后不可见）让整个窗口矩形都可命中/拖拽/悬停。
     pub fn clear(&mut self) {
-        self.pixels.fill(0);
+        self.pixels.fill(1);
     }
 
-    /// 只清空一个子矩形（按行 `fill(0)`，A3：省掉整画布 187KB memset）。
+    /// 只清空一个子矩形（按行填充，A3：省掉整画布 memset）。
     ///
     /// 负坐标/越界自动裁剪到画布范围，不 panic。
+    /// 填充值 = [0,0,0,1]（BGRA，预乘 alpha=1）：与 [`Self::clear`] 同底色。
     pub fn clear_rect(&mut self, x: i32, y: i32, w: i32, h: i32) {
         let x = x.max(0);
         let y = y.max(0);
@@ -99,7 +104,12 @@ impl SoftwareSurface {
             let start = ((yy * self.width + x) * 4) as usize;
             let end = ((yy * self.width + x1) * 4) as usize;
             if let Some(row) = self.pixels.get_mut(start..end) {
-                row.fill(0);
+                for px in row.chunks_exact_mut(4) {
+                    px[0] = 0;
+                    px[1] = 0;
+                    px[2] = 0;
+                    px[3] = 1;
+                }
             }
         }
     }
