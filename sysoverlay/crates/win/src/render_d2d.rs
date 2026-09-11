@@ -364,6 +364,12 @@ impl D2DSurface {
     }
 
     /// 在 (x,y) 处用 DWrite 画一段文字（含可选阴影/描边，镜像 draw_row_text 语义）。
+    ///
+    /// `right_align`：该 cell 是右侧数值（右对齐）。布局的 cell 几何由**位图等宽
+    /// 度量**推算，而 DIN 真字形是比例字体、宽度与之不等 → 直接按 `x` 绘制会让
+    /// 数值右缘逐行漂移（同一列对不齐，网速串尤甚）。置 true 时用 DWrite 实测宽度
+    /// 修正绘制原点，使 ink 右缘恒等于布局锚点 `x + 位图度量宽`。
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_glyphs(
         &mut self,
         text: &str,
@@ -375,6 +381,7 @@ impl D2DSurface {
         shade: Rgba,
         shadow: bool,
         outline: bool,
+        right_align: bool,
     ) {
         if text.is_empty() || (color.a == 0 && shade.a == 0) {
             return;
@@ -384,33 +391,38 @@ impl D2DSurface {
             Some(f) => f.clone(),
             None => return,
         };
+        let text_buf = encode_text(text);
+        let layout: IDWriteTextLayout = match unsafe {
+            self.dwrite
+                .CreateTextLayout(&text_buf, &fmt, 1e6, 1e6)
+        } {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let mut tm = DWRITE_TEXT_METRICS::default();
+        unsafe {
+            let _ = layout.GetMetrics(&mut tm);
+        }
+        let actual_w = tm.widthIncludingTrailingWhitespace;
+        // 右对齐修正：布局锚点 = x + 位图度量宽（与 cell_sig 用同一度量函数）。
+        let base_x = if right_align {
+            x as f32 + sysoverlay_ui::font::measure_scaled_f(text, scale) as f32 - actual_w
+        } else {
+            x as f32
+        };
         let draw = |surface: &mut Self, ox: i32, oy: i32, col: Rgba| {
             let b = match surface.brush(col) {
                 Some(b) => b.clone(),
                 None => return,
             };
-            let text_buf = encode_text(text);
-            let layout: IDWriteTextLayout = match unsafe {
-                surface
-                    .dwrite
-                    .CreateTextLayout(&text_buf, &fmt, 1e6, 1e6)
-            } {
-                Ok(l) => l,
-                Err(_) => return,
-            };
             // 自愈扩窗依据：DWrite 实测该行文本右缘（DIN 真字形宽度，非位图度量）。
-            // 布局的 cell 几何由位图度量推算 → 实际字形更宽时会超出窗口右缘被裁。
-            let mut tm = DWRITE_TEXT_METRICS::default();
-            unsafe {
-                let _ = layout.GetMetrics(&mut tm);
-            }
-            let right = (x + ox) as f32 + tm.widthIncludingTrailingWhitespace;
+            let right = base_x + ox as f32 + actual_w;
             if right > surface.max_text_right {
                 surface.max_text_right = right;
             }
             unsafe {
                 surface.rt.DrawTextLayout(
-                    D2D_POINT_2F { x: (x + ox) as f32, y: (y + oy) as f32 },
+                    D2D_POINT_2F { x: base_x + ox as f32, y: (y + oy) as f32 },
                     &layout,
                     &b,
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
@@ -507,8 +519,8 @@ impl RenderTarget for D2DSurface {
     }
 
     fn draw_text(&mut self, s: &str, at: Rect, color: Rgba, _font: sysoverlay_ui::FontSpec) {
-        // 调用方使用 draw_glyphs（含阴影/描边）；单色直绘兜底（默认粗）。
-        self.draw_glyphs(s, at.x, at.y, 1.0, 2, color, Rgba::transparent(), false, false);
+        // 调用方使用 draw_glyphs（含阴影/描边）；单色直绘兜底（默认粗、左对齐）。
+        self.draw_glyphs(s, at.x, at.y, 1.0, 2, color, Rgba::transparent(), false, false, false);
     }
 
     fn measure_text(&self, s: &str, _font: sysoverlay_ui::FontSpec) -> (i32, i32) {
@@ -574,6 +586,7 @@ pub fn paint_cells(
             c.shade,
             c.shadow,
             c.outline,
+            c.right_align,
         );
     }
 }

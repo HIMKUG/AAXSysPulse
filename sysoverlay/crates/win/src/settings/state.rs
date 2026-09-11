@@ -17,7 +17,9 @@ pub enum Interaction {
     Idle,
     /// 悬停中的控件（widgets 下标）。
     Hover { widget: usize },
-    /// 正在拖动的滑杆。
+    /// 已按下但未抬起（按压反馈用；抬起时若命中同一控件则触发动作）。
+    Pressing { widget: usize },
+    /// 正在拖动的滑杆（绝对位置）。
     Dragging { widget: usize, origin: POINT },
     /// 滑杆值框编辑态。
     Editing { widget: usize },
@@ -41,34 +43,6 @@ pub struct EditState {
     pub select_all: bool,
 }
 
-/// 摇杆（弹簧杆）物理状态：杆永远居中，拖拽只产生增量。
-///
-/// - `deflect`：杆相对中心的位移（[-1,1]，1 = 触及轨道右端），**不代表绝对值**。
-/// - `vel`：杆速度（弹簧-阻尼积分用）。
-/// - `target`：目标位移（拖动中 = 手指位置；松手后 = 0 → 回中）。
-/// - `releasing`：已松开、正弹簧回中阶段（此阶段只动视觉，不再累加数值）。
-/// - `pos`：数值累计推量（单位）——加速度模型的"位移"。
-/// - `speed`：当前推进速率（单位/秒），由加速度积累并钳制到 ±10/s。
-///
-/// 数值推进 = **加速度模型**（用户规格："类似于加速度的公式，上限为 +10/s"）：
-/// 每 tick `speed += deflect·ACCEL·dt`（推得越远加速度越大）、`speed` 钳到
-/// ±[`FX_MAX_RATE`]、`pos += speed·dt`；数值 = base + pos。轻推慢加速、快推
-/// 逼近 10 单位/秒的上限，符合"物理"直觉；旧 integral 模型对所有偏移等速推进，
-/// 偏快且不具"加速感"。
-#[derive(Clone, Copy, Debug)]
-pub struct SliderFx {
-    pub widget: usize,
-    pub deflect: f32,
-    pub vel: f32,
-    pub target: f32,
-    pub releasing: bool,
-    pub pos: f32,
-    pub speed: f32,
-    /// true = 摇杆（杆居中，增量式，速度上限 10/s）。
-    /// false = 简单滑杆（杆位即值，速度上限 5/s）。
-    pub joystick: bool,
-}
-
 /// 每帧派生的控件状态（从 Config 同步 + Interaction 覆盖）。
 #[derive(Default, Clone, Debug)]
 pub struct WidgetState {
@@ -76,8 +50,19 @@ pub struct WidgetState {
     pub value_f: f64,
     /// 选择下标（Segmented/Swatches/MetricSwatches）。
     pub selected: usize,
+    /// 分段是否存在选中项（显示位置未贴角时为 false → 不画选中胶囊）。
+    pub has_sel: bool,
+    /// 键盘焦点（仅 keyboard_mode 下绘制焦点环）。
+    pub focused: bool,
     pub hovered: bool,
     pub editing: bool,
+    /// 悬停过渡进度 0..1（弹簧驱动）。
+    pub hover_t: f32,
+    /// 按压过渡进度 0..1（弹簧驱动）。
+    pub press_t: f32,
+    /// 过渡弹簧的当前值：Toggle = 0..1、Segment/Swatch = 选中下标、Slider = 数值。
+    /// 由 `paint_page` 从逐控件弹簧写入；绘制侧据此做「滑动 / 渐变」而非硬切换。
+    pub anim_v: f32,
 }
 
 /// 单向数据流的动作枚举：交互层只产出 Action，写 Config 只在 dispatch。
@@ -93,6 +78,8 @@ pub enum Action {
     LiveValue(CfgRef, f64),
     /// 滑杆提交（松手 / 输入框回车）。
     CommitValue(CfgRef, f64),
+    /// 展开/收起某指标的配置卡。
+    ToggleMetricExpand(usize),
 }
 
 // ── 控件树 ───────────────────────────────────────────────
@@ -108,6 +95,16 @@ pub struct Row {
     pub label: &'static str,
     /// 该行从左到右的 widget 下标。
     pub widgets: Vec<usize>,
+    /// 分组分隔线（画在本行顶缘；折叠卡分节用）。
+    pub divider: bool,
+    /// 辅助说明行（hint：比正文小一号、次级色）。
+    pub hint: bool,
+    /// 行内说明（画在标签下方的小字；有值时行高 = ROW_H_HINT）。
+    pub hint_text: Option<&'static str>,
+    /// 行内说明第二行（主句 + 弱化补充句，报告窗口页）。
+    pub hint2: Option<&'static str>,
+    /// 行顶相对「卡内行区顶部」的物理偏移（行高可变，由布局写入）。
+    pub y_off: i32,
 }
 
 #[derive(Debug, Default)]
@@ -115,15 +112,23 @@ pub struct Card {
     pub caption: &'static str,
     pub rect: RECT,
     pub rows: Vec<Row>,
+    /// 行区总高（物理像素；脚注定位用，行高可变后不再能按行数 × ROW_H 推算）。
+    pub rows_h: i32,
     pub footnote: Option<&'static str>,
 }
 
 #[derive(Default)]
 pub struct Page {
+    /// 页标题（内容区顶部大标题；报告 §11 每页 h5）。
+    pub title: &'static str,
+    /// 页副标题（标题下方的次级说明行）。
+    pub subtitle: &'static str,
     pub cards: Vec<Card>,
     pub widgets: Vec<Widget>,
     /// 内容区高度（DPI 缩放后，物理像素）。
     pub h: i32,
+    /// 内容滚动偏移（DPI 缩放后，物理像素）——负值向上滚动。
+    pub scroll_y: i32,
 }
 
 // ── 控件 trait ───────────────────────────────────────────
@@ -140,6 +145,11 @@ pub trait IWidget: Any + Send {
     fn cfg(&self) -> Option<CfgRef>;
     /// 从 Config 同步当前值到 state。
     fn sync(&self, cfg: &Config, state: &mut WidgetState);
+    /// 过渡弹簧的目标值：Toggle = 0/1；Segment/Swatch = 选中下标；
+    /// Slider = 数值；纯按钮 / 箭头 = 0。用于「切换即滑动」的非线性过渡。
+    fn anim_target(&self, state: &WidgetState) -> f32 {
+        state.value_f as f32
+    }
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -148,7 +158,14 @@ pub fn sync_via_cfg(r: CfgRef, cfg: &Config, state: &mut WidgetState) {
     match r.get(cfg) {
         Value::Bool(b) => state.value_f = b as i32 as f64,
         Value::Num(x) => state.value_f = x,
-        Value::Select(i) => state.selected = i,
+        Value::Select(i) => {
+            state.selected = i;
+            state.has_sel = true;
+        }
+        Value::SelectOpt(o) => {
+            state.selected = o.unwrap_or(0);
+            state.has_sel = o.is_some();
+        }
         Value::Color(_) => {}
     }
 }

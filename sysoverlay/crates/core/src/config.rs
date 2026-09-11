@@ -26,9 +26,8 @@
 //! 与颜色 [`Rgb`] 都不在此处定义 —— 见 [`crate::types`] 与 [`crate::color`]。
 //! 这里只做重导出，保证 `config::Shape` 这类旧路径继续可用。
 
-// 枚举与颜色的唯一真源在 `core::types` / `core::color`，此处重导出保持 API 稳定。
 pub use crate::color::Rgb;
-pub use crate::types::{Lang, Metric, MetricColors, NetMode, NetUnit, PowerDisplay, RenderEngine, RenderMode, RenderStyle, VertLayout, Zoom};
+pub use crate::types::{Lang, Metric, MetricColors, NetMode, NetUnit, PowerDisplay, Appearance, RenderEngine, RenderMode, RenderStyle, VertLayout, Zoom};
 
 /// 配置文件格式版本。用于将来格式变更时的迁移锚点。
 pub const CONFIG_VERSION: u32 = 2;
@@ -46,7 +45,6 @@ pub struct Config {
     pub version: u32,
     pub minimal: bool,
     pub zoom: Zoom,
-    pub hover: bool,
     pub net_unit: NetUnit,
     /// 网络栏显示模式：双向/仅下载/仅上传（Rust 新增，默认双向）。
     pub net_mode: NetMode,
@@ -97,11 +95,9 @@ pub struct Config {
     pub metric_gap: u32,
     /// 每个指标「名称 ↔ 数值」之间的间距（px，0..=64）。
     pub label_value_gap: u32,
-    /// 悬停时的透明度（%，0..=100）。别名旧键 `opacity`。
-    pub hover_opacity: u8,
-    /// 非悬停时的透明度（%，0..=100，默认 35，旧版 hover 关 = 恒悬停档）。
+    /// 非悬停时的透明度（%，0..=100，默认 35）。
     pub normal_opacity: u8,
-    /// 悬停↔非悬停与设置页翻页的过渡动画时长（ms，100..=2000，默认 300）。
+    /// 窗口翻页的过渡动画时长（ms，100..=2000，默认 300）。
     pub anim_ms: u32,
     /// 逐项配色：每个指标的名称/数值色槽，None = 跟随 `fg`。
     pub metric_colors: [MetricColors; 5],
@@ -150,7 +146,22 @@ pub struct Config {
     /// D2d = 整帧 Direct2D + DirectWrite（高质量字体 / 圆角抗锯齿 / 半透明渐变）。
     /// 设置页「窗口」页可切换，默认 Gdi 以保持升级后行为逐帧一致。
     pub render_engine: RenderEngine,
+
+    // ── 设置窗口（升级新增，C 版忽略） ──
+    /// 外观模式：跟随系统 / 强制浅色 / 强制深色。
+    pub appearance: Appearance,
+    /// 设置窗口客户区尺寸（逻辑 px）。独立于 window_size，用独立键 set_size。
+    pub settings_size: (i32, i32),
+    // ── v5 设置页规范新增（报告 §5 窗口页；C 版忽略未知键） ──
+    /// 鼠标可穿透：悬浮窗不接收鼠标事件（WS_EX_TRANSPARENT）。默认关。
+    pub click_through: bool,
+    /// 贴靠屏幕的哪个角：0=右上 1=右下 2=左上 3=左下；
+    /// 255 = 未贴角（自由定位，兼容既有 window_pos 用户）。默认 255。
+    pub snap_corner: u8,
 }
+
+/// 未贴角标记值（自由定位）。
+pub const SNAP_CORNER_FREE: u8 = 255;
 
 impl Default for Config {
     fn default() -> Self {
@@ -158,7 +169,6 @@ impl Default for Config {
             version: CONFIG_VERSION,
             minimal: false,
             zoom: Zoom::Zoom100,
-            hover: false,
             net_unit: NetUnit::MB,
             net_mode: NetMode::Both,
             vert: VertLayout::SingleRow,
@@ -182,7 +192,6 @@ impl Default for Config {
             font_weight: 2,
             metric_gap: 8,
             label_value_gap: 6,
-            hover_opacity: 90,
             normal_opacity: 35,
             anim_ms: 300,
             metric_colors: [MetricColors::default(); 5],
@@ -202,6 +211,10 @@ impl Default for Config {
             gpu_3d_only: true,
             net_low_freq: true,
             render_engine: RenderEngine::Gdi,
+            appearance: Appearance::System,
+            settings_size: (720, 560),
+            click_through: false,
+            snap_corner: SNAP_CORNER_FREE,
         }
     }
 }
@@ -270,16 +283,17 @@ impl Config {
                 "show_gpu" => cfg.show_gpu = Self::parse_bool(value, cfg.show_gpu),
                 "show_net" => cfg.show_net = Self::parse_bool(value, cfg.show_net),
                 "mem_gb" => cfg.mem_show_gb = Self::parse_bool(value, cfg.mem_show_gb),
-                // 新字号（px，0.5 步进）
+                // 新字号（px，0.5 步进）。上限 72（报告 §11 滑杆范围 12..72；
+                // 下限保留 8 兼容旧配置的小字号，UI 端再按 12..72 展示）。
                 "font_size" | "fontsize" => {
                     if let Ok(v) = value.parse::<f32>() {
-                        cfg.font_size = (v.clamp(8.0, 40.0) * 2.0).round() / 2.0;
+                        cfg.font_size = (v.clamp(8.0, 72.0) * 2.0).round() / 2.0;
                     }
                 }
                 // 旧字号（bitmap 缩放倍数）迁移：×16 像素，再钳位到合法范围
                 "font_scale" => {
                     if let Ok(v) = value.parse::<u32>() {
-                        cfg.font_size = ((v.clamp(1, 4) as f32) * 16.0).clamp(8.0, 40.0);
+                        cfg.font_size = ((v.clamp(1, 4) as f32) * 16.0).clamp(8.0, 72.0);
                     }
                 }
                 // 字重档位：0=细 / 1=中 / 2=粗（缺省 2=粗 = 位图字体原样）
@@ -298,11 +312,6 @@ impl Config {
                         cfg.label_value_gap = v.clamp(0, 64);
                     }
                 }
-                "hover_opacity" | "opacity" => {
-                    if let Ok(v) = value.parse::<u32>() {
-                        cfg.hover_opacity = v.clamp(0, 100) as u8;
-                    }
-                }
                 "normal_opacity" => {
                     if let Ok(v) = value.parse::<u32>() {
                         cfg.normal_opacity = v.clamp(0, 100) as u8;
@@ -315,7 +324,20 @@ impl Config {
                 }
                 // 逐项配色：mc_<metric>_lbl|val  <COLORREF|0>
                 //  "0"/"off"/"none"/"follow"/"default" → None（跟随全局文字色）
+                //  mc_<metric>_valauto 0|1 → 数值槽「自动色」（占用率分档变色）
                 _ if key.starts_with("mc_") => {
+                    if let Some(rest) = key.strip_prefix("mc_") {
+                        if let Some(metric_key) = rest.strip_suffix("_valauto") {
+                            if let Some(idx) = Metric::ALL
+                                .iter()
+                                .position(|m| m.key_name() == metric_key)
+                            {
+                                cfg.metric_colors[idx].value_auto =
+                                    Self::parse_bool(value, cfg.metric_colors[idx].value_auto);
+                                continue;
+                            }
+                        }
+                    }
                     if let Some((slot, color)) = parse_metric_color(&key, value) {
                         let idx = match slot.0 {
                             Metric::Cpu => 0,
@@ -362,7 +384,6 @@ impl Config {
                         cfg.zoom = Zoom::from_config(v);
                     }
                 }
-                "hover" => cfg.hover = Self::parse_bool(value, cfg.hover),
                 "netunit" => {
                     if let Some(u) = NetUnit::from_config(value) {
                         cfg.net_unit = u;
@@ -443,6 +464,31 @@ impl Config {
                 "net_low_freq" => {
                     cfg.net_low_freq = Self::parse_bool(value, cfg.net_low_freq);
                 }
+                "appearance" => {
+                    if let Some(a) = Appearance::from_config(value) {
+                        cfg.appearance = a;
+                    }
+                }
+                // 鼠标可穿透（报告 §5 窗口页）
+                "click_through" => {
+                    cfg.click_through = Self::parse_bool(value, cfg.click_through);
+                }
+                // 贴角：0=右上 1=右下 2=左上 3=左下；255/未写 = 自由定位
+                "snap_corner" => {
+                    if let Ok(v) = value.parse::<u32>() {
+                        cfg.snap_corner = if v <= 3 { v as u8 } else { SNAP_CORNER_FREE };
+                    }
+                }
+                "set_size" => {
+                    let mut it = value.split_whitespace();
+                    if let (Some(w), Some(h)) = (it.next(), it.next()) {
+                        if let (Ok(w), Ok(h)) = (w.parse::<i32>(), h.parse::<i32>()) {
+                            if w >= 560 && h >= 460 && w <= 1400 && h <= 1000 {
+                                cfg.settings_size = (w, h);
+                            }
+                        }
+                    }
+                }
                 // 未知键静默忽略：C 版或更新版本的配置文件都能安全加载。
                 _ => {}
             }
@@ -483,8 +529,6 @@ impl Config {
         s.push_str(&format!("outline {}\n", self.text_outline as u32));
         s.push_str(&format!("autostart {}\n", self.autostart as u32));
         s.push_str(&format!("topmost {}\n", self.topmost as u32));
-        // 旧键 opacity 继续输出（语义 = 悬停透明度），C 版读得动
-        s.push_str(&format!("opacity {}\n", self.hover_opacity));
         s.push_str(&format!("normal_opacity {}\n", self.normal_opacity));
         s.push_str(&format!("anim_ms {}\n", self.anim_ms));
         // C 版单位是 100ms
@@ -492,7 +536,6 @@ impl Config {
         s.push_str(&format!("refresh_auto {}\n", self.refresh_auto as u32));
         s.push_str(&format!("minimal {}\n", self.minimal as u32));
         s.push_str(&format!("zoom {}\n", self.zoom.to_config()));
-        s.push_str(&format!("hover {}\n", self.hover as u32));
         s.push_str(&format!("netunit {}\n", self.net_unit.to_config()));
         s.push_str(&format!("net_mode {}\n", self.net_mode.to_config()));
         s.push_str(&format!("vert {}\n", self.vert.to_config()));
@@ -516,6 +559,11 @@ impl Config {
         s.push_str(&format!("gpu_primary_only {}\n", self.gpu_primary_only as u32));
         s.push_str(&format!("gpu_3d_only {}\n", self.gpu_3d_only as u32));
         s.push_str(&format!("net_low_freq {}\n", self.net_low_freq as u32));
+        s.push_str(&format!("appearance {}\n", self.appearance.to_config()));
+        s.push_str(&format!("set_size {} {}\n", self.settings_size.0, self.settings_size.1));
+        // v5 窗口页新增（C 版忽略）
+        s.push_str(&format!("click_through {}\n", self.click_through as u32));
+        s.push_str(&format!("snap_corner {}\n", self.snap_corner));
         // 逐项配色：只有非跟随全局的色槽才落盘
         for (i, metric) in Metric::ALL.iter().enumerate() {
             let mc = &self.metric_colors[i];
@@ -524,6 +572,10 @@ impl Config {
             }
             if let Some(c) = mc.value {
                 s.push_str(&format!("mc_{}_val {:06X}\n", metric.key_name(), c.to_colorref()));
+            }
+            // 数值槽「自动色」（Rust 专属，C 版忽略）
+            if mc.value_auto {
+                s.push_str(&format!("mc_{}_valauto 1\n", metric.key_name()));
             }
         }
         // 逐指标字号覆盖：只有非跟随全局的槽才落盘
@@ -653,7 +705,7 @@ fn parse_metric_font_size(key: &str, value: &str) -> Option<(usize, Option<f32>)
     let size = match v.to_ascii_lowercase().as_str() {
         "0" | "off" | "none" | "follow" | "default" => None,
         _ => {
-            let s = (v.parse::<f32>().ok()?.clamp(8.0, 40.0) * 2.0).round() / 2.0;
+            let s = (v.parse::<f32>().ok()?.clamp(8.0, 72.0) * 2.0).round() / 2.0;
             Some(s)
         }
     };
@@ -688,12 +740,10 @@ fg F4F1EE
 
         assert_eq!(cfg.window_pos, Some((1200, 40)), "pos 必须能被读回（此前写而不读）");
         assert!(cfg.topmost);
-        assert_eq!(cfg.hover_opacity, 90, "旧键 opacity → 悬停透明度");
         assert_eq!(cfg.normal_opacity, 35, "没有 normal_opacity 行时用默认 35");
         assert_eq!(cfg.interval_ms, 1000, "C 版 interval 10 = 10×100ms");
         assert!(!cfg.minimal);
         assert_eq!(cfg.zoom, Zoom::Zoom100);
-        assert!(!cfg.hover);
         assert_eq!(cfg.net_unit, NetUnit::MB, "C 版 netunit 1 = MB/s");
         assert_eq!(cfg.vert, VertLayout::SingleCol, "C 版 vert 1 = 单列");
         // COLORREF(BBGGRR)：0x1B1614 → R=0x14=20, G=0x16=22, B=0x1B=27
@@ -722,7 +772,6 @@ fg F4F1EE
     fn test_roundtrip_non_default() {
         let mut cfg = Config::default();
         cfg.topmost = false;
-        cfg.hover_opacity = 40;
         cfg.normal_opacity = 15;
         cfg.font_size = 20.5;
         cfg.metric_gap = 24;
@@ -731,7 +780,6 @@ fg F4F1EE
         cfg.interval_ms = 2000;
         cfg.minimal = true;
         cfg.zoom = Zoom::Zoom150;
-        cfg.hover = true;
         cfg.net_unit = NetUnit::GB;
         cfg.vert = VertLayout::SplitCol;
         cfg.bg = Rgb::new(0x1A, 0x2B, 0x3C);
@@ -749,10 +797,12 @@ fg F4F1EE
         cfg.metric_colors[0] = MetricColors {
             label: Some(Rgb::new(0x12, 0x34, 0x56)),
             value: None,
+            value_auto: false,
         };
         cfg.metric_colors[3] = MetricColors {
             label: None,
             value: Some(Rgb::new(0xAB, 0xCD, 0xEF)),
+            value_auto: true,
         };
 
         let text = cfg.serialize();
@@ -775,6 +825,31 @@ fg F4F1EE
         // 往返
         let parsed = Config::parse(&cfg.serialize());
         assert_eq!(parsed.render_engine, RenderEngine::D2d);
+    }
+
+    #[test]
+    fn appearance_and_set_size_roundtrip() {
+        // 非默认值经 serialize → parse 必须相等。
+        let mut cfg = Config::default();
+        cfg.appearance = Appearance::Dark;
+        cfg.settings_size = (900, 640);
+        let parsed = Config::parse(&cfg.serialize());
+        assert_eq!(parsed.appearance, Appearance::Dark);
+        assert_eq!(parsed.settings_size, (900, 640));
+        // 字符串写法也要读得动
+        assert_eq!(Config::parse("appearance light\n").appearance, Appearance::Light);
+    }
+
+    #[test]
+    fn set_size_out_of_range_rejected() {
+        // 过小 / 过大都回落到默认 (720, 560)
+        let a = Config::parse("set_size 100 100\n");
+        assert_eq!(a.settings_size, (720, 560), "过小应拒绝");
+        let b = Config::parse("set_size 9999 9999\n");
+        assert_eq!(b.settings_size, (720, 560), "过大应拒绝");
+        // 合法值保留
+        let c = Config::parse("set_size 1024 720\n");
+        assert_eq!(c.settings_size, (1024, 720));
     }
 
     #[test]
@@ -868,8 +943,8 @@ fg F4F1EE
     fn test_key_value_format_also_accepted() {
         let cfg = Config::parse("topmost=0\nopacity=70\nshape=square\nnetunit=gb\nvert=splitcol\n");
         assert!(!cfg.topmost);
-        assert_eq!(cfg.hover_opacity, 70);
-        // shape 是旧版遗留键（已移除）：应被静默忽略，不影响其它解析
+        // shape / opacity 是旧版遗留键：应被静默忽略，不影响其它解析
+        assert_eq!(cfg.normal_opacity, 35);
         assert_eq!(cfg.net_unit, NetUnit::GB);
         assert_eq!(cfg.vert, VertLayout::SplitCol);
     }
@@ -925,7 +1000,6 @@ fg F4F1EE
         for input in inputs {
             let cfg = Config::parse(input);
             // 只要不 panic 且值域合法即可
-            assert!((0..=100).contains(&cfg.hover_opacity), "hover_opacity 越界: {}", input);
             assert!((0..=100).contains(&cfg.normal_opacity), "normal_opacity 越界: {}", input);
             assert_eq!(cfg.font_size, (cfg.font_size.clamp(8.0, 40.0) * 2.0).round() / 2.0, "字号 0.5 步进: {}", input);
             assert!(
@@ -1022,7 +1096,6 @@ fg F4F1EE
         let cfg = Config::default();
         assert!(!cfg.minimal);
         assert_eq!(cfg.zoom, Zoom::Zoom100);
-        assert_eq!(cfg.hover_opacity, 90);
         assert_eq!(cfg.normal_opacity, 35);
         assert_eq!(cfg.font_size, 32.0);
         assert_eq!(cfg.metric_gap, 8);
@@ -1112,9 +1185,38 @@ fg F4F1EE
     fn test_metric_font_size_accepts_follow_and_clamps() {
         let cfg = Config::parse("mfs_cpu follow\nmfs_gpu 999\nmfs_mem 12.25");
         assert_eq!(cfg.metric_font_sizes[0], None, "follow → None");
-        assert_eq!(cfg.metric_font_sizes[2], Some(40.0), "越界 clamp 到 40");
+        assert_eq!(cfg.metric_font_sizes[2], Some(72.0), "越界 clamp 到 72");
         assert_eq!(cfg.metric_font_sizes[1], Some(12.5), "0.5 步进四舍五入 (12.25→12.5)");
         assert_eq!(cfg.metric_font_sizes[3], None, "未指定的槽保持跟随");
+    }
+
+    #[test]
+    fn test_font_size_clamp_widened_to_72() {
+        // 报告 §11：字号滑杆 12..72。旧上限 40 会让 72 在重启后丢值。
+        let cfg = Config::parse("font_size 60\n");
+        assert_eq!(cfg.font_size, 60.0, "60 在放宽后的合法范围内应保留");
+        assert_eq!(Config::parse("font_size 5").font_size, 8.0, "下限仍为 8（旧数据兼容）");
+        assert_eq!(Config::parse("font_size 999").font_size, 72.0);
+    }
+
+    #[test]
+    fn test_click_through_and_snap_corner_roundtrip() {
+        // 缺省：不穿透 + 自由定位（兼容既有 window_pos 用户，升级不跳位）
+        let d = Config::default();
+        assert!(!d.click_through);
+        assert_eq!(d.snap_corner, SNAP_CORNER_FREE);
+        // 往返
+        let mut cfg = Config::default();
+        cfg.click_through = true;
+        cfg.snap_corner = 2;
+        let parsed = Config::parse(&cfg.serialize());
+        assert_eq!(parsed.click_through, true);
+        assert_eq!(parsed.snap_corner, 2);
+        // 越界角标回落自由定位，不 panic
+        assert_eq!(Config::parse("snap_corner 7").snap_corner, SNAP_CORNER_FREE);
+        assert_eq!(Config::parse("click_through yes").click_through, true);
+        // 旧配置无这两个键 → 语义不变
+        assert_eq!(Config::parse(C_REAL_CONFIG).snap_corner, SNAP_CORNER_FREE);
     }
 
     #[test]

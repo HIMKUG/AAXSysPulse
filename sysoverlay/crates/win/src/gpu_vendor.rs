@@ -20,6 +20,7 @@
 //! - 每次失败都记探针（`SYSOVERLAY_PROBE=1`）。
 
 use crate::gpu_detect;
+use crate::perf;
 use crate::probe;
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -66,11 +67,28 @@ fn merge_reading(dst: &mut VendorReading, (u, w): VendorReading) {
 }
 
 pub fn sample() -> VendorReading {
+    let t0 = perf::begin();
     let bs = backend();
     let mut r: VendorReading = (None, None);
-    if let Some(b) = &bs.nvml { merge_reading(&mut r, b.sample()); }
-    if let Some(b) = &bs.adl { merge_reading(&mut r, b.sample()); }
-    if let Some(b) = &bs.igcl { merge_reading(&mut r, b.sample()); }
+    if let Some(b) = &bs.nvml {
+        let t1 = perf::begin();
+        let rv = b.sample();
+        perf::note_section("gpunvml", t1);
+        merge_reading(&mut r, rv);
+    }
+    if let Some(b) = &bs.adl {
+        let t1 = perf::begin();
+        let rv = b.sample();
+        perf::note_section("gpuadl", t1);
+        merge_reading(&mut r, rv);
+    }
+    if let Some(b) = &bs.igcl {
+        let t1 = perf::begin();
+        let rv = b.sample();
+        perf::note_section("gpuigcl", t1);
+        merge_reading(&mut r, rv);
+    }
+    perf::note_section("gpusample", t0);
     if let Some(w) = r.1 {
         GPU_WATTS.store((w * 100.0).clamp(0.0, u32::MAX as f32) as u32,
             std::sync::atomic::Ordering::Relaxed);

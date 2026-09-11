@@ -8,9 +8,11 @@ edition = "2021"
 license = "MIT"
 
 [profile.release]
+# 体积优先，但 panic 必须保持 unwind：gdi.rs 的 D2D 自愈依赖 catch_unwind
+# （panic=abort 会使其失效 → D2D panic 时进程直接崩溃，用户无法自救）。
 opt-level = "z"
 lto = true
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 strip = true
 overflow-checks = false

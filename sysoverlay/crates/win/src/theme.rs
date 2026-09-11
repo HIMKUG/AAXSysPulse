@@ -13,8 +13,20 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::System::Registry::{RegGetValueW, RRF_RT_REG_DWORD};
 
+use sysoverlay_core::types::Appearance;
+
 impl Theme {
     /// 读取系统当前主题（跟随系统；读取失败回落浅色）。
+    /// 由三态外观解析出实际主题（B1）。
+    /// System = 跟随系统（读注册表，失败回落浅色）；Light/Dark 直接取对应预设。
+    pub fn resolve(a: Appearance) -> Theme {
+        match a {
+            Appearance::System => Theme::system(),
+            Appearance::Light => LIGHT,
+            Appearance::Dark => DARK,
+        }
+    }
+
     pub fn system() -> Theme {
         if apps_use_light_theme() {
             LIGHT
@@ -67,6 +79,15 @@ pub struct Theme {
     pub button_bg: u32,
     /// 次级按钮悬停
     pub button_bg_hover: u32,
+    // ── 侧边栏 / 内容区分层（B1，左侧栏导航用） ──
+    /// 侧边栏底色（导航区）
+    pub sidebar_bg: u32,
+    /// 内容区底色（卡片列表区）
+    pub content_bg: u32,
+    /// 侧边栏项悬停（以 alpha 叠加使用）
+    pub sidebar_hover: u32,
+    /// 侧边栏选中项（accent，以 alpha 叠加背景）
+    pub sidebar_selected: u32,
 }
 
 /// iOS systemBlue / systemGreen / systemGray 分层（浅色）。
@@ -89,6 +110,10 @@ pub const LIGHT: Theme = Theme {
     knob_stroke: rgb(214, 214, 219),
     button_bg: rgb(235, 235, 238),
     button_bg_hover: rgb(224, 224, 228),
+    sidebar_bg: rgb(246, 246, 248),
+    content_bg: rgb(255, 255, 255),
+    sidebar_hover: rgb(0, 0, 0),
+    sidebar_selected: rgb(0, 122, 255),
 };
 
 /// 深色（macOS System Settings dark 风格的分层）。
@@ -111,6 +136,10 @@ pub const DARK: Theme = Theme {
     knob_stroke: rgb(255, 255, 255),
     button_bg: rgb(68, 68, 73),
     button_bg_hover: rgb(84, 84, 89),
+    sidebar_bg: rgb(44, 44, 46),
+    content_bg: rgb(30, 30, 32),
+    sidebar_hover: rgb(255, 255, 255),
+    sidebar_selected: rgb(10, 132, 255),
 };
 
 /// 注册表 `AppsUseLightTheme`：1/缺失 = 浅色，0 = 深色。
@@ -158,5 +187,19 @@ mod tests {
         assert_eq!(LIGHT.accent, rgb(0, 122, 255), "systemBlue 浅色");
         assert_eq!(DARK.accent, rgb(10, 132, 255), "systemBlue 深色");
         assert!(!LIGHT.dark && DARK.dark);
+    }
+
+    #[test]
+    fn test_appearance_resolve_and_sidebar() {
+        // 三态解析：System=读系统（必为 Light/Dark 之一），Light/Dark 取预设。
+        let sys = Theme::resolve(Appearance::System);
+        assert!(sys.dark == LIGHT.dark || sys.dark == DARK.dark);
+        assert_eq!(Theme::resolve(Appearance::Light), LIGHT);
+        assert_eq!(Theme::resolve(Appearance::Dark), DARK);
+        // 侧边栏分层在明暗下应不同。
+        assert_ne!(LIGHT.sidebar_bg, DARK.sidebar_bg);
+        assert_ne!(LIGHT.content_bg, DARK.content_bg);
+        assert_eq!(LIGHT.sidebar_selected, rgb(0, 122, 255));
+        assert_eq!(DARK.sidebar_selected, rgb(10, 132, 255));
     }
 }

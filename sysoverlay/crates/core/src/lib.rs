@@ -23,6 +23,7 @@ pub mod types;
 
 pub mod snapshot;
 pub mod sampler;
+pub mod cadence;
 pub mod scheduler;
 pub mod metrics;
 pub mod layout;

@@ -10,9 +10,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, GetDC, GetDeviceCaps, GetMonitorInfoW, InvalidateRect,
-    MonitorFromWindow, ReleaseDC, ValidateRect, HORZRES, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-    PAINTSTRUCT, VERTRES,
+    BeginPaint, EndPaint, GetDC, GetDeviceCaps, InvalidateRect,
+    ReleaseDC, ValidateRect, HORZRES, PAINTSTRUCT, VERTRES,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -279,11 +278,9 @@ unsafe extern "system" fn wndproc(
             if let Some(state) = get_state_ptr(hwnd).as_mut() {
                 if !state.hovered {
                     state.hovered = true;
-                    if state.cfg.hover {
-                        track_mouse_leave(hwnd);
-                        let snap = snap_get();
-                        crate::gdi::render(hwnd, &*snap, &state.cfg);
-                    }
+                    track_mouse_leave(hwnd);
+                    let snap = snap_get();
+                    crate::gdi::render(hwnd, &*snap, &state.cfg);
                 }
 
                 if state.dragging {
@@ -291,19 +288,14 @@ unsafe extern "system" fn wndproc(
                     let _ = GetCursorPos(&mut pt);
                     let new_x = state.win_start.x + (pt.x - state.drag_start.x);
                     let new_y = state.win_start.y + (pt.y - state.drag_start.y);
-                    // 用窗口**实际**尺寸做边界限制。cfg.window_size 可能是历史脏值
-                    // (0x0)——用 0 限制会把右/下边界算成只有 64px 的伪边界，
-                    // 表现为"只能拖一小段就被钉住"，随后光标脱窗触发 mouseleave。
-                    let mut wr0 = RECT::default();
-                    let _ = GetWindowRect(hwnd, &mut wr0);
-                    let w = (wr0.right - wr0.left).max(1) as i32;
-                    let h = (wr0.bottom - wr0.top).max(1) as i32;
-                    let (clamped_x, clamped_y) = clamp_to_monitor(new_x, new_y, w, h, hwnd);
+                    // 拖动中不 clamp——让窗口自由跟随光标，避免每帧 clamp
+                    // 产生的"光标与窗口相对位移失同步"导致的卡顿/弹跳。
+                    // 释放时会统一做一次安全钳制（见 WM_LBUTTONUP）。
                     let _ = SetWindowPos(
                         hwnd,
                         None,
-                        clamped_x,
-                        clamped_y,
+                        new_x,
+                        new_y,
                         0,
                         0,
                         SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
@@ -368,15 +360,17 @@ unsafe extern "system" fn wndproc(
                     state.cfg.window_size =
                         Some((rect.right - rect.left, rect.bottom - rect.top));
                 }
+                // 用户自由拖动 → 解除贴角（显示位置回到「自由定位」，
+                // 避免下次启动强行拉回旧角，尊重用户刚拖到的位置）。
+                if state.dragging {
+                    state.cfg.snap_corner = sysoverlay_core::config::SNAP_CORNER_FREE;
+                }
                 state.pos_dirty = false;
                 state.size_dirty = false;
                 let was_dragging = state.dragging;
                 state.dragging = false;
                 if was_dragging {
-                    // 拖动结束后同样重新登记，避免 hovered 卡在旧状态
-                    if state.cfg.hover {
-                        track_mouse_leave(hwnd);
-                    }
+                    track_mouse_leave(hwnd);
                     let snap = snap_get();
                     crate::gdi::render(hwnd, &*snap, &state.cfg);
                 }
@@ -470,8 +464,6 @@ unsafe extern "system" fn wndproc(
                     if let Some(cmd) = crate::menu::show_tray_menu(hwnd) {
                         match cmd {
                             crate::menu::IDM_SETTINGS => crate::settings::open_settings(hwnd),
-                            crate::menu::IDM_CHARTS => crate::graph::open(),
-                            crate::menu::IDM_PROCESSES => crate::proc_list::open(),
                             crate::menu::IDM_QUIT => {
                                 let _ = DestroyWindow(hwnd);
                             }
@@ -506,6 +498,7 @@ unsafe extern "system" fn wndproc(
 
         // ── 采样线程新快照：可见才渲染（推送式，空闲零开销） ──
         WM_NEW_SNAPSHOT => {
+            let t0 = crate::perf::begin();
             // 拖动期间同样不渲染（见 WM_TIMER/WM_PAINT 注释）：采样线程每帧
             // 都会推一帧，若在拖动中渲染会把消失的悬停态/过期帧提交上去。
             // 合并冗余调用：一次取状态指针同时判断拖动与可见性（P2-20）。
@@ -515,6 +508,7 @@ unsafe extern "system" fn wndproc(
                     crate::gdi::render(hwnd, &*snap, &state.cfg);
                 }
             }
+            crate::perf::note_section("msg_newsnap", t0);
             LRESULT(0)
         }
 
@@ -674,30 +668,52 @@ pub fn apply_topmost(hwnd: HWND, on: bool) {
     }
 }
 
-fn clamp_to_monitor(x: i32, y: i32, win_w: i32, win_h: i32, hwnd: HWND) -> (i32, i32) {
-    let hmon = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
-    let mut mi = MONITORINFO {
-        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
-    if !unsafe { GetMonitorInfoW(hmon, &mut mi) }.as_bool() {
-        // 取显示器信息失败：保守退回原始坐标（不改动窗口位置）
-        return (x, y);
+const GWL_EXSTYLE: i32 = -20;
+
+/// 应用「鼠标可穿透」（设置面板开关，报告 §5 窗口页）。
+/// 悬浮窗本就是 WS_EX_LAYERED，切换 WS_EX_TRANSPARENT 即可让鼠标事件穿透。
+pub fn apply_click_through(hwnd: HWND, on: bool) {
+    use windows::Win32::UI::WindowsAndMessaging::{WS_EX_TRANSPARENT, SWP_NOMOVE, SWP_NOSIZE, SWP_FRAMECHANGED};
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        let new_ex = if on {
+            ex | WS_EX_TRANSPARENT.0
+        } else {
+            ex & !WS_EX_TRANSPARENT.0
+        };
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex as isize);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
     }
-    let rc = mi.rcWork;
-    // AFMF 兼容约束：坐标必须落在 [rc.left, rc.right - win_w - 64] ×
-    // [rc.top, rc.bottom - win_h - 64] 内（防 AMD 驱动多屏误判）。
-    // min 侧允许贴边（rc.left/rc.top），不加额外边距，否则窗口拖回
-    // 屏幕边缘会被"弹开"，表现为拖不动 / 只能拖一小段。
-    const MARGIN: i32 = 64;
-    let max_x = (rc.right - win_w - MARGIN).max(rc.left);
-    let max_y = (rc.bottom - win_h - MARGIN).max(rc.top);
-    let min_x = rc.left;
-    let min_y = rc.top;
-    (
-        x.clamp(min_x, max_x),
-        y.clamp(min_y, max_y),
-    )
+}
+
+/// 把悬浮窗贴到指定屏幕角（报告 §5 Corner：0=右上 1=右下 2=左上 3=左下）。
+pub fn snap_overlay_to_corner(hwnd: HWND, corner: u8) {
+    use windows::Win32::UI::WindowsAndMessaging::{SWP_NOZORDER, SWP_NOACTIVATE};
+    const MARGIN: i32 = 0;
+    unsafe {
+        let mut r = RECT::default();
+        if !GetWindowRect(hwnd, &mut r).as_bool() {
+            return;
+        }
+        let (sw, sh) = get_screen_size();
+        let w = r.right - r.left;
+        let h = r.bottom - r.top;
+        let (x, y) = match corner {
+            0 => (sw - w - MARGIN, MARGIN),                 // 右上
+            1 => (sw - w - MARGIN, sh - h - MARGIN),        // 右下
+            2 => (MARGIN, MARGIN),                          // 左上
+            _ => (MARGIN, sh - h - MARGIN),                 // 左下
+        };
+        let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
 }
 
 fn get_screen_size() -> (i32, i32) {
@@ -810,6 +826,14 @@ impl OverlayWindow {
 
         unsafe {
             let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA.0 as i32, state_ptr);
+        }
+
+        // v5 窗口页新增：启动时应用贴角与鼠标穿透（报告 §5）。
+        if state.cfg.snap_corner <= 3 {
+            snap_overlay_to_corner(hwnd, state.cfg.snap_corner);
+        }
+        if state.cfg.click_through {
+            apply_click_through(hwnd, true);
         }
 
         Ok(Self { hwnd, state })

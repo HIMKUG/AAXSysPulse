@@ -8,8 +8,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 pub const IDM_SETTINGS: u16 = 1;
 pub const IDM_QUIT: u16 = 2;
-pub const IDM_CHARTS: u16 = 3;
-pub const IDM_PROCESSES: u16 = 4;
 
 unsafe fn append(menu: HMENU, id: u16, label: &str) {
     let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
@@ -29,8 +27,6 @@ pub fn show_tray_menu(hwnd: HWND) -> Option<u16> {
             .unwrap_or_default();
         let t = |k: &'static str| crate::i18n::t(lang, k);
         append(menu, IDM_SETTINGS, t("MenuSettings"));
-        append(menu, IDM_CHARTS, t("MenuCharts"));
-        append(menu, IDM_PROCESSES, t("MenuProcesses"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
         append(menu, IDM_QUIT, t("MenuQuit"));
 

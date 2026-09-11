@@ -22,15 +22,16 @@
 
 use std::collections::HashMap;
 
-use windows::core::w;
+use windows::core::{w, PCWSTR};
 use windows::Foundation::Numerics::Matrix3x2;
-use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND, RECT};
+use windows::Win32::Foundation::{BOOL, D2DERR_RECREATE_TARGET, HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F,
-    D2D_SIZE_U,
+    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BEZIER_SEGMENT, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
+    D2D1_FIGURE_END_CLOSED, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1Layer, ID2D1SolidColorBrush,
+    D2D1CreateFactory, ID2D1Factory, ID2D1GeometrySink, ID2D1HwndRenderTarget, ID2D1Layer,
+    ID2D1PathGeometry, ID2D1SolidColorBrush,
     D2D1_ANTIALIAS_MODE_ALIASED, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_DRAW_TEXT_OPTIONS_NONE,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_LAYER_OPTIONS_NONE,
     D2D1_LAYER_PARAMETERS, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
@@ -39,7 +40,7 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_HWND_RENDER_TARGET_PROPERTIES,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
+    DWriteCreateFactory, IDWriteFactory, IDWriteFontCollection, IDWriteTextFormat, IDWriteTextLayout,
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
     DWRITE_FONT_WEIGHT, DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_ALIGNMENT_CENTER,
     DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS,
@@ -81,6 +82,12 @@ impl ColorF {
 
     pub fn d2d(self) -> D2D1_COLOR_F {
         self.0
+    }
+
+    /// 以新 alpha 重着色（UI 选中态/悬停态半透明用）。
+    pub fn with_alpha(mut self, a: f32) -> Self {
+        self.0.a = a;
+        self
     }
 }
 
@@ -180,6 +187,19 @@ struct LayoutEntry {
 /// 布局缓存上限：超出即整表清空（设置页文本量远小于此，正常永不触发）。
 const LAYOUT_CACHE_MAX: usize = 512;
 
+// ── SVG 路径（图标用） ─────────────────────────────────────
+
+/// 归一化路径段（坐标为 viewBox 单位，绘制时线性映射到目标矩形）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PathSeg {
+    Move(f32, f32),
+    Line(f32, f32),
+    /// 三次贝塞尔：控制点 1、控制点 2、终点。
+    Cubic(f32, f32, f32, f32, f32, f32),
+    /// 闭合当前子路径。
+    Close,
+}
+
 // ── Gfx：D2D 资源唯一持有者 ────────────────────────────────
 
 pub struct Gfx {
@@ -196,6 +216,113 @@ pub struct Gfx {
     layouts: HashMap<LayoutKey, LayoutEntry>,
     /// 淡入层（翻页动画用）：与 RT 绑定，RT 重建即失效。
     layer: Option<ID2D1Layer>,
+    /// C2：已探测的 UI 字体族（null 结尾 UTF-16），首次绘制时惰性填充，之后复用。
+    ui_family: Option<Vec<u16>>,
+    /// 图标路径几何缓存：键 = (图标号, 目标宽, 目标高)。
+    /// 几何由工厂创建、与 RT 无关，故 RT 重建后仍可复用（无需清理）。
+    paths: HashMap<(usize, i32, i32), ID2D1PathGeometry>,
+}
+
+/// C2：探测系统可用 UI 字体族，按 Apple 观感优先级降级。
+///
+/// `GetSystemFontCollection` 是重操作，结果由 [`Gfx::ui_font_family`] 缓存，
+/// 绝不可逐帧调用。字族名以 null 结尾的 UTF-16 返回，可直接喂给 `CreateTextFormat`。
+fn probe_font_family(dwrite: &IDWriteFactory) -> Vec<u16> {
+    const CANDIDATES: [&str; 3] = [
+        "Segoe UI Variable Text",
+        "Segoe UI Variable",
+        "Segoe UI",
+    ];
+    let fallback: Vec<u16> = "Segoe UI".encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let mut coll: Option<IDWriteFontCollection> = None;
+        if dwrite.GetSystemFontCollection(&mut coll, BOOL(0)).is_ok() {
+            if let Some(coll) = coll {
+                for cand in CANDIDATES {
+                    let w: Vec<u16> = cand.encode_utf16().chain(std::iter::once(0)).collect();
+                    let mut idx = 0u32;
+                    let mut exists = BOOL(0);
+                    if coll.FindFamilyName(PCWSTR(w.as_ptr()), &mut idx, &mut exists).is_ok()
+                        && exists.as_bool()
+                    {
+                        return w;
+                    }
+                }
+            }
+        }
+    }
+    fallback
+}
+
+#[cfg(test)]
+mod font_tests {
+    use super::*;
+
+    #[test]
+    fn probe_returns_null_terminated_wide() {
+        unsafe {
+            let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).unwrap();
+            let fam = probe_font_family(&dwrite);
+            assert!(!fam.is_empty(), "字族名不应为空");
+            assert_eq!(*fam.last().unwrap(), 0, "须为空结尾 UTF-16 串");
+        }
+    }
+}
+
+/// 把归一化路径段按 `rect` 线性缩放，构建 D2D 路径几何。
+///
+/// `view` = SVG viewBox 边长（本项目统一 1024）。坐标为 viewBox 单位。
+fn build_path(
+    factory: &ID2D1Factory,
+    segs: &[PathSeg],
+    view: f32,
+    rect: RectF,
+) -> Option<ID2D1PathGeometry> {
+    let sx = rect.w() / view.max(1.0);
+    let sy = rect.h() / view.max(1.0);
+    let pt = |x: f32, y: f32| D2D_POINT_2F { x: rect.l + x * sx, y: rect.t + y * sy };
+    unsafe {
+        let geom = factory.CreatePathGeometry().ok()?;
+        let sink: ID2D1GeometrySink = geom.Open().ok()?;
+        let mut open = false;
+        for seg in segs {
+            match *seg {
+                PathSeg::Move(x, y) => {
+                    if open {
+                        sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+                    }
+                    sink.BeginFigure(pt(x, y), D2D1_FIGURE_BEGIN_FILLED);
+                    open = true;
+                }
+                PathSeg::Line(x, y) => {
+                    if open {
+                        sink.AddLine(pt(x, y));
+                    }
+                }
+                PathSeg::Cubic(x1, y1, x2, y2, x3, y3) => {
+                    if open {
+                        let bez = D2D1_BEZIER_SEGMENT {
+                            point1: pt(x1, y1),
+                            point2: pt(x2, y2),
+                            point3: pt(x3, y3),
+                        };
+                        sink.AddBezier(&bez);
+                    }
+                }
+                PathSeg::Close => {
+                    if open {
+                        sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+                        open = false;
+                    }
+                }
+            }
+        }
+        if open {
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+        }
+        let _ = sink.Close();
+        Some(geom)
+    }
 }
 
 impl Gfx {
@@ -215,6 +342,8 @@ impl Gfx {
                 formats: HashMap::new(),
                 layouts: HashMap::new(),
                 layer: None,
+                ui_family: None,
+                paths: HashMap::new(),
             })
         }
     }
@@ -300,10 +429,12 @@ impl Gfx {
         if let Some(f) = self.formats.get(&key) {
             return Some(f.clone());
         }
+        let fam = self.ui_font_family();
+        let fam_w = PCWSTR(fam.as_ptr());
         let fmt = unsafe {
             self.dwrite
                 .CreateTextFormat(
-                    w!("Segoe UI"),
+                    fam_w,
                     None,
                     DWRITE_FONT_WEIGHT(weight as i32),
                     DWRITE_FONT_STYLE_NORMAL,
@@ -375,6 +506,29 @@ impl Gfx {
         Some((mw, mh))
     }
 
+    /// 只测量不绘制（toast 胶囊等需要先量宽再画底的场景）。
+    /// 复用布局缓存：宽度键取哨兵值 u32::MAX，与任何绘制调用不冲突。
+    pub fn measure_text(&mut self, text: &str, px: f32, weight: u32) -> Option<(f32, f32)> {
+        let fmt = self.text_format(px, weight, HAlign::Leading, false)?;
+        let fkey = Self::format_key(px, weight, HAlign::Leading, false);
+        let key = LayoutKey(text.to_string(), fkey, u32::MAX);
+        if let Some(e) = self.layouts.get(&key) {
+            return Some((e.width, e.height));
+        }
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let layout: IDWriteTextLayout = unsafe {
+            self.dwrite.CreateTextLayout(&wide, &fmt, 1.0e4, 1.0e4).ok()?
+        };
+        let mut m = DWRITE_TEXT_METRICS::default();
+        unsafe { layout.GetMetrics(&mut m).ok()? };
+        if self.layouts.len() >= LAYOUT_CACHE_MAX {
+            self.layouts.clear();
+        }
+        let out = (m.width, m.height);
+        self.layouts.insert(key, LayoutEntry { layout, width: m.width, height: m.height });
+        Some(out)
+    }
+
     /// 绘制一帧：`BeginDraw → painter → EndDraw`。
     ///
     /// 设备丢失（`D2DERR_RECREATE_TARGET`）时自动 [`Gfx::rebuild`] 并返回 false，
@@ -436,6 +590,29 @@ impl Gfx {
         };
         if let Some(b) = self.brush(rt, c) {
             unsafe { rt.FillEllipse(&e, &b) };
+        }
+    }
+
+    /// 填充一条 SVG 路径（viewBox `view` 边长）到 `rect`。
+    /// `key` 为图标序号；几何按 (key, w, h) 缓存，避免逐帧重建。
+    pub fn fill_path(
+        &mut self,
+        rt: &ID2D1HwndRenderTarget,
+        key: usize,
+        segs: &[PathSeg],
+        view: f32,
+        rect: RectF,
+        color: ColorF,
+    ) {
+        let ck = (key, rect.w() as i32, rect.h() as i32);
+        if !self.paths.contains_key(&ck) {
+            let Some(g) = build_path(&self.d2d, segs, view, rect) else { return };
+            self.paths.insert(ck, g);
+        }
+        // 克隆句柄以结束对 self.paths 的借用（COM 引用计数，代价极低）。
+        let Some(geom) = self.paths.get(&ck).cloned() else { return };
+        if let Some(b) = self.brush(rt, color) {
+            unsafe { let _ = rt.FillGeometry(&geom, &b, None); }
         }
     }
 
@@ -543,6 +720,16 @@ impl Gfx {
 
     pub fn reset_transform(&self, rt: &ID2D1HwndRenderTarget) {
         unsafe { rt.SetTransform(&Matrix3x2::identity()) };
+    }
+
+    /// C2：取（或探测并缓存）UI 字体族 wide 名。`ui_family` 命中即不再探测。
+    fn ui_font_family(&mut self) -> Vec<u16> {
+        if let Some(f) = &self.ui_family {
+            return f.clone();
+        }
+        let chosen = probe_font_family(&self.dwrite);
+        self.ui_family = Some(chosen.clone());
+        chosen
     }
 
     fn create_rt(&self) -> Option<ID2D1HwndRenderTarget> {        unsafe {

@@ -14,7 +14,9 @@ use std::io::Write;
 use std::thread;
 use std::time::Duration;
 
+use sysoverlay_core::cadence::{DELTA_ENTER, DELTA_EXIT, EXIT_TICKS, IDLE_MAX_MS, REFRESH_FLOOR_MS, TICK_MS, ACTIVE_CPU_PCT, ACTIVE_NET_BPS};
 use sysoverlay_core::scheduler::Scheduler;
+use sysoverlay_core::scheduler::Source;
 use sysoverlay_win::window::{get_shared_seq, publish_schedule_cfg, schedule_cfg, schedule_power, setup_resume_channel, snap_store, WM_NEW_SNAPSHOT};
 use sysoverlay_win::OverlayWindow;
 use sysoverlay_win::SystemSampler;
@@ -248,12 +250,6 @@ fn main() {
             });
         }
     }
-    if diag_on("graph") {
-        sysoverlay_win::graph::open();
-    }
-    if diag_on("procs") {
-        sysoverlay_win::proc_list::open();
-    }
 
     // ── 4c. Spawn scheduler-driven sampling thread ────────────────────────
     // 分频调度：GPU/Net 不快于 1s（计数器本身 1s 才更新），
@@ -280,8 +276,19 @@ fn main() {
         let mut sampler = SystemSampler::new(exclude_virtual, power_interval);
         let (interval_ms, auto, _) = schedule_cfg();
         let mut sched = Scheduler::new(interval_ms, auto);
-        let mut last: Option<sysoverlay_win::Snapshot> = None;
         let overlay_hwnd = windows::Win32::Foundation::HWND(hwnd_addr as *mut _);
+
+        let now_init = get_tick_count_ms();
+
+        let mut last_refresh = now_init.saturating_sub(REFRESH_FLOOR_MS);
+        let mut ema_cpu_committed = 0f32;
+        let mut ema_mem_committed = 0f32;
+        let mut ema_gpu_committed = 0f32;
+        let mut ema_net_committed = 0f32;
+        let mut quiet_ticks: u32 = 0;
+        let mut mode_active = false;
+        let mut pending: sysoverlay_win::Snapshot = sysoverlay_win::Snapshot::placeholder(now_init);
+        let mut seq: u64 = 0;
 
         loop {
             // 覆盖层隐藏时完全停止采样：省 CPU + 彻底消除 AFMF 冲突（数值不更新，DWM 无合成）。
@@ -307,57 +314,113 @@ fn main() {
             sched.set_user(interval_ms, auto);
 
             let now_ms = get_tick_count_ms();
+
             let plan = sched.plan(now_ms, &enabled);
-
             let power_on = schedule_power();
-            let snap = sampler.sample(&plan, last.as_ref(), now_ms, power_on);
-            // D4：每周期只取两次 tick（now / after），cost 与 wake/sleep 全部复用，
-            // 不再调 4~5 次 GetTickCount64。
+            let snap = sampler.sample(&plan, Some(&pending), now_ms, power_on);
             let after_ms = get_tick_count_ms();
-            let cost_ms = after_ms.saturating_sub(now_ms) as u32;
-            sched.record_cycle(cost_ms, &enabled);
 
-            shared_seq.store(snap.seq, std::sync::atomic::Ordering::Relaxed);
-            snap_store(snap.clone());
-            // 曲线窗口数据源：每轮追加 CPU/内存/网络时序点（ArcSwap 无锁，窗口未开时内部跳过）
-            sysoverlay_win::history::push(&snap);
-            // D5：只有「会显示到屏幕」的内容真的变了才唤醒 UI 线程；
-            // 指标静止时省掉一次消息循环唤醒（hover/动画/DPI/主题重绘由窗口线程自行投递）。
-            let content_changed = last.as_ref().map_or(true, |p| displayed_changed(&snap, p));
-            last = Some(snap);
+            if plan.cpu {
+                if let Some(v) = snap.cpu.value() {
+                    sched.update_ema(Source::Cpu, v);
+                }
+            }
+            if plan.mem {
+                sched.update_ema(Source::Mem, snap.memory.load_pct);
+            }
+            if plan.gpu {
+                if let Some(v) = snap.gpu.value() {
+                    sched.update_ema(Source::Gpu, v);
+                }
+            }
+            if plan.net {
+                let v = (snap.net.rx_bps.saturating_add(snap.net.tx_bps)) as f32;
+                sched.update_ema(Source::Net, v);
+            }
 
-            if content_changed {
-                unsafe {
-                    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
-                    use windows::Win32::Foundation::{LPARAM, WPARAM};
-                    let _ = PostMessageW(
-                        overlay_hwnd,
-                        WM_NEW_SNAPSHOT,
-                        WPARAM(0),
-                        LPARAM(0),
+            pending = snap;
+
+            let since = after_ms.saturating_sub(last_refresh);
+            if since >= REFRESH_FLOOR_MS {
+                let ema_cpu = sched.ema(Source::Cpu);
+                let ema_mem = sched.ema(Source::Mem);
+                let ema_gpu = sched.ema(Source::Gpu);
+                let ema_net = sched.ema(Source::Net);
+                let delta_cpu = (ema_cpu - ema_cpu_committed).abs();
+                let delta_mem = (ema_mem - ema_mem_committed).abs();
+                let delta_gpu = (ema_gpu - ema_gpu_committed).abs();
+                let delta_net = (ema_net - ema_net_committed).abs();
+                let max_delta = delta_cpu.max(delta_mem).max(delta_gpu).max(delta_net);
+
+                let cpu_active = ema_cpu >= ACTIVE_CPU_PCT;
+                let net_active = ema_net >= ACTIVE_NET_BPS;
+
+                if mode_active {
+                    if max_delta < DELTA_EXIT && !cpu_active && !net_active {
+                        quiet_ticks += 1;
+                        if quiet_ticks >= EXIT_TICKS {
+                            mode_active = false;
+                            quiet_ticks = 0;
+                        }
+                    } else {
+                        quiet_ticks = 0;
+                    }
+                } else {
+                    if max_delta >= DELTA_ENTER || cpu_active || net_active {
+                        mode_active = true;
+                        quiet_ticks = 0;
+                    }
+                }
+
+                let should_commit = if mode_active {
+                    true
+                } else {
+                    max_delta >= DELTA_ENTER || after_ms.saturating_sub(last_refresh) >= IDLE_MAX_MS
+                };
+
+                if should_commit {
+                    let mut committed = pending.clone();
+                    committed.seq = seq;
+                    seq += 1;
+                    shared_seq.store(committed.seq, std::sync::atomic::Ordering::Relaxed);
+                    snap_store(committed.clone());
+                    sysoverlay_win::history::push(&committed);
+                    last_refresh = after_ms;
+                    ema_cpu_committed = ema_cpu;
+                    ema_mem_committed = ema_mem;
+                    ema_gpu_committed = ema_gpu;
+                    ema_net_committed = ema_net;
+                    sysoverlay_win::perf::note_barrier_commit(
+                        seq,
+                        max_delta,
+                        mode_active as u32,
                     );
+                    unsafe {
+                        use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+                        use windows::Win32::Foundation::{LPARAM, WPARAM};
+                        let _ = PostMessageW(
+                            overlay_hwnd,
+                            WM_NEW_SNAPSHOT,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    }
                 }
             }
 
-            // 睡到最近的到期源，而不是固定间隔——分频调度的节能关键
-            let wake = sched.next_wake_ms(after_ms, &enabled);
-            let sleep_ms = wake.saturating_sub(after_ms).max(1).min(5000);
-            // 采样循环探针：记录每轮采样耗时与休眠时长（sched 忙等/采样超支一眼可见）
-            // P1-15：探针关闭时零成本——`log_lazy` 先判 enabled 再格式化。
+            let sleep_ms = TICK_MS;
             sysoverlay_win::probe::log_lazy(|| {
                 format!(
-                    "cycle cost_ms={} sleep_ms={} penalty={} auto={} plan={}{}{}{}",
-                    cost_ms,
+                    "sleep_ms={} auto={} plan={}{}{}{} mode={}",
                     sleep_ms,
-                    sched.penalty(),
                     auto as u8,
                     plan.cpu as u8,
                     plan.mem as u8,
                     plan.gpu as u8,
                     plan.net as u8,
+                    mode_active as u8,
                 )
             });
-            sysoverlay_win::perf::note_cycle(cost_ms, sleep_ms);
             thread::sleep(Duration::from_millis(sleep_ms));
         }
     });
@@ -370,20 +433,6 @@ fn main() {
     if !config_io::save_config(&final_cfg) {
         eprintln!("[SysOverlay] Warning: failed to save config on exit");
     }
-}
-
-/// 比较两个快照中「会显示到屏幕」的字段是否一致（D5 用）。
-///
-/// 注意：`seq`/`timestamp_ms`/`uptime_ms` 每轮都变，不能纳入比较——
-/// 否则静止指标也会被误判为「有变化」，D5 就失效了。
-fn displayed_changed(a: &sysoverlay_win::Snapshot, b: &sysoverlay_win::Snapshot) -> bool {
-    a.cpu != b.cpu
-        || a.gpu != b.gpu
-        || a.power != b.power
-        || a.memory.load_pct != b.memory.load_pct
-        || a.memory.used_gb != b.memory.used_gb
-        || a.net.rx_bps != b.net.rx_bps
-        || a.net.tx_bps != b.net.tx_bps
 }
 
 /// Returns the current tick count in milliseconds since system boot.

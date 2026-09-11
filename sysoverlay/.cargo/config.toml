@@ -7,4 +7,8 @@ rustflags = [
   "-C", "link-arg=/LIBPATH:C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64",
   "-C", "link-arg=/LIBPATH:C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\um\\x64",
   "-C", "link-arg=/LIBPATH:C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\ucrt\\x64",
+  # 体积优化：磁盘分节对齐 4096→512（只影响文件布局，不影响内存加载/性能），
+  # 并显式开启 COMDAT 折叠（同内容函数/数据合并，LTO 后仍可再省几 KB）。
+  "-C", "link-arg=/FILEALIGN:512",
+  "-C", "link-arg=/OPT:REF,ICF",
 ]

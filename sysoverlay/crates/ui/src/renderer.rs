@@ -93,7 +93,7 @@ pub trait Renderer {
             }
             if !full_clear {
                 let pad = if c.outline { 2 } else if c.shadow { 1 } else { 0 };
-                out.clear_rect(c.x - pad, c.y - pad, c.w + 2 * pad, c.h + 2 * pad);
+                out.clear_rect(c.bbox_x, c.y - pad, c.w + 2 * pad, c.h + 2 * pad);
             }
             draw_row_text(out, c.text.as_str(), c.x, c.y, c.scale, c.color, c.shade, c.shadow, c.outline);
         }
@@ -236,6 +236,17 @@ pub struct CellSig {
     pub y: i32,
     pub w: i32,
     pub h: i32,
+    /// 脏区/清除用包围盒左缘。
+    ///
+    /// 右侧数值 cell 右对齐时，ink 会向左溢出 `x`（D2D 真字形宽度 ≠
+    /// 位图等宽度量），故包围盒必须比 `x` 更靠左覆盖整个预留槽位，
+    /// 否则数值变化时左侧残影无法被清除/上传（幽灵像素）。
+    pub bbox_x: i32,
+    /// 该 cell 是否为右对齐数值（槽位 > 0）。
+    ///
+    /// D2D 引擎据此用 DWrite 实测字形宽把绘制原点重新对齐到布局锚点，
+    /// 消除比例字体导致的逐行右缘漂移（位图度量 vs DIN 真字形）。
+    pub right_align: bool,
     pub hash: u64,
     pub text: StrBuf,
     pub color: Rgba,
@@ -251,6 +262,7 @@ pub struct CellSig {
 /// 的所有偏移像素都落在 `w/h` 内（脏区上屏不漏像素）。
 ///
 /// `h_rows` 为墨迹行数（引擎相关，见 [`visible_rows`]）。
+/// `slot_w`：数值 cell 固定槽位宽度（像素），用于扩大脏区确保右对齐覆盖完整。
 #[allow(clippy::too_many_arguments)]
 fn cell_sig(
     text: &StrBuf,
@@ -262,17 +274,28 @@ fn cell_sig(
     shade: Rgba,
     shadow: bool,
     outline: bool,
+    slot_w: i32,
 ) -> CellSig {
-    let w = measure_scaled_f(text.as_str(), scale);
-    let h = (h_rows * scale).ceil() as i32;
+    let text_w = measure_scaled_f(text.as_str(), scale);
     let pad = if outline { 2 } else if shadow { 1 } else { 0 };
+    // 槽位 > 0 = 右对齐数值 cell（标签 cell 传 0）。
+    // 右对齐锚点 = x + text_w（布局按位图度量把右缘对齐到该点）；
+    // 包围盒向左覆盖整个预留槽位（max(text_w, slot_w)），以容纳 D2D 真字形
+    // 向右对齐修正后向左溢出的那部分 ink。
+    let reserved = text_w.max(slot_w);
+    let right_align = slot_w > 0;
+    let bbox_x = if right_align {
+        x + text_w - reserved - pad
+    } else {
+        x - pad
+    };
+    let w = reserved + 2 * pad;
+    let h = (h_rows * scale).ceil() as i32;
     let mut acc = FNV_OFFSET;
     for b in text.as_str().as_bytes() {
         fnv_mix(&mut acc, &[*b]);
     }
     fnv_u32(&mut acc, color.to_colorref());
-    // 预乘黑/白等颜色的 rgb 不随 alpha 变化（to_colorref 也不含 alpha），
-    // 字重半透明化后必须显式混入 a，否则脏区检测漏掉字重变化。
     fnv_u8(&mut acc, color.a);
     fnv_u32(&mut acc, shade.to_colorref());
     fnv_u8(&mut acc, shade.a);
@@ -282,8 +305,10 @@ fn cell_sig(
     CellSig {
         x,
         y,
-        w: w + 2 * pad,
+        w,
         h: h + 2 * pad,
+        bbox_x,
+        right_align,
         hash: acc,
         text: text.clone(),
         color,
@@ -325,12 +350,15 @@ fn metric_index(m: MetricEnum) -> usize {
 }
 
 /// 名称/数值配色：指标专属色优先，否则回退到 fallback。
+/// 数值槽开启「自动色」时忽略自定义色，直接采用 fallback——
+/// CPU/GPU/内存百分比的 fallback 即占用率强调色
+/// （`style.accent(pct)`：<60% 绿 / 60~85% 橙 / ≥85% 红）。
 fn slot_color(cfg: &Config, m: MetricEnum, label: bool, fallback: Rgba) -> Rgba {
-    let over = if label {
-        cfg.metric_colors[metric_index(m)].label
-    } else {
-        cfg.metric_colors[metric_index(m)].value
-    };
+    let mc = &cfg.metric_colors[metric_index(m)];
+    if !label && mc.value_auto {
+        return fallback;
+    }
+    let over = if label { mc.label } else { mc.value };
     match over {
         Some(c) => Rgba::opaque(c.r, c.g, c.b),
         None => fallback,
@@ -487,15 +515,23 @@ fn build_rows(snap: &Snapshot, cfg: &Config) -> RowList {
             }
             NetMode::Both => {
                 label = "Net";
+                // ⚠️ `fmt_rate` 内部会 `buf.clear()`。若直接在 b 上连续调用两次，
+                // 第二次会把刚拼好的「↓下载值/s ↑」整段清空，最终只剩上传值/s
+                // ——直接表现为"双向只显示一个值，且与 NetU 相同"。
+                // 必须先把 rx/tx 各自格式化到独立缓冲，再拼进 b。
+                let mut rx = StrBuf::new();
+                let mut tx = StrBuf::new();
+                fmt_rate(&mut rx, snap.net.rx_bps, cfg.net_unit);
+                fmt_rate(&mut tx, snap.net.tx_bps, cfg.net_unit);
                 b.push_str("\u{2193}");
-                fmt_rate(&mut b, snap.net.rx_bps, cfg.net_unit);
+                b.push_str(rx.as_str());
                 b.push_str("/s \u{2191}");
-                fmt_rate(&mut b, snap.net.tx_bps, cfg.net_unit);
+                b.push_str(tx.as_str());
                 b.push_str("/s");
                 slot = SLOT_RATE * 2 + 3;
             }
         }
-        let mut net_row = new_row(
+        let net_row = new_row(
             MetricEnum::Net,
             label,
             b,
@@ -504,11 +540,6 @@ fn build_rows(snap: &Snapshot, cfg: &Config) -> RowList {
             style.ui.name,
             style.ui.value,
         );
-        // 网络文本变长且随单位/上下行浮动（如双向 "↓1.23M/s ↑0.23M/s"），
-        // 固定的 "0"×slot 预留（slot=19 → 约 19 字符宽）远大于或远小于实测宽度，
-        // 会让自然宽度/右对齐锚点失准：双向模式整段被右移、末尾速率顶到窗口右缘
-        // 被裁掉（"只显示一个 + 大间隙"）。改为按实测文本宽度预留。
-        net_row.slot_w = net_row.value_w;
         rows.push(net_row);
     }
 
@@ -526,7 +557,7 @@ fn build_rows(snap: &Snapshot, cfg: &Config) -> RowList {
         } else {
             style.ui.value
         };
-        let mut power_row = new_row(
+        let power_row = new_row(
             MetricEnum::Power,
             "Power",
             b,
@@ -535,9 +566,6 @@ fn build_rows(snap: &Snapshot, cfg: &Config) -> RowList {
             style.ui.name,
             color,
         );
-        // 功耗值与 Net 双向长文本同排时，固定 "0"×slot 预留会顶到窗口右缘被裁：
-        // 与网络行一致，改为按实测文本宽度预留，锁尺寸/auto-fit 下都能完整显示。
-        power_row.slot_w = power_row.value_w;
         rows.push(power_row);
     }
 
@@ -718,9 +746,9 @@ impl Renderer for StripRenderer {
             let row_h = (16.0 * row.scale).ceil() as i32;
             let dy = (glyph_h - row_h) / 2;
             let ly = y + dy;
-            cells.push(cell_sig(&row.label, x, ly, ink_rows, row.scale, row.label_color, shade, cfg.text_shadow, cfg.text_outline));
+            cells.push(cell_sig(&row.label, x, ly, ink_rows, row.scale, row.label_color, shade, cfg.text_shadow, cfg.text_outline, 0));
             let vx = x + row.label_w + row.label_value_gap + if row.value_w < row.slot_w { row.slot_w - row.value_w } else { 0 };
-            cells.push(cell_sig(&row.value, vx, ly, ink_rows, row.scale, row.value_color, shade, cfg.text_shadow, cfg.text_outline));
+            cells.push(cell_sig(&row.value, vx, ly, ink_rows, row.scale, row.value_color, shade, cfg.text_shadow, cfg.text_outline, row.slot_w));
             // 超宽值（Net 双向速率）按实测宽度推进，避免与下一项重叠
             x += row.label_w + row.label_value_gap + row.value_w.max(row.slot_w);
         }
@@ -792,10 +820,10 @@ impl Renderer for VerticalRenderer {
             // 行高用引擎墨迹行数（位图字体 8 行 / DWrite 16 行），
             // 间距为 0 时性能模式各行墨迹紧贴。
             let row_h = (line_h * row.scale).ceil() as i32;
-            cells.push(cell_sig(&row.label, PAD_X, y, line_h, row.scale, row.label_color, shade, cfg.text_shadow, cfg.text_outline));
+            cells.push(cell_sig(&row.label, PAD_X, y, line_h, row.scale, row.label_color, shade, cfg.text_shadow, cfg.text_outline, 0));
             let min_x = PAD_X + row.label_w + row.label_value_gap;
             let dx = (value_right - row.value_w).max(min_x);
-            cells.push(cell_sig(&row.value, dx, y, line_h, row.scale, row.value_color, shade, cfg.text_shadow, cfg.text_outline));
+            cells.push(cell_sig(&row.value, dx, y, line_h, row.scale, row.value_color, shade, cfg.text_shadow, cfg.text_outline, row.slot_w));
             y += row_h + cfg.metric_gap as i32;
         }
 
@@ -971,6 +999,116 @@ mod tests {
             "CPU 字号放大后横版必须变宽（{} → {}）",
             base.0,
             grown.0
+        );
+    }
+
+    #[test]
+    fn net_both_row_keeps_download_and_upload_values() {
+        // 回归锁：`fmt_rate` 内部会 `buf.clear()`。Both 模式若在同一缓冲上连续
+        // 调用两次（中间只 push_str 分隔符），第二次会把刚拼好的
+        // 「↓下载值/s ↑」整段清空，最终只剩上传值/s —— 用户实测「双向只显示
+        // 一个值，且与 NetU 相同」。必须用独立缓冲分别格式化 rx/tx 再拼接。
+        let mut cfg = demo_cfg();
+        cfg.net_mode = NetMode::Both;
+        cfg.net_unit = sysoverlay_core::types::NetUnit::MB;
+        let mut snap = Snapshot::placeholder(0);
+        snap.net.rx_bps = 11_850_000; // 11.85M（下载）
+        snap.net.tx_bps = 240_000; // 0.24M（上传）
+
+        let rows = build_rows(&snap, &cfg);
+        let net = rows
+            .as_slice()
+            .iter()
+            .find(|r| matches!(r.metric, MetricEnum::Net))
+            .expect("Net 行必须存在");
+        assert_eq!(net.label.as_str(), "Net", "双向模式标签为 Net");
+        let s = net.value.as_str();
+        assert!(s.contains('\u{2193}'), "双向必须含下载箭头 ↓：{s:?}");
+        assert!(s.contains('\u{2191}'), "双向必须含上传箭头 ↑：{s:?}");
+        assert!(s.contains("11.85M"), "双向必须含下载值 11.85M：{s:?}");
+        assert!(s.contains("0.24M"), "双向必须含上传值 0.24M：{s:?}");
+        assert!(
+            s.find("11.85M").unwrap() < s.find("0.24M").unwrap(),
+            "下载值须排在上传值之前：{s:?}"
+        );
+    }
+
+    #[test]
+    fn net_single_direction_rows_show_only_own_value() {
+        // 单向模式只显示对应方向的速率（下载 NetD / 上传 NetU）。
+        let mut snap = Snapshot::placeholder(0);
+        snap.net.rx_bps = 11_850_000;
+        snap.net.tx_bps = 240_000;
+
+        let mut cfg = demo_cfg();
+        cfg.net_unit = sysoverlay_core::types::NetUnit::MB;
+        cfg.net_mode = NetMode::Down;
+        let rows = build_rows(&snap, &cfg);
+        let d = rows.as_slice().iter().find(|r| matches!(r.metric, MetricEnum::Net)).unwrap();
+        assert_eq!(d.label.as_str(), "NetD");
+        assert!(d.value.as_str().contains("11.85M"));
+        assert!(!d.value.as_str().contains("0.24M"));
+
+        cfg.net_mode = NetMode::Up;
+        let rows = build_rows(&snap, &cfg);
+        let u = rows.as_slice().iter().find(|r| matches!(r.metric, MetricEnum::Net)).unwrap();
+        assert_eq!(u.label.as_str(), "NetU");
+        assert!(u.value.as_str().contains("0.24M"));
+        assert!(!u.value.as_str().contains("11.85M"));
+    }
+
+    #[test]
+    fn value_cells_are_right_aligned_with_slot_covering_bbox() {
+        // 右对齐数值 cell 必须标记 right_align，且包围盒向左覆盖整个预留槽位
+        // ——D2D 真字形比位图度量宽时，右对齐修正会让 ink 向左溢出绘制原点 `x`，
+        // 包围盒不覆盖就会留下幽灵像素。
+        let snap = demo_snap();
+        let cfg = demo_cfg();
+        let (_, _, cells) = VerticalRenderer.layout(&snap, &cfg, 600, 600);
+
+        let value = cells
+            .iter()
+            .find(|c| c.text.as_str().contains('%'))
+            .expect("CPU 百分比数值 cell");
+        assert!(value.right_align, "数值 cell 必须标记右对齐");
+        assert!(
+            value.bbox_x <= value.x,
+            "右对齐数值包围盒左缘不得晚于绘制原点：bbox_x={} x={}",
+            value.bbox_x,
+            value.x
+        );
+
+        let label = cells
+            .iter()
+            .find(|c| c.text.as_str() == "CPU")
+            .expect("CPU 标签 cell");
+        assert!(!label.right_align, "标签 cell 不得右对齐");
+    }
+
+    #[test]
+    fn vertical_value_cells_share_one_right_edge() {
+        // 竖版右对齐锚点一致性：所有数值 cell 的「绘制原点 + 位图度量宽」必须相等。
+        // D2D 引擎正是按该锚点用 DWrite 实测宽度重定位，才能让整列数值右缘对齐
+        // （否则比例字形宽度差异会让各行右缘漂移，网速串最明显）。
+        let snap = demo_snap();
+        let mut cfg = demo_cfg();
+        cfg.net_mode = NetMode::Both;
+        cfg.label_value_gap = 64;
+        cfg.power_enabled = true;
+        let (_, _, cells) = VerticalRenderer.layout(&snap, &cfg, 900, 900);
+
+        let mut anchors: Vec<i32> = cells
+            .iter()
+            .filter(|c| c.right_align)
+            .map(|c| c.x + measure_scaled_f(c.text.as_str(), c.scale))
+            .collect();
+        assert!(anchors.len() >= 5, "应当有 5 个数值 cell，实际 {}", anchors.len());
+        anchors.sort_unstable();
+        anchors.dedup();
+        assert_eq!(
+            anchors.len(),
+            1,
+            "所有数值 cell 必须共享同一右对齐锚点，实际 {anchors:?}"
         );
     }
 }

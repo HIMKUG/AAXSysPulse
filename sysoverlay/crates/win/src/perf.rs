@@ -54,6 +54,8 @@ pub fn begin() -> u64 {
     qpc()
 }
 
+fn wall_ms() -> u64 { qpc_ms() }
+
 /// 结束一次**实际渲染**的计时并累计。
 pub fn end_render(start: u64) {
     if !enabled() || start == 0 {
@@ -71,6 +73,7 @@ pub fn end_render(start: u64) {
             Err(v) => cur = v,
         }
     }
+    write_line(&format!("frame_render ms={} us={}\n", wall_ms() % 1_000_000, us));
     maybe_report();
 }
 
@@ -80,6 +83,7 @@ pub fn note_skipped() {
         return;
     }
     SKIPPED.fetch_add(1, Ordering::Relaxed);
+    write_line(&format!("frame_skip ms={}\n", wall_ms() % 1_000_000));
     HAS_DATA.store(true, Ordering::Relaxed);
     maybe_report();
 }
@@ -270,7 +274,7 @@ pub fn note_section(label: &str, start: u64) {
         return;
     }
     let us = elapsed_us(start);
-    if us > MSG_SLOW_US {
+    if true {
         write_line(&format!("section {} us={}\n", label, us));
     }
 }
@@ -285,6 +289,19 @@ pub fn note_cycle(cost_ms: u32, sleep_ms: u64) {
     if sleep_ms <= 2 || cost_ms > 100 {
         write_line(&format!("cycle cost_ms={} sleep_ms={}\n", cost_ms, sleep_ms));
     }
+}
+
+/// 提交探针：每次提交落盘一行（无条件，无阈值）。
+pub fn note_barrier_commit(seq: u64, max_delta: f32, mode_active: u32) {
+    if !enabled() {
+        return;
+    }
+    write_line(&format!(
+        "commit seq={} max_delta={:.1} active={}\n",
+        seq,
+        max_delta,
+        mode_active,
+    ));
 }
 
 // ── QPC 封装 ─────────────────────────────────────────────

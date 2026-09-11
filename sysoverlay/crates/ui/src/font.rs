@@ -589,11 +589,9 @@ pub fn render_str_scaled(
 /// 把配置字号（px，基准字形高 16px）换算为渲染缩放比。
 ///
 /// 位图字形 8×16 是 "1.0 倍" 的基准：字号 16px ↔ scale 1.0。
-/// 字号 8..=40 的 0.5 步进直接映射到 scale 0.5..=2.5。
-/// 与旧 `font_scale`（整数倍 1..=4）相比，这一步能让用户在
-/// 8px 量级上做更精细的连续调节。
+/// 字号允许 1~999，无上下限。
 pub fn scale_of_font(font_size: f32) -> f32 {
-    (font_size.clamp(8.0, 40.0) / FONT_HEIGHT as f32).max(0.5)
+    (font_size.max(1.0) / FONT_HEIGHT as f32).max(0.5)
 }
 
 /// 浮点缩放下的字符串宽度（像素，向上取整）。

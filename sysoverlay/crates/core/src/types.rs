@@ -204,6 +204,45 @@ impl RenderEngine {
     }
 }
 
+/// 设置窗口外观模式：跟随系统 / 强制浅色 / 强制深色。
+///
+/// 设置页「常规」页提供三态切换；`Theme::resolve` 据此解析出实际 `Theme`。
+/// 序列化写**数值**（C 版无此键，会静默忽略），读同时接受数值与字符串。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Appearance {
+    /// 跟随系统（读注册表 `AppsUseLightTheme`）。
+    #[default]
+    System,
+    /// 强制浅色。
+    Light,
+    /// 强制深色。
+    Dark,
+}
+
+impl Appearance {
+    /// 全部档位，顺序即设置页分段标签顺序（红线 R1：必须与 layout labels 对齐）。
+    pub const ALL: [Appearance; 3] = [Appearance::System, Appearance::Light, Appearance::Dark];
+
+    /// 宽容解析：接受数值（0/1/2）与字符串。非法值返回 None（交给调用方保留原值）。
+    pub fn from_config(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "0" | "system" | "auto" => Some(Appearance::System),
+            "1" | "light" => Some(Appearance::Light),
+            "2" | "dark" => Some(Appearance::Dark),
+            _ => None,
+        }
+    }
+
+    /// 序列化为数值（0/1/2）。
+    pub fn to_config(self) -> u32 {
+        match self {
+            Appearance::System => 0,
+            Appearance::Light => 1,
+            Appearance::Dark => 2,
+        }
+    }
+}
+
 /// 可逐项调色的指标。顺序即悬浮窗自左到右 / 自上而下的排列顺序。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Metric {
@@ -240,6 +279,9 @@ pub struct MetricColors {
     pub label: Option<Rgb>,
     /// 指标数值（如 "47%"）颜色。
     pub value: Option<Rgb>,
+    /// 数值槽「自动色」：按占用率分档变色（<60% 绿 / 60~85% 橙 / ≥85% 红）。
+    /// 开启时忽略 `value` 的自定义色（用户反馈 2026-09-11）。
+    pub value_auto: bool,
 }
 
 impl Default for MetricColors {
@@ -247,6 +289,7 @@ impl Default for MetricColors {
         Self {
             label: None,
             value: None,
+            value_auto: false,
         }
     }
 }

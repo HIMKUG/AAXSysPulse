@@ -18,14 +18,16 @@
 //! - 离开本窗口 = `SettingsCtx` Drop = 全部 D2D/DWrite 资源释放，零残留。
 
 mod cfg_ref;
+mod icons;
 mod layout;
+mod motion;
 mod state;
 mod tasks;
 mod widget;
 
 pub use tasks::SAVE_DEBOUNCE_MS;
 
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::time::Instant;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -38,28 +40,35 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClientRect, LoadCursorW, PostMessageW, RegisterClassExW,
-    SetCursor, SetWindowPos, ShowWindow, HCURSOR, IDC_HAND, SW_HIDE, SW_SHOW, HWND_NOTOPMOST,
-    HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WINDOW_EX_STYLE, WNDCLASSEXW, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, GetClientRect,
+    LoadCursorW, PostMessageW, RegisterClassExW, SetCursor, SetWindowPos, ShowWindow, HCURSOR,
+    IDC_HAND, MINMAXINFO, SW_HIDE, SW_SHOW, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, WINDOW_EX_STYLE, WNDCLASSEXW, WS_MINIMIZEBOX, WS_POPUP,
 };
 
 use crate::gfx_d2d::{ColorF, Gfx, HAlign, RectF};
 use crate::theme::Theme;
 use crate::titlebar::{self, TitleBarState, TitleBtn};
 use crate::window::{self, WM_RECONFIG};
-use crate::{autostart, config_io};
-use state::{Action, EditState, Interaction, Page, SliderFx, WidgetState};
+use crate::config_io;
+use state::{Action, EditState, Interaction, Page, WidgetState};
 use tasks::DebouncedSave;
 
 use cfg_ref::{CfgRef, Value};
 use layout::{
-    build_pages, content_top_y, page_caption, s, CARD_PAD, CARD_RADIUS, CAPTION_GAP, CAPTION_H,
-    CLIENT_W, FOOTNOTE_H, MARGIN_X, NAV_GAP, NAV_H, ROW_H,
+    build_pages, content_origin, content_viewport, page_caption, s, CARD_PAD, CARD_RADIUS,
+    CAPTION_GAP, CAPTION_H, FOOTNOTE_H,
+    MAX_H, MAX_W, MIN_H, MIN_W, ROW_H, SB_ICON, SB_ICON_TEXT_GAP, SB_ITEM_GAP, SB_ITEM_H,
+    SIDEBAR_PAD, SIDEBAR_W, SCROLLBAR_INSET, SCROLLBAR_W,
 };
 use state::pt_in;
-use widget::{track_rect, value_box_rect, SW_FOLLOW, SW_N};
+use widget::{metric_font_status_restore_rect, sw_custom, sw_follow, sw_n, value_box_rect};
 
 // ── 消息常量 ─────────────────────────────────────────────
+
+/// 模态对话框（系统取色）打开标志：paint_d2d 检查到即跳过本帧，
+/// 防止 ChooseColorW 的模态消息循环重入本窗口 proc 时与绘制争用 `Gfx`。
+static MODAL_DIALOG: AtomicBool = AtomicBool::new(false);
 
 const WM_DESTROY: u32 = 0x0002;
 const WM_CLOSE: u32 = 0x0010;
@@ -78,18 +87,37 @@ const WM_CHAR: u32 = 0x0102;
 const WM_KILLFOCUS: u32 = 0x0008;
 const WM_DIAG_CLICK: u32 = 0x8000 + 41;
 const WM_TIMER: u32 = 0x0113;
+const WM_GETMINMAXINFO: u32 = 0x0024;
+const WM_SIZE: u32 = 0x0005;
+const WM_EXITSIZEMOVE: u32 = 0x0232;
+const WM_MOUSEWHEEL: u32 = 0x020A;
 
 const HTCAPTION: u32 = 2;
 const HTCLIENT: u32 = 1;
 const HTTRANSPARENT: i32 = -1;
+// 边框热区（WM_NCHITTEST 返回值，与 WinUser.h 数值一致）。
+const HTLEFT: i32 = 10;
+const HTRIGHT: i32 = 11;
+const HTTOP: i32 = 12;
+const HTTOPLEFT: i32 = 13;
+const HTTOPRIGHT: i32 = 14;
+const HTBOTTOM: i32 = 15;
+const HTBOTTOMLEFT: i32 = 16;
+const HTBOTTOMRIGHT: i32 = 17;
 
 /// 诊断点击目标：颜色页 CPU 开关（build_pages 中第一个指标 Toggle 的 id）。
 const IDC_DIAG_CPU: i32 = 200;
 
 // 定时器
-const PAGE_TIMER: usize = 11;
+/// 动画主时钟：所有连续动画（翻页/滚动/悬停/布局）统一由它驱动，
+/// WM_TIMER 回调里**直接 paint_d2d**，不经过 WM_PAINT 队列（输入饥饿免疫）。
+const ANIM_TIMER: usize = 11;
 const EDIT_TIMER: usize = 12;
-const DRAG_TIMER: usize = 13;
+/// 状态提示（关于页按钮反馈等）自动消失计时。
+const STATUS_TIMER: usize = 13;
+/// 步进器长按连发：350ms 首延迟，之后每 60ms 一步。
+const STEPPER_TIMER: usize = 14;
+const STEPPER_REPEAT_MS: u32 = 60;
 
 // ── GDI extern（window.rs 的声明是私有的，此处独立声明） ─
 #[link(name = "user32")]
@@ -100,6 +128,7 @@ extern "system" {
 }
 
 const GWLP_UD: i32 = -21;
+const GWL_STYLE: i32 = -16;
 
 /// 已打开的设置窗口句柄（单例；-1 = 未创建）。
 static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(-1);
@@ -116,8 +145,10 @@ pub struct ContentPt(pub POINT);
 
 impl ClientPt {
     /// 客户区 → 内容区（正文命中测试唯一入口）。
-    pub fn to_content(self, dpi: u32) -> ContentPt {
-        ContentPt(POINT { x: self.0.x, y: self.0.y - content_top_y(dpi) })
+    /// 减去侧边栏 x 偏移与滚动 y 偏移，得到内容坐标。
+    pub fn to_content(self, dpi: u32, scroll_y: i32) -> ContentPt {
+        let (ox, oy) = content_origin(dpi, scroll_y);
+        ContentPt(POINT { x: self.0.x - ox, y: self.0.y - oy })
     }
 }
 
@@ -138,8 +169,14 @@ struct SettingsCtx {
     interaction: Interaction,
     /// 正在编辑的输入框（buf/caret）。
     edit: Option<EditState>,
-    /// 摇杆弹簧物理状态（拖动/回中期间 Some，其余 None = 零空闲开销）。
-    fx: Option<SliderFx>,
+    /// 各指标配置卡的展开态（UI 状态，不落盘）。
+    metric_expanded: [bool; 5],
+    /// 滚轮惯性的滚动速度（px/s），橡胶边界用。
+    scroll_vel: f32,
+    /// 当前客户区尺寸（WM_SIZE 更新，rebuild_pages 与命中测试用）。
+    client_size: (i32, i32),
+    /// 侧边栏导航项悬停态（鼠标在侧边栏内时记录命中项下标）。
+    nav_hover: Option<usize>,
     tracking: bool,
     /// 自定义标题栏状态。
     tb: TitleBarState,
@@ -147,19 +184,54 @@ struct SettingsCtx {
     dirty: Option<Vec<usize>>,
     /// 空间网格索引：每页一个。
     spatial_grids: Vec<state::SpatialGrid>,
+    /// 逐控件过渡弹簧：键 = (页下标, 控件 id)。用 id 而非下标，
+    /// 折叠展开引起重排时动画状态不会串到别的控件。
+    transitions: std::collections::HashMap<(usize, i32), Transition>,
+    /// 侧边栏选中胶囊的滑动脉簧（值 = 页面下标）。
+    nav_sel: motion::Spring,
+    /// 各指标折叠卡的动画展开度（0..1）。
+    metric_expand_t: [motion::Spring; 5],
+    /// 上一帧是否仍在推进布局类弹簧（收敛后再补一次重排）。
+    layout_anim_active: bool,
+    /// 翻页弹簧：水平位移（px，从 24 滑入到 0）。
+    page_slide: motion::Spring,
+    /// 翻页弹簧：淡入进度（0→1）。
+    page_fade: motion::Spring,
+    /// 滚动惯性弹簧（scroll_y 趋近目标）。
+    scroll_spring: motion::Spring,
+    /// 上一帧绘制时刻（帧间 dt）。
+    last_frame: Instant,
+    /// 高精度定时器已提升（timeBeginPeriod 引用计数须配对）。
+    hires: bool,
     /// D2D 渲染底座（唯一资源持有者）。
     gfx: Gfx,
     /// 防抖落盘状态机。
     save: DebouncedSave,
     /// 进程内单调时钟起点（DebouncedSave 的 now 来源）。
     clock0: Instant,
-    /// 上次通知悬浮窗重排的毫秒时间戳（LiveValue 拖动节流用）。
-    last_reconfig_ms: u64,
+    /// 键盘焦点（当前页控件下标；None = 无焦点）。
+    focus: Option<usize>,
+    /// 最近一次输入是否来自键盘（焦点环仅此时绘制，报告 §7.1）。
+    keyboard_mode: bool,
+    /// 瞬态状态提示（文案 + 出现时刻），2.5s 后自动清除。
+    status: Option<(String, Instant)>,
+    /// 步进器长按连发状态：(控件下标, 方向)。松开/失捕获即清。
+    stepper_hold: Option<(usize, f64)>,
 }
 
+/// 翻页动画进行中标记（进度由弹簧推进，见 `anim_params`）。
 #[derive(Clone, Copy)]
-struct PageAnim {
-    t0: Instant,
+struct PageAnim;
+
+/// 单个控件的过渡弹簧组（H2）。
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Transition {
+    hover: motion::Spring,
+    press: motion::Spring,
+    /// 值 / 选中项弹簧（Toggle 旋钮、Segment 指示条、Swatch 选中环、Slider 滑块）。
+    val: motion::Spring,
+    /// `val` 是否已按目标初始化（避免首帧从 0 滑入）。
+    val_init: bool,
 }
 
 impl SettingsCtx {
@@ -172,6 +244,7 @@ impl SettingsCtx {
         match &self.interaction {
             Interaction::Idle => None,
             Interaction::Hover { widget }
+            | Interaction::Pressing { widget }
             | Interaction::Dragging { widget, .. }
             | Interaction::Editing { widget } => Some(*widget),
         }
@@ -202,17 +275,25 @@ impl SettingsCtx {
         if let Some(cfg) = self.cfg() {
             let lang = cfg.lang;
             let dpi = self.dpi;
-            build_pages(&mut self.pages, &cfg, lang, dpi);
-            let page_h = self.pages.iter().map(|p| p.h).max().unwrap_or(0).max(s(dpi, 200));
+            let (client_w, client_h) = self.client_size;
+            let expand = self.metric_expand_t.map(|sp| sp.x.clamp(0.0, 1.0));
+            build_pages(&mut self.pages, &cfg, lang, dpi, client_w, &expand);
             let mut grids = Vec::with_capacity(6);
             for page in &self.pages {
-                let mut grid = state::SpatialGrid::new(s(dpi, layout::CLIENT_W), page_h, s(dpi, 30));
+                let mut grid =
+                    state::SpatialGrid::new(client_w, page.h.max(s(dpi, 200)), s(dpi, 30));
                 for (idx, w) in page.widgets.iter().enumerate() {
                     grid.insert(idx, w.rect);
                 }
                 grids.push(grid);
             }
             self.spatial_grids = grids;
+            // 尺寸变化后重新钳制滚动位置，防止悬空
+            for p in self.pages.iter_mut() {
+                let max = (p.h - client_h).max(0);
+                p.scroll_y = p.scroll_y.clamp(0, max);
+            }
+            // 过渡弹簧按 (页, 控件 id) 持久化，无需随重排重建。
             crate::probe::log_lazy(|| {
                 let n: usize = self.pages.iter().map(|p| p.widgets.len()).sum();
                 format!(
@@ -228,17 +309,44 @@ impl SettingsCtx {
     }
 }
 
-/// 翻页动画进度：返回 (水平偏移px, 不透明度0..1)。
-fn anim_params(ctx: &SettingsCtx) -> (f32, f32) {
-    match &ctx.page_anim {
-        Some(anim) => {
-            let dur_ms = ctx.cfg().map(|c| c.anim_ms).unwrap_or(300).max(1) as f32;
-            let t = (anim.t0.elapsed().as_secs_f32() * 1000.0 / dur_ms).clamp(0.0, 1.0);
-            let e = 1.0 - (1.0 - t).powi(3); // 三次方缓出
-            ((1.0 - e) * 24.0, e)
-        }
-        None => (0.0, 1.0),
+/// 翻页动画进度（H3）：弹簧驱动，返回 (水平偏移px, 不透明度0..1)。
+/// 可中断：切页时不重置弹簧，仅由 `dispatch(SetPage)` 在「非动画中」时置初值。
+fn anim_params(ctx: &mut SettingsCtx, dt: f32) -> (f32, f32) {
+    if ctx.page_anim.is_none() {
+        return (0.0, 1.0);
     }
+    let (k, damp) = if motion::animations_enabled() {
+        (motion::K_SHEET, motion::C_SHEET)
+    } else {
+        (motion::K_REDUCED, motion::C_REDUCED)
+    };
+    let settled_s = ctx.page_slide.step(0.0, dt, k, damp);
+    let settled_f = ctx.page_fade.step(1.0, dt, k, damp);
+    if settled_s && settled_f {
+        ctx.page_anim = None;
+    }
+    (ctx.page_slide.x, ctx.page_fade.x.clamp(0.0, 1.0))
+}
+
+/// 推进「布局类」弹簧：折叠卡展开度 + 侧边栏选中胶囊。
+/// 返回 true = 仍在动（调用方需每帧重排，并在帧末请求下一帧）。
+fn step_layout_anims(ctx: &mut SettingsCtx, dt: f32) -> bool {
+    let (k, damp) = if motion::animations_enabled() {
+        (motion::K_SHEET, motion::C_SHEET)
+    } else {
+        (motion::K_REDUCED, motion::C_REDUCED)
+    };
+    let mut moving = false;
+    for (i, sp) in ctx.metric_expand_t.iter_mut().enumerate() {
+        let target = if ctx.metric_expanded[i] { 1.0 } else { 0.0 };
+        if !sp.step(target, dt, k, damp) {
+            moving = true;
+        }
+    }
+    if !ctx.nav_sel.step(ctx.page as f32, dt, motion::K_UI, motion::C_UI) {
+        moving = true;
+    }
+    moving
 }
 
 // ── 公开入口 ─────────────────────────────────────────────
@@ -297,7 +405,10 @@ fn create_dialog(overlay: HWND) {
             let _ = RegisterClassExW(&wc);
         });
 
-        let theme = Theme::system();
+        // 主题按配置外观解析：跟随系统 / 强制浅色 / 强制深色。
+        let theme = window::get_config_of(overlay)
+            .map(|c| Theme::resolve(c.appearance))
+            .unwrap_or_else(Theme::system);
         let dpi = crate::dpi::get_system_dpi();
         let lang = window::get_config_of(overlay)
             .map(|c| c.lang)
@@ -307,8 +418,11 @@ fn create_dialog(overlay: HWND) {
             .chain(std::iter::once(0))
             .collect();
 
-        let w = s(dpi, CLIENT_W);
-        let h = layout::window_total_h(dpi);
+        let (cfg_w, cfg_h) = window::get_config_of(overlay)
+            .map(|c| c.settings_size)
+            .unwrap_or((layout::DEFAULT_W, layout::DEFAULT_H));
+        let w = s(dpi, cfg_w.clamp(layout::MIN_W, layout::MAX_W));
+        let h = s(dpi, cfg_h.clamp(layout::MIN_H, layout::MAX_H));
 
         // 屏幕居中
         let sw = crate::dpi::screen_w();
@@ -320,7 +434,7 @@ fn create_dialog(overlay: HWND) {
             WINDOW_EX_STYLE(0),
             windows::core::w!("SysOverlay_Settings"),
             windows::core::PCWSTR(title_wide.as_ptr()),
-            WS_POPUP,
+            WS_POPUP | WS_MINIMIZEBOX,
             x,
             y,
             w,
@@ -331,6 +445,9 @@ fn create_dialog(overlay: HWND) {
             None,
         );
         let Ok(hwnd) = hwnd else { return };
+        // 双保险：初始样式去掉了 WS_THICKFRAME，此处运行时再剥一次，防止任何路径绕过。
+        // WS_POPUP=0x80000000, WS_MINIMIZEBOX=0x00020000, WS_THICKFRAME=0x00040000。
+        let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, 0x80020000_isize);
         let Some(gfx) = Gfx::new(hwnd) else {
             crate::probe::log("settings Gfx::new failed (no D2D?)");
             return;
@@ -346,20 +463,35 @@ fn create_dialog(overlay: HWND) {
             page_anim: None,
             interaction: Interaction::Idle,
             edit: None,
-            fx: None,
+            metric_expanded: [false; 5],
+            scroll_vel: 0.0,
+            client_size: (w, h),
+            nav_hover: None,
             tracking: false,
             tb: TitleBarState::default(),
             dirty: None,
             spatial_grids: Vec::new(),
+            transitions: std::collections::HashMap::new(),
+            nav_sel: motion::Spring::new(0.0),
+            metric_expand_t: [motion::Spring::new(0.0); 5],
+            layout_anim_active: false,
+            page_slide: motion::Spring::new(0.0),
+            page_fade: motion::Spring::new(1.0),
+            scroll_spring: motion::Spring::new(0.0),
+            last_frame: Instant::now(),
+            hires: false,
             gfx,
             save: DebouncedSave::default(),
             clock0: Instant::now(),
-            last_reconfig_ms: 0,
+            focus: None,
+            keyboard_mode: false,
+            status: None,
+            stepper_hold: None,
         };
         ctx.rebuild_pages();
         crate::probe::log(&format!(
             "settings layout w={w} h={h} content_top={} page_h={:?} widgets={:?}",
-            content_top_y(dpi),
+            0i32,
             ctx.pages.iter().map(|p| p.h).collect::<Vec<_>>(),
             ctx.pages.iter().map(|p| p.widgets.len()).collect::<Vec<_>>()
         ));
@@ -425,17 +557,33 @@ fn widget_at(ctx: &SettingsCtx, pt: ContentPt) -> Option<usize> {
     hit
 }
 
-/// 导航条命中（客户区坐标；导航自己带 TB_H+NAV_GAP 偏移）。
-fn nav_at(ctx: &SettingsCtx, pt: ClientPt) -> Option<usize> {
-    let d = ctx.dpi;
-    let top = s(d, crate::titlebar::TB_H) + s(d, NAV_GAP);
-    if pt.0.y < top || pt.0.y >= top + s(d, NAV_H) {
+/// 侧边栏导航项命中（客户区坐标 → 项下标）。
+fn sidebar_at(dpi: u32, pt: ClientPt) -> Option<usize> {
+    let x0 = s(dpi, SIDEBAR_PAD) as i32;
+    let x1 = s(dpi, SIDEBAR_W) - s(dpi, SIDEBAR_PAD);
+    if pt.0.x < x0 || pt.0.x >= x1 {
         return None;
     }
-    let n = 6;
-    let seg = s(d, CLIENT_W) / n;
-    let i = (pt.0.x / seg.max(1)) as usize;
-    if (i as i32) < n { Some(i) } else { None }
+    let top = s(dpi, 8 + 30 + 12);
+    let step = s(dpi, SB_ITEM_H + SB_ITEM_GAP);
+    let rel = pt.0.y - top;
+    if rel < 0 {
+        return None;
+    }
+    let i = rel / step;
+    if i >= 6 {
+        return None;
+    }
+    // 落于项间距（gap）内视为未命中
+    if rel % step >= s(dpi, SB_ITEM_H) {
+        return None;
+    }
+    Some(i as usize)
+}
+
+/// 鼠标是否在内容区（用于滚轮与滚动条拖拽的归属判定）。
+fn in_content(dpi: u32, client_w: i32, pt: ClientPt) -> bool {
+    pt.0.x >= s(dpi, SIDEBAR_W) && pt.0.x < client_w
 }
 
 // ── 单向数据流：Action 分派（唯一写入口） ────────────────
@@ -462,11 +610,20 @@ fn dispatch(ctx: &mut SettingsCtx, action: Action) {
     match action {
         Action::SetPage(p) => {
             if p != ctx.page {
-                slider_cancel(ctx, find_hwnd(ctx));
                 ctx.page = p;
-                ctx.page_anim = Some(PageAnim { t0: Instant::now() });
-                // 33ms ≈ 30fps：翻页过渡对流畅度足够，且比 16ms 少一半重绘负载
-                unsafe { start_timer(find_hwnd(ctx), PAGE_TIMER, 33) };
+                // H3：可中断翻页——仅在非动画中重置弹簧初值；动画中从当前位置续接。
+                if ctx.page_anim.is_none() {
+                    ctx.page_slide.set(24.0);
+                    ctx.page_fade.set(0.0);
+                }
+                ctx.page_anim = Some(PageAnim);
+                // 过渡弹簧数量对齐新页控件数。
+                let n = ctx.pages[p].widgets.len();
+                ctx.transitions.clear();
+                for wi in 0..n {
+                    ctx.transitions.insert((p, wi as i32), Transition::default());
+                }
+                // 翻页动画由 paint_d2d 帧末启动的 ANIM_TIMER(16ms) 驱动。
                 ctx.interaction = Interaction::Idle;
             }
         }
@@ -483,16 +640,7 @@ fn dispatch(ctx: &mut SettingsCtx, action: Action) {
             let applied = apply_config(ctx, |cfg| {
                 let Value::Bool(old) = r.get(cfg) else { return false };
                 let new = !old;
-                if r.set(cfg, Value::Bool(new)) {
-                    // LockSize 开启时用自然尺寸而非默认 300x200；
-                    // 关闭时保留 window_size 仅作几何恢复（fit 不再认它）。
-                    if r == CfgRef::LockSize && new {
-                        cfg.window_size = Some(crate::gdi::natural_size(cfg));
-                    }
-                    true
-                } else {
-                    false
-                }
+                r.set(cfg, Value::Bool(new))
             });
             if applied {
                 // 副作用
@@ -502,11 +650,8 @@ fn dispatch(ctx: &mut SettingsCtx, action: Action) {
                         CfgRef::Topmost => {
                             window::apply_topmost(overlay, cfg.topmost);
                         }
-                        CfgRef::AutoStart => {
-                            autostart::apply(cfg.autostart);
-                        }
-                        CfgRef::DebugLog => {
-                            crate::probe::set_debug(cfg.debug_log);
+                        CfgRef::ClickThrough => {
+                            window::apply_click_through(overlay, cfg.click_through);
                         }
                         _ => {}
                     }
@@ -518,12 +663,22 @@ fn dispatch(ctx: &mut SettingsCtx, action: Action) {
             }
         }
         Action::Select(r, i) => {
-            apply_config(ctx, |cfg| {
-                let Value::Select(old) = r.get(cfg) else { return false };
-                if old == i {
-                    return false;
+            let applied = apply_config(ctx, |cfg| {
+                match r.get(cfg) {
+                    Value::Select(old) => {
+                        if old == i {
+                            return false;
+                        }
+                        r.set(cfg, Value::Select(i))
+                    }
+                    Value::SelectOpt(old) => {
+                        if old == Some(i) {
+                            return false;
+                        }
+                        r.set(cfg, Value::SelectOpt(Some(i)))
+                    }
+                    _ => false,
                 }
-                r.set(cfg, Value::Select(i))
             });
             if r == CfgRef::Lang {
                 if let Some(cfg) = ctx.cfg() {
@@ -531,33 +686,44 @@ fn dispatch(ctx: &mut SettingsCtx, action: Action) {
                 }
                 ctx.rebuild_pages();
             }
-        }
-        Action::LiveValue(r, v) => {
-            // 拖动中：改内存预览 + 实时通知悬浮窗（不落盘，松手才提交）。
-            // 宽/高滑杆本身即「自定义尺寸」意图 → 顺带锁定，否则 fit 不认。
-            apply_config_quiet(ctx, |cfg| {
-                if matches!(r, CfgRef::WinW | CfgRef::WinH) {
-                    cfg.size_locked = true;
-                    if cfg.window_size.is_none() {
-                        cfg.window_size = Some(crate::gdi::natural_size(cfg));
+            // 外观切换（跟随系统 / 浅色 / 深色）：重新解析主题 + 刷新窗口边框并重绘。
+            if applied && r == CfgRef::Appearance {
+                if let Some(cfg) = ctx.cfg() {
+                    ctx.theme = Theme::resolve(cfg.appearance);
+                }
+                unsafe { apply_window_chrome(find_hwnd(ctx), ctx.theme.dark) };
+                invalidate_settings();
+            }
+            // 显示位置（贴角）：立即把悬浮窗贴到选定角（报告 §5 Corner）。
+            if applied && r == CfgRef::SnapCorner {
+                if let Some(cfg) = ctx.cfg() {
+                    if cfg.snap_corner <= 3 {
+                        window::snap_overlay_to_corner(overlay, cfg.snap_corner);
                     }
                 }
+            }
+        }
+        Action::LiveValue(r, v) => {
+            apply_config_quiet(ctx, |cfg| {
                 r.set(cfg, Value::Num(v))
             });
-            // 拖动中节流（80ms），避免 16ms 一跳把悬浮窗拖成 60fps 全量 layout。
-            notify_overlay_reconfig_throttled(ctx, 80);
+            notify_overlay_reconfig(ctx);
         }
         Action::CommitValue(r, v) => {
             apply_config(ctx, |cfg| {
-                if matches!(r, CfgRef::WinW | CfgRef::WinH) {
-                    cfg.size_locked = true;
-                    if cfg.window_size.is_none() {
-                        cfg.window_size = Some(crate::gdi::natural_size(cfg));
-                    }
-                }
                 r.set(cfg, Value::Num(v))
             });
         }
+        Action::ToggleMetricExpand(i) => {
+            if i < ctx.metric_expanded.len() {
+                ctx.metric_expanded[i] = !ctx.metric_expanded[i];
+                // 行结构变化 → 必须重排（重建卡片 / 网格 / 滚动范围）。
+                ctx.rebuild_pages();
+                invalidate_settings();
+            }
+        }
+        // 滚轮滚动由 WM_MOUSEWHEEL 直接写 scroll_y（H4：橡胶边界 + 惯性吸附），
+        // 因此不再经 Action::Scroll 中转。
     }
 }
 
@@ -615,19 +781,6 @@ fn notify_overlay_reconfig(ctx: &SettingsCtx) {
     }
 }
 
-/// 拖动中的节流通知：LiveValue 每 16ms 发出一跳，若每跳都 PostMessage WM_RECONFIG，
-/// 悬浮窗线程会被迫以 60fps 全量 layout（build_rows + 全指纹哈希）——"摇杆卡顿"的直接
-/// 成因之一。这里把拖动中的通知压到最小间隔（80ms ≈ 12 次/秒），仍足够实时预览，
-/// 提交/落盘路径不受影响。
-fn notify_overlay_reconfig_throttled(ctx: &mut SettingsCtx, min_gap_ms: u64) {
-    let now = ctx.now_ms();
-    if now.saturating_sub(ctx.last_reconfig_ms) < min_gap_ms {
-        return;
-    }
-    ctx.last_reconfig_ms = now;
-    notify_overlay_reconfig(ctx);
-}
-
 /// 刷新 settings 窗口。
 fn invalidate_settings() {
     let hwnd = SETTINGS_HWND.load(Ordering::SeqCst);
@@ -636,189 +789,179 @@ fn invalidate_settings() {
     }
 }
 
-// ── 摇杆（弹簧杆）交互 ───────────────────────────────────
-//
-// 所有数值滑杆改造成"摇杆"：杆永远居中（不含绝对值），真实数值只在右侧值框
-// 显示。拖动 = 在当前值基础上做增量，增量大小随推杆偏移（"力"）随时间累加，
-// 并带弹簧-阻尼物理：松手后杆以阻尼弹簧回到中心，改动值保留。
-//
-// 弹簧积分用固定步长（16ms 定时器驱动），数值累加只在拖动阶段生效，回中阶段
-// 只动视觉不改值。空闲态 `ctx.fx = None`、定时器停用 → 零额外 CPU/GPU 开销。
+// ── 状态提示 / 动作辅助（报告 §6 action） ────────────────
 
-/// 弹簧-阻尼常数（临界阻尼附近，无可见振荡）。
-const FX_K: f32 = 150.0;
-const FX_C: f32 = 12.5;
-/// 固定物理步长（秒）。
-const FX_DT: f32 = 0.016;
-/// 摇杆数值推进 = 加速度模型（用户规格"类似加速度公式，上限 +10/s"）：
-/// - `FX_ACCEL`（单位/s²）：满偏 deflect=1 时的加速度。0→10/s 约 0.28s，
-///   小偏移加速度按比例缩小 → "轻推慢加速、快推迅速到位"的物理手感。
-/// - `FX_MAX_RATE`（单位/s）：推进速率上限（终端速度），钳制 ±10 单位/秒。
-const FX_ACCEL: f32 = 36.0;
-const FX_MAX_RATE: f32 = 10.0;
-/// 简单滑杆速度上限（单位/秒）：speed = deflect × SIMPLE_MAX_RATE。
-const SIMPLE_MAX_RATE: f32 = 5.0;
-
-/// 鼠标 x → 目标位移 [-1,1]（以轨道中心为 0）。
-fn slider_target_of(ctx: &SettingsCtx, idx: usize, pt: ContentPt) -> f32 {
-    let page = &ctx.pages[ctx.page];
-    let Some(w) = page.widgets.get(idx) else { return 0.0 };
-    let tr = track_rect(&w.rect, ctx.dpi);
-    let half = ((tr.right - tr.left).max(1) as f32) / 2.0;
-    let center = (tr.left + tr.right) as f32 / 2.0;
-    ((pt.0.x as f32 - center) / half).clamp(-1.0, 1.0)
+fn lang_of(ctx: &SettingsCtx) -> sysoverlay_core::types::Lang {
+    ctx.cfg().map(|c| c.lang).unwrap_or_else(global_lang)
 }
 
-/// 抓杆：摇杆从中心开始，简单滑杆从当前位置开始。
-fn slider_grab(ctx: &mut SettingsCtx, idx: usize, pt: ContentPt) {
-    let page = &ctx.pages[ctx.page];
-    let Some(w) = page.widgets.get(idx) else { return };
-    let Some(slider) = w.kind.as_any().downcast_ref::<widget::SliderWidget>() else { return };
-    let joystick = slider.joystick;
+/// 设置瞬态状态提示（2.5s 自动消失；WM_TIMER/STATUS_TIMER 清除）。
+fn set_status(ctx: &mut SettingsCtx, text: &str) {
+    ctx.status = Some((text.to_string(), Instant::now()));
+    unsafe { start_timer(find_hwnd(ctx), STATUS_TIMER, 2500) };
+    invalidate_settings();
+}
 
-    let deflect = if joystick {
-        slider_target_of(ctx, idx, pt)
-    } else {
-        let tr = track_rect(&w.rect, ctx.dpi);
-        let span = ((tr.right - tr.left).max(1) as f32).abs();
-        let frac = if span > 0.0 {
-            ((pt.0.x as f32 - tr.left as f32) / span).clamp(0.0, 1.0)
-        } else {
-            0.5
-        };
-        frac * 2.0 - 1.0
+/// 打开日志文件所在目录（报告 C-01：路径降级为动作）。
+/// probe.log 位于 `%LOCALAPPDATA%\SysOverlayC\`（见 probe.rs）。
+fn open_log_folder(ctx: &mut SettingsCtx) {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let Some(dir) = std::env::var_os("LOCALAPPDATA") else {
+        crate::probe::log("open_log_folder: no LOCALAPPDATA");
+        return;
     };
-
-    ctx.fx = Some(SliderFx {
-        widget: idx,
-        deflect,
-        vel: 0.0,
-        target: deflect,
-        releasing: false,
-        pos: 0.0,
-        speed: 0.0,
-        joystick,
-    });
-    unsafe { start_timer(find_hwnd(ctx), DRAG_TIMER, 16) };
-}
-
-/// 拖动中：更新目标位移（物理积分在定时器里跑）。
-fn slider_move(ctx: &mut SettingsCtx, idx: usize, pt: ContentPt) {
-    if ctx.fx.map_or(false, |f| f.widget == idx) {
-        let t = slider_target_of(ctx, idx, pt);
-        if let Some(fx) = ctx.fx.as_mut() {
-            fx.target = t;
-        }
+    use std::os::windows::ffi::OsStrExt;
+    let dir = std::path::PathBuf::from(dir).join("SysOverlayC");
+    let _ = std::fs::create_dir_all(&dir);
+    let dir_w: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let verb: Vec<u16> = "open\0".encode_utf16().collect();
+    unsafe {
+        let _ = ShellExecuteW(
+            find_hwnd(ctx),
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(dir_w.as_ptr()),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        );
     }
+    set_status(ctx, crate::i18n::t(lang_of(ctx), "StatusFolderOpened"));
 }
 
-/// 取消摇杆（翻页/进入编辑/捕获丢失）：提交当前值并清态、停表。
-fn slider_cancel(ctx: &mut SettingsCtx, hwnd: HWND) {
-    let keep = ctx.fx.take();
-    if keep.is_none() {
+/// 复制版本信息到剪贴板（报告 §6 COPY_VERSION）。
+fn copy_version_info(ctx: &mut SettingsCtx) {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
+    use windows::Win32::System::Ole::CF_UNICODETEXT;
+
+    let text = format!(
+        "SysOverlay {}\n硬件监控悬浮条",
+        env!("CARGO_PKG_VERSION")
+    );
+    let mut wide: Vec<u16> = text.encode_utf16().collect();
+    wide.push(0);
+    let bytes = wide.len() * 2;
+
+    unsafe {
+        if OpenClipboard(find_hwnd(ctx)).is_err() {
+            crate::probe::log("copy_version: OpenClipboard failed");
+            return;
+        }
+        let _ = EmptyClipboard();
+        if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, bytes) {
+            let dst = GlobalLock(hmem);
+            if !dst.is_null() {
+                std::ptr::copy_nonoverlapping(wide.as_ptr(), dst as *mut u16, wide.len());
+                let _ = GlobalUnlock(hmem);
+                // 成功交出所有权；失败则系统忽略
+                let _ = SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(hmem.0));
+            }
+        }
+        let _ = CloseClipboard();
+    }
+    set_status(ctx, crate::i18n::t(lang_of(ctx), "StatusCopied"));
+}
+
+// ── 键盘焦点链（报告 §7.1：自绘控件没有系统 Tab 链，必须自己实现） ──
+
+/// Tab 推进焦点（backwards = Shift+Tab）。
+fn focus_advance(ctx: &mut SettingsCtx, backwards: bool) {
+    let n = ctx.pages[ctx.page].widgets.len();
+    if n == 0 {
         return;
     }
-    unsafe { kill_timer(hwnd, DRAG_TIMER) };
-    if let Some(fx) = keep {
-        if let Some(w) = ctx.pages[ctx.page].widgets.get(fx.widget) {
-            if let Some(slider) = w.kind.as_any().downcast_ref::<widget::SliderWidget>() {
-                let v = match slider.cfg.get(&ctx.cfg().unwrap_or_default()) {
-                    Value::Num(x) => x,
-                    _ => slider.min as f64,
-                };
-                dispatch(ctx, Action::CommitValue(slider.cfg, v));
-            }
-        }
-    }
+    ctx.focus = Some(match (ctx.focus, backwards) {
+        (None, false) => 0,
+        (None, true) => n - 1,
+        (Some(i), false) => (i + 1) % n,
+        (Some(i), true) => (i + n - 1) % n,
+    });
 }
 
-/// 松手：摇杆进入回中阶段（视觉弹回，值保留）；简单滑杆立即提交值。
-fn slider_release(ctx: &mut SettingsCtx) {
-    if let Some(fx) = ctx.fx.as_mut() {
-        if fx.joystick {
-            fx.releasing = true;
-            fx.target = 0.0;
-        } else {
-            fx.releasing = true;
-            fx.target = fx.deflect;
-        }
+/// Space 触发焦点控件：复用点击路径（控件中心点）。
+fn activate_focused(ctx: &mut SettingsCtx) {
+    let Some(idx) = ctx.focus else { return };
+    if idx >= ctx.pages[ctx.page].widgets.len() {
+        ctx.focus = None;
+        return;
     }
+    let w = &ctx.pages[ctx.page].widgets[idx];
+    let pt = ContentPt(POINT { x: (w.rect.left + w.rect.right) / 2, y: (w.rect.top + w.rect.bottom) / 2 });
+    on_click_plain(ctx, idx, pt);
 }
 
-/// 物理步进 + 增量累加。返回是否仍需保持定时器（false = 收敛/简单滑杆松手停表）。
-fn slider_tick(ctx: &mut SettingsCtx) -> bool {
-    let Some(fx) = ctx.fx else { return false };
-    let (slider_cfg, smin, smax, sstep, joystick) = {
-        let page = &ctx.pages[ctx.page];
-        let Some(w) = page.widgets.get(fx.widget) else { ctx.fx = None; return false };
-        let Some(slider) = w.kind.as_any().downcast_ref::<widget::SliderWidget>() else {
-            ctx.fx = None;
-            return false;
+/// ← / →：滑杆 ±步进、步进器 ±1、分段左右切换（报告 §7.1 键盘可达性）。
+fn on_hkey(ctx: &mut SettingsCtx, forward: bool) {
+    let Some(idx) = ctx.focus else { return };
+    let Some(cfg) = ctx.cfg() else { return };
+    let page = &ctx.pages[ctx.page];
+    let Some(w) = page.widgets.get(idx) else { return };
+    let dir = if forward { 1.0 } else { -1.0 };
+    if let Some(sl) = w.kind.as_any().downcast_ref::<widget::SliderWidget>() {
+        let cur = match sl.cfg.get(&cfg) {
+            Value::Num(x) => x,
+            _ => return,
         };
-        (slider.cfg, slider.min, slider.max, slider.step, slider.joystick)
-    };
-    let cur = ctx.cfg();
-
-    let mut fx = fx;
-
-    if joystick {
-        let a = FX_K * (fx.target - fx.deflect) - FX_C * fx.vel;
-        fx.vel += a * FX_DT;
-        fx.deflect += fx.vel * FX_DT;
-        fx.deflect = fx.deflect.clamp(-1.0, 1.0);
-        if fx.releasing && fx.deflect.abs() < 0.002 && fx.vel.abs() < 0.03 {
-            let base = cur
-                .and_then(|c| match slider_cfg.get(&c) { Value::Num(x) => Some(x), _ => None })
-                .unwrap_or(smin as f64);
-            ctx.fx = None;
-            dispatch(ctx, Action::CommitValue(slider_cfg, base));
-            return false;
+        let nv = (cur + dir * sl.step as f64).clamp(sl.min as f64, sl.max as f64);
+        dispatch(ctx, Action::CommitValue(sl.cfg, nv));
+    } else if let Some(st) = w.kind.as_any().downcast_ref::<widget::StepperWidget>() {
+        let cur = match st.cfg.get(&cfg) {
+            Value::Num(x) => x,
+            _ => return,
+        };
+        let nv = (cur + dir * st.step).clamp(st.min, st.max);
+        dispatch(ctx, Action::CommitValue(st.cfg, nv));
+    } else if let Some(seg) = w.kind.as_any().downcast_ref::<widget::SegmentedWidget>() {
+        let n = seg.labels.len();
+        if n == 0 {
+            return;
         }
-        if !fx.releasing {
-            fx.speed += fx.deflect * FX_ACCEL * FX_DT;
-            fx.speed = fx.speed.clamp(-FX_MAX_RATE, FX_MAX_RATE);
-            fx.pos += fx.speed * FX_DT;
-            if let Some(cfg) = &cur {
-                if let Value::Num(base) = slider_cfg.get(cfg) {
-                    let v = base as f32 + fx.pos;
-                    let stepped = ((v / sstep).round() * sstep).clamp(smin, smax);
-                    if (stepped - base as f32).abs() > 1e-6 {
-                        dispatch(ctx, Action::LiveValue(slider_cfg, stepped as f64));
-                    }
-                }
-            }
-        }
-    } else {
-        fx.speed = fx.deflect * SIMPLE_MAX_RATE;
-        if fx.releasing {
-            ctx.fx = None;
-            if let Some(cfg) = &cur {
-                if let Value::Num(v) = slider_cfg.get(cfg) {
-                    dispatch(ctx, Action::CommitValue(slider_cfg, v));
-                }
-            }
-            return false;
-        }
-        if let Some(cfg) = &cur {
-            if let Value::Num(base) = slider_cfg.get(cfg) {
-                let v = base as f32 + fx.speed * FX_DT;
-                let stepped = ((v / sstep).round() * sstep).clamp(smin, smax);
-                if (stepped - base as f32).abs() > 1e-6 {
-                    dispatch(ctx, Action::LiveValue(slider_cfg, stepped as f64));
-                }
-            }
+        let cur = match seg.cfg.get(&cfg) {
+            Value::Select(i) => i,
+            Value::SelectOpt(o) => o.unwrap_or(0),
+            _ => return,
+        };
+        let ni = if forward { (cur + 1).min(n - 1) } else { cur.saturating_sub(1) };
+        if ni != cur {
+            dispatch(ctx, Action::Select(seg.cfg, ni));
         }
     }
+}
 
-    ctx.fx = Some(fx);
-    ctx.invalidate_widget(fx.widget);
-    unsafe { let _ = InvalidateRect(find_hwnd(ctx), None, false); }
-    true
+// ── 步进器长按连发（−/＋ 按住持续步进） ──────────────────
+
+/// 点位落在步进器的哪个按钮上：− = -1，＋ = +1，其余 0。
+fn stepper_dir(rect: &RECT, dpi: u32, pt: ContentPt) -> f64 {
+    let minus = widget::stepper_minus_rect(rect, dpi);
+    let plus = widget::stepper_plus_rect(rect, dpi);
+    if pt_in(&minus, pt.0) {
+        -1.0
+    } else if pt_in(&plus, pt.0) {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// 步进一次（经 dispatch 唯一写入口）。
+fn stepper_step(ctx: &mut SettingsCtx, idx: usize, dir: f64) {
+    let Some(cfg) = ctx.cfg() else { return };
+    let Some(w) = ctx.pages[ctx.page].widgets.get(idx) else { return };
+    let Some(st) = w.kind.as_any().downcast_ref::<widget::StepperWidget>() else { return };
+    let cur = match st.cfg.get(&cfg) {
+        Value::Num(x) => x,
+        _ => return,
+    };
+    let nv = (cur + dir * st.step).clamp(st.min, st.max);
+    dispatch(ctx, Action::CommitValue(st.cfg, nv));
 }
 
 /// 进入输入框编辑态。
 fn begin_edit(ctx: &mut SettingsCtx, idx: usize) {
-    slider_cancel(ctx, find_hwnd(ctx));
     let (val, orig) = if let Some(slider) = ctx.pages[ctx.page].widgets[idx]
         .kind
         .as_any()
@@ -868,6 +1011,49 @@ fn commit_edit(ctx: &mut SettingsCtx) {
 
 // ── 点击类控件 ───────────────────────────────────────────
 
+/// 系统颜色对话框（ChooseColorW）：色板「+」格的自定义取色。
+/// 模态期间置 MODAL_DIALOG 暂停自绘，防止模态消息循环重入争用 Gfx。
+/// 成功后写入所选颜色并同时关闭「自动色」。
+fn open_color_picker(ctx: &mut SettingsCtx, color_cfg: CfgRef, auto_cfg: Option<CfgRef>) {
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::UI::Controls::Dialogs::{
+        ChooseColorW, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW,
+    };
+
+    static CUST: std::sync::Mutex<[COLORREF; 16]> = std::sync::Mutex::new([COLORREF(0); 16]);
+
+    // 当前颜色作为对话框初值（跟随默认/自动时用白色）。
+    let cur = ctx.cfg().and_then(|c| match color_cfg.get(&c) {
+        Value::Color(Some(rgb)) => Some(rgb),
+        _ => None,
+    });
+
+    let Ok(mut cust) = CUST.lock() else { return };
+    let mut cc = CHOOSECOLORW::default();
+    cc.lStructSize = std::mem::size_of::<CHOOSECOLORW>() as u32;
+    cc.hwndOwner = find_hwnd(ctx);
+    cc.rgbResult = COLORREF(cur.map(|rgb| rgb.to_colorref()).unwrap_or(0x00FF_FFFF));
+    cc.lpCustColors = cust.as_mut_ptr();
+    cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+
+    MODAL_DIALOG.store(true, Ordering::SeqCst);
+    let ok = unsafe { ChooseColorW(&mut cc) }.as_bool();
+    MODAL_DIALOG.store(false, Ordering::SeqCst);
+    drop(cust);
+
+    if ok {
+        let rgb = sysoverlay_core::color::Rgb::from_colorref(cc.rgbResult.0);
+        apply_config(ctx, |c| {
+            let mut changed = false;
+            if let Some(r) = auto_cfg {
+                changed |= r.set(c, Value::Bool(false));
+            }
+            changed |= color_cfg.set(c, Value::Color(Some(rgb)));
+            changed
+        });
+    }
+}
+
 fn on_click_plain(ctx: &mut SettingsCtx, idx: usize, pt: ContentPt) {
     let w = &ctx.pages[ctx.page].widgets[idx];
     let Some(cfg) = ctx.cfg() else {
@@ -886,6 +1072,43 @@ fn on_click_plain(ctx: &mut SettingsCtx, idx: usize, pt: ContentPt) {
         dispatch(ctx, Action::Toggle(t.cfg));
         return;
     }
+    // 指标折叠头：点击整行 = 展开/收起（手风琴语义，报告 L03）。
+    if let Some(mh) = w.kind.as_any().downcast_ref::<widget::MetricHeaderWidget>() {
+        dispatch(ctx, Action::ToggleMetricExpand(mh.index));
+        return;
+    }
+    // 字号状态条：仅点击右侧「恢复跟随全局」按钮才恢复该指标字号。
+    if let Some(ms) = w.kind.as_any().downcast_ref::<widget::MetricFontStatusWidget>() {
+        let index = ms.index;
+        let lang = ms.lang;
+        let overridden = cfg.metric_font_sizes.get(index).copied().flatten().is_some();
+        if overridden {
+            let rect = w.rect;
+            let r = RectF::new(
+                rect.left as f32, rect.top as f32,
+                rect.right as f32, rect.bottom as f32,
+            );
+            if let Some(btn) = metric_font_status_restore_rect(
+                r, ctx.dpi, &mut ctx.gfx, true, lang, body_px(ctx.dpi),
+            ) {
+                let p = pt.0;
+                if p.x >= btn.l as i32 && p.x < btn.r as i32
+                    && p.y >= btn.t as i32 && p.y < btn.b as i32
+                {
+                    apply_config(ctx, |cfg| {
+                        if index < cfg.metric_font_sizes.len() {
+                            let changed = cfg.metric_font_sizes[index].is_some();
+                            cfg.metric_font_sizes[index] = None;
+                            changed
+                        } else {
+                            false
+                        }
+                    });
+                }
+            }
+        }
+        return;
+    }
     // Segmented
     if let Some(seg) = w.kind.as_any().downcast_ref::<widget::SegmentedWidget>() {
         let n = seg.labels.len();
@@ -896,17 +1119,16 @@ fn on_click_plain(ctx: &mut SettingsCtx, idx: usize, pt: ContentPt) {
         let i = (((pt.0.x - w.rect.left) / seg_w.max(1)) as usize).min(n - 1);
         let mut st = WidgetState::default();
         w.kind.sync(&cfg, &mut st);
-        if i != st.selected {
+        // `has_sel=false`（如显示位置处于「自由定位」）时 selected 退化成 0，
+        // 若仍用 `i != st.selected` 会令点击第 0 段被吞掉 → 选项无法选中。
+        if !st.has_sel || i != st.selected {
             dispatch(ctx, Action::Select(seg.cfg, i));
         }
         return;
     }
-    // Button：按动作派发（颜色/字号重置）
+    // Button：按动作派发（字号重置、日志目录、关于页动作）
     if let Some(btn) = w.kind.as_any().downcast_ref::<widget::ButtonWidget>() {
         match btn.action {
-            widget::ButtonAction::ResetColor(r) => {
-                apply_config(ctx, |cfg| r.set(cfg, Value::Color(None)));
-            }
             widget::ButtonAction::ResetAllColors => {
                 apply_config(ctx, |cfg| {
                     let mut changed = false;
@@ -923,16 +1145,18 @@ fn on_click_plain(ctx: &mut SettingsCtx, idx: usize, pt: ContentPt) {
                     changed
                 });
             }
-            widget::ButtonAction::ResetFont(i) => {
-                apply_config(ctx, |cfg| {
-                    if i < cfg.metric_font_sizes.len() {
-                        let changed = cfg.metric_font_sizes[i].is_some();
-                        cfg.metric_font_sizes[i] = None;
-                        changed
-                    } else {
-                        false
-                    }
-                });
+            widget::ButtonAction::ToggleMetricExpand(i) => {
+                dispatch(ctx, Action::ToggleMetricExpand(i));
+            }
+            widget::ButtonAction::OpenLogFolder => {
+                open_log_folder(ctx);
+            }
+            widget::ButtonAction::CheckUpdate => {
+                // 无更新服务：反馈「已是最新」（行为收敛于状态提示，不弹窗）。
+                set_status(ctx, crate::i18n::t(lang_of(ctx), "StatusUpToDate"));
+            }
+            widget::ButtonAction::CopyVersion => {
+                copy_version_info(ctx);
             }
         }
         return;
@@ -954,30 +1178,85 @@ fn on_click_plain(ctx: &mut SettingsCtx, idx: usize, pt: ContentPt) {
         }
         return;
     }
-    // MetricSwatches
+    // MetricSwatches（8 预设色 [+ 自动色 A] + 跟随默认 ≈ + 自定义 +）
     if let Some(ms) = w.kind.as_any().downcast_ref::<widget::MetricSwatchesWidget>() {
-        let wd = (w.rect.right - w.rect.left) / SW_N as i32;
-        let i = (((pt.0.x - w.rect.left) / wd.max(1)) as usize).min(SW_N - 1);
+        let auto = ms.auto_cfg.is_some();
+        let color_cfg = ms.cfg;
+        let auto_cfg = ms.auto_cfg;
+        let n = sw_n(auto);
+        let wd = (w.rect.right - w.rect.left) / n as i32;
+        let i = (((pt.0.x - w.rect.left) / wd.max(1)) as usize).min(n - 1);
+        let follow_i = sw_follow(auto);
+        let custom_i = sw_custom(auto);
+
+        // 自定义取色：打开系统颜色对话框（ChooseColorW）。
+        if i == custom_i {
+            open_color_picker(ctx, color_cfg, auto_cfg);
+            return;
+        }
+
+        let auto_on = auto_cfg
+            .map(|r| matches!(r.get(&cfg), Value::Bool(true)))
+            .unwrap_or(false);
+
+        // 自动色 A 格：开启占用率分档变色。
+        if auto && i == widget::SW_AUTO {
+            if let Some(r) = auto_cfg {
+                apply_config(ctx, |c| r.set(c, Value::Bool(true)));
+            }
+            return;
+        }
+
         let mut st = WidgetState::default();
         w.kind.sync(&cfg, &mut st);
         let follow = st.value_f > 0.5;
-        crate::probe::log(&format!(
-            "swatch click wrect=({},{},{},{}) i={} SW_N={} selected={} follow={}",
-            w.rect.left, w.rect.top, w.rect.right, w.rect.bottom, i, SW_N, st.selected, follow
-        ));
-        // ⚠️ 修复（2026-09-09）：旧逻辑 `if i == SW_FOLLOW || follow { None }` 在
-        // 当前为"跟随默认"(follow=true) 时，点**任意**色块都写成 None → 颜色永远
-        // 切不过去（探针实证：apply_config ok 但渲染侧 metric_colors 恒为 None）。
-        // 正确语义：只有点"跟随默认"格(≈)才写 None；点普通色块永远写所选颜色。
-        if i != st.selected || !(i == SW_FOLLOW && follow) {
-            let color = if i == SW_FOLLOW {
+        // 正确语义：点「跟随默认」写 None；点普通色块写所选颜色；
+        // 自动色开启时点颜色/跟随需同时关掉 auto。
+        if i != st.selected || auto_on || !(i == follow_i && follow) {
+            let color = if i == follow_i {
                 None
             } else {
                 let (r, g, b) = widget::METRIC_SWATCHES[i];
                 Some(sysoverlay_core::color::Rgb::new(r, g, b))
             };
-            let r = ms.cfg;
-            apply_config(ctx, |cfg| r.set(cfg, Value::Color(color)));
+            apply_config(ctx, |c| {
+                let mut changed = false;
+                if auto_on {
+                    if let Some(r) = auto_cfg {
+                        changed |= r.set(c, Value::Bool(false));
+                    }
+                }
+                changed |= color_cfg.set(c, Value::Color(color));
+                changed
+            });
+        }
+        return;
+    }
+    // Disclosure（折叠箭头，G3）
+    if let Some(d) = w.kind.as_any().downcast_ref::<widget::DisclosureWidget>() {
+        if let widget::ButtonAction::ToggleMetricExpand(i) = d.action {
+            dispatch(ctx, Action::ToggleMetricExpand(i));
+        }
+        return;
+    }
+    // Stepper（− / 值 / ＋，报告 §4）：按左三分之一减、右三分之一加。
+    if let Some(st) = w.kind.as_any().downcast_ref::<widget::StepperWidget>() {
+        let minus = widget::stepper_minus_rect(&w.rect, ctx.dpi);
+        let plus = widget::stepper_plus_rect(&w.rect, ctx.dpi);
+        let dir: f64 = if pt_in(&minus, pt.0) {
+            -1.0
+        } else if pt_in(&plus, pt.0) {
+            1.0
+        } else {
+            0.0
+        };
+        if dir != 0.0 {
+            let cur = match st.cfg.get(&cfg) {
+                Value::Num(x) => x,
+                _ => 0.0,
+            };
+            let nv = (cur + dir * st.step).clamp(st.min, st.max);
+            dispatch(ctx, Action::CommitValue(st.cfg, nv));
         }
         return;
     }
@@ -1048,11 +1327,72 @@ unsafe extern "system" fn settings_wndproc(
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
+        WM_GETMINMAXINFO => {
+            // resize 钳制：客户区最小/最大尺寸（经 DPI 缩放）。
+            let mm = lparam.0 as *mut MINMAXINFO;
+            if !mm.is_null() {
+                let d = crate::dpi::get_system_dpi();
+                (*mm).ptMinTrackSize.x = s(d, MIN_W);
+                (*mm).ptMinTrackSize.y = s(d, MIN_H);
+                (*mm).ptMaxTrackSize.x = s(d, MAX_W);
+                (*mm).ptMaxTrackSize.y = s(d, MAX_H);
+            }
+            LRESULT(0)
+        }
+        WM_SIZE => {
+            // 记录客户区尺寸：内容区宽度、滚动钳制、尺寸落盘都以它为准。
+            if let Some(ctx) = ctx_of(hwnd) {
+                ctx.client_size = ((lparam.0 & 0xFFFF) as i32, ((lparam.0 >> 16) & 0xFFFF) as i32);
+                ctx.rebuild_pages();
+            }
+            LRESULT(0)
+        }
+        WM_EXITSIZEMOVE => {
+            // 拖动结束：把最终客户区尺寸落盘（物理像素）。
+            if let Some(ctx) = ctx_of(hwnd) {
+                let (w, h) = ctx.client_size;
+                window::modify_config(ctx.overlay, |c| c.settings_size = (w, h));
+                if let Some(c) = ctx.cfg() {
+                    let _ = config_io::save_config(&c);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            // 仅当光标位于内容区时滚动（侧边栏不接受滚轮）。
+            // H4：越界用橡胶位移（可再挪一点后回弹），并记录速度供惯性吸附。
+            if let Some(ctx) = ctx_of(hwnd) {
+                let mut sc = POINT {
+                    x: (lparam.0 & 0xFFFF) as i16 as i32,
+                    y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+                };
+                let _ = ScreenToClient(hwnd, &mut sc);
+                let mut cr = RECT::default();
+                let _ = GetClientRect(hwnd, &mut cr);
+                if in_content(ctx.dpi, cr.right - cr.left, ClientPt(sc)) {
+                    let raw = ((wparam.0 >> 16) & 0xFFFF) as i16 as i32;
+                    let d = ctx.dpi;
+                    let (_, vp_h) = content_viewport(d, ctx.client_size.0, ctx.client_size.1);
+                    let max = (ctx.pages[ctx.page].h - vp_h).max(0);
+                    let delta_px = raw / 120 * s(d, 48);
+                    let nv = ctx.pages[ctx.page].scroll_y - delta_px;
+                    ctx.pages[ctx.page].scroll_y = if nv < 0 {
+                        -motion::rubber_band((-nv) as f32, vp_h as f32, 0.55) as i32
+                    } else if nv > max {
+                        max + motion::rubber_band((nv - max) as f32, vp_h as f32, 0.55) as i32
+                    } else {
+                        nv
+                    };
+                    // 惯性速度（px/s），供帧内动量投射。
+                    ctx.scroll_vel = -(raw as f32) / 120.0 * s(d, 48) as f32 * 12.0;
+                    ctx.scroll_spring.set(ctx.pages[ctx.page].scroll_y as f32);
+                    invalidate_settings();
+                }
+            }
+            LRESULT(0)
+        }
         WM_NCHITTEST => {
-            // lparam 是**屏幕**坐标，必须转成客户区坐标再与标题栏矩形比较
-            // （参考 graph.rs / proc_list.rs：二者都先 ScreenToClient 再测命中）。
-            // 之前直接用屏幕坐标当客户坐标，只有窗口贴屏幕顶边(y≈0)时才命中，
-            // 其余位置判定失败 → 标题栏无法拖动。
+            // lparam 是**屏幕**坐标，先转客户区坐标（参考 graph.rs / proc_list.rs）。
             let mut sc = POINT {
                 x: (lparam.0 & 0xFFFF) as i16 as i32,
                 y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
@@ -1060,16 +1400,30 @@ unsafe extern "system" fn settings_wndproc(
             let _ = ScreenToClient(hwnd, &mut sc);
             let pt = ClientPt(sc);
             let d = crate::dpi::get_system_dpi();
+            let mut r = RECT::default();
+            let _ = GetClientRect(hwnd, &mut r);
+            let (cw, ch) = (r.right - r.left, r.bottom - r.top);
+            // (a) 边框热区：WS_THICKFRAME 原生 resize（先判角，再判边）。
+            let b = s(d, 6);
+            let (on_l, on_r) = (pt.0.x < b, pt.0.x >= cw - b);
+            let (on_t, on_b) = (pt.0.y < b, pt.0.y >= ch - b);
+            if on_t && on_l { return LRESULT(HTTOPLEFT as isize); }
+            if on_t && on_r { return LRESULT(HTTOPRIGHT as isize); }
+            if on_b && on_l { return LRESULT(HTBOTTOMLEFT as isize); }
+            if on_b && on_r { return LRESULT(HTBOTTOMRIGHT as isize); }
+            if on_t { return LRESULT(HTTOP as isize); }
+            if on_b { return LRESULT(HTBOTTOM as isize); }
+            if on_l { return LRESULT(HTLEFT as isize); }
+            if on_r { return LRESULT(HTRIGHT as isize); }
+            // (b) 标题栏：按钮区 HTCLIENT（收鼠标消息），空白 HTCAPTION（拖动）。
             if titlebar::in_title_bar(d, pt.0) {
-                let mut r = RECT::default();
-                let _ = GetClientRect(hwnd, &mut r);
                 if ctx_of(hwnd).map(|c| c.tb.pinned).unwrap_or(false) {
-                    if titlebar::hit_button(d, r.right - r.left, pt.0, true).is_some() {
+                    if titlebar::hit_button(d, cw, pt.0, true).is_some() {
                         return LRESULT(HTCLIENT as isize);
                     }
                     return LRESULT(HTTRANSPARENT as isize);
                 }
-                if titlebar::hit_button(d, r.right - r.left, pt.0, false).is_some() {
+                if titlebar::hit_button(d, cw, pt.0, false).is_some() {
                     return LRESULT(HTCLIENT as isize);
                 }
                 return LRESULT(HTCAPTION as isize);
@@ -1082,10 +1436,32 @@ unsafe extern "system" fn settings_wndproc(
                 y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
             });
             if let Some(ctx) = ctx_of(hwnd) {
-                let cpt = pt.to_content(ctx.dpi);
-                // 拖动中：更新滑杆值
+                let cpt = pt.to_content(ctx.dpi, ctx.pages[ctx.page].scroll_y);
+                // 侧边栏悬停态（用于导航项高亮）
+                ctx.nav_hover = if pt.0.x < s(ctx.dpi, SIDEBAR_W) as i32 {
+                    sidebar_at(ctx.dpi, pt)
+                } else {
+                    None
+                };
+                // 拖动中：按当前 x 绝对落值（不再累积、不再看 origin）
                 if let Interaction::Dragging { widget: idx, .. } = &ctx.interaction {
-                    slider_move(ctx, *idx, cpt);
+                    let idx = *idx;
+                    if let Some(s) = ctx.pages[ctx.page].widgets[idx]
+                        .kind
+                        .as_any()
+                        .downcast_ref::<widget::SliderWidget>()
+                    {
+                        let r = ctx.pages[ctx.page].widgets[idx].rect;
+                        let tr = widget::track_rect(&r, ctx.dpi);
+                        let new = widget::slider_value_from_x(
+                            cpt.0.x as f32,
+                            RectF::from_win32(tr),
+                            s.min as f64,
+                            s.max as f64,
+                            s.step as f64,
+                        );
+                        dispatch(ctx, Action::LiveValue(s.cfg, new));
+                    }
                     let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
                 }
@@ -1145,6 +1521,10 @@ unsafe extern "system" fn settings_wndproc(
                 ctx.tracking = false;
                 ctx.tb.over = false;
                 ctx.tb.hover = None;
+                ctx.nav_hover = None;
+                // 光标离窗：步进器长按连发停止。
+                ctx.stepper_hold = None;
+                kill_timer(hwnd, STEPPER_TIMER);
                 if let Interaction::Hover { widget } = &ctx.interaction {
                     ctx.invalidate_widget(*widget);
                     ctx.interaction = Interaction::Idle;
@@ -1160,7 +1540,10 @@ unsafe extern "system" fn settings_wndproc(
             });
             crate::probe::log(&format!("WM_LBUTTONDOWN pt=({},{})", pt.0.x, pt.0.y));
             let Some(ctx) = ctx_of(hwnd) else { return LRESULT(0) };
-            let cpt = pt.to_content(ctx.dpi);
+            let cpt = pt.to_content(ctx.dpi, ctx.pages[ctx.page].scroll_y);
+            // 鼠标输入 → 退出键盘模式（焦点环仅键盘导航时出现，报告 §7.1）。
+            ctx.keyboard_mode = false;
+            ctx.focus = widget_at(ctx, cpt);
 
             // 正在编辑而点击的不是同一值框 → 提交并退出编辑
             if ctx.is_editing() {
@@ -1189,7 +1572,7 @@ unsafe extern "system" fn settings_wndproc(
                 }
             }
             // 2) 导航
-            if let Some(page) = nav_at(ctx, pt) {
+            if let Some(page) = sidebar_at(ctx.dpi, pt) {
                 dispatch(ctx, Action::SetPage(page));
                 let _ = InvalidateRect(hwnd, None, false);
                 return LRESULT(0);
@@ -1197,7 +1580,7 @@ unsafe extern "system" fn settings_wndproc(
             // 3) 控件（内容坐标）
             if let Some(idx) = widget_at(ctx, cpt) {
                 if ctx.cfg().is_some() {
-                    // 滑杆：值框内 → 编辑；否则拖动
+                    // 滑杆：值框内 → 编辑；否则按下即跳值 + 进入拖动
                     let is_slider = ctx.pages[ctx.page].widgets[idx]
                         .kind
                         .as_any()
@@ -1212,16 +1595,51 @@ unsafe extern "system" fn settings_wndproc(
                             let _ = InvalidateRect(hwnd, None, false);
                             return LRESULT(0);
                         }
-                        // 摇杆：任意命中轨道即从中心抓杆（增量式弹簧）。
-                        slider_cancel(ctx, hwnd);
+                        // 按下即跳值 + 进入拖动（Apple「按下即反馈」）
+                        let s = ctx.pages[ctx.page].widgets[idx]
+                            .kind
+                            .as_any()
+                            .downcast_ref::<widget::SliderWidget>()
+                            .unwrap();
+                        let r = ctx.pages[ctx.page].widgets[idx].rect;
+                        let tr = widget::track_rect(&r, ctx.dpi);
+                        let new = widget::slider_value_from_x(
+                            cpt.0.x as f32,
+                            RectF::from_win32(tr),
+                            s.min as f64,
+                            s.max as f64,
+                            s.step as f64,
+                        );
+                        dispatch(ctx, Action::LiveValue(s.cfg, new));
                         ctx.interaction = Interaction::Dragging { widget: idx, origin: cpt.0 };
                         let _ = SetCapture(hwnd);
-                        slider_grab(ctx, idx, cpt);
                         ctx.invalidate_widget(idx);
                         let _ = InvalidateRect(hwnd, None, false);
                         return LRESULT(0);
                     }
-                    on_click_plain(ctx, idx, cpt);
+                    // 步进器：按下即 ±1 并进入长按连发（350ms 首延迟 → 60ms/步）；
+                    // 抬起 / 失去捕获 / 离开窗口即停。UP 路径对持握中的步进器不再重复触发。
+                    let step_dir = {
+                        let w = &ctx.pages[ctx.page].widgets[idx];
+                        if w.kind.as_any().is::<widget::StepperWidget>() {
+                            stepper_dir(&w.rect, d, cpt)
+                        } else {
+                            0.0
+                        }
+                    };
+                    if step_dir != 0.0 {
+                        stepper_step(ctx, idx, step_dir);
+                        ctx.stepper_hold = Some((idx, step_dir));
+                        ctx.interaction = Interaction::Pressing { widget: idx };
+                        let _ = SetCapture(hwnd);
+                        start_timer(hwnd, STEPPER_TIMER, 350);
+                        ctx.invalidate_widget(idx);
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
+                    // H2：按下即进入 Pressing（视觉反馈），抬起且仍命中才触发动作。
+                    ctx.interaction = Interaction::Pressing { widget: idx };
+                    let _ = SetCapture(hwnd);
                     ctx.invalidate_widget(idx);
                     let _ = InvalidateRect(hwnd, None, false);
                 } else {
@@ -1231,7 +1649,7 @@ unsafe extern "system" fn settings_wndproc(
                 // 未命中任何控件：记录坐标，用于验证「绘制坐标 vs 命中坐标」是否同一系。
                 crate::probe::log(&format!(
                     "click MISS client=({},{}) content=({},{}) content_top={}",
-                    pt.0.x, pt.0.y, cpt.0.x, cpt.0.y, content_top_y(ctx.dpi)
+                    pt.0.x, pt.0.y, cpt.0.x, cpt.0.y, content_origin(ctx.dpi, ctx.pages[ctx.page].scroll_y).1
                 ));
             }
             LRESULT(0)
@@ -1240,11 +1658,41 @@ unsafe extern "system" fn settings_wndproc(
             if let Some(ctx) = ctx_of(hwnd) {
                 if let Interaction::Dragging { widget, .. } = &ctx.interaction {
                     let idx = *widget;
+                    // 松手 → 提交当前内存值（落盘）
+                    if let Some(s) = ctx.pages[ctx.page].widgets[idx]
+                        .kind
+                        .as_any()
+                        .downcast_ref::<widget::SliderWidget>()
+                    {
+                        if let Some(cfg) = ctx.cfg() {
+                            if let Value::Num(n) = s.cfg.get(&cfg) {
+                                dispatch(ctx, Action::CommitValue(s.cfg, n));
+                            }
+                        }
+                    }
                     ctx.invalidate_widget(idx);
                     ctx.interaction = Interaction::Idle;
-                    // 松手 → 弹簧回中（DRAG_TIMER 继续驱动），收敛后自动提交。
-                    slider_release(ctx);
                     let _ = ReleaseCapture();
+                    let _ = InvalidateRect(hwnd, None, false);
+                } else if let Interaction::Pressing { widget } = &ctx.interaction {
+                    // H2：抬起时若仍命中同一控件 → 执行动作；否则仅回弹。
+                    // 步进器在按下时已触发（且长按连发），UP 不再重复。
+                    let idx = *widget;
+                    let held = ctx.stepper_hold.map(|(i, _)| i) == Some(idx);
+                    ctx.stepper_hold = None;
+                    kill_timer(hwnd, STEPPER_TIMER);
+                    let pt = ClientPt(POINT {
+                        x: (lparam.0 & 0xFFFF) as i16 as i32,
+                        y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+                    });
+                    let cpt = pt.to_content(ctx.dpi, ctx.pages[ctx.page].scroll_y);
+                    let still = widget_at(ctx, cpt) == Some(idx);
+                    ctx.interaction = Interaction::Idle;
+                    let _ = ReleaseCapture();
+                    if still && !held {
+                        on_click_plain(ctx, idx, cpt);
+                    }
+                    ctx.invalidate_widget(idx);
                     let _ = InvalidateRect(hwnd, None, false);
                 }
             }
@@ -1252,28 +1700,21 @@ unsafe extern "system" fn settings_wndproc(
         }
         WM_CAPTURECHANGED => {
             if let Some(ctx) = ctx_of(hwnd) {
-                if let Interaction::Dragging { .. } = ctx.interaction {
+                // 捕获丢失（被系统打断）：长按连发一并停止。
+                ctx.stepper_hold = None;
+                kill_timer(hwnd, STEPPER_TIMER);
+                if matches!(ctx.interaction, Interaction::Dragging { .. } | Interaction::Pressing { .. }) {
                     ctx.interaction = Interaction::Idle;
-                    slider_cancel(ctx, hwnd);
                 }
             }
             LRESULT(0)
         }
         WM_TIMER => {
-            if wparam.0 as usize == PAGE_TIMER {
-                if let Some(ctx) = ctx_of(hwnd) {
-                    if let Some(anim) = &ctx.page_anim {
-                        let dur_ms = ctx.cfg().map(|c| c.anim_ms).unwrap_or(300).max(1) as f32;
-                        if anim.t0.elapsed().as_secs_f32() * 1000.0 / dur_ms >= 1.0 {
-                            ctx.page_anim = None;
-                            kill_timer(hwnd, PAGE_TIMER);
-                        }
-                    }
-                }
-                // ⚠️ 每帧必须主动失效重绘：此前只更新状态不 InvalidateRect，
-                // 动画只画第一帧中间态就永久停格（半透明+偏移帧）——
-                // 用户视角即「点一下导航整个界面卡死」（2026-09-09 实证）。
-                let _ = InvalidateRect(hwnd, None, false);
+            if wparam.0 as usize == ANIM_TIMER {
+                // 动画主时钟：绕过 WM_PAINT 队列直接绘制（WM_PAINT 是最低优先级
+                // 消息，鼠标移动会无限推迟它 → 动画帧饿死，这是卡顿根源）。
+                // 本帧是否续表由 paint_d2d 帧末决定（收敛即 kill + 恢复时钟精度）。
+                paint_d2d(hwnd);
             } else if wparam.0 as usize == EDIT_TIMER {
                 if let Some(ctx) = ctx_of(hwnd) {
                     let need = ctx.edit.as_mut().map(|e| { e.caret = !e.caret; true }).unwrap_or(false);
@@ -1287,24 +1728,78 @@ unsafe extern "system" fn settings_wndproc(
                     }
                 }
                 let _ = InvalidateRect(hwnd, None, false);
-            } else if wparam.0 as usize == DRAG_TIMER {
+            } else if wparam.0 as usize == STATUS_TIMER {
+                // 状态提示到期清除。
                 if let Some(ctx) = ctx_of(hwnd) {
-                    if !slider_tick(ctx) {
-                        kill_timer(hwnd, DRAG_TIMER);
+                    ctx.status = None;
+                }
+                kill_timer(hwnd, STATUS_TIMER);
+                let _ = InvalidateRect(hwnd, None, false);
+            } else if wparam.0 as usize == STEPPER_TIMER {
+                // 步进器长按连发：仍在按住同一控件则步进并续期，否则停止。
+                if let Some(ctx) = ctx_of(hwnd) {
+                    let holding = match (&ctx.interaction, ctx.stepper_hold) {
+                        (Interaction::Pressing { widget }, Some((hi, _))) => *widget == hi,
+                        _ => false,
+                    };
+                    if holding {
+                        let (idx, dir) = ctx.stepper_hold.unwrap();
+                        stepper_step(ctx, idx, dir);
+                        start_timer(hwnd, STEPPER_TIMER, STEPPER_REPEAT_MS);
+                    } else {
+                        ctx.stepper_hold = None;
+                        kill_timer(hwnd, STEPPER_TIMER);
                     }
                 }
+                let _ = InvalidateRect(hwnd, None, false);
             }
             LRESULT(0)
         }
         WM_KEYDOWN => {
             if let Some(ctx) = ctx_of(hwnd) {
-                if ctx.is_editing() && wparam.0 as u32 == 0x1B {
-                    if let Some(idx) = ctx.active_widget() {
-                        ctx.invalidate_widget(idx);
+                let vk = wparam.0 as u32;
+                // 键盘输入 → 进入键盘模式（焦点环仅此时绘制，报告 §7.1）。
+                if !ctx.is_editing() {
+                    ctx.keyboard_mode = true;
+                }
+                match vk {
+                    0x1B => {
+                        // ESC：退出编辑 / 清除焦点。
+                        if ctx.is_editing() {
+                            if let Some(idx) = ctx.active_widget() {
+                                ctx.invalidate_widget(idx);
+                            }
+                            ctx.interaction = Interaction::Idle;
+                            kill_timer(hwnd, EDIT_TIMER);
+                        }
+                        ctx.focus = None;
+                        let _ = InvalidateRect(hwnd, None, false);
                     }
-                    ctx.interaction = Interaction::Idle;
-                    kill_timer(hwnd, EDIT_TIMER);
-                    let _ = InvalidateRect(hwnd, None, false);
+                    0x09 => {
+                        // Tab：焦点链推进（Shift+Tab 反向）。
+                        if !ctx.is_editing() {
+                            let shift = unsafe {
+                                windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x10) < 0
+                            };
+                            focus_advance(ctx, shift);
+                            let _ = InvalidateRect(hwnd, None, false);
+                        }
+                    }
+                    0x20 => {
+                        // Space：触发焦点控件（开关切换 / 按钮点击）。
+                        if !ctx.is_editing() {
+                            activate_focused(ctx);
+                            let _ = InvalidateRect(hwnd, None, false);
+                        }
+                    }
+                    0x25 | 0x27 => {
+                        // ← / →：滑杆 ±步进、步进器 ±1、分段左右切换。
+                        if !ctx.is_editing() {
+                            on_hkey(ctx, vk == 0x27);
+                            let _ = InvalidateRect(hwnd, None, false);
+                        }
+                    }
+                    _ => {}
                 }
             }
             LRESULT(0)
@@ -1390,7 +1885,9 @@ unsafe extern "system" fn settings_wndproc(
         }
         WM_SETTINGCHANGE => {
             if let Some(ctx) = ctx_of(hwnd) {
-                ctx.theme = Theme::system();
+                // 跟随系统时跟随 OS 变化；强制浅/深色时保持用户选择。
+                let app = ctx.cfg().map(|c| c.appearance).unwrap_or_default();
+                ctx.theme = Theme::resolve(app);
                 apply_window_chrome(hwnd, ctx.theme.dark);
                 // 主题色在绘制时从 ctx.theme 读取，无需重建页面；重绘即可。
                 let _ = InvalidateRect(hwnd, None, false);
@@ -1398,9 +1895,8 @@ unsafe extern "system" fn settings_wndproc(
             LRESULT(0)
         }
         WM_CLOSE => {
-            // 隐藏前清理摇杆物理（停表）+ flush pending 改动（防抖未到期的最后一次变更不丢）
+            // 隐藏前 flush pending 改动（防抖未到期的最后一次变更不丢）
             if let Some(ctx) = ctx_of(hwnd) {
-                slider_cancel(ctx, hwnd);
                 if ctx.save.has_pending() {
                     flush_config(ctx.overlay);
                 }
@@ -1444,6 +1940,10 @@ fn c(_t: &Theme, v: u32) -> ColorF {
 
 /// 全量 D2D 绘制一帧。返回 false = D2D 链路不可用（下一帧自动重建重试）。
 fn paint_d2d(hwnd: HWND) -> bool {
+    // 模态对话框（系统取色）打开中：跳过自绘，防止消息循环重入争用 Gfx。
+    if MODAL_DIALOG.load(Ordering::SeqCst) {
+        return true;
+    }
     let t0 = std::time::Instant::now();
     let Some(ctx) = ctx_of(hwnd) else {
         crate::probe::log("paint_d2d: ctx_of failed");
@@ -1457,40 +1957,130 @@ fn paint_d2d(hwnd: HWND) -> bool {
         return true; // 无效尺寸：当成功处理（ValidateRect 由调用方完成）
     }
     let lang = ctx.cfg().map(|c| c.lang).unwrap_or_else(global_lang);
-    let title = crate::i18n::t(lang, "WinTitle");
     let theme = ctx.theme;
     let dpi = ctx.dpi;
-    let content_top = content_top_y(dpi);
-    let bg = c(&theme, theme.window_bg);
-    let (dx, alpha) = anim_params(ctx);
+
+    // 帧间 dt（上限 ~1/30s：帧被推迟时防弹簧大步跳格）。
+    let now = Instant::now();
+    let dt = (now - ctx.last_frame).as_secs_f32().clamp(0.0, 0.033);
+    ctx.last_frame = now;
+
+    // 布局类弹簧（折叠卡展开度 / 侧栏选中胶囊）：动则每帧重排；
+    // 收敛的那一帧再补一次（收起时要把已展开的内容行真正移除）。
+    let moving = step_layout_anims(ctx, dt);
+    if moving || ctx.layout_anim_active {
+        ctx.rebuild_pages();
+    }
+    ctx.layout_anim_active = moving;
+
+    // H4：滚动惯性——动量投射 → 行吸附 → 弹簧趋近（收敛即停）。
+    if ctx.scroll_vel.abs() > 1.0 {
+        let (_, vp_h) = content_viewport(dpi, ctx.client_size.0, ctx.client_size.1);
+        let page = &mut ctx.pages[ctx.page];
+        let max = (page.h - vp_h).max(0);
+        let projected = motion::project(ctx.scroll_vel);
+        let row = s(dpi, ROW_H) as f32;
+        let raw = (page.scroll_y as f32 + projected).clamp(0.0, max as f32);
+        let snapped = if row > 0.0 { (raw / row).round() * row } else { raw };
+        let target = snapped.clamp(0.0, max as f32);
+        let settled = ctx.scroll_spring.step(target, dt, motion::K_SHEET, motion::C_SHEET);
+        page.scroll_y = ctx.scroll_spring.x.round() as i32;
+        if settled {
+            ctx.scroll_vel = 0.0;
+        }
+    }
+
+    let (anim_dx, alpha) = anim_params(ctx, dt);
 
     // 字段级不相交借用：闭包只捕获 pages/交互快照，与 &mut ctx.gfx 无重叠。
     let pages = &ctx.pages;
     let page_idx = ctx.page;
+    let scroll_y = pages[page_idx].scroll_y;
     let interaction = ctx.interaction.clone();
     let edit = ctx.edit.clone();
     let cfg = ctx.cfg();
     let tb = &ctx.tb;
-    // 摇杆推杆位移：仅当前拖动/回中的滑杆非零，其余显示居中。
-    let slider_thumb = ctx.fx.map(|f| (f.widget, f.deflect, f.joystick));
+    let nav_hover = ctx.nav_hover;
+    let metric_expanded = &ctx.metric_expanded;
+    let transitions = &mut ctx.transitions;
+    let nav_t = ctx.nav_sel.x;
+    // 瞬态状态提示文案（窗口层绘制，不随内容滚动）。
+    let status_msg = ctx.status.as_ref().map(|(s, _)| s.clone());
+    // 置 true 表示本帧仍有未收敛的过渡弹簧 → 需再请求一帧。
+    let mut anim_active = false;
+
+    let (ox, oy) = content_origin(dpi, scroll_y);
+    let (vp_w, _vp_h) = content_viewport(dpi, win_w, win_h);
 
     let presented = ctx.gfx.frame(|rt, gfx| {
-        unsafe { rt.Clear(Some(&bg.d2d())) };
+        unsafe { rt.Clear(Some(&c(&theme, theme.window_bg).d2d())) };
         // 卡片均为不透明填充 → 全程 ClearType（与旧 GDI quality=5 一致）
         gfx.set_text_aa(rt, true);
 
-        paint_titlebar(rt, gfx, &theme, dpi, win_w, tb, &title);
-        paint_nav(rt, gfx, &theme, dpi, lang, win_w, page_idx);
-
-        // 内容区（翻页动画：水平滑入 + 淡入）
-        let bounds = RectF::new(0.0, content_top as f32, win_w as f32, win_h as f32);
+        let bounds = RectF::new(0.0, 0.0, win_w as f32, win_h as f32);
         let faded = if alpha < 1.0 { gfx.push_fade(rt, bounds, alpha) } else { false };
-        gfx.set_translate(rt, dx, 0.0);
-        paint_page(
-            rt, gfx, pages, page_idx, &interaction, edit.as_ref(), cfg.as_ref(), &theme, dpi, dx,
-            body_px(dpi), small_px(dpi), slider_thumb,
+
+        // 侧边栏（固定在左侧，不随内容滚动）
+        paint_sidebar(rt, gfx, &theme, dpi, win_h, lang, page_idx, nav_hover, nav_t);
+
+        // 内容区（翻页动画：水平滑入）。先裁到视口，再平移绘制。
+        let clip = RectF::new(ox as f32, 0.0, (ox + vp_w) as f32, win_h as f32);
+        unsafe {
+            let _ = rt.PushAxisAlignedClip(
+                &clip.d2d(),
+                windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            );
+        }
+        gfx.fill_rect(rt, clip, c(&theme, theme.content_bg));
+        gfx.set_translate(rt, anim_dx, 0.0);
+        anim_active = paint_page(
+            rt,
+            gfx,
+            pages,
+            page_idx,
+            &interaction,
+            edit.as_ref(),
+            cfg.as_ref(),
+            &theme,
+            dpi,
+            ox as f32,
+            oy as f32,
+            body_px(dpi),
+            caption_px(dpi),
+            metric_expanded,
+            transitions,
+            dt,
+            ctx.focus,
+            ctx.keyboard_mode,
         );
         gfx.reset_transform(rt);
+        unsafe { rt.PopAxisAlignedClip() };
+
+        // 滚动条（内容溢出时淡入，浮于内容之上）
+        paint_scrollbar(rt, gfx, &theme, dpi, win_w, win_h, scroll_y, pages[page_idx].h);
+        // 窗口控制按钮（右上角，浮于内容区之上，不占布局高度）
+        paint_window_controls(rt, gfx, &theme, dpi, win_w, tb);
+
+        // 瞬态状态提示：右下角小胶囊（先量宽再画底；卡片底色 + 描边 + 正文色）。
+        if let Some(msg) = &status_msg {
+            let px = caption_px(dpi);
+            if let Some((tw, _th)) = gfx.measure_text(msg, px, 400) {
+                let pad = s(dpi, 12) as f32;
+                let h = s(dpi, 26) as f32;
+                let w = tw + 2.0 * pad;
+                let margin = s(dpi, 14) as f32;
+                let r = RectF::new(
+                    win_w as f32 - margin - w,
+                    win_h as f32 - margin - h,
+                    win_w as f32 - margin,
+                    win_h as f32 - margin,
+                );
+                gfx.fill_round(rt, r, h / 2.0, c(&theme, theme.card));
+                gfx.stroke_round(rt, r, h / 2.0, c(&theme, theme.card_stroke), 1.0);
+                gfx.text(rt, msg, px, 400, HAlign::Center, r, c(&theme, theme.label), true);
+            }
+        }
+
         if faded {
             gfx.pop_fade(rt);
         }
@@ -1498,12 +2088,30 @@ fn paint_d2d(hwnd: HWND) -> bool {
     // 帧探针：每 64 帧采样一次耗时（避免日志风暴）；失败帧每次都打（低频且关键）。
     static PAINT_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = PAINT_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // H2/H3/H4：仍有未收敛动画 → 维持 ANIM_TIMER(16ms) 主时钟直画下一帧。
+    // 动画期间提升系统时钟精度到 1ms（SetTimer 粒度默认 15.6ms，不提升则
+    // 16ms 表实际抖到 ~31ms）；收敛即停表并恢复，防引用计数泄漏与空转烧 CPU。
+    let animating = presented
+        && (anim_active || moving || ctx.page_anim.is_some() || ctx.scroll_vel.abs() > 1.0);
+    if animating && !ctx.hires {
+        unsafe {
+            windows::Win32::Media::timeBeginPeriod(1);
+            start_timer(hwnd, ANIM_TIMER, 16);
+        }
+        ctx.hires = true;
+    } else if !animating && ctx.hires {
+        unsafe {
+            kill_timer(hwnd, ANIM_TIMER);
+            windows::Win32::Media::timeEndPeriod(1);
+        }
+        ctx.hires = false;
+    }
     if presented {
         if n % 64 == 0 {
             crate::probe::log_lazy(|| {
                 format!(
                     "settings paint frame#{} {}x{} page={} dx={:.1} alpha={:.2} us={}",
-                    n, win_w, win_h, page_idx, dx, alpha,
+                    n, win_w, win_h, page_idx, anim_dx, alpha,
                     t0.elapsed().as_micros()
                 )
             });
@@ -1513,7 +2121,7 @@ fn paint_d2d(hwnd: HWND) -> bool {
         crate::probe::log_lazy(|| {
             format!(
                 "settings paint FAILED frame#{} page={} dx={:.1} alpha={:.2}",
-                n, page_idx, dx, alpha
+                n, page_idx, anim_dx, alpha
             )
         });
     }
@@ -1525,30 +2133,15 @@ fn global_lang() -> sysoverlay_core::types::Lang {
     if crate::i18n::global_lang() == Lang::Zh { Lang::Zh } else { Lang::En }
 }
 
-fn paint_titlebar(
+fn paint_window_controls(
     rt: &windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget,
     gfx: &mut Gfx,
     t: &Theme,
     dpi: u32,
     win_w: i32,
     tb: &TitleBarState,
-    title: &str,
 ) {
-    let h = s(dpi, crate::titlebar::TB_H) as f32;
-    // 底层：与卡片同色 + 底部分隔线
-    gfx.fill_rect(rt, RectF::new(0.0, 0.0, win_w as f32, h), c(t, t.card));
-    gfx.line(rt, 0.0, h - 1.0, win_w as f32, h - 1.0, c(t, t.card_stroke), 1.0);
-    // 标题（左侧）
-    if !title.is_empty() {
-        let tx = RectF::new(
-            s(dpi, titlebar::CAPTION_PAD_L) as f32,
-            0.0,
-            (win_w - s(dpi, 200)) as f32,
-            h,
-        );
-        gfx.text(rt, title, small_px(dpi), 400, HAlign::Leading, tx, c(t, t.label), true);
-    }
-    // 按钮
+    // 按钮（仅右上角；标题已移入侧边栏，此处不画顶栏底色）
     if tb.pinned {
         if tb.over {
             if let Some((b, r)) = titlebar::btn_rects(dpi, win_w, true).into_iter().next() {
@@ -1569,22 +2162,14 @@ fn paint_titlebar(
             let m = s(dpi, 3) as f32;
             match b {
                 TitleBtn::Pin => {
-                    let d = s(dpi, 4) as f32;
-                    let dot_top = r.top as f32 + m - d / 2.0 + s(dpi, 1) as f32;
-                    gfx.fill_ellipse(
+                    // 用户提供的「固定」图钉 SVG（icons.rs 内嵌路径）。
+                    let sz = (r.bottom - r.top) as f32 - 2.0 * m;
+                    icons::draw(
                         rt,
-                        RectF::new(cx - d / 2.0, dot_top, cx + d / 2.0, dot_top + d),
+                        gfx,
+                        icons::IconKind::Pin,
+                        RectF::new(cx - sz / 2.0, cy - sz / 2.0, cx + sz / 2.0, cy + sz / 2.0),
                         c(t, t.label),
-                    );
-                    gfx.line(rt, cx, r.top as f32 + m + s(dpi, 2) as f32, cx, r.bottom as f32 - m, c(t, t.label), 1.0);
-                    gfx.line(
-                        rt,
-                        cx - s(dpi, 4) as f32,
-                        r.bottom as f32 - m,
-                        cx + s(dpi, 4) as f32,
-                        r.bottom as f32 - m,
-                        c(t, t.label),
-                        1.0,
                     );
                 }
                 TitleBtn::Min => {
@@ -1608,38 +2193,129 @@ fn paint_titlebar(
     }
 }
 
-fn paint_nav(
+/// 分节标题字号（与 small_px 同量级；独立命名便于 I1 统一光学层级）。
+fn caption_px(dpi: u32) -> f32 {
+    11.0 * dpi as f32 / 72.0
+}
+
+/// 侧边栏标题字号（I1：20pt）。
+fn display_px(dpi: u32) -> f32 {
+    20.0 * dpi as f32 / 72.0
+}
+
+/// 侧边栏（D3）：底色 + 标题 + 6 个导航项（图标 + 文案 + 胶囊选中/悬停）。
+/// 固定在左侧，不随内容滚动；几何必须与命中测试 `sidebar_at` 保持一致。
+fn paint_sidebar(
     rt: &windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget,
     gfx: &mut Gfx,
     t: &Theme,
     dpi: u32,
+    win_h: i32,
     lang: sysoverlay_core::types::Lang,
-    win_w: i32,
-    page_idx: usize,
+    _page_idx: usize,
+    nav_hover: Option<usize>,
+    sel_t: f32,
 ) {
-    let top = (s(dpi, crate::titlebar::TB_H) + s(dpi, NAV_GAP)) as f32;
-    let h = s(dpi, NAV_H) as f32;
-    let slot = RectF::new(
-        s(dpi, MARGIN_X) as f32,
-        top,
-        (win_w - s(dpi, MARGIN_X)) as f32,
-        top + h,
+    let x1 = s(dpi, SIDEBAR_W) as f32;
+    let hc = motion::high_contrast();
+    gfx.fill_rect(rt, RectF::new(0.0, 0.0, x1, win_h as f32), c(t, t.sidebar_bg));
+
+    // 标题（顶带左半侧，与右上角窗口按钮同高）。I1：20pt / 600。
+    let pad = s(dpi, SIDEBAR_PAD) as f32;
+    gfx.text(
+        rt,
+        crate::i18n::t(lang, "SbTitle"),
+        display_px(dpi),
+        600,
+        HAlign::Leading,
+        RectF::new(pad, s(dpi, 8) as f32, x1 - pad, s(dpi, 8 + 30) as f32),
+        c(t, t.label),
+        true,
     );
-    gfx.fill_round(rt, slot, s(dpi, NAV_H) as f32 / 2.0, c(t, t.segmented_bg));
-    let n = 6;
-    let seg_w = slot.w() / n as f32;
-    for i in 0..n {
-        let r = RectF::new(slot.l + i as f32 * seg_w, top, slot.l + (i + 1) as f32 * seg_w, top + h);
-        if i == page_idx {
-            let m = s(dpi, 2) as f32;
-            let ir = RectF::new(r.l + m, r.t + m, r.r - m, r.b - m);
-            gfx.fill_round(rt, ir, s(dpi, NAV_H) as f32 / 2.0 - 2.0, c(t, t.seg_selected));
-            gfx.stroke_round(rt, ir, s(dpi, NAV_H) as f32 / 2.0 - 2.0, c(t, t.seg_selected_stroke), 1.0);
-        }
-        let label = page_caption(i, lang);
-        let color = if i == page_idx { c(t, t.label) } else { c(t, t.secondary) };
-        gfx.text(rt, label, small_px(dpi), 400, HAlign::Center, r, color, true);
+
+    let isz = s(dpi, SB_ICON) as f32;
+    let item_h = s(dpi, SB_ITEM_H) as f32;
+    let step = s(dpi, SB_ITEM_H + SB_ITEM_GAP) as f32;
+    let top = s(dpi, 8 + 30 + 12) as f32;
+    let active = (sel_t.round() as usize).min(5);
+    // 悬停底（画在选中胶囊之下）
+    if let Some(h) = nav_hover {
+        let hy = top + h as f32 * step;
+        gfx.fill_round(
+            rt,
+            RectF::new(pad, hy, x1 - pad, hy + item_h),
+            item_h / 2.0,
+            c(t, t.sidebar_hover).with_alpha(0.07),
+        );
     }
+    // 选中胶囊：沿 `sel_t` 滑到目标项（而非瞬间跳格）。
+    let py = top + sel_t.clamp(0.0, 5.0) * step;
+    let pill = if hc {
+        c(t, t.sidebar_selected)
+    } else {
+        c(t, t.sidebar_selected).with_alpha(0.12)
+    };
+    gfx.fill_round(rt, RectF::new(pad, py, x1 - pad, py + item_h), item_h / 2.0, pill);
+    for i in 0..6 {
+        let y = top + i as f32 * step;
+        let selected = i == active;
+        let ix = pad + s(dpi, 6) as f32;
+        let iy = y + (item_h - isz) / 2.0;
+        let icon_color = if selected { c(t, t.accent) } else { c(t, t.secondary) };
+        icons::draw(
+            rt,
+            gfx,
+            icons::IconKind::ALL[i],
+            RectF::new(ix, iy, ix + isz, iy + isz),
+            icon_color,
+        );
+        let tx = ix + isz + s(dpi, SB_ICON_TEXT_GAP) as f32;
+        let label_color = if selected { c(t, t.accent) } else { c(t, t.label) };
+        gfx.text(
+            rt,
+            page_caption(i, lang),
+            caption_px(dpi),
+            500,
+            HAlign::Leading,
+            RectF::new(tx, y, x1 - pad, y + item_h),
+            label_color,
+            true,
+        );
+    }
+}
+
+/// 浮动滚动条（D3f）：仅当内容高于视口时显示；
+/// 拇指位置 = (-scroll_y) / max_scroll，拇指高 = 视口/内容比例。
+#[allow(clippy::too_many_arguments)]
+fn paint_scrollbar(
+    rt: &windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget,
+    gfx: &mut Gfx,
+    t: &Theme,
+    dpi: u32,
+    win_w: i32,
+    win_h: i32,
+    scroll_y: i32,
+    content_h: i32,
+) {
+    if content_h <= win_h {
+        return;
+    }
+    let inset = s(dpi, SCROLLBAR_INSET) as f32;
+    let w = s(dpi, SCROLLBAR_W) as f32;
+    let track_h = win_h as f32 - 2.0 * inset;
+    let max_scroll = (content_h - win_h) as f32;
+    let thumb_h = (track_h * win_h as f32 / content_h as f32)
+        .max(s(dpi, 24) as f32)
+        .min(track_h);
+    let ratio = ((-scroll_y) as f32 / max_scroll).clamp(0.0, 1.0);
+    let top = inset + ratio * (track_h - thumb_h);
+    let x = win_w as f32 - inset - w;
+    gfx.fill_round(
+        rt,
+        RectF::new(x, top, x + w, top + thumb_h),
+        w / 2.0,
+        c(t, t.secondary).with_alpha(0.45),
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1653,35 +2329,93 @@ fn paint_page(
     cfg: Option<&sysoverlay_core::config::Config>,
     t: &Theme,
     dpi: u32,
-    dx: f32,
+    ox: f32,
+    oy: f32,
     body: f32,
-    small: f32,
-    slider_thumb: Option<(usize, f32, bool)>,
-) {
+    caption: f32,
+    _metric_expanded: &[bool; 5],
+    transitions: &mut std::collections::HashMap<(usize, i32), Transition>,
+    dt: f32,
+    focus: Option<usize>,
+    keyboard_mode: bool,
+) -> bool {
+    let mut active = false;
     let page = &pages[page_idx];
-    // `card.rect` / `widget.rect` 都是**内容坐标**（相对内容区顶部），
-    // 绘制必须统一加客户区偏移 content_top——漏加会让整页内容盖住导航栏
-    // （2026-09-09 截图实证：分节标题与标题栏重叠、导航条不可见）。
-    let ct = content_top_y(dpi) as f32;
+    // `card.rect` / `widget.rect` 均为**内容坐标**；绘制统一加内容区原点 (ox, oy)。
+    // 红线 R7：漏加会让内容与侧边栏/标题重叠。折叠卡（G1-G3）将消费 _metric_expanded。
+
+    // 页标题 + 副标题（报告 §11 每页 h5 + p；随内容滚动）。
+    // 内容坐标：ox 已含侧栏偏移，这里只加内容左边距。
+    let title_l = s(dpi, layout::CONTENT_PAD_X) as f32 + ox;
+    let title_r = if let Some(first) = page.cards.first() {
+        first.rect.right as f32 + ox
+    } else {
+        title_l + s(dpi, 400) as f32
+    };
+    let ty = s(dpi, layout::CONTENT_PAD_TOP) as f32 + oy;
+    gfx.text(
+        rt,
+        page.title,
+        body * 1.3,
+        600,
+        HAlign::Leading,
+        RectF::new(title_l, ty, title_r, ty + s(dpi, layout::TITLE_H) as f32),
+        c(t, t.label),
+        true,
+    );
+    let sy_ = ty + s(dpi, layout::TITLE_H + layout::TITLE_SUB_GAP) as f32;
+    gfx.text(
+        rt,
+        page.subtitle,
+        caption,
+        400,
+        HAlign::Leading,
+        RectF::new(title_l, sy_, title_r, sy_ + s(dpi, layout::SUB_H) as f32),
+        c(t, t.secondary),
+        true,
+    );
+
     for card in &page.cards {
         // 分节标题
         let cap = RectF::new(
-            (card.rect.left + s(dpi, 2)) as f32 + dx,
-            (card.rect.top - s(dpi, CAPTION_H + CAPTION_GAP)) as f32 + ct,
-            card.rect.right as f32 + dx,
-            (card.rect.top - s(dpi, CAPTION_GAP)) as f32 + ct,
+            (card.rect.left + s(dpi, 2)) as f32 + ox,
+            (card.rect.top - s(dpi, CAPTION_H + CAPTION_GAP)) as f32 + oy,
+            card.rect.right as f32 + ox,
+            (card.rect.top - s(dpi, CAPTION_GAP)) as f32 + oy,
         );
-        gfx.text(rt, card.caption, small, 400, HAlign::Leading, cap, c(t, t.secondary), true);
+        gfx.text(rt, card.caption, caption, 400, HAlign::Leading, cap, c(t, t.secondary), true);
 
         // 圆角卡片
         let card_rect = RectF::from_i32(card.rect.left, card.rect.top, card.rect.right, card.rect.bottom)
-            .offset(dx, ct);
+            .offset(ox, oy);
         gfx.fill_round(rt, card_rect, s(dpi, CARD_RADIUS) as f32, c(t, t.card));
-        gfx.stroke_round(rt, card_rect, s(dpi, CARD_RADIUS) as f32, c(t, t.card_stroke), 1.0);
+        // I1：高对比度下卡片描边用全色强化边界。
+        let stroke = if motion::high_contrast() { c(t, t.label) } else { c(t, t.card_stroke) };
+        gfx.stroke_round(rt, card_rect, s(dpi, CARD_RADIUS) as f32, stroke, 1.0);
+        // 内容裁剪到卡片内：折叠动画 = 卡片长高 + 内容被揭开。
+        unsafe {
+            let _ = rt.PushAxisAlignedClip(
+                &card_rect.d2d(),
+                windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            );
+        }
 
-        // 行
-        for (row_i, row) in card.rows.iter().enumerate() {
-            let row_top = (card.rect.top + s(dpi, CARD_PAD) + s(dpi, row_i as i32 * ROW_H)) as f32 + ct;
+        // 行（行高可变：位置由布局写入 row.y_off / row.h）
+        for row in &card.rows {
+            let row_top = (card.rect.top + s(dpi, CARD_PAD)) as f32 + row.y_off as f32 + oy;
+            // 分组分隔线（监控项折叠卡分节：贴行顶的细线）。
+            if row.divider {
+                let ly = row_top + s(dpi, 2) as f32;
+                gfx.line(
+                    rt,
+                    (card.rect.left + s(dpi, 12)) as f32 + ox,
+                    ly,
+                    (card.rect.right - s(dpi, 12)) as f32 + ox,
+                    ly,
+                    c(t, t.card_stroke),
+                    1.0,
+                );
+            }
             if !row.label.is_empty() {
                 let first_widget_left = row
                     .widgets
@@ -1689,41 +2423,96 @@ fn paint_page(
                     .map(|&i| (page.widgets[i].rect.left - s(dpi, 8)) as f32)
                     .unwrap_or((card.rect.right - s(dpi, 12)) as f32);
                 let lr = RectF::new(
-                    (card.rect.left + s(dpi, 12)) as f32 + dx,
+                    (card.rect.left + s(dpi, 12)) as f32 + ox,
                     row_top,
-                    first_widget_left + dx,
+                    first_widget_left + ox,
                     row_top + s(dpi, ROW_H) as f32,
                 );
+                // hint 行：小一号次级色（V03 辅助说明）；普通行：正文标签色。
+                let (px, col) =
+                    if row.hint { (caption, t.secondary) } else { (body, t.label) };
                 // 轴对齐裁剪替代旧 DT_END_ELLIPSIS（标签列宽充裕时无差异）
                 unsafe { let _ = rt.PushAxisAlignedClip(&lr.d2d(), windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_PER_PRIMITIVE); }
-                gfx.text(rt, row.label, body, 400, HAlign::Leading, lr, c(t, t.label), true);
+                gfx.text(rt, row.label, px, if row.hint { 400 } else { 500 }, HAlign::Leading, lr, c(t, col), true);
                 unsafe { rt.PopAxisAlignedClip() };
+                // 行内说明（报告 §11：hint 紧贴标签下方的小字；可选第二行）。
+                // 行距 = HINT_EXTRA（与布局预留的行高一致，避免与下一行重叠）。
+                // 宽度横跨到卡片右缘：hint 位于行顶部 28 带之下，不会与控件重叠。
+                if row.hint_text.is_some() || row.hint2.is_some() {
+                    let mut hy = row_top + s(dpi, ROW_H) as f32;
+                    let line_h = s(dpi, layout::HINT_EXTRA) as f32;
+                    let hint_r = (card.rect.right - s(dpi, 12)) as f32 + ox;
+                    for line in [row.hint_text, row.hint2].into_iter().flatten() {
+                        let hr = RectF::new(
+                            (card.rect.left + s(dpi, 12)) as f32 + ox,
+                            hy,
+                            hint_r,
+                            hy + line_h,
+                        );
+                        unsafe { let _ = rt.PushAxisAlignedClip(&hr.d2d(), windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_PER_PRIMITIVE); }
+                        gfx.text(rt, line, caption, 400, HAlign::Leading, hr, c(t, t.secondary), true);
+                        unsafe { rt.PopAxisAlignedClip() };
+                        hy += line_h;
+                    }
+                }
             }
             for &wi in &row.widgets {
                 let mut ws = WidgetState::default();
                 if let Some(cfg) = cfg {
                     page.widgets[wi].kind.sync(cfg, &mut ws);
                 }
-                ws.hovered = matches!(interaction, Interaction::Hover { widget } if *widget == wi);
+                // 逐控件推进三根弹簧：hover / press / val（值·选中项）。
+                let is_hover = matches!(interaction, Interaction::Hover { widget } if *widget == wi)
+                    || matches!(interaction, Interaction::Pressing { widget } if *widget == wi);
+                let is_press = matches!(interaction, Interaction::Pressing { widget } if *widget == wi);
+                let is_drag = matches!(interaction, Interaction::Dragging { widget, origin: _ } if *widget == wi);
+                let (k, damp) = if motion::animations_enabled() {
+                    (motion::K_UI, motion::C_UI)
+                } else {
+                    (motion::K_REDUCED, motion::C_REDUCED)
+                };
+                let target_v = page.widgets[wi].kind.anim_target(&ws);
+                let key = (page_idx, page.widgets[wi].id);
+                let tr = transitions.entry(key).or_default();
+                if !tr.val_init {
+                    tr.val.set(target_v);
+                    tr.val_init = true;
+                }
+                let sh = tr.hover.step(if is_hover { 1.0 } else { 0.0 }, dt, k, damp);
+                let sp = tr.press.step(if is_press { 1.0 } else { 0.0 }, dt, k, damp);
+                // 拖动的滑杆直接跟手（不插值）；其余切换一律「滑过去」。
+                let sv = if is_drag {
+                    tr.val.set(target_v);
+                    true
+                } else {
+                    tr.val.step(target_v, dt, k, damp)
+                };
+                ws.hover_t = tr.hover.x.clamp(0.0, 1.0);
+                ws.press_t = tr.press.x.clamp(0.0, 1.0);
+                ws.anim_v = tr.val.x;
+                if !(sh && sp && sv) {
+                    active = true;
+                }
+                ws.hovered = ws.hover_t > 0.5;
                 ws.editing = matches!(interaction, Interaction::Editing { widget } if *widget == wi);
-                let (dfl, joystick) = slider_thumb
-                    .filter(|(i, _, _)| *i == wi)
-                    .map(|(_, d, j)| (d, j))
-                    .unwrap_or((0.0, false));
-                widget::paint_widget(rt, gfx, &page.widgets[wi], &ws, dpi, t, dx, ct, body, small, edit, dfl, joystick);
+                // 键盘焦点环仅键盘模式绘制（报告 §7.1 should_draw_focus_ring）。
+                ws.focused = keyboard_mode && focus == Some(wi);
+                widget::paint_widget(rt, gfx, &page.widgets[wi], &ws, dpi, t, ox, oy, body, caption, edit, cfg);
             }
         }
 
-        // 脚注（多行换行）
+        // 脚注（多行换行；位置 = 行区底部，行高可变后由 rows_h 给出）
         if let Some(foot) = card.footnote {
-            let rows_bottom = (card.rect.top + s(dpi, CARD_PAD) + s(dpi, card.rows.len() as i32 * ROW_H)) as f32 + ct;
+            let rows_bottom = (card.rect.top + s(dpi, CARD_PAD)) as f32 + card.rows_h as f32 + oy;
             let fr = RectF::new(
-                (card.rect.left + s(dpi, 12)) as f32 + dx,
+                (card.rect.left + s(dpi, 12)) as f32 + ox,
                 rows_bottom,
-                (card.rect.right - s(dpi, 12)) as f32 + dx,
+                (card.rect.right - s(dpi, 12)) as f32 + ox,
                 rows_bottom + s(dpi, FOOTNOTE_H) as f32,
             );
-            gfx.text_wrap(rt, foot, small, 400, HAlign::Leading, fr, c(t, t.secondary));
+            gfx.text_wrap(rt, foot, caption, 400, HAlign::Leading, fr, c(t, t.secondary));
         }
+        unsafe { rt.PopAxisAlignedClip() };
     }
+    active
 }

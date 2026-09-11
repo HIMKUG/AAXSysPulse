@@ -19,10 +19,7 @@
 
 use sysoverlay_core::color::Rgb;
 use sysoverlay_core::config::Config;
-use sysoverlay_core::types::{Lang, NetMode, RenderEngine, RenderStyle};
-
-/// 刷新率分段下标 → interval_ms（0 = Auto 档）。
-pub const RATE_MS: [u32; 6] = [0, 100, 200, 1000, 2000, 5000];
+use sysoverlay_core::types::{Appearance, Lang, NetMode, RenderEngine, RenderStyle};
 
 /// 控件写入/读出的泛化值。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -33,6 +30,8 @@ pub enum Value {
     Num(f64),
     /// 分段选择类（样式、形状、内存单位、刷新率、语言）。
     Select(usize),
+    /// 可空分段选择（显示位置：None = 未贴角/自由定位）。
+    SelectOpt(Option<usize>),
     /// 指标颜色（None = 跟随默认）。
     Color(Option<Rgb>),
 }
@@ -49,28 +48,24 @@ pub enum CfgRef {
     TextShadow,
     TextOutline,
     Topmost,
-    AutoStart,
-    DebugLog,
-    Hover,
-    /// 固定悬浮窗尺寸（window_size.is_some()）。
-    LockSize,
+    #[allow(dead_code)] AutoStart,
+    #[allow(dead_code)] DebugLog,
     GpuPrimaryOnly,
     Gpu3dOnly,
     NetLowFreq,
     /// 网络栏显示模式：0=双向 1=仅下载 2=仅上传。
     NetMode,
+    /// 鼠标可穿透（窗口页，报告 §5）。
+    ClickThrough,
+    /// 贴靠屏幕的哪个角：0=右上 1=右下 2=左上 3=左下；None = 自由定位。
+    SnapCorner,
+    /// 悬浮窗不透明度（%），映射 `normal_opacity`（报告范围 40..=100）。
+    Opacity,
 
     // ── 数值滑杆 ──
     FontSize,
     MetricGap,
     LabelValueGap,
-    HoverOpacity,
-    NormalOpacity,
-    AnimMs,
-    /// 悬浮窗宽（window_size.0；None 时读默认 300）。
-    WinW,
-    /// 悬浮窗高（window_size.1；None 时读默认 200）。
-    WinH,
     /// 逐指标字号（下标 0..5）。
     MetricFont(usize),
 
@@ -78,20 +73,23 @@ pub enum CfgRef {
     Style,
     /// 内存单位：0 = 百分比，1 = GB。
     MemUnit,
-    /// 刷新率分段（0 = Auto，其余见 [`RATE_MS`]）。
-    Rate,
     /// 界面语言：0 = En，1 = Zh。
     Lang,
     /// 悬浮窗渲染引擎：0 = 性能（像素块），1 = 高画质（D2D + DirectWrite）。
     RenderEngine,
     /// 字重档位：0 = 细，1 = 中，2 = 粗（默认）。
     FontWeight,
+    /// 外观模式：0 = 跟随系统，1 = 浅色，2 = 深色。
+    /// 顺序必须与 layout.rs 的 labels 顺序一致（红线 R1）。
+    Appearance,
 
     // ── 指标颜色 ──
     /// 指标名称色（下标 0..5）。
     MetricLabel(usize),
     /// 指标数值色（下标 0..5）。
     MetricValue(usize),
+    /// 数值槽「自动色」：按占用率分档变色（<60% 绿 / 60~85% 橙 / ≥85% 红）。
+    MetricValueAuto(usize),
 }
 
 impl CfgRef {
@@ -109,8 +107,6 @@ impl CfgRef {
             CfgRef::Topmost => Value::Bool(cfg.topmost),
             CfgRef::AutoStart => Value::Bool(cfg.autostart),
             CfgRef::DebugLog => Value::Bool(cfg.debug_log),
-            CfgRef::Hover => Value::Bool(cfg.hover),
-            CfgRef::LockSize => Value::Bool(cfg.size_locked),
             CfgRef::GpuPrimaryOnly => Value::Bool(cfg.gpu_primary_only),
             CfgRef::Gpu3dOnly => Value::Bool(cfg.gpu_3d_only),
             CfgRef::NetLowFreq => Value::Bool(cfg.net_low_freq),
@@ -121,45 +117,34 @@ impl CfgRef {
                     NetMode::Up => 2,
                 })
             }
+            CfgRef::ClickThrough => Value::Bool(cfg.click_through),
+            CfgRef::SnapCorner => Value::SelectOpt(if cfg.snap_corner <= 3 {
+                Some(cfg.snap_corner as usize)
+            } else {
+                None
+            }),
+            CfgRef::Opacity => Value::Num(cfg.normal_opacity as f64),
             // num
             CfgRef::FontSize => Value::Num(cfg.font_size as f64),
             CfgRef::MetricGap => Value::Num(cfg.metric_gap as f64),
             CfgRef::LabelValueGap => Value::Num(cfg.label_value_gap as f64),
-            CfgRef::HoverOpacity => Value::Num(cfg.hover_opacity as f64),
-            CfgRef::NormalOpacity => Value::Num(cfg.normal_opacity as f64),
-            CfgRef::AnimMs => Value::Num(cfg.anim_ms as f64),
-            CfgRef::WinW => Value::Num(cfg.window_size.map_or(300.0, |s| s.0 as f64)),
-            CfgRef::WinH => Value::Num(cfg.window_size.map_or(200.0, |s| s.1 as f64)),
             CfgRef::MetricFont(i) => {
                 Value::Num(cfg.metric_font_sizes[i].unwrap_or(cfg.font_size) as f64)
             }
             // select
-            // Style 分段控件只有 2 档（横版/竖版）；枚举里 Classic 是历史遗留
-            // （parse 阶段已迁移为 Strip）。此前 get 直接用 `as usize`（Classic=0/
-            // Strip=1/Vertical=2）而 set 也按 3 值映射 → 点「竖版」(下标 1) 实际
-            // 写成 Strip，竖版永远不生效、高亮也错位。
             CfgRef::Style => Value::Select(match cfg.render_style {
                 RenderStyle::Vertical => 1,
                 _ => 0,
             }),
             CfgRef::MemUnit => Value::Select(if cfg.mem_show_gb { 1 } else { 0 }),
-            CfgRef::Rate => Value::Select(if cfg.refresh_auto {
-                0
-            } else {
-                match cfg.interval_ms {
-                    100 => 1,
-                    200 => 2,
-                    1000 => 3,
-                    2000 => 4,
-                    _ => 5,
-                }
-            }),
             CfgRef::Lang => Value::Select(cfg.lang as usize),
             CfgRef::RenderEngine => Value::Select(if cfg.render_engine == RenderEngine::D2d { 1 } else { 0 }),
             CfgRef::FontWeight => Value::Select(cfg.font_weight as usize),
+            CfgRef::Appearance => Value::Select(cfg.appearance.to_config() as usize),
             // color
     CfgRef::MetricLabel(i) => Value::Color(cfg.metric_colors[i].label),
     CfgRef::MetricValue(i) => Value::Color(cfg.metric_colors[i].value),
+    CfgRef::MetricValueAuto(i) => Value::Bool(cfg.metric_colors[i].value_auto),
     }
     }
 
@@ -177,15 +162,6 @@ impl CfgRef {
             (CfgRef::Topmost, Value::Bool(x)) => cfg.topmost = x,
             (CfgRef::AutoStart, Value::Bool(x)) => cfg.autostart = x,
             (CfgRef::DebugLog, Value::Bool(x)) => cfg.debug_log = x,
-            (CfgRef::Hover, Value::Bool(x)) => cfg.hover = x,
-            (CfgRef::LockSize, Value::Bool(x)) => {
-                // 锁定语义独立于几何恢复：window_size 永远保留（重启后恢复
-                // 上次尺寸用），fit_window 只认 size_locked。
-                cfg.size_locked = x;
-                if x {
-                    cfg.window_size.get_or_insert((300, 200));
-                }
-            }
             (CfgRef::GpuPrimaryOnly, Value::Bool(x)) => cfg.gpu_primary_only = x,
             (CfgRef::Gpu3dOnly, Value::Bool(x)) => cfg.gpu_3d_only = x,
             (CfgRef::NetLowFreq, Value::Bool(x)) => cfg.net_low_freq = x,
@@ -195,21 +171,25 @@ impl CfgRef {
                 2 => cfg.net_mode = NetMode::Up,
                 _ => return false,
             },
+            (CfgRef::ClickThrough, Value::Bool(x)) => cfg.click_through = x,
+            (CfgRef::SnapCorner, Value::SelectOpt(o)) => match o {
+                Some(i) if i <= 3 => cfg.snap_corner = i as u8,
+                None => cfg.snap_corner = sysoverlay_core::config::SNAP_CORNER_FREE,
+                _ => return false,
+            },
+            (CfgRef::SnapCorner, Value::Select(i)) => {
+                // 容错：普通分段值也接受
+                if i <= 3 {
+                    cfg.snap_corner = i as u8;
+                } else {
+                    return false;
+                }
+            }
+            (CfgRef::Opacity, Value::Num(x)) => cfg.normal_opacity = (x as u32).clamp(0, 100) as u8,
             // num
             (CfgRef::FontSize, Value::Num(x)) => cfg.font_size = x as f32,
             (CfgRef::MetricGap, Value::Num(x)) => cfg.metric_gap = x as u32,
             (CfgRef::LabelValueGap, Value::Num(x)) => cfg.label_value_gap = x as u32,
-            (CfgRef::HoverOpacity, Value::Num(x)) => cfg.hover_opacity = x as u8,
-            (CfgRef::NormalOpacity, Value::Num(x)) => cfg.normal_opacity = x as u8,
-            (CfgRef::AnimMs, Value::Num(x)) => cfg.anim_ms = x as u32,
-            (CfgRef::WinW, Value::Num(x)) => {
-                let h = cfg.window_size.map_or(200, |s| s.1);
-                cfg.window_size = Some((x as i32, h));
-            }
-            (CfgRef::WinH, Value::Num(x)) => {
-                let w = cfg.window_size.map_or(300, |s| s.0);
-                cfg.window_size = Some((w, x as i32));
-            }
             (CfgRef::MetricFont(i), Value::Num(x)) => {
                 if i < cfg.metric_font_sizes.len() {
                     let v = x as f32;
@@ -242,16 +222,12 @@ impl CfgRef {
                     return false;
                 }
             }
-            (CfgRef::Rate, Value::Select(i)) => {
-                if i == 0 {
-                    cfg.refresh_auto = true;
-                } else if i < RATE_MS.len() {
-                    cfg.refresh_auto = false;
-                    cfg.interval_ms = RATE_MS[i];
-                } else {
-                    return false;
-                }
-            }
+            (CfgRef::Appearance, Value::Select(i)) => match i {
+                0 => cfg.appearance = Appearance::System,
+                1 => cfg.appearance = Appearance::Light,
+                2 => cfg.appearance = Appearance::Dark,
+                _ => return false,
+            },
             (CfgRef::Lang, Value::Select(i)) => match i {
                 0 => cfg.lang = Lang::En,
                 1 => cfg.lang = Lang::Zh,
@@ -271,6 +247,13 @@ impl CfgRef {
             (CfgRef::MetricValue(i), Value::Color(c)) => {
                 if i < cfg.metric_colors.len() {
                     cfg.metric_colors[i].value = c;
+                } else {
+                    return false;
+                }
+            }
+            (CfgRef::MetricValueAuto(i), Value::Bool(x)) => {
+                if i < cfg.metric_colors.len() {
+                    cfg.metric_colors[i].value_auto = x;
                 } else {
                     return false;
                 }
@@ -309,8 +292,6 @@ mod tests {
             (CfgRef::Topmost, Value::Bool(false)),
             (CfgRef::AutoStart, Value::Bool(true)),
             (CfgRef::DebugLog, Value::Bool(false)),
-            (CfgRef::Hover, Value::Bool(false)),
-            (CfgRef::LockSize, Value::Bool(true)),
             (CfgRef::GpuPrimaryOnly, Value::Bool(false)),
             (CfgRef::Gpu3dOnly, Value::Bool(false)),
             (CfgRef::NetLowFreq, Value::Bool(false)),
@@ -320,22 +301,27 @@ mod tests {
             (CfgRef::FontSize, Value::Num(24.0)),
             (CfgRef::MetricGap, Value::Num(40.0)),
             (CfgRef::LabelValueGap, Value::Num(30.0)),
-            (CfgRef::HoverOpacity, Value::Num(90.0)),
-            (CfgRef::NormalOpacity, Value::Num(35.0)),
-            (CfgRef::AnimMs, Value::Num(450.0)),
-            (CfgRef::WinW, Value::Num(420.0)),
-            (CfgRef::WinH, Value::Num(160.0)),
             (CfgRef::MetricFont(2), Value::Num(18.0)),
             (CfgRef::Style, Value::Select(1)),
             (CfgRef::MemUnit, Value::Select(1)),
-            (CfgRef::Rate, Value::Select(3)),
             (CfgRef::Lang, Value::Select(1)),
             (CfgRef::RenderEngine, Value::Select(1)),
             (CfgRef::FontWeight, Value::Select(0)),
             (CfgRef::FontWeight, Value::Select(1)),
             (CfgRef::FontWeight, Value::Select(2)),
+            (CfgRef::Appearance, Value::Select(0)),
+            (CfgRef::Appearance, Value::Select(1)),
+            (CfgRef::Appearance, Value::Select(2)),
             (CfgRef::MetricLabel(0), Value::Color(Some(Rgb::new(10, 200, 255)))),
             (CfgRef::MetricValue(4), Value::Color(None)),
+            // v5 窗口页新增
+            (CfgRef::ClickThrough, Value::Bool(true)),
+            (CfgRef::ClickThrough, Value::Bool(false)),
+            (CfgRef::SnapCorner, Value::SelectOpt(Some(0))),
+            (CfgRef::SnapCorner, Value::SelectOpt(Some(3))),
+            (CfgRef::SnapCorner, Value::SelectOpt(None)),
+            (CfgRef::Opacity, Value::Num(80.0)),
+            (CfgRef::Opacity, Value::Num(40.0)),
         ]
     }
 
@@ -364,46 +350,11 @@ mod tests {
     }
 
     #[test]
-    fn lock_size_on_then_off_only_flips_lock_flag() {
-        // 新语义：window_size 是「几何恢复」值，开关只动 size_locked——
-        // 关闭锁定不得清掉几何（否则重启后窗口尺寸丢失）。
+    fn out_of_range_index_is_rejected_not_panicking() {
         let mut c = cfg();
-        assert!(CfgRef::LockSize.set(&mut c, Value::Bool(true)));
-        assert!(c.size_locked);
-        assert!(c.window_size.is_some());
-        assert!(CfgRef::LockSize.set(&mut c, Value::Bool(false)));
-        assert!(!c.size_locked);
-        assert!(c.window_size.is_some(), "关闭锁定只解锁，不清几何恢复值");
-    }
-
-    #[test]
-    fn lock_size_on_preserves_existing_size() {
-        let mut c = cfg();
-        c.window_size = Some((640, 480));
-        assert!(CfgRef::LockSize.set(&mut c, Value::Bool(true)));
-        assert_eq!(c.window_size, Some((640, 480)), "重复开启不得重置已设尺寸");
-    }
-
-    #[test]
-    fn win_w_set_keeps_existing_height() {
-        let mut c = cfg();
-        c.window_size = Some((300, 200));
-        assert!(CfgRef::WinW.set(&mut c, Value::Num(500.0)));
-        assert_eq!(c.window_size, Some((500, 200)), "改宽不得动高");
-        assert!(CfgRef::WinH.set(&mut c, Value::Num(240.0)));
-        assert_eq!(c.window_size, Some((500, 240)), "改高不得动宽");
-    }
-
-    #[test]
-    fn rate_auto_uses_index_zero_and_others_map_to_ms() {
-        let mut c = cfg();
-        assert!(CfgRef::Rate.set(&mut c, Value::Select(0)));
-        assert!(c.refresh_auto);
-        assert!(CfgRef::Rate.set(&mut c, Value::Select(1)));
-        assert!(!c.refresh_auto);
-        assert_eq!(c.interval_ms, 100);
-        assert!(CfgRef::Rate.set(&mut c, Value::Select(5)));
-        assert_eq!(c.interval_ms, 5000);
+        assert!(!CfgRef::MetricFont(9).set(&mut c, Value::Num(1.0)));
+        assert!(!CfgRef::MetricLabel(9).set(&mut c, Value::Color(None)));
+        assert!(!CfgRef::Lang.set(&mut c, Value::Select(7)));
     }
 
     #[test]
@@ -415,16 +366,10 @@ mod tests {
         assert_eq!(c.metric_font_sizes[0], Some(15.0));
     }
 
+    // debug_assert! 在 release 下被编译掉 → 本测试只能在 debug 构建中运行
+    // （`cargo test --release` 会因「未触发 panic」而失败，故加门控）。
     #[test]
-    fn out_of_range_index_is_rejected_not_panicking() {
-        let mut c = cfg();
-        assert!(!CfgRef::MetricFont(9).set(&mut c, Value::Num(1.0)));
-        assert!(!CfgRef::MetricLabel(9).set(&mut c, Value::Color(None)));
-        assert!(!CfgRef::Rate.set(&mut c, Value::Select(99)));
-        assert!(!CfgRef::Lang.set(&mut c, Value::Select(7)));
-    }
-
-    #[test]
+    #[cfg(debug_assertions)]
     #[should_panic]
     fn type_mismatch_panics_in_debug() {
         let mut c = cfg();
@@ -437,5 +382,27 @@ mod tests {
         let mut c = cfg();
         assert!(CfgRef::Lang.set(&mut c, Value::Select(1)));
         assert!(matches!(c.lang, Lang::Zh));
+    }
+
+    #[test]
+    fn snap_corner_free_semantics() {
+        // 默认（无键）= 自由定位 → UI 显示为未选中（SelectOpt(None)）
+        let c = cfg();
+        assert_eq!(CfgRef::SnapCorner.get(&c), Value::SelectOpt(None));
+        // 贴角后可读回；解除贴角写回 255
+        let mut c = cfg();
+        assert!(CfgRef::SnapCorner.set(&mut c, Value::SelectOpt(Some(1))));
+        assert_eq!(c.snap_corner, 1);
+        assert!(CfgRef::SnapCorner.set(&mut c, Value::SelectOpt(None)));
+        assert_eq!(c.snap_corner, sysoverlay_core::config::SNAP_CORNER_FREE);
+    }
+
+    #[test]
+    fn opacity_maps_to_normal_opacity() {
+        let mut c = cfg();
+        c.normal_opacity = 35; // 旧默认
+        assert_eq!(CfgRef::Opacity.get(&c), Value::Num(35.0));
+        assert!(CfgRef::Opacity.set(&mut c, Value::Num(70.0)));
+        assert_eq!(c.normal_opacity, 70);
     }
 }

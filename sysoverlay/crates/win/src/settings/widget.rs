@@ -1,16 +1,18 @@
-//! 六种自绘控件：数据（CfgRef 持有）+ D2D 绘制。
+//! 自绘控件：数据（CfgRef 持有）+ D2D 绘制 + 非线性过渡。
 //!
-//! # 迁移保真说明
-//!
-//! 视觉规格逐像素对齐旧 GDI 版（圆角半径/内缩/色值全部沿用），仅两处**有意**的修正：
-//! 1. MetricSwatches 选中态旧实现会先用卡片色**填充**外框再描边（把选中格的
-//!    颜色盖掉）；新版改为只描边不填充，选中格颜色保持可见；
-//! 2. 文字省略：GDI `DT_END_ELLIPSIS` → D2D 端用轴对齐裁剪（PushAxisAlignedClip），
-//!    视觉为直接截断（标签列宽充裕时无差异）。
+//! # 过渡（H2 扩展）
+//! 每个控件有一组弹簧（hover / press / val，见 `mod.rs::Transition`）。
+//! `WidgetState::anim_v` 携带 `val` 弹簧的当前值：
+//! - Toggle → 0..1（旋钮滑动 + 轨道渐变）
+//! - Segmented / Swatches → 选中下标（指示条 / 选中环滑动）
+//! - Slider → 数值（滑块滑动）
+//! - Disclosure → 0..1（箭头展开角度）
+//! 因此**所有可切换控件都是「滑过去」而非「跳过去」**。
 
 use windows::Win32::Foundation::RECT;
 
 use sysoverlay_core::config::Config;
+use sysoverlay_core::types::Lang;
 
 use crate::gfx_d2d::{ColorF, Gfx, HAlign, RectF};
 use crate::theme::Theme;
@@ -37,7 +39,7 @@ pub const FG_SWATCHES: [(u8, u8, u8); 6] = [
     (20, 20, 20),
     (30, 30, 30),
 ];
-/// 指标名称/数值色板（8 预设 + 第 9 格「跟随默认」）。
+/// 指标名称/数值色板（8 预设 + 「跟随默认」等扩展格）。
 pub const METRIC_SWATCHES: [(u8, u8, u8); 8] = [
     (255, 255, 255),
     (10, 200, 255),
@@ -48,9 +50,6 @@ pub const METRIC_SWATCHES: [(u8, u8, u8); 8] = [
     (190, 120, 255),
     (140, 255, 255),
 ];
-/// 色板总格数（含末尾「跟随默认」格）。
-pub const SW_N: usize = 8 + 1;
-pub const SW_FOLLOW: usize = 8;
 
 // ── 控件定义 ─────────────────────────────────────────────
 
@@ -68,18 +67,81 @@ pub struct SegmentedWidget {
 /// 按钮动作（点击时由 settings 层派发）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ButtonAction {
-    /// 把指定指标颜色重置为「跟随默认」（None）。
-    ResetColor(CfgRef),
     /// 重置全部指标颜色（名称色 + 数值色全部返回跟随默认）。
     ResetAllColors,
-    /// 把指定指标字号重置为「跟随全局字号」（metric_font_sizes[i] = None）。
-    ResetFont(usize),
+    /// 展开/收起指定指标的配置卡。
+    ToggleMetricExpand(usize),
+    /// 打开日志文件所在目录（报告 C-01：路径降级为动作，不出现在文案）。
+    OpenLogFolder,
+    /// 检查更新（无更新服务，反馈「已是最新」状态提示）。
+    CheckUpdate,
+    /// 复制版本信息到剪贴板。
+    CopyVersion,
+}
+
+/// 按钮视觉级别。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ButtonKind {
+    /// 次级：设置页降噪样式（常态极淡、悬停浮起）。
+    Secondary,
+    /// 链接：无底色，强调色文字（「恢复跟随全局」等，报告 §6 action）。
+    Link,
 }
 
 /// 按钮（绑定一个动作）。
 pub struct ButtonWidget {
     pub label: String,
     pub action: ButtonAction,
+    pub kind: ButtonKind,
+}
+
+/// 折叠箭头（向右 = 收起，向下 = 展开；过渡时按角度插值）。
+pub struct DisclosureWidget {
+    pub expanded: bool,
+    pub action: ButtonAction,
+}
+
+/// 指标折叠头（个性化页）：字母徽标 + 标题 + 状态/副标题。
+/// 折叠态显示「已启用 · 40 px / 已关闭」，展开态显示静态副标题；
+/// 整体可点击（展开/收起），开关与箭头是行内独立控件、不与其重叠。
+pub struct MetricHeaderWidget {
+    pub index: usize,
+    /// 构建时的展开状态（布局随弹簧每帧重建，值保持新鲜）。
+    pub expanded: bool,
+    /// 构建时语言（跟随 cfg.lang，不依赖全局态时序）。
+    pub lang: Lang,
+}
+
+/// 指标字号状态条（个性化页展开后位于滑杆下方）。
+/// 未覆盖：左侧「跟随全局」药丸 + 说明文字。
+/// 已覆盖：左侧绿色「已自定义」药丸 + 说明文字 + 右侧「恢复跟随全局」按钮。
+/// 点击**右侧恢复按钮**触发 ResetFont（不再整行可点）。
+pub struct MetricFontStatusWidget {
+    pub index: usize,
+    pub lang: Lang,
+}
+
+/// 计算字号状态条右侧「恢复跟随全局」按钮的矩形。
+/// 未覆盖（`overridden=false`）时返回 None。
+pub fn metric_font_status_restore_rect(
+    r: RectF,
+    dpi: u32,
+    gfx: &mut Gfx,
+    overridden: bool,
+    lang: Lang,
+    body_px: f32,
+) -> Option<RectF> {
+    if !overridden {
+        return None;
+    }
+    let text = crate::i18n::t(lang, "ActRestoreGlobal");
+    let (tw, _th) = gfx.measure_text(text, body_px, 400)?;
+    let pad_x = super::layout::s(dpi, 10) as f32;
+    let h = super::layout::s(dpi, 20) as f32;
+    let w = tw + 2.0 * pad_x;
+    let by = (r.t + r.b) / 2.0;
+    let btn = RectF::new((r.r - w).max(r.l), by - h / 2.0, r.r, by + h / 2.0);
+    Some(btn)
 }
 
 /// 背景/前景色板。
@@ -90,20 +152,53 @@ pub struct SwatchesWidget {
 }
 
 /// 逐指标颜色色板。
+/// `auto_cfg` 有值（数值色板）时末尾多一格「自动色 A」：占用率分档变色。
 pub struct MetricSwatchesWidget {
     pub cfg: CfgRef,
+    pub auto_cfg: Option<CfgRef>,
 }
 
-/// 滑杆 + 数值框。
+// 色板格下标：8 预设色 + （自动色 A）+ 跟随默认 ≈ + 自定义 +
+pub const SW_COLORS: usize = 8;
+/// 「自动色」格（仅数值色板）。
+pub const SW_AUTO: usize = 8;
+/// 色板总格数。
+pub fn sw_n(auto: bool) -> usize {
+    if auto { 8 + 3 } else { 8 + 2 }
+}
+/// 「跟随默认」格下标。
+pub fn sw_follow(auto: bool) -> usize {
+    if auto { 9 } else { 8 }
+}
+/// 「自定义取色」格下标。
+pub fn sw_custom(auto: bool) -> usize {
+    if auto { 10 } else { 9 }
+}
+
+/// 滑杆 + 数值框（绝对位置，杆位即值）。
 pub struct SliderWidget {
     pub min: f32,
     pub max: f32,
     pub step: f32,
     pub dp: u32,
+    /// 数值单位后缀（如 "px"）；空串 = 不显示。
+    pub unit: &'static str,
     pub cfg: CfgRef,
-    /// true = 摇杆（弹簧增量式、杆居中）；false = 简单滑杆（绝对值、杆位即值）。
-    /// 间距类用简单滑杆：拖动时数值按偏移比例以 ~1..5 单位/秒逼近目标（用户规格）。
-    pub joystick: bool,
+    /// 个性化页字号滑杆专用样式：绿色填充 + 白圈滑块 + 数值纯文本（无圆角底框）。
+    pub metric_style: bool,
+}
+
+/// 步进器（− / 值 / ＋；报告 §4 组件与 §11 视觉稿：条目间距、名值间距）。
+pub struct StepperWidget {
+    pub min: f64,
+    pub max: f64,
+    pub step: f64,
+    pub cfg: CfgRef,
+}
+
+/// 关于页头部：Logo 方块 + 应用名 + 版本（报告 §11 关于页）。
+pub struct AboutHeaderWidget {
+    pub lang: Lang,
 }
 
 impl IWidget for ToggleWidget {
@@ -115,12 +210,37 @@ impl IWidget for ToggleWidget {
 impl IWidget for SegmentedWidget {
     fn cfg(&self) -> Option<CfgRef> { Some(self.cfg) }
     fn sync(&self, cfg: &Config, st: &mut WidgetState) { sync_via_cfg(self.cfg, cfg, st) }
+    /// 指示条在分段之间滑动。
+    fn anim_target(&self, st: &WidgetState) -> f32 { st.selected as f32 }
     fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 impl IWidget for ButtonWidget {
     fn cfg(&self) -> Option<CfgRef> { None }
     fn sync(&self, _cfg: &Config, _st: &mut WidgetState) {}
+    fn anim_target(&self, _st: &WidgetState) -> f32 { 0.0 }
+    fn as_any(&self) -> &dyn std::any::Any { self }
+}
+
+impl IWidget for DisclosureWidget {
+    fn cfg(&self) -> Option<CfgRef> { None }
+    fn sync(&self, _cfg: &Config, _st: &mut WidgetState) {}
+    /// 箭头展开角度。
+    fn anim_target(&self, _st: &WidgetState) -> f32 { if self.expanded { 1.0 } else { 0.0 } }
+    fn as_any(&self) -> &dyn std::any::Any { self }
+}
+
+impl IWidget for MetricHeaderWidget {
+    fn cfg(&self) -> Option<CfgRef> { None }
+    fn sync(&self, _cfg: &Config, _st: &mut WidgetState) {}
+    fn anim_target(&self, _st: &WidgetState) -> f32 { 0.0 }
+    fn as_any(&self) -> &dyn std::any::Any { self }
+}
+
+impl IWidget for MetricFontStatusWidget {
+    fn cfg(&self) -> Option<CfgRef> { None }
+    fn sync(&self, _cfg: &Config, _st: &mut WidgetState) {}
+    fn anim_target(&self, _st: &WidgetState) -> f32 { 0.0 }
     fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
@@ -139,34 +259,59 @@ impl IWidget for SwatchesWidget {
                 .unwrap_or(0);
         }
     }
+    fn anim_target(&self, st: &WidgetState) -> f32 { st.selected as f32 }
     fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 impl IWidget for MetricSwatchesWidget {
     fn cfg(&self) -> Option<CfgRef> { Some(self.cfg) }
     fn sync(&self, cfg: &Config, st: &mut WidgetState) {
+        let has_auto = self.auto_cfg.is_some();
+        // 「自动色」开启：选中 A 格（仅数值色板），优先级高于自定义色。
+        if let Some(r) = self.auto_cfg {
+            if matches!(r.get(cfg), Value::Bool(true)) {
+                st.selected = SW_AUTO;
+                st.has_sel = true;
+                return;
+            }
+        }
         if let Value::Color(c) = self.cfg.get(cfg) {
             match c {
                 Some(rgb) => {
                     st.selected = METRIC_SWATCHES
                         .iter()
                         .position(|&(r, g, b)| sysoverlay_core::color::Rgb::new(r, g, b) == rgb)
-                        .unwrap_or(SW_FOLLOW);
+                        .unwrap_or(sw_custom(has_auto));
                     st.value_f = 0.0;
                 }
                 None => {
-                    st.selected = SW_FOLLOW;
+                    st.selected = sw_follow(has_auto);
                     st.value_f = 1.0;
                 }
             }
         }
     }
+    fn anim_target(&self, st: &WidgetState) -> f32 { st.selected as f32 }
     fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 impl IWidget for SliderWidget {
     fn cfg(&self) -> Option<CfgRef> { Some(self.cfg) }
     fn sync(&self, cfg: &Config, st: &mut WidgetState) { sync_via_cfg(self.cfg, cfg, st) }
+    fn as_any(&self) -> &dyn std::any::Any { self }
+}
+
+impl IWidget for StepperWidget {
+    fn cfg(&self) -> Option<CfgRef> { Some(self.cfg) }
+    fn sync(&self, cfg: &Config, st: &mut WidgetState) { sync_via_cfg(self.cfg, cfg, st) }
+    fn anim_target(&self, _st: &WidgetState) -> f32 { 0.0 }
+    fn as_any(&self) -> &dyn std::any::Any { self }
+}
+
+impl IWidget for AboutHeaderWidget {
+    fn cfg(&self) -> Option<CfgRef> { None }
+    fn sync(&self, _cfg: &Config, _st: &mut WidgetState) {}
+    fn anim_target(&self, _st: &WidgetState) -> f32 { 0.0 }
     fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
@@ -194,13 +339,116 @@ pub fn track_rect(slider_rect: &RECT, dpi: u32) -> RECT {
     }
 }
 
+/// 步进器「−」按钮子矩形（左侧；命中测试与绘制共用）。
+pub fn stepper_minus_rect(stepper_rect: &RECT, dpi: u32) -> RECT {
+    let w = super::layout::s(dpi, super::layout::STEPPER_BTN_W);
+    RECT { left: stepper_rect.left, top: stepper_rect.top, right: stepper_rect.left + w, bottom: stepper_rect.bottom }
+}
+
+/// 步进器「＋」按钮子矩形（右侧）。
+pub fn stepper_plus_rect(stepper_rect: &RECT, dpi: u32) -> RECT {
+    let w = super::layout::s(dpi, super::layout::STEPPER_BTN_W);
+    RECT { left: stepper_rect.right - w, top: stepper_rect.top, right: stepper_rect.right, bottom: stepper_rect.bottom }
+}
+
+// ── 滑杆值 ↔ 位置映射（纯函数） ──────────────────────────
+
+/// 值 → 归一化位置 0..1（钳制）。
+pub fn slider_t_from_value(v: f64, min: f64, max: f64) -> f32 {
+    if (max - min).abs() < f64::EPSILON {
+        return 0.0;
+    }
+    (((v - min) / (max - min)).clamp(0.0, 1.0)) as f32
+}
+
+/// 轨道内 x 坐标 → 吸附步进后的值（钳制到 min..=max）。
+pub fn slider_value_from_x(x: f32, track: RectF, min: f64, max: f64, step: f64) -> f64 {
+    let t = ((x - track.l) / track.w().max(1.0)).clamp(0.0, 1.0) as f64;
+    let raw = min + t * (max - min);
+    if step <= 0.0 {
+        return raw.clamp(min, max);
+    }
+    let snapped = ((raw - min) / step).round() * step + min;
+    snapped.clamp(min, max)
+}
+
+#[cfg(test)]
+mod slider_tests {
+    use super::*;
+
+    #[test]
+    fn t_maps_value_range_to_unit() {
+        assert_eq!(slider_t_from_value(8.0, 8.0, 256.0), 0.0);
+        assert_eq!(slider_t_from_value(256.0, 8.0, 256.0), 1.0);
+        assert!((slider_t_from_value(132.0, 8.0, 256.0) - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn t_clamps_out_of_range() {
+        assert_eq!(slider_t_from_value(-100.0, 8.0, 256.0), 0.0);
+        assert_eq!(slider_t_from_value(9999.0, 8.0, 256.0), 1.0);
+    }
+
+    #[test]
+    fn value_from_x_snaps_to_step_and_clamps() {
+        let track = RectF::new(100.0, 0.0, 300.0, 24.0);
+        assert!((slider_value_from_x(200.0, track, 8.0, 256.0, 0.5) - 132.0).abs() < 1e-3);
+        assert_eq!(slider_value_from_x(0.0, track, 8.0, 256.0, 0.5), 8.0);
+        assert_eq!(slider_value_from_x(9999.0, track, 8.0, 256.0, 0.5), 256.0);
+        let v = slider_value_from_x(201.0, track, 8.0, 256.0, 0.5);
+        assert!((v * 2.0).fract().abs() < 1e-6, "必须吸附到 0.5 步进，实际 {v}");
+    }
+
+    #[test]
+    fn lerp_color_midpoint_and_clamp() {
+        let a = ColorF::rgba(0, 0, 0, 1.0);
+        let b = ColorF::rgba(255, 255, 255, 1.0);
+        let m = lerp_color(a, b, 0.5).d2d();
+        assert!((m.r - 0.5).abs() < 0.01 && (m.g - 0.5).abs() < 0.01);
+        assert_eq!(lerp_color(a, b, -1.0).d2d().r, 0.0);
+        assert_eq!(lerp_color(a, b, 2.0).d2d().r, 1.0);
+    }
+}
+
 // ── D2D 绘制 ─────────────────────────────────────────────
 
 fn c(_t: &Theme, v: u32) -> ColorF {
     ColorF::from_colorref(v, 1.0)
 }
 
-/// 控件绘制总入口（含动画水平偏移 `dx`，物理像素）。
+/// 按进度在两色间线性插值。
+pub fn lerp_color(a: ColorF, b: ColorF, t: f32) -> ColorF {
+    let t = t.clamp(0.0, 1.0);
+    let (a, b) = (a.d2d(), b.d2d());
+    ColorF::rgba(
+        ((a.r + (b.r - a.r) * t).clamp(0.0, 1.0) * 255.0).round() as u8,
+        ((a.g + (b.g - a.g) * t).clamp(0.0, 1.0) * 255.0).round() as u8,
+        ((a.b + (b.b - a.b) * t).clamp(0.0, 1.0) * 255.0).round() as u8,
+        a.a + (b.a - a.a) * t,
+    )
+}
+
+fn lerp2(a: (f32, f32), b: (f32, f32), t: f32) -> (f32, f32) {
+    let t = t.clamp(0.0, 1.0);
+    (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t)
+}
+
+/// 通用悬停高亮：以 `hover_t` 为进度叠加淡底（无专属 hover 色的控件共用）。
+fn hover_overlay(
+    gfx: &mut Gfx,
+    rt: &windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget,
+    t: &Theme,
+    r: RectF,
+    radius: f32,
+    hover_t: f32,
+) {
+    if hover_t <= 0.01 {
+        return;
+    }
+    gfx.fill_round(rt, r, radius, c(t, t.button_bg_hover).with_alpha(0.55 * hover_t));
+}
+
+/// 控件绘制总入口（内容坐标 + 内容区原点）。
 #[allow(clippy::too_many_arguments)]
 pub fn paint_widget(
     rt: &windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget,
@@ -209,32 +457,51 @@ pub fn paint_widget(
     state: &WidgetState,
     dpi: u32,
     theme: &Theme,
-    dx: f32,
-    ct: f32,
+    ox: f32,
+    oy: f32,
     body_px: f32,
     small_px: f32,
     edit: Option<&EditState>,
-    slider_deflect: f32,
-    slider_joystick: bool,
+    cfg: Option<&Config>,
 ) {
-    // `w.rect` 是内容坐标（相对内容区顶部）；ct = content_top_y(dpi) 客户区偏移。
-    let r = RectF::from_i32(w.rect.left, w.rect.top, w.rect.right, w.rect.bottom).offset(dx, ct);
+    let r = RectF::from_i32(w.rect.left, w.rect.top, w.rect.right, w.rect.bottom).offset(ox, oy);
     if let Some(_t) = w.kind.as_any().downcast_ref::<ToggleWidget>() {
         paint_toggle(rt, gfx, state, dpi, theme, r);
     } else if let Some(seg) = w.kind.as_any().downcast_ref::<SegmentedWidget>() {
         paint_segmented(rt, gfx, state, dpi, theme, r, &seg.labels, small_px);
     } else if let Some(btn) = w.kind.as_any().downcast_ref::<ButtonWidget>() {
-        paint_button(rt, gfx, state, dpi, theme, r, &btn.label, body_px);
+        paint_button(rt, gfx, state, dpi, theme, r, &btn.label, body_px, btn.kind);
     } else if let Some(sw) = w.kind.as_any().downcast_ref::<SwatchesWidget>() {
         let palette: &[(u8, u8, u8)] = if sw.palette == 0 { &BG_SWATCHES } else { &FG_SWATCHES };
         paint_swatches(rt, gfx, state, dpi, theme, r, palette);
-    } else if let Some(_ms) = w.kind.as_any().downcast_ref::<MetricSwatchesWidget>() {
-        paint_metric_swatches(rt, gfx, state, dpi, theme, r, small_px);
+    } else if let Some(ms) = w.kind.as_any().downcast_ref::<MetricSwatchesWidget>() {
+        paint_metric_swatches(rt, gfx, state, dpi, theme, r, small_px, ms.auto_cfg.is_some());
     } else if let Some(slider) = w.kind.as_any().downcast_ref::<SliderWidget>() {
         paint_slider(
-            rt, gfx, state, dpi, theme, r, slider.dp, slider.min, slider.max, small_px, edit, slider_deflect,
-            slider_joystick,
+            rt, gfx, state, dpi, theme, r, slider.dp, slider.min, slider.max, small_px,
+            slider.unit, small_px, edit, slider.metric_style,
         );
+    } else if let Some(_d) = w.kind.as_any().downcast_ref::<DisclosureWidget>() {
+        paint_disclosure(rt, gfx, state, dpi, theme, r);
+    } else if let Some(st) = w.kind.as_any().downcast_ref::<StepperWidget>() {
+        paint_stepper(rt, gfx, state, dpi, theme, r, st.min, st.max);
+    } else if let Some(ab) = w.kind.as_any().downcast_ref::<AboutHeaderWidget>() {
+        paint_about_header(rt, gfx, dpi, theme, r, ab.lang);
+    } else if let Some(mh) = w.kind.as_any().downcast_ref::<MetricHeaderWidget>() {
+        paint_metric_header(
+            rt, gfx, dpi, theme, r, cfg, mh.index, mh.expanded, mh.lang, body_px, small_px,
+        );
+    } else if let Some(ms) = w.kind.as_any().downcast_ref::<MetricFontStatusWidget>() {
+        paint_metric_font_status(
+            rt, gfx, state, dpi, theme, r, cfg, ms.index, ms.lang, body_px, small_px,
+        );
+    }
+
+    // 键盘焦点环（报告 §7.1：仅键盘导航时出现，鼠标用户看不到）。
+    if state.focused {
+        let g = super::layout::s(dpi, 2) as f32;
+        let fr = RectF::new(r.l - g, r.t - g, r.r + g, r.b + g);
+        gfx.stroke_round(rt, fr, super::layout::s(dpi, 7) as f32, c(theme, theme.accent), 2.0);
     }
 }
 
@@ -246,23 +513,22 @@ fn paint_toggle(
     t: &Theme,
     r: RectF,
 ) {
-    let on = state.value_f > 0.5;
+    // 报告 §2/§4.1 规格：34×20 胶囊，右对齐到操作边缘（行矩形可能略大）。
+    let tw = super::layout::s(dpi, 34) as f32;
+    let th = super::layout::s(dpi, 20) as f32;
+    let r = RectF::new(r.r - tw, (r.t + r.b - th) / 2.0, r.r, (r.t + r.b + th) / 2.0);
+    // 旋钮位置 + 轨道配色都随 `anim_v` 连续变化（开关是「滑」过去的）。
+    let k = state.anim_v.clamp(0.0, 1.0);
     let radius = r.h() / 2.0;
-    let (fill, stroke) = if on {
-        (c(t, t.toggle_on), c(t, t.toggle_on))
-    } else {
-        (c(t, t.toggle_off), c(t, t.toggle_off_stroke))
-    };
+    hover_overlay(gfx, rt, t, r, radius, state.hover_t);
+    let fill = lerp_color(c(t, t.toggle_off), c(t, t.toggle_on), k);
+    let stroke = lerp_color(c(t, t.toggle_off_stroke), c(t, t.toggle_on), k);
     gfx.fill_round(rt, r, radius, fill);
     gfx.stroke_round(rt, r, radius, stroke, 1.0);
-    let m = super::layout::s(dpi, 3) as f32;
+    let m = super::layout::s(dpi, 2) as f32;
     let d = r.h() - 2.0 * m;
-    let kx = if on { r.r - m - d } else { r.l + m };
-    gfx.fill_ellipse(
-        rt,
-        RectF::new(kx, r.t + m, kx + d, r.b - m),
-        c(t, t.knob),
-    );
+    let kx = r.l + m + (r.w() - 2.0 * m - d) * k;
+    gfx.fill_ellipse(rt, RectF::new(kx, r.t + m, kx + d, r.b - m), c(t, t.knob));
 }
 
 fn paint_segmented(
@@ -277,25 +543,36 @@ fn paint_segmented(
 ) {
     let n = labels.len().max(1);
     let seg_w = r.w() / n as f32;
+    let m = super::layout::s(dpi, 2) as f32;
+    hover_overlay(gfx, rt, t, r, super::layout::s(dpi, 7) as f32, state.hover_t);
     gfx.fill_round(rt, r, super::layout::s(dpi, 7) as f32, c(t, t.segmented_bg));
-    for (i, label) in labels.iter().enumerate() {
-        let seg = RectF::new(
-            r.l + i as f32 * seg_w,
-            r.t,
-            r.l + (i + 1) as f32 * seg_w,
-            r.b,
+    // 选中片沿「动画下标」滑动（而非逐格跳变）；无选中态（未贴角）不画胶囊。
+    let sel = state.anim_v.clamp(0.0, (n - 1) as f32);
+    let active = (sel.round() as usize).min(n - 1);
+    if state.has_sel {
+        let ir = RectF::new(
+            r.l + sel * seg_w + m,
+            r.t + m,
+            r.l + (sel + 1.0) * seg_w - m,
+            r.b - m,
         );
-        if i == state.selected {
-            let m = super::layout::s(dpi, 2) as f32;
-            let ir = RectF::new(seg.l + m, seg.t + m, seg.r - m, seg.b - m);
-            gfx.fill_round(rt, ir, super::layout::s(dpi, 5) as f32, c(t, t.seg_selected));
-            gfx.stroke_round(rt, ir, super::layout::s(dpi, 5) as f32, c(t, t.seg_selected_stroke), 1.0);
+        gfx.fill_round(rt, ir, super::layout::s(dpi, 5) as f32, c(t, t.seg_selected));
+        gfx.stroke_round(rt, ir, super::layout::s(dpi, 5) as f32, c(t, t.seg_selected_stroke), 1.0);
+    }
+    for (i, label) in labels.iter().enumerate() {
+        let seg = RectF::new(r.l + i as f32 * seg_w, r.t, r.l + (i + 1) as f32 * seg_w, r.b);
+        let is_active = state.has_sel && i == active;
+        let color = if is_active { c(t, t.label) } else { c(t, t.secondary) };
+        // 轴对齐裁剪：英文标签比中文宽，溢出不再压入相邻分段。
+        unsafe {
+            rt.PushAxisAlignedClip(&seg.d2d(), windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         }
-        let color = if i == state.selected { c(t, t.label) } else { c(t, t.secondary) };
         gfx.text(rt, label, px, 400, HAlign::Center, seg, color, true);
+        unsafe { rt.PopAxisAlignedClip() };
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_button(
     rt: &windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget,
     gfx: &mut Gfx,
@@ -305,10 +582,123 @@ fn paint_button(
     r: RectF,
     label: &str,
     px: f32,
+    kind: ButtonKind,
 ) {
-    let fill = if state.hovered { c(t, t.accent_hover) } else { c(t, t.accent) };
-    gfx.fill_round(rt, r, super::layout::s(dpi, 7) as f32, fill);
-    gfx.text(rt, label, px, 400, HAlign::Center, r, ColorF::rgba(255, 255, 255, 1.0), true);
+    // 链接样式：无底色，强调色文字（报告 §6 action：恢复跟随全局等）。
+    if kind == ButtonKind::Link {
+        let color = if state.hovered { c(t, t.accent_hover) } else { c(t, t.accent) };
+        gfx.text(rt, label, px, 400, HAlign::Center, r, color, true);
+        return;
+    }
+    // 次级：常态极淡、悬停才浮起，避免抢注意力（设置页无主 CTA，C05）。
+    let (fill, text) = (
+        lerp_color(c(t, t.button_bg), c(t, t.button_bg_hover), state.hover_t),
+        c(t, t.label),
+    );
+    let sc = 1.0 - 0.02 * state.press_t;
+    let cx = (r.l + r.r) / 2.0;
+    let cy = (r.t + r.b) / 2.0;
+    let rr = RectF::new(
+        cx - r.w() / 2.0 * sc,
+        cy - r.h() / 2.0 * sc,
+        cx + r.w() / 2.0 * sc,
+        cy + r.h() / 2.0 * sc,
+    );
+    gfx.fill_round(rt, rr, super::layout::s(dpi, 7) as f32, fill);
+    // 轴对齐裁剪：英文按钮文字溢出不再画出按钮边界（EN 本地化保护）。
+    unsafe {
+        rt.PushAxisAlignedClip(&rr.d2d(), windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    }
+    gfx.text(rt, label, px, 400, HAlign::Center, rr, text, true);
+    unsafe { rt.PopAxisAlignedClip() };
+}
+
+/// 步进器（报告 §11 视觉稿：`[−] 值 [＋]`；条目间距 / 名值间距用）。
+/// 三段等高：−按钮 | 值 | ＋按钮，整体一个圆角容器。
+fn paint_stepper(
+    rt: &windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget,
+    gfx: &mut Gfx,
+    state: &WidgetState,
+    dpi: u32,
+    t: &Theme,
+    r: RectF,
+    min: f64,
+    max: f64,
+) {
+    let vbh = super::layout::s(dpi, 24) as f32;
+    let box_r = RectF::new(r.l, r.t + (r.h() - vbh) / 2.0, r.r, r.t + (r.h() + vbh) / 2.0);
+    hover_overlay(gfx, rt, t, box_r, super::layout::s(dpi, 6) as f32, state.hover_t);
+    gfx.fill_round(rt, box_r, super::layout::s(dpi, 6) as f32, c(t, t.button_bg));
+    gfx.stroke_round(rt, box_r, super::layout::s(dpi, 6) as f32, c(t, t.card_stroke), 1.0);
+
+    let minus = RectF::from_win32(stepper_minus_rect(
+        &windows::Win32::Foundation::RECT {
+            left: box_r.l as i32, top: box_r.t as i32,
+            right: box_r.r as i32, bottom: box_r.b as i32,
+        },
+        dpi,
+    ));
+    let plus = RectF::from_win32(stepper_plus_rect(
+        &windows::Win32::Foundation::RECT {
+            left: box_r.l as i32, top: box_r.t as i32,
+            right: box_r.r as i32, bottom: box_r.b as i32,
+        },
+        dpi,
+    ));
+    // 按钮符号（次级色；触底/触顶时禁用色）。
+    let val = state.value_f;
+    let dim = c(t, t.secondary).with_alpha(0.45);
+    let glyph = |at_min: bool, at_max: bool| {
+        // 返回 (−, ＋) 各自的颜色：到达边界的一侧降透明度（禁用感）。
+        (
+            if at_min { dim } else { c(t, t.label) },
+            if at_max { dim } else { c(t, t.label) },
+        )
+    };
+    let (cm, cp) = glyph(val <= min + 1e-6, val >= max - 1e-6);
+    let k = super::layout::s(dpi, 5) as f32;
+    let my = (minus.t + minus.b) / 2.0;
+    let mx = (minus.l + minus.r) / 2.0;
+    gfx.line(rt, mx - k, my, mx + k, my, cm, 1.5);
+    let py_ = (plus.t + plus.b) / 2.0;
+    let px_ = (plus.l + plus.r) / 2.0;
+    gfx.line(rt, px_ - k, py_, px_ + k, py_, cp, 1.5);
+    gfx.line(rt, px_, py_ - k, px_, py_ + k, cp, 1.5);
+
+    // 值（中间，居中；整数直出，C-02：无 "40.0" 式浮点直出）。
+    let value_r = RectF::new(minus.r, box_r.t, plus.l, box_r.b);
+    let show = format!("{}", val.round() as i64);
+    gfx.text(rt, &show, super::layout::s(dpi, 12) as f32, 500, HAlign::Center, value_r, c(t, t.label), true);
+}
+
+/// 色块选中态双层环（React Aria 规范，报告 C03）：内白边 + 外深环
+/// （outline-offset:-4px）。白边保证在深色/彩色块上可见，深环保证在浅色块上可见，
+/// 因此无论色块本身深浅都清晰可辨。
+fn swatch_selected_ring(
+    gfx: &mut Gfx,
+    rt: &windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget,
+    dpi: u32,
+    cell: RectF,
+    radius: f32,
+) {
+    let white = ColorF::rgba(255, 255, 255, 1.0);
+    let dark = ColorF::rgba(15, 23, 42, 1.0);
+    let m1 = super::layout::s(dpi, 1) as f32;
+    gfx.stroke_round(
+        rt,
+        RectF::new(cell.l + m1, cell.t + m1, cell.r - m1, cell.b - m1),
+        radius,
+        white,
+        2.0,
+    );
+    let m2 = super::layout::s(dpi, 4) as f32;
+    gfx.stroke_round(
+        rt,
+        RectF::new(cell.l + m2, cell.t + m2, cell.r - m2, cell.b - m2),
+        radius,
+        dark,
+        2.0,
+    );
 }
 
 fn paint_swatches(
@@ -326,10 +716,14 @@ fn paint_swatches(
     for (i, &(cr, cg, cb)) in palette.iter().enumerate() {
         let sw = RectF::new(r.l + i as f32 * wd, r.t, r.l + (i + 1) as f32 * wd, r.b);
         let inner = RectF::new(sw.l + m, sw.t + m, sw.r - m, sw.b - m);
-        let stroke = if i == state.selected { c(t, t.accent) } else { c(t, t.card_stroke) };
         gfx.fill_round(rt, inner, super::layout::s(dpi, 5) as f32, ColorF::rgba(cr, cg, cb, 1.0));
-        gfx.stroke_round(rt, inner, super::layout::s(dpi, 5) as f32, stroke, 1.0);
+        gfx.stroke_round(rt, inner, super::layout::s(dpi, 5) as f32, c(t, t.card_stroke), 1.0);
     }
+    // 选中态：双层环（内白边 + 外深环，报告 C03），沿动画下标滑动。
+    let sel = state.anim_v.clamp(0.0, (n - 1) as f32);
+    let cell = RectF::new(r.l + sel * wd, r.t, r.l + (sel + 1.0) * wd, r.b);
+    let inner_sel = RectF::new(cell.l + m, cell.t + m, cell.r - m, cell.b - m);
+    swatch_selected_ring(gfx, rt, dpi, inner_sel, super::layout::s(dpi, 5) as f32);
 }
 
 fn paint_metric_swatches(
@@ -340,29 +734,42 @@ fn paint_metric_swatches(
     t: &Theme,
     r: RectF,
     px: f32,
+    auto: bool,
 ) {
-    let follow_flag = state.value_f > 0.5;
-    let n = SW_N;
+    let n = sw_n(auto);
+    let follow_i = sw_follow(auto);
+    let custom_i = sw_custom(auto);
     let wd = r.w() / n as f32;
     let m = super::layout::s(dpi, 3) as f32;
     for i in 0..n {
         let sw = RectF::new(r.l + i as f32 * wd, r.t, r.l + (i + 1) as f32 * wd, r.b);
         let inner = RectF::new(sw.l + m, sw.t + m, sw.r - m, sw.b - m);
-        if i < SW_FOLLOW {
+        if i < SW_COLORS {
             let (cr, cg, cb) = METRIC_SWATCHES[i];
             gfx.fill_round(rt, inner, super::layout::s(dpi, 4) as f32, ColorF::rgba(cr, cg, cb, 1.0));
             gfx.stroke_round(rt, inner, super::layout::s(dpi, 4) as f32, c(t, t.card_stroke), 1.0);
-        } else {
+        } else if auto && i == SW_AUTO {
+            // 自动色：中性底框 + 「A」（占用率分档变色：<60 绿 / 60~85 橙 / ≥85 红）。
+            gfx.fill_round(rt, inner, super::layout::s(dpi, 4) as f32, c(t, t.card));
+            gfx.stroke_round(rt, inner, super::layout::s(dpi, 4) as f32, c(t, t.secondary), 1.0);
+            gfx.text(rt, "A", px, 600, HAlign::Center, inner, c(t, t.secondary), true);
+        } else if i == follow_i {
             gfx.fill_round(rt, inner, super::layout::s(dpi, 4) as f32, c(t, t.card));
             gfx.stroke_round(rt, inner, super::layout::s(dpi, 4) as f32, c(t, t.secondary), 1.0);
             gfx.text(rt, "≈", px, 400, HAlign::Center, inner, c(t, t.secondary), true);
-        }
-        let selected = (i == state.selected) || (i == SW_FOLLOW && follow_flag && state.selected == SW_FOLLOW);
-        if selected {
-            // 修正：旧版先填卡片色再描边（盖掉选中格颜色），新版只描边。
-            gfx.stroke_round(rt, sw, super::layout::s(dpi, 5) as f32, c(t, t.accent), 1.0);
+        } else if i == custom_i {
+            // 自定义入口：虚线框 + 「+」。
+            gfx.fill_round(rt, inner, super::layout::s(dpi, 4) as f32, c(t, t.card).with_alpha(0.3));
+            gfx.stroke_round(rt, inner, super::layout::s(dpi, 4) as f32, c(t, t.secondary), 1.0);
+            gfx.text(rt, "+", px, 400, HAlign::Center, inner, c(t, t.secondary), true);
         }
     }
+    // 选中态：双层环（报告 C03），含末尾「跟随默认」格。
+    let sel = state.anim_v.clamp(0.0, (n - 1) as f32);
+    let cell = RectF::new(r.l + sel * wd, r.t, r.l + (sel + 1.0) * wd, r.b);
+    let m3 = super::layout::s(dpi, 3) as f32;
+    let inner_sel = RectF::new(cell.l + m3, cell.t + m3, cell.r - m3, cell.b - m3);
+    swatch_selected_ring(gfx, rt, dpi, inner_sel, super::layout::s(dpi, 4) as f32);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -377,13 +784,17 @@ fn paint_slider(
     min: f32,
     max: f32,
     px: f32,
+    unit: &'static str,
+    small_px: f32,
     edit: Option<&EditState>,
-    deflect: f32,
-    joystick: bool,
+    metric_style: bool,
 ) {
-    let val = state.value_f as f32;
+    // 文本显示真值；滑块/填充用动画值（跳变与重置时滑过去）。
+    let val = state.value_f;
+    let anim = if state.anim_v == 0.0 && val != 0.0 { val as f32 } else { state.anim_v };
     let editing = state.editing;
     let base = RectF::new(r.l, r.t, r.r, r.b);
+    // 行矩形可能加高（容纳端点标注）：轨道固定贴行顶，值框高度与行高解耦。
     let vb = RectF::from_win32(value_box_rect(
         &windows::Win32::Foundation::RECT {
             left: base.l as i32,
@@ -403,34 +814,49 @@ fn paint_slider(
         dpi,
     ));
 
-    // 轨道
-    let track_y = (tr.t + tr.b) / 2.0;
-    gfx.line(rt, tr.l, track_y, tr.r, track_y, c(t, t.segmented_bg), super::layout::s(dpi, 2).max(1) as f32);
-
-    // 滑块位置：摇杆 = 居中 + deflect×半宽；简单滑杆 = 按当前值映射轨道
+    // 轨道固定在行顶 +8 逻辑 px（端点标注画在其下方）。
+    let track_y = r.t + super::layout::s(dpi, 8) as f32;
+    let th = super::layout::s(dpi, 2).max(1) as f32;
+    gfx.line(rt, tr.l, track_y, tr.r, track_y, c(t, t.segmented_bg), th);
+    let frac = slider_t_from_value(anim as f64, min as f64, max as f64);
+    let cx = (tr.l + frac * tr.w()).clamp(tr.l, tr.r);
+    let fill_color = if metric_style { c(t, t.toggle_on) } else { c(t, t.accent) };
+    if cx > tr.l + 0.5 {
+        gfx.line(rt, tr.l, track_y, cx, track_y, fill_color, th);
+    }
     let thumb_d = super::layout::s(dpi, 13) as f32;
-    let cx = if joystick {
-        let center_x = (tr.l + tr.r) / 2.0;
-        let half = tr.w() / 2.0;
-        (center_x + deflect * half).clamp(tr.l, tr.r)
+    let thumb_r = RectF::new(cx - thumb_d / 2.0, track_y - thumb_d / 2.0, cx + thumb_d / 2.0, track_y + thumb_d / 2.0);
+    if metric_style {
+        // 白圈滑块（理想布局）。
+        gfx.fill_ellipse(rt, thumb_r, c(t, t.knob));
     } else {
-        let span = (max - min).max(1.0);
-        let frac = ((val - min) / span).clamp(0.0, 1.0);
-        tr.l + frac * tr.w()
+        gfx.fill_ellipse(rt, thumb_r, c(t, t.accent));
+    }
+
+    // 端点标注（报告 B-05：每个滑块必须有可见的 min / max 端点）。
+    // 位于轨道下方；小字号 + 次级色。
+    let ep_t = track_y + super::layout::s(dpi, 7) as f32;
+    let ep_b = ep_t + small_px * 1.3;
+    let min_s = format!("{}", min.round() as i64);
+    let max_s = format!("{}", max.round() as i64);
+    gfx.text(rt, &min_s, small_px, 400, HAlign::Leading,
+             RectF::new(tr.l, ep_t, tr.l + super::layout::s(dpi, 40) as f32, ep_b), c(t, t.secondary), true);
+    gfx.text(rt, &max_s, small_px, 400, HAlign::Trailing,
+             RectF::new(tr.r - super::layout::s(dpi, 40) as f32, ep_t, tr.r, ep_b), c(t, t.secondary), true);
+
+    // 数值显示：普通滑杆带圆角底框；个性化页字号滑杆用纯文本（理想布局）。
+    let vbh = super::layout::s(dpi, 24) as f32;
+    let vbr = RectF::new(vb.l, r.t + (r.h() - vbh) / 2.0, vb.r, r.t + (r.h() + vbh) / 2.0);
+    let content = if metric_style {
+        // 纯文本右对齐，右侧留少量内边距。
+        RectF::new(vb.l, vbr.t, vb.r - super::layout::s(dpi, 4) as f32, vbr.b)
+    } else {
+        let fill = if editing { c(t, t.button_bg_hover) } else { c(t, t.button_bg) };
+        gfx.fill_round(rt, vbr, super::layout::s(dpi, 6) as f32, fill);
+        RectF::new(vbr.l, vbr.t, vbr.r - super::layout::s(dpi, 8) as f32, vbr.b)
     };
-    gfx.fill_ellipse(
-        rt,
-        RectF::new(cx - thumb_d / 2.0, track_y - thumb_d / 2.0, cx + thumb_d / 2.0, track_y + thumb_d / 2.0),
-        c(t, t.accent),
-    );
 
-    // 值框
-    let fill = if editing { c(t, t.button_bg_hover) } else { c(t, t.button_bg) };
-    gfx.fill_round(rt, vb, super::layout::s(dpi, 6) as f32, fill);
-    let content = RectF::new(vb.l, vb.t, vb.r - super::layout::s(dpi, 4) as f32, vb.b);
-
-    // 显示文本：编辑态优先显示用户正在输入的内容
-    let show: String = if editing {
+    let mut show: String = if editing {
         edit
             .map(|e| {
                 let mut s: String = e.buf.iter().map(|&c| char::from_u32(c as u32).unwrap_or('\u{FFFD}')).collect();
@@ -445,5 +871,204 @@ fn paint_slider(
     } else {
         format!("{val:.1}")
     };
+    // 单位后缀（C01：40.0 → 40 px）。
+    if !unit.is_empty() && !editing {
+        show.push(' ');
+        show.push_str(unit);
+    }
     gfx.text(rt, &show, px, 400, HAlign::Trailing, content, c(t, t.label), true);
+}
+
+/// 折叠箭头：0 = 朝右，1 = 朝下；两端点按 `anim_v` 插值（箭头「翻开」）。
+fn paint_disclosure(
+    rt: &windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget,
+    gfx: &mut Gfx,
+    state: &WidgetState,
+    dpi: u32,
+    t: &Theme,
+    r: RectF,
+) {
+    // 圆形按钮（用户反馈：展开/收起应为圆形按钮，符号居中）。
+    let cx = (r.l + r.r) / 2.0;
+    let cy = (r.t + r.b) / 2.0;
+    let rad = (r.w().min(r.h())) / 2.0 - super::layout::s(dpi, 3) as f32;
+    let bg = lerp_color(c(t, t.button_bg), c(t, t.button_bg_hover), state.hover_t);
+    let er = RectF::new(cx - rad, cy - rad, cx + rad, cy + rad);
+    gfx.fill_ellipse(rt, er, bg);
+    let color = if state.hovered { c(t, t.label) } else { c(t, t.secondary) };
+    let k = super::layout::s(dpi, 4) as f32;
+    let st = super::layout::s(dpi, 1).max(1) as f32 * 1.5;
+    let a = state.anim_v.clamp(0.0, 1.0);
+    // 朝右：(-0.5k,-k) (0.5k,0) (-0.5k,k)；朝下：(-k,-0.5k) (0,0.5k) (k,-0.5k)
+    let p1 = lerp2((-k * 0.5, -k), (-k, -k * 0.5), a);
+    let p2 = lerp2((k * 0.5, 0.0), (0.0, k * 0.5), a);
+    let p3 = lerp2((-k * 0.5, k), (k, -k * 0.5), a);
+    gfx.line(rt, cx + p1.0, cy + p1.1, cx + p2.0, cy + p2.1, color, st);
+    gfx.line(rt, cx + p3.0, cy + p3.1, cx + p2.0, cy + p2.1, color, st);
+}
+
+/// 字号状态条（理想布局）：字号滑杆下方的一行。
+/// - 未覆盖：「跟随全局  随「布局」页的全局字号变化」
+/// - 已覆盖：「已自定义」标签 + 说明文字 + 右侧「恢复跟随全局」链接。
+/// 整行可点（命中右侧链接区域即重置）。
+#[allow(clippy::too_many_arguments)]
+fn paint_metric_font_status(
+    rt: &windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget,
+    gfx: &mut Gfx,
+    state: &WidgetState,
+    dpi: u32,
+    t: &Theme,
+    r: RectF,
+    cfg: Option<&Config>,
+    index: usize,
+    lang: Lang,
+    body_px: f32,
+    caption_px: f32,
+) {
+    let overridden = cfg
+        .map(|c| c.metric_font_sizes.get(index).copied().flatten().is_some())
+        .unwrap_or(false);
+    let by = (r.t + r.b) / 2.0;
+    let gap = super::layout::s(dpi, 10) as f32;
+
+    if overridden {
+        // 左侧「已自定义」药丸（按钮外观）。
+        let tag_text = crate::i18n::t(lang, "MtrCustomized");
+        let tag_w = gfx
+            .measure_text(tag_text, caption_px, 600)
+            .map(|(w, _)| w + 2.0 * gap)
+            .unwrap_or_else(|| super::layout::s(dpi, 56) as f32);
+        let tag_h = super::layout::s(dpi, 18) as f32;
+        let tag_r = RectF::new(r.l, by - tag_h / 2.0, r.l + tag_w, by + tag_h / 2.0);
+        let green = c(t, t.toggle_on);
+        gfx.fill_round(rt, tag_r, tag_h / 2.0, green.with_alpha(0.16));
+        gfx.text(rt, tag_text, caption_px, 600, HAlign::Center, tag_r, green, true);
+
+        // 右侧「恢复跟随全局」按钮（实测宽 + 内边距，hover 高亮）。
+        if let Some(btn) = metric_font_status_restore_rect(r, dpi, gfx, true, lang, body_px) {
+            if state.hover_t > 0.01 {
+                gfx.fill_round(rt, btn, btn.h() / 2.0, c(t, t.accent).with_alpha(0.10 * state.hover_t));
+            }
+            gfx.text(
+                rt, crate::i18n::t(lang, "ActRestoreGlobal"), body_px, 400,
+                HAlign::Center, btn, c(t, t.accent), true,
+            );
+
+            // 中间说明文字：位于药丸与按钮之间。
+            let msg_l = tag_r.r + gap;
+            let msg_r = (btn.l - gap).max(msg_l);
+            if msg_r > msg_l {
+                let msg = crate::i18n::t(lang, "HintFontSizeOverride");
+                let msg_rect = RectF::new(msg_l, r.t, msg_r, r.b);
+                gfx.text(rt, msg, body_px, 400, HAlign::Leading, msg_rect, c(t, t.secondary), true);
+            }
+        }
+    } else {
+        // 未覆盖：灰色「跟随全局」药丸 + 说明。
+        let tag_text = crate::i18n::t(lang, "MtrFollow");
+        let tag_w = gfx
+            .measure_text(tag_text, caption_px, 600)
+            .map(|(w, _)| w + 2.0 * gap)
+            .unwrap_or_else(|| super::layout::s(dpi, 56) as f32);
+        let tag_h = super::layout::s(dpi, 18) as f32;
+        let tag_r = RectF::new(r.l, by - tag_h / 2.0, r.l + tag_w, by + tag_h / 2.0);
+        gfx.fill_round(rt, tag_r, tag_h / 2.0, c(t, t.secondary).with_alpha(0.12));
+        gfx.text(rt, tag_text, caption_px, 600, HAlign::Center, tag_r, c(t, t.secondary), true);
+
+        let msg_l = tag_r.r + gap;
+        let hint = crate::i18n::t(lang, "MtrStatusFollowHint");
+        if r.r > msg_l {
+            let msg_rect = RectF::new(msg_l, r.t, r.r, r.b);
+            gfx.text(rt, hint, body_px, 400, HAlign::Leading, msg_rect, c(t, t.secondary), true);
+        }
+    }
+}
+
+/// 指标折叠头：字母徽标 + 标题 + 状态摘要（报告 L03/L08、C-05/C-06）。
+/// 折叠态/展开态均为状态摘要：
+/// - 关闭：`已关闭`
+/// - 开启且未覆盖字号：`已启用 · 40 px · 跟随全局`
+/// - 开启且已覆盖：`已启用 · 42 px` + 「已自定义」标记
+/// 硬约束（B-07）：折叠头不含任何可调参数控件，仅图标 + 名称 + 状态 + 开关 + 箭头。
+#[allow(clippy::too_many_arguments)]
+fn paint_metric_header(
+    rt: &windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget,
+    gfx: &mut Gfx,
+    dpi: u32,
+    t: &Theme,
+    r: RectF,
+    _cfg: Option<&Config>,
+    index: usize,
+    _expanded: bool,
+    lang: Lang,
+    body_px: f32,
+    caption_px: f32,
+) {
+    const LETTERS: [char; 5] = ['C', 'M', 'G', 'N', 'P'];
+    const KEYS: [&str; 5] = ["LblCpu", "LblMem", "LblGpu", "LblNet", "LblPower"];
+    let name = crate::i18n::t(lang, KEYS[index.min(4)]);
+
+    let badge = super::layout::s(dpi, 20) as f32;
+    let by = (r.t + r.b) / 2.0;
+    // 徽标：accent 12% 底 + accent 字母（唯一的强调色派生，C05）。
+    let brect = RectF::new(r.l, by - badge / 2.0, r.l + badge, by + badge / 2.0);
+    gfx.fill_round(rt, brect, super::layout::s(dpi, 5) as f32, c(t, t.accent).with_alpha(0.12));
+    gfx.text(
+        rt, &LETTERS[index.min(4)].to_string(), caption_px, 600, HAlign::Center, brect,
+        c(t, t.accent), true,
+    );
+
+    // 标题（600 字重）+ 定宽名称列（报告 size::MONITOR_NAME_W = 58，跨项左对齐）。
+    // 折叠态不显示「已启用 · N px / 已关闭」——开关本身即状态（报告用户反馈）。
+    let title_l = r.l + badge + super::layout::s(dpi, 10) as f32;
+    let sub_l = title_l + super::layout::s(dpi, 58) as f32;
+    let tr = RectF::new(title_l, r.t, sub_l, r.b);
+    gfx.text(rt, name, body_px, 600, HAlign::Leading, tr, c(t, t.label), true);
+}
+
+/// 关于页头部：Logo 方块 + 应用名 + 版本（报告 §11 关于页布局）。
+fn paint_about_header(
+    rt: &windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget,
+    gfx: &mut Gfx,
+    dpi: u32,
+    t: &Theme,
+    r: RectF,
+    lang: Lang,
+) {
+    let side = super::layout::s(dpi, 22) as f32;
+    let cy = (r.t + r.b) / 2.0;
+    let logo = RectF::new(r.l, cy - side / 2.0, r.l + side, cy + side / 2.0);
+    gfx.fill_round(rt, logo, super::layout::s(dpi, 6) as f32, c(t, t.label));
+    gfx.text(
+        rt,
+        crate::i18n::t(lang, "AboutLogo"),
+        super::layout::s(dpi, 9) as f32,
+        700,
+        HAlign::Center,
+        logo,
+        c(t, t.card),
+        true,
+    );
+    // 应用名 + 版本（版本次级色，紧跟名称）。
+    let name = crate::i18n::t(lang, "AboutName");
+    let name_r = RectF::new(logo.r + super::layout::s(dpi, 10) as f32, r.t, r.r, r.b);
+    let mw = gfx.text(rt, name, body_px(dpi), 600, HAlign::Leading, name_r, c(t, t.label), true);
+    if let Some((w, _)) = mw {
+        let ver_r = RectF::new(
+            name_r.l + w + super::layout::s(dpi, 10) as f32,
+            r.t,
+            r.r,
+            r.b,
+        );
+        gfx.text(rt, crate::i18n::t(lang, "AboutVer"), caption_px(dpi), 400, HAlign::Leading, ver_r, c(t, t.secondary), true);
+    }
+}
+
+/// 旧字号换算（关于页头部等处按 DPI 取字号的小工具）。
+fn body_px(dpi: u32) -> f32 {
+    13.0 * dpi as f32 / 72.0
+}
+
+fn caption_px(dpi: u32) -> f32 {
+    11.0 * dpi as f32 / 72.0
 }

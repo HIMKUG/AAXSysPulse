@@ -85,16 +85,8 @@ fn ease_out_cubic(t: f32) -> f32 {
 }
 
 /// 计算本帧 alpha 百分比；动画进行中返回 true（调用方应确保后续帧继续到来）。
-fn compute_alpha_pct(hwnd: HWND, cfg: &Config) -> (f32, bool) {
-    // hover 开关语义（2026-09-09）：开 → 悬停时显示（normal→hover_opacity）；
-    // 关 → 窗口固定为常态透明度（normal_opacity），完全不响应悬停（仅可拖动）。
-    // 因此关时忽略 hovered，避免悬停把窗口点亮。
-    let hovered = cfg.hover && crate::window::is_window_hovered(hwnd);
-    let desired = if hovered {
-        cfg.hover_opacity as f32
-    } else {
-        cfg.normal_opacity as f32
-    };
+fn compute_alpha_pct(_hwnd: HWND, cfg: &Config) -> (f32, bool) {
+    let desired = cfg.normal_opacity as f32;
     let anim_ms = cfg.anim_ms as f32;
     let rendered = RENDERED_PCT_X100.load(AtomicOrdering::Relaxed) as f32 / 100.0;
 
@@ -233,6 +225,7 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
         // 尺寸走缓存（P1-10）：避免每帧一次跨进程 GetWindowRect 系统调用。
         let (width, height) = crate::window::get_window_size(hwnd);
         if width == 0 || height == 0 {
+            crate::perf::note_section("render_early_zero", t0);
             return;
         }
         if width > MAX_WIN || height > MAX_WIN {
@@ -246,6 +239,7 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
                 windows::Win32::Foundation::WPARAM(0),
                 windows::Win32::Foundation::LPARAM(0),
             );
+            crate::perf::note_section("render_early_big", t0);
             return;
         }
 
@@ -281,16 +275,34 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
             if !ANNOUNCED.swap(true, AtomicOrdering::Relaxed) {
                 crate::probe::log("engine=D2d (high quality) — first frame");
             }
-            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                render_d2d(hwnd, snap, cfg, renderer, width, height, src_alpha, alpha_pct_f, animating);
-            }))
-            .is_err();
-            if !panicked {
-                return;
+            static D2D_FAILS: AtomicU32 = AtomicU32::new(0);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                render_d2d(hwnd, snap, cfg, renderer, width, height, src_alpha, alpha_pct_f, animating, t0)
+            }));
+            match outcome {
+                Ok(true) => {
+                    D2D_FAILS.store(0, AtomicOrdering::Relaxed);
+                    perf::note_section("render_d2d_ok", t0);
+                    return;
+                }
+                Ok(false) => {
+                    // 本帧 D2D 绘制失败（bind 失败/设备丢失等）。⚠️ 关键修复：
+                    // 旧实现直接 return → 每帧都空过 → 悬浮窗整体消失（用户实测
+                    // 「切渲染模式后悬浮窗不见了」的根因）。现在立即走 GDI 分支
+                    // 兜底上屏；连续失败 5 次判定 D2D 不可用并持久回退。
+                    let n = D2D_FAILS.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                    crate::probe::log(&format!("d2d frame failed x{n} → gdi fallback this frame"));
+                    if n >= 5 {
+                        D2D_FAILS.store(0, AtomicOrdering::Relaxed);
+                        mark_d2d_broken_and_persist_gdi(hwnd);
+                    }
+                }
+                Err(_) => {
+                    D2D_FAILS.store(0, AtomicOrdering::Relaxed);
+                    crate::probe::log("engine=D2d PANICKED → fall back to Gdi this session");
+                    mark_d2d_broken_and_persist_gdi(hwnd);
+                }
             }
-            // D2D 渲染 panic：禁用并回退 Gdi，本帧改走性能路径（下方 GDI 分支）。
-            crate::probe::log("engine=D2d PANICKED → fall back to Gdi this session");
-            mark_d2d_broken_and_persist_gdi(hwnd);
             // 继续往下走 GDI 分支
         }
 
@@ -319,6 +331,7 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
         // ⚠️ 只扩不缩：窗口比内容大时保持（用户可能手动拉宽过；且与 D2D
         // self-heal 组合时双向收窄会造成"缩→扩→缩"死循环——实测 282↔298）。
         if ensure_content_fits(hwnd, cfg, nat_w, nat_h, width, height) {
+            perf::note_section("render_d2d_fit", t0);
             return;
         }
 
@@ -428,10 +441,12 @@ fn compute_dirty_in(
         }
         if a.hash != b.hash {
             changed[i] = true;
+            // 包围盒用 bbox_x（右对齐数值 cell 会向左覆盖整个预留槽位，
+            // 比绘制原点 x 更靠左）——否则数值变化时左侧残影不会被上传清除。
             let r = RECT {
-                left: a.x,
+                left: a.bbox_x,
                 top: a.y,
-                right: a.x + a.w,
+                right: a.bbox_x + a.w,
                 bottom: a.y + a.h,
             };
             union = Some(match union {
@@ -482,7 +497,7 @@ fn compute_dirty_in(
 
 /// cell 包围盒（已含阴影/描边外扩）相交测试。
 fn cells_intersect(a: &CellSig, b: &CellSig) -> bool {
-    a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+    a.bbox_x < b.bbox_x + b.w && b.bbox_x < a.bbox_x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
 }
 
 /// 逐帧复用的离屏画布（P2）。
@@ -768,7 +783,8 @@ fn render_d2d(
     src_alpha: u8,
     alpha_pct_f: f32,
     animating: bool,
-) {
+    t0: u64,
+) -> bool {
     unsafe {
         // 布局（与性能模式同一套 cell 几何/文字）→ 门面指纹；
         // 异或 ENGINE_HASH_XOR 让引擎切换强制整窗重绘（同内容不同像素不能共享跳过）。
@@ -788,18 +804,19 @@ fn render_d2d(
         // ⚠️ 只扩不缩（与 GDI 分支共用 ensure_content_fits），避免与下方
         // self-heal 互相拉锯死循环（实测 282↔298 每帧抖动、418 被压回 282）。
         if ensure_content_fits(hwnd, cfg, nat_w, nat_h, width, height) {
-            return;
+            return true; // 扩窗续帧（非失败）
         }
 
         let base = renderer.frame_hash(snap, cfg, width, height, src_alpha);
         let sig = base ^ ENGINE_HASH_XOR;
         if LAST_FRAME_HASH.load(std::sync::atomic::Ordering::Relaxed) == sig {
             perf::note_skipped();
+            perf::note_section("render_d2d_skip", t0);
             crate::probe::log_lazy(|| format!("d2d HASH-SKIP sig={sig:x}"));
             if animating {
                 let _ = SetTimer(hwnd, ANIM_TIMER_ID, 16, None);
             }
-            return;
+            return true; // 内容未变（非失败）
         }
         LAST_FRAME_HASH.store(sig, std::sync::atomic::Ordering::Relaxed);
 
@@ -821,17 +838,17 @@ fn render_d2d(
 
         let screen_dc = GetDC(hwnd);
         if screen_dc.is_invalid() {
-            return;
+            return false;
         }
         let dib = DIB.get_or_init(|| Mutex::new(DibCache::default()));
         let Ok(mut dib) = dib.lock() else {
             let _ = ReleaseDC(hwnd, screen_dc);
-            return;
+            return false;
         };
         let Some((mem_dc, _bits)) = dib.get(screen_dc, width, height) else {
             drop(dib);
             let _ = ReleaseDC(hwnd, screen_dc);
-            return;
+            return false;
         };
 
         // 绑 D2D 到 DIB 内存 DC，整帧重绘（上屏按脏区子矩形，DWrite 确定性渲染
@@ -839,11 +856,11 @@ fn render_d2d(
         let mut surface = match D2DSurface::bind(mem_dc, width, height) {
             Some(s) => s,
             None => {
-                crate::probe::log("d2d bind FAILED (no RT) — fallback skipped frame");
+                crate::probe::log("d2d bind FAILED (no RT) — gdi fallback this frame");
                 drop(dib);
                 let _ = ReleaseDC(hwnd, screen_dc);
                 LAST_FRAME_HASH.store(u64::MAX, AtomicOrdering::Relaxed);
-                return;
+                return false; // 失败：调用方走 GDI 分支兜底
             }
         };
         surface.begin_draw();
@@ -854,11 +871,12 @@ fn render_d2d(
         // 若超出，立即按实测右缘扩宽窗口并续帧重画，直到收敛（无需估算余量）。
         let text_right = surface.max_text_right;
         if !surface.end_draw() {
-            // 设备丢失/状态错误：本帧跳过上屏并回滚指纹，下帧 bind 会重建 RT 重试。
+            // 设备丢失/状态错误：本帧跳过上屏并回滚指纹，改走 GDI 分支兜底；
+            // 下帧 bind 会重建 RT 重试 D2D。
             drop(dib);
             let _ = ReleaseDC(hwnd, screen_dc);
             LAST_FRAME_HASH.store(u64::MAX, AtomicOrdering::Relaxed);
-            return;
+            return false;
         }
         let need_w = (text_right + 12.0).ceil() as i32;
         // 仅当确实超出且未达上限才扩；超过上限（内容本身超宽）放弃扩避免死循环。
@@ -876,7 +894,8 @@ fn render_d2d(
                 windows::Win32::Foundation::WPARAM(0),
                 windows::Win32::Foundation::LPARAM(0),
             );
-            return;
+            perf::note_section("render_d2d_heal", t0);
+            return true; // 扩窗续帧（非失败）
         }
         crate::probe::log_lazy(|| format!("d2d PAINT-DONE -> upload {}x{} dirty={:?}", width, height, match &dirty { Dirty::Full => "Full".into(), Dirty::Rect(r) => format!("Rect({},{},{},{})", r.left, r.top, r.right, r.bottom) }));
 
@@ -895,6 +914,7 @@ fn render_d2d(
             let _ = KillTimer(hwnd, ANIM_TIMER_ID);
         }
         let _ = ReleaseDC(hwnd, screen_dc);
+        true
     }
 }
 
@@ -979,12 +999,12 @@ fn force_fit_natural(hwnd: HWND, cfg: &Config) {
 /// 低估真实内容宽度 → 窗口恒窄、右侧文本（如双向 Net 的 "↓xx/s ↑xx/s" 后半段
 /// 上传值）落在窗口外被"裁掉"，观感即"双向只显示一个数值"。给 D2D 下自然宽度
 /// 加 +15% 安全余量；GDI 性能档度量同源（渲染即位图旁路），不加余量不失真。
-fn natural_w_oversized(nat_w: i32, cfg: &Config) -> i32 {
-    let v = if cfg.render_engine == RenderEngine::D2d {
-        ((nat_w as f32) * 1.4).ceil() as i32
-    } else {
-        nat_w
-    };
+fn natural_w_oversized(nat_w: i32, _cfg: &Config) -> i32 {
+    // 网络双向模式 "↓xxx/s ↑xxx/s" 的渲染宽度被低估，
+    // 导致 GDI/D2D 两侧上传值都被裁切。
+    // 加 +40% 安全余量（D2D 因 DIN 字形偏宽原本已有此补偿，
+    // GDI 同理，故统一应用）。
+    let v = ((nat_w as f32) * 1.4).ceil() as i32;
     // 上限钳制：guard 比较与 fit 共用此值，超限会造成"扩→clamp→再扩"死循环。
     v.clamp(60, MAX_WIN)
 }
