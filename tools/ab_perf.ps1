@@ -1,7 +1,7 @@
 <#
 ab_perf.ps1 —— 悬浮窗 A/B 测量一条命令（悬浮窗性能恢复计划 P4.2，验收门槛⑤）
 
-完成：构建 -> 双跑 -> 解析 perf.log -> 输出 A/B 分位数对比表。
+完成：构建 -> 双跑 -> 解析统一日志 -> 输出 A/B 分位数对比表。
   A 组 = 默认（内容指纹跳过 + 脏区 Rect 上传）
   B 组 = SYSOVERLAY_NODIRTY=1（每帧经典整窗 UpdateLayeredWindow）
 
@@ -12,7 +12,10 @@ ab_perf.ps1 —— 悬浮窗 A/B 测量一条命令（悬浮窗性能恢复计�
 注意：
   - 每组跑 -DurationSec 秒（建议 >=60：尾刺与跳帧率需要长窗才稳定）。
   - 跑前强制停止正在运行的 sysoverlay-app（测量不允许旧实例干扰），跑完不自动重启。
-  - perf.log 先备份到 perf.log.ab_bak 再清空，脚本结束前还原原始日志。
+  - 统一日志为 %LOCALAPPDATA%\SysOverlayC\sysoverlay_YYYYMMDD_HHMM.log
+    （logging.rs：每会话一个文件，行格式 `[hh:mm:ss.mmm] [perf] ...`）。
+    解析取「本轮运行期间有写入」的最新会话文件；与本轮同分钟名的旧会话文件
+    先备份（.ab_bak）再删除，脚本结束前还原。
   - 每组原始日志另存 tools\ab_perf_A.log / ab_perf_B.log 供复查。
 #>
 param(
@@ -26,7 +29,17 @@ $repo = Split-Path -Parent $PSScriptRoot
 if (-not $Exe) { $Exe = Join-Path $repo "sysoverlay\target\release\sysoverlay-app.exe" }
 $localAppData = $env:LOCALAPPDATA
 if (-not $localAppData) { $localAppData = $env:TEMP }
-$perfLog = Join-Path $localAppData "SysOverlayC\perf.log"
+$logDir = Join-Path $localAppData "SysOverlayC"
+
+# 统一日志会话文件（logging.rs）：每会话一个 sysoverlay_YYYYMMDD_HHMM.log。
+# After：只看该时刻之后有写入的文件（区分本轮与历史会话），返回最新一个。
+function Get-SessionLog {
+    param([datetime]$After = [datetime]::MinValue)
+    if (-not (Test-Path $logDir)) { return $null }
+    Get-ChildItem -Path $logDir -Filter "sysoverlay_*.log" -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -ge $After } |
+        Sort-Object LastWriteTime | Select-Object -Last 1
+}
 
 function Write-Section([string]$t) {
     Write-Host ""
@@ -49,8 +62,13 @@ function Invoke-Round {
     Get-Process sysoverlay-app -ErrorAction SilentlyContinue | Stop-Process -Force
     Start-Sleep -Milliseconds 600
 
-    if (Test-Path $perfLog) { Copy-Item $perfLog "$perfLog.ab_bak" -Force }
-    Remove-Item $perfLog -ErrorAction SilentlyContinue
+    # 与本轮同分钟名的旧会话文件：应用按文件名追加，不删会混入上一轮数据。
+    # 备份后删除；其他分钟的历史会话文件一律不动。
+    $curName = "sysoverlay_{0:yyyyMMdd}_{0:HHmm}.log" -f (Get-Date)
+    $curPath = Join-Path $logDir $curName
+    if (Test-Path $curPath) { Copy-Item $curPath "$curPath.ab_bak" -Force }
+    Remove-Item $curPath -ErrorAction SilentlyContinue
+    $runStart = Get-Date
 
     $env:SYSOVERLAY_PERF = "1"
     foreach ($k in $ExtraEnv.Keys) { Set-Item -Path "Env:$k" -Value $ExtraEnv[$k] }
@@ -67,15 +85,18 @@ function Invoke-Round {
         foreach ($k in $ExtraEnv.Keys) { Remove-Item -Path "Env:$k" -ErrorAction SilentlyContinue }
     }
 
-    if (-not (Test-Path $perfLog)) { throw "$Name 组没有产生 perf.log（$perfLog）——确认 SYSOVERLAY_PERF 生效" }
-    Copy-Item $perfLog (Join-Path $PSScriptRoot "ab_perf_$Name.log") -Force
+    $sessionLog = Get-SessionLog -After $runStart.AddSeconds(-2)
+    if (-not $sessionLog) { throw "$Name 组没有产生会话日志（$logDir\sysoverlay_*.log）——确认 SYSOVERLAY_PERF 生效" }
+    Copy-Item $sessionLog.FullName (Join-Path $PSScriptRoot "ab_perf_$Name.log") -Force
 
     # ── 解析：frame_render 逐帧样本 + section 段样本 + frames/skipped 聚合行 ──
+    # 行格式：`[hh:mm:ss.mmm] [perf] 原字段`（见 logging.rs）。
+    # section 标签可含空格（如 `seg_upload pct=51`），故用 (.+) 而非 (\S+)。
     $frm = New-Object System.Collections.Generic.List[long]
     $sections = @{}
     $aggN = 0; $aggSkip = [long]0; $aggFrames = [long]0
-    foreach ($ln in (Get-Content $perfLog)) {
-        if ($ln -match '^frames=(\d+)\s+skipped=(\d+)\s+skip_pct=(\d+)%\s+avg_us=(\d+)\s+p50_us=(\d+)\s+p99_us=(\d+)\s+max_us=(\d+)') {
+    foreach ($ln in (Get-Content $sessionLog.FullName)) {
+        if ($ln -match '^\[[\d:.]+\] \[perf\] frames=(\d+)\s+skipped=(\d+)\s+skip_pct=(\d+)%\s+avg_us=(\d+)\s+p50_us=(\d+)\s+p99_us=(\d+)\s+max_us=(\d+)') {
             $aggN++
             if ($aggN -gt 1) {
                 # 首个聚合窗含启动突发（DIB/D2D 冷启动），统计上剔除
@@ -84,8 +105,8 @@ function Invoke-Round {
             }
             continue
         }
-        if ($ln -match '^frame_render ms=\d+ us=(\d+)') { $frm.Add([long]$Matches[1]); continue }
-        if ($ln -match '^section (\S+) us=(\d+)') {
+        if ($ln -match '^\[[\d:.]+\] \[perf\] frame_render ms=\d+ us=(\d+)') { $frm.Add([long]$Matches[1]); continue }
+        if ($ln -match '^\[[\d:.]+\] \[perf\] section (.+) us=(\d+)') {
             $lab = $Matches[1]
             if (-not $sections.ContainsKey($lab)) { $sections[$lab] = New-Object System.Collections.Generic.List[long] }
             $sections[$lab].Add([long]$Matches[2])
@@ -155,5 +176,8 @@ Write-Host ""
 Write-Host ("样本量：A frames={0}  B frames={1}（过少则加长 -DurationSec）" -f $a.Frames, $b.Frames)
 Write-Host "解读：p50/p99 越低越好；A 相对 B 的差值 = 脏区上传+跳帧架构的实际收益。"
 
-# 还原用户原始 perf.log（各组日志已另存 tools\ab_perf_*.log）
-if (Test-Path "$perfLog.ab_bak") { Move-Item "$perfLog.ab_bak" $perfLog -Force }
+# 还原本轮开始前被备份的同分钟会话日志（各组日志已另存 tools\ab_perf_*.log）
+if (Test-Path $logDir) {
+    Get-ChildItem -Path $logDir -Filter "sysoverlay_*.log.ab_bak" -File -ErrorAction SilentlyContinue |
+        ForEach-Object { Move-Item $_.FullName ($_.FullName -replace '\.ab_bak$', '') -Force }
+}

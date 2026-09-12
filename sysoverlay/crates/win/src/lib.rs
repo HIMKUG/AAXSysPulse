@@ -28,6 +28,7 @@ pub mod msr;
 pub mod power_system;
 pub mod sysinfo;
 pub mod elevate;
+pub mod logging;
 pub mod probe;
 pub mod menu;
 pub mod dpi;

@@ -3,10 +3,11 @@
 //! # 为什么需要它
 //!
 //! 悬浮窗是 GUI 子系统进程（`windows_subsystem = "windows"`），**没有控制台**，
-//! `eprintln!` 看不到。所以这里直接写文件：
+//! `eprintln!` 看不到。所以这里写文件（落盘出口统一在 [`crate::logging`]，
+//! 与 probe 流共用 `sysoverlay_YYYYMMDD_HHMM.log`，行前缀 `[perf]`）：
 //!
 //! ```text
-//! %LOCALAPPDATA%\SysOverlayC\perf.log
+//! %LOCALAPPDATA%\SysOverlayC\sysoverlay_YYYYMMDD_HHMM.log
 //! ```
 //!
 //! 每 5 秒追加一行：`frames`（实际渲染帧数）、`skipped`（脏检查跳过的帧）、
@@ -154,32 +155,22 @@ fn maybe_report() {
         "frames={:<6} skipped={:<6} skip_pct={:<3}% avg_us={:<6} p50_us={:<6} p99_us={:<6} max_us={:<6}\n",
         frames, skipped, skip_pct, avg, p50, p99, max
     );
-    // 段级样本批量落盘（观察者效应修复）：与聚合行同窗口、同一次 open/write/close。
+    // 段级样本批量落盘（观察者效应修复）：与聚合行同窗口、同一次落盘写调用。
     // 丢弃策略：缓冲溢出（>16k）时旧样本已被截断，此处照常落盘现有样本。
     if let Ok(mut v) = SECTION_SAMPLES.lock() {
         for (l, u) in v.drain(..) {
             line.push_str(&format!("section {l} us={u}\n"));
         }
     }
-    if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
-        let dir = std::path::PathBuf::from(dir).join("SysOverlayC");
-        let _ = std::fs::create_dir_all(&dir);
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("perf.log"))
-        {
-            let _ = f.write_all(line.as_bytes());
-        }
-    }
+    // 多行文本由 logging 逐行加前缀、合并为一次 write_all（常驻句柄，无 open/close）。
+    crate::logging::write(crate::logging::Stream::Perf, &line);
 }
 
 // ── 消息级耗时探针（UI 线程谁在卡？） ─────────────────────
 //
 // SYSOVERLAY_PERF=1 时，消息循环每条消息从 GetMessageW 返回到
 // DispatchMessageW 返回之间的耗时（wall-time）若超过 MSG_SLOW_US
-// 阈值，立即追加一行到 perf.log：`msg slow hwnd=.. msg=0x.. us=..`。
+// 阈值，立即追加一行到统一日志的 perf 流：`msg slow hwnd=.. msg=0x.. us=..`。
 // 用于定位「UI 线程被谁占住」（进程扫描 / 渲染 / 设置窗口重绘）。
 
 /// 慢消息阈值（微秒）：超过即落盘。默认 20ms —— 超过人眼感知不跟手。
@@ -290,20 +281,9 @@ fn maybe_report_msgs() {
     write_line(&line);
 }
 
-/// 追加一行到 perf.log（不 trim，简单可靠）。
+/// 追加一行（或一段多行文本）到统一日志文件的 perf 流（见 logging.rs）。
 fn write_line(line: &str) {
-    if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
-        let dir = std::path::PathBuf::from(dir).join("SysOverlayC");
-        let _ = std::fs::create_dir_all(&dir);
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("perf.log"))
-        {
-            let _ = f.write_all(line.as_bytes());
-        }
-    }
+    crate::logging::write(crate::logging::Stream::Perf, line);
 }
 
 /// 通用耗时探针：`label` 段从 `start` 到现在的耗时，**聚合进内存缓冲**，

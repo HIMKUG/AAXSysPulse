@@ -1062,7 +1062,7 @@ fn set_status(ctx: &mut SettingsCtx, text: &str) {
 }
 
 /// 打开日志文件所在目录（报告 C-01：路径降级为动作）。
-/// 滚动日志文件位于 `%LOCALAPPDATA%\SysOverlayC\`（见 probe.rs：每 10 分钟一个 `probe_<YYYYMMDD>_<HHMM>.log`）。
+/// 统一日志文件位于 `%LOCALAPPDATA%\SysOverlayC\`（见 logging.rs：每会话一个 `sysoverlay_<YYYYMMDD>_<HHMM>.log`，probe/perf 双流）。
 fn open_log_folder(ctx: &mut SettingsCtx) {
     use windows::core::PCWSTR;
     use windows::Win32::UI::Shell::ShellExecuteW;

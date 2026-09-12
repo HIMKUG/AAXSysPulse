@@ -133,8 +133,8 @@ pub struct Config {
     pub power_interval_ms: u32,
     /// 是否排除虚拟网卡（WSL2 vEthernet / DockerNAT / Hyper-V switch）。
     pub exclude_virtual_nic: bool,
-    /// 调试日志开关。开启后各采样器把原始 API 数据写入
-    /// `%LOCALAPPDATA%\SysOverlayC\probe_<YYYYMMDD>_<HHMM>.log`（每 10 分钟滚动一个文件，设置面板可实时切换）。
+    /// 调试日志开关。开启后各采样器把原始 API 数据写入统一日志文件
+    /// `%LOCALAPPDATA%\SysOverlayC\sysoverlay_<YYYYMMDD>_<HHMM>.log`（每会话一个文件，probe 流，设置面板可实时切换）。
     pub debug_log: bool,
 
     // ── v3 新增 ──────────────────────────────────────────────
