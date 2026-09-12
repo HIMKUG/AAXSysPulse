@@ -8,6 +8,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 pub const IDM_SETTINGS: u16 = 1;
 pub const IDM_QUIT: u16 = 2;
+pub const IDM_RESTART: u16 = 3;
 
 unsafe fn append(menu: HMENU, id: u16, label: &str) {
     let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
@@ -28,10 +29,11 @@ pub fn show_tray_menu(hwnd: HWND) -> Option<u16> {
         let t = |k: &'static str| crate::i18n::t(lang, k);
         append(menu, IDM_SETTINGS, t("MenuSettings"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+        append(menu, IDM_RESTART, t("MenuRestart"));
         append(menu, IDM_QUIT, t("MenuQuit"));
 
         // 不调用 SetForegroundWindow：用 TPM_NOACTIVATE 让菜单跟随托盘图标，
-        // 不抢游戏前台（AFMF 破坏路径 1：抢焦点）。
+        // 不抢前台应用焦点。
         let mut pt = windows::Win32::Foundation::POINT::default();
         let _ = GetCursorPos(&mut pt);
         let cmd = TrackPopupMenu(

@@ -765,11 +765,20 @@ fn step_drag_release(ctx: &mut SettingsCtx, dt: f32) -> bool {
 
 // ── 单向数据流：Action 分派（唯一写入口） ────────────────
 
-/// 拒绝「关闭全部指标」：至少保留一项可见。
+/// v3：Time 与 CPU/Mem/GPU/Net/Power 平权，同属监控项（共 6 项）。
 fn is_metric_toggle(r: CfgRef) -> bool {
-    matches!(r, CfgRef::ShowCpu | CfgRef::ShowMem | CfgRef::ShowGpu | CfgRef::ShowNet | CfgRef::PowerEnabled)
+    matches!(
+        r,
+        CfgRef::ShowCpu
+            | CfgRef::ShowMem
+            | CfgRef::ShowGpu
+            | CfgRef::ShowNet
+            | CfgRef::ShowTime
+            | CfgRef::PowerEnabled
+    )
 }
 
+/// 拒绝「关闭全部监控项」：任意时刻可见项数 ≥ 1（含 Time）。
 fn metrics_all_off_after(cfg: &sysoverlay_core::config::Config, turning_off: CfgRef) -> bool {
     let v = |r: CfgRef| matches!(r.get(cfg), Value::Bool(true));
     let would_off = |r: CfgRef| r == turning_off;
@@ -777,7 +786,31 @@ fn metrics_all_off_after(cfg: &sysoverlay_core::config::Config, turning_off: Cfg
         && (!v(CfgRef::ShowMem) || would_off(CfgRef::ShowMem))
         && (!v(CfgRef::ShowGpu) || would_off(CfgRef::ShowGpu))
         && (!v(CfgRef::ShowNet) || would_off(CfgRef::ShowNet))
+        && (!v(CfgRef::ShowTime) || would_off(CfgRef::ShowTime))
         && (!v(CfgRef::PowerEnabled) || would_off(CfgRef::PowerEnabled))
+}
+
+/// v3：行关闭触发驱动/厂商库卸载时，弹原生提示框告知「重启应用恢复」。
+/// 阻塞直至用户点确定（设置线程，可接受）。
+fn show_teardown_notice(overlay: HWND, i18n_key: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND,
+    };
+    let lang = crate::i18n::global_lang();
+    let body: Vec<u16> = crate::i18n::t(lang, i18n_key)
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let caption: Vec<u16> = "SysOverlay\0".encode_utf16().collect();
+    crate::probe::log(&format!("teardown notice shown: {i18n_key}"));
+    unsafe {
+        MessageBoxW(
+            overlay,
+            windows::core::PCWSTR(body.as_ptr()),
+            windows::core::PCWSTR(caption.as_ptr()),
+            MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
+        );
+    }
 }
 
 /// Action 分派：业务规则 + 副作用 + 唯一 Config 写入口。
@@ -829,6 +862,15 @@ fn dispatch(ctx: &mut SettingsCtx, action: Action) {
                         }
                         CfgRef::ClickThrough => {
                             window::apply_click_through(overlay, cfg.click_through);
+                        }
+                        CfgRef::PowerEnabled if !cfg.power_enabled => {
+                            // v3「行关即完全停止」：MSR 内核驱动会被卸载，
+                            // 本会话重开不热恢复 → 原生弹窗告知重启恢复。
+                            show_teardown_notice(overlay, "TeardownPower");
+                        }
+                        CfgRef::ShowGpu if !cfg.show_gpu => {
+                            // v3：厂商驱动库（NVML/ADL）被卸载，本会话不热恢复。
+                            show_teardown_notice(overlay, "TeardownGpu");
                         }
                         _ => {}
                     }
@@ -980,7 +1022,7 @@ fn set_status(ctx: &mut SettingsCtx, text: &str) {
 }
 
 /// 打开日志文件所在目录（报告 C-01：路径降级为动作）。
-/// probe.log 位于 `%LOCALAPPDATA%\SysOverlayC\`（见 probe.rs）。
+/// 滚动日志文件位于 `%LOCALAPPDATA%\SysOverlayC\`（见 probe.rs：每 10 分钟一个 `probe_<YYYYMMDD>_<HHMM>.log`）。
 fn open_log_folder(ctx: &mut SettingsCtx) {
     use windows::core::PCWSTR;
     use windows::Win32::UI::Shell::ShellExecuteW;
@@ -2263,7 +2305,10 @@ fn paint_d2d(hwnd: HWND) -> bool {
     let slide_moving = step_card_slide(ctx, dt);
 
     // 拖拽释放弹簧：被拖卡从当前偏移量 spring 到 0，收敛后 rebuild + 落盘。
-    let release_moving = !step_drag_release(ctx, dt);
+    // ⚠️ 必须先判 drag_release 是否存在：无拖拽释放时 step 返回 false（非收敛），
+    // 直接取反会让 release_moving 恒 true → animating 永真 → 设置窗 40fps 空转
+    // （实测单帧 ~2.4ms ≈ 单核 10%，是 CPU 占用回退 0.1-0.2%→0.6% 的主因）。
+    let release_moving = ctx.drag_release.is_some() && !step_drag_release(ctx, dt);
 
     // H4：滚动惯性——动量投射 → 行吸附 → 弹簧趋近（收敛即停）。
     if ctx.scroll_vel.abs() > 1.0 {

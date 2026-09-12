@@ -40,6 +40,8 @@ pub fn t(lang: Lang, key: &str) -> &str {
         // ── 托盘菜单 ────────────────────────────────────
         ("MenuSettings", false) => "Settings",
         ("MenuSettings", true) => "设置",
+        ("MenuRestart", false) => "Quick Restart",
+        ("MenuRestart", true) => "快速重启",
         ("MenuQuit", false) => "Quit",
         ("MenuQuit", true) => "退出",
 
@@ -123,8 +125,6 @@ pub fn t(lang: Lang, key: &str) -> &str {
         ("LblAutostart", true) => "开机自启",
         ("LblDebug", false) => "Debug Log",
         ("LblDebug", true) => "调试日志",
-        ("LblFullscreenHide", false) => "Hide in Fullscreen",
-        ("LblFullscreenHide", true) => "全屏时隐藏",
 
         // ── 设置面板：分段控件 / 按钮文案 ────────────────
         ("SegPercent", false) => "Percent",
@@ -179,14 +179,6 @@ pub fn t(lang: Lang, key: &str) -> &str {
             "FootnoteDebug",
             true,
         ) => "记录运行状态用于排查问题，会持续写入磁盘，建议仅在需要时开启。",
-        (
-            "FootnoteFullscreenHide",
-            false,
-        ) => "Hides the overlay when a fullscreen app (e.g. game) is detected, restoring AFMF frame generation that overlays otherwise break.",
-        (
-            "FootnoteFullscreenHide",
-            true,
-        ) => "检测到全屏应用（如游戏）时自动隐藏悬浮窗，恢复被叠加层破坏的 AFMF 帧生成。",
         (
             "FootnoteTopmost",
             false,
@@ -454,6 +446,24 @@ pub fn t(lang: Lang, key: &str) -> &str {
         ("HintNetLowFreq", true) => "减少资源占用，网速显示会有短暂延迟。",
         ("HintRenderMode", false) => "Smooth favors lower cost; Fine favors animation quality.",
         ("HintRenderMode", true) => "流畅优先降低绘制开销，精细优先保证动画细腻",
+
+        // v3「行关即完全停止」：驱动/厂商库卸载后的重启恢复提示
+        ("TeardownPower", false) => {
+            "Power row stopped: the MSR kernel driver has been unloaded.\n\
+             Re-enabling it requires restarting SysOverlay to restore the display."
+        }
+        ("TeardownPower", true) => {
+            "功耗行已停止：MSR 内核驱动已卸载。\n\
+             重新开启需要重启应用才能恢复显示。"
+        }
+        ("TeardownGpu", false) => {
+            "GPU row stopped: vendor driver libraries (NVML/ADL) have been unloaded.\n\
+             Utilization falls back to D3DKMT; vendor power readings require restarting SysOverlay."
+        }
+        ("TeardownGpu", true) => {
+            "GPU 行已停止：厂商驱动库（NVML/ADL）已卸载。\n\
+             利用率将回落到 D3DKMT 读取；厂商功耗读数需重启应用恢复。"
+        }
 
         _ => key,
     }

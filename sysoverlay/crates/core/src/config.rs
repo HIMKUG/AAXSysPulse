@@ -134,7 +134,7 @@ pub struct Config {
     /// 是否排除虚拟网卡（WSL2 vEthernet / DockerNAT / Hyper-V switch）。
     pub exclude_virtual_nic: bool,
     /// 调试日志开关。开启后各采样器把原始 API 数据写入
-    /// `%LOCALAPPDATA%\SysOverlayC\probe.log`（设置面板可实时切换）。
+    /// `%LOCALAPPDATA%\SysOverlayC\probe_<YYYYMMDD>_<HHMM>.log`（每 10 分钟滚动一个文件，设置面板可实时切换）。
     pub debug_log: bool,
 
     // ── v3 新增 ──────────────────────────────────────────────
@@ -142,9 +142,6 @@ pub struct Config {
     pub render_style: RenderStyle,
     /// 界面语言：En / Zh（全界面双语切换）。
     pub lang: Lang,
-    /// 全屏游戏自动隐藏悬浮窗（根治 AFMF 合成层破坏）。
-    /// 检测到全屏应用时隐藏，退出全屏自动恢复。默认开。
-    pub afmf_auto_hide: bool,
 
     // ── v3 性能档（默认全部最佳性能） ─────────────────────────
     /// GPU 只查主适配器（节点数最大的 dGPU），跳过其余虚拟/副卡适配器。
@@ -246,7 +243,6 @@ impl Default for Config {
             debug_log: false,
             render_style: RenderStyle::Strip,
             lang: Lang::En,
-            afmf_auto_hide: true,
             gpu_primary_only: true,
             gpu_3d_only: true,
             net_low_freq: true,
@@ -525,9 +521,6 @@ impl Config {
                         cfg.lang = l;
                     }
                 }
-                "afmf_auto_hide" | "fullscreen_hide" => {
-                    cfg.afmf_auto_hide = Self::parse_bool(value, cfg.afmf_auto_hide);
-                }
                 "gpu_primary_only" => {
                     cfg.gpu_primary_only = Self::parse_bool(value, cfg.gpu_primary_only);
                 }
@@ -667,7 +660,6 @@ impl Config {
         s.push_str(&format!("debug_log {}\n", self.debug_log as u32));
         s.push_str(&format!("render_style {}\n", self.render_style.to_config()));
         s.push_str(&format!("lang {}\n", self.lang.to_config()));
-        s.push_str(&format!("afmf_auto_hide {}\n", self.afmf_auto_hide as u32));
         // v3 性能档开关（C 版忽略）
         s.push_str(&format!("gpu_primary_only {}\n", self.gpu_primary_only as u32));
         s.push_str(&format!("gpu_3d_only {}\n", self.gpu_3d_only as u32));

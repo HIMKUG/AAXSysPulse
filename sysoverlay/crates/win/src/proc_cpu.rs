@@ -16,6 +16,12 @@ impl CpuSampler {
     pub fn new() -> Self {
         Self { prev: None }
     }
+
+    /// 重置 GetSystemTimes 前值（CPU 行重新启用时调用）：
+    /// 跨大间隔的陈旧 delta 会让首帧占用率飙到 100%，重置后首帧只建基线。
+    pub fn reset_baseline(&mut self) {
+        self.prev = None;
+    }
 }
 
 impl Default for CpuSampler {

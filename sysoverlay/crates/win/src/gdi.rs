@@ -453,13 +453,10 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
             dirty = Dirty::Full;
             changed = vec![true; cells.len()];
         }
-        // 时钟秒变化 → 强制整窗（原因见 LAST_PRESENTED_SEC 注释：局部 ULW 在
-        // 部分合成器上不重混，时间会"跟调度器几秒一跳"）。 Full 后 paint 收到
-        // None 即整画布重画，无需再动 changed。
+        // 时钟秒变化：v3 起恢复 clock.rs 设计的脏矩形上传（此前因 AFMF 兼容
+        // 强制 Full；AFMF 兼容已整体取消，局部 ULW 的合成器问题不再迁就）。
+        // compute_dirty 已把秒变化的 time cell 并进脏区，无需额外处理。
         let present_sec = sysoverlay_ui::clock::get().2;
-        if cfg.show_time && LAST_PRESENTED_SEC.load(AtomicOrdering::Relaxed) != present_sec {
-            dirty = Dirty::Full;
-        }
 
         // 绘制（A3：仅首帧/alpha/布局变化才整画布清零，否则只清脏区 cell）
         renderer.paint(
@@ -826,6 +823,10 @@ unsafe fn upload_dib(hwnd: HWND, width: i32, height: i32, src_alpha: u8, dirty: 
         SourceConstantAlpha: src_alpha,
         AlphaFormat: windows::Win32::Graphics::Gdi::AC_SRC_ALPHA as u8,
     };
+    // 卡死探针（2026-09-12 13:40 事故）：渲染线程最后日志停在 PAINT-DONE，
+    // 唯一剩余阻塞点在 upload_dib 内部（GetDC / DIB.lock / ULW）。
+    // ULW 前后各打一条，下次复现即可把挂起点钉死到具体 API。
+    crate::probe::log_lazy(|| format!("upload-begin {width}x{height} dirty={}", match dirty { Dirty::Full => "Full".into(), Dirty::Rect(r) => format!("Rect({},{},{},{})", r.left, r.top, r.right, r.bottom) }));
     let ok = if *DIRTY_DISABLED || matches!(dirty, Dirty::Full) {
         let sz = SIZE { cx: width, cy: height };
         let src_pt = POINT::default();
@@ -865,6 +866,7 @@ unsafe fn upload_dib(hwnd: HWND, width: i32, height: i32, src_alpha: u8, dirty: 
     if !ok {
         crate::probe::log("upload_dib: UpdateLayeredWindow failed");
     }
+    crate::probe::log_lazy(|| format!("upload-end ok={ok}"));
     let _ = ReleaseDC(hwnd, screen_dc);
     ok
 }
@@ -929,12 +931,10 @@ fn render_d2d(
         if take_force_full() || present_size_changed(width, height) {
             dirty = Dirty::Full;
         }
-        // 时钟秒变化 → 强制整窗（同下方 GDI 分支：局部 ULW 在部分合成器上
-        // 不重混该子区，时间会"跟调度器几秒一跳"）。
+        // 时钟秒变化：v3 起恢复 clock.rs 设计的脏矩形上传（此前因 AFMF 兼容
+        // 强制 Full；AFMF 兼容已整体取消，局部 ULW 的合成器问题不再迁就）。
+        // compute_dirty_in 已把秒变化的 time cell 并进脏区，无需额外处理。
         let present_sec = sysoverlay_ui::clock::get().2;
-        if cfg.show_time && LAST_PRESENTED_SEC.load(AtomicOrdering::Relaxed) != present_sec {
-            dirty = Dirty::Full;
-        }
         crate::probe::log_lazy(|| {
             let kind = match &dirty {
                 Dirty::Full => "Full".to_string(),

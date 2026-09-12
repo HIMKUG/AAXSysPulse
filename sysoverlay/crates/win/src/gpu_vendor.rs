@@ -36,25 +36,14 @@ struct BackendSet {
     igcl: Option<Igcl>,
 }
 
-static BACKEND: OnceLock<BackendSet> = OnceLock::new();
+/// v3「行关即完全停止」：包一层 `Mutex<Option<_>>`，
+/// teardown 取出并 drop → Nvml/Adl 的 Drop 卸载厂商驱动库；
+/// 取出后 `None` → 采样短路（D3DKMT 兜底），本会话不热恢复。
+static BACKEND: OnceLock<std::sync::Mutex<Option<BackendSet>>> = OnceLock::new();
 static GPU_WATTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// GPU 利用率缓存（0xFFFF_FFFF = 无缓存）；用 u32 bitpattern 而非 f32 避免 0.0 歧义。
 const GPU_UTIL_NONE: u32 = 0xFFFF_FFFF;
 static GPU_UTIL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(GPU_UTIL_NONE);
-
-fn backend() -> &'static BackendSet {
-    BACKEND.get_or_init(|| {
-        // 只要机器上存在某厂商的显卡（含核显）就加载该厂商后端：
-        // 多卡机器（同厂商多卡 / 混合厂商 / 独显+核显）每张卡的功耗都能统计。
-        let gpus = gpu_detect::enum_adapters();
-        let has = |v: u32| gpus.iter().any(|g| g.vendor_id == v);
-        BackendSet {
-            nvml: if has(gpu_detect::VENDOR_NVIDIA) { Nvml::load() } else { None },
-            adl: if has(gpu_detect::VENDOR_AMD) { Adl::load().map(Box::new) } else { None },
-            igcl: if has(gpu_detect::VENDOR_INTEL) { Igcl::load() } else { None },
-        }
-    })
-}
 
 /// 合并一轮读数：利用率取较大的那个，功耗相加。
 fn merge_reading(dst: &mut VendorReading, (u, w): VendorReading) {
@@ -68,26 +57,46 @@ fn merge_reading(dst: &mut VendorReading, (u, w): VendorReading) {
 
 pub fn sample() -> VendorReading {
     let t0 = perf::begin();
-    let bs = backend();
-    let mut r: VendorReading = (None, None);
-    if let Some(b) = &bs.nvml {
-        let t1 = perf::begin();
-        let rv = b.sample();
-        perf::note_section("gpunvml", t1);
-        merge_reading(&mut r, rv);
-    }
-    if let Some(b) = &bs.adl {
-        let t1 = perf::begin();
-        let rv = b.sample();
-        perf::note_section("gpuadl", t1);
-        merge_reading(&mut r, rv);
-    }
-    if let Some(b) = &bs.igcl {
-        let t1 = perf::begin();
-        let rv = b.sample();
-        perf::note_section("gpuigcl", t1);
-        merge_reading(&mut r, rv);
-    }
+    let r: VendorReading = {
+        let lock = BACKEND.get_or_init(|| {
+            // 只要机器上存在某厂商的显卡（含核显）就加载该厂商后端：
+            // 多卡机器（同厂商多卡 / 混合厂商 / 独显+核显）每张卡的功耗都能统计。
+            let gpus = gpu_detect::enum_adapters();
+            let has = |v: u32| gpus.iter().any(|g| g.vendor_id == v);
+            std::sync::Mutex::new(Some(BackendSet {
+                nvml: if has(gpu_detect::VENDOR_NVIDIA) { Nvml::load() } else { None },
+                adl: if has(gpu_detect::VENDOR_AMD) { Adl::load().map(Box::new) } else { None },
+                igcl: if has(gpu_detect::VENDOR_INTEL) { Igcl::load() } else { None },
+            }))
+        });
+        let bs = lock.lock().unwrap_or_else(|e| e.into_inner());
+        match bs.as_ref() {
+            // 已 teardown：短路，不触碰厂商库
+            None => (None, None),
+            Some(bs) => {
+                let mut r: VendorReading = (None, None);
+                if let Some(b) = &bs.nvml {
+                    let t1 = perf::begin();
+                    let rv = b.sample();
+                    perf::note_section("gpunvml", t1);
+                    merge_reading(&mut r, rv);
+                }
+                if let Some(b) = &bs.adl {
+                    let t1 = perf::begin();
+                    let rv = b.sample();
+                    perf::note_section("gpuadl", t1);
+                    merge_reading(&mut r, rv);
+                }
+                if let Some(b) = &bs.igcl {
+                    let t1 = perf::begin();
+                    let rv = b.sample();
+                    perf::note_section("gpuigcl", t1);
+                    merge_reading(&mut r, rv);
+                }
+                r
+            }
+        }
+    };
     perf::note_section("gpusample", t0);
     if let Some(w) = r.1 {
         GPU_WATTS.store((w * 100.0).clamp(0.0, u32::MAX as f32) as u32,
@@ -98,6 +107,18 @@ pub fn sample() -> VendorReading {
         GPU_UTIL.store(u.to_bits(), std::sync::atomic::Ordering::Relaxed);
     }
     r
+}
+
+/// 卸载厂商后端（GPU 行关闭时由采样线程调用）：
+/// 取出并 drop BackendSet → NVML/ADL 驱动库 unload，清除利用率/功耗缓存。
+/// 幂等；重开 GPU 行后走 D3DKMT 兜底（厂商库本会话不热恢复）。
+pub fn teardown() {
+    if let Some(m) = BACKEND.get() {
+        *m.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    GPU_WATTS.store(0, std::sync::atomic::Ordering::Relaxed);
+    GPU_UTIL.store(GPU_UTIL_NONE, std::sync::atomic::Ordering::Relaxed);
+    probe::log("gpu_vendor teardown: vendor backends unloaded");
 }
 
 /// 返回缓存的 GPU 利用率（None = 无缓存）。

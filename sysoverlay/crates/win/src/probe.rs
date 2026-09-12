@@ -1,5 +1,8 @@
 //! 诊断探针（P-DIAG）：`SYSOVERLAY_PROBE=1` 时把各采样器的**原始 API 数据**
-//! 逐行追加到 `%LOCALAPPDATA%\SysOverlayC\probe.log`。
+//! 逐行追加到 `%LOCALAPPDATA%\SysOverlayC\probe_<YYYYMMDD>_<HHMM>.log`。
+//!
+//! 日志按 **10 分钟时间窗滚动**：文件名带当前 10 分钟窗起点（UTC），窗口切换后
+//! 自动新建文件，不再把全部运行日志堆进同一个大文件——单文件不会再无限膨胀。
 //!
 //! # 用途
 //!
@@ -90,7 +93,7 @@ pub fn log_startup() {
     ));
 }
 
-/// 安装全局 panic hook：任何线程 panic 都把位置 + 消息写入 probe.log。
+/// 安装全局 panic hook：任何线程 panic 都把位置 + 消息写入当前 10 分钟窗的日志文件。
 ///
 /// 为什么关键：wndproc 是 `extern "system"`，panic 一旦跨过该边界就是
 /// UB/abort——表现正是「点一下按钮整个界面冻结」。没有 hook，
@@ -133,17 +136,85 @@ fn perf_flag() -> bool {
         .unwrap_or(false)
 }
 
+/// 滚动写盘：每 10 分钟落到独立文件，避免单文件无限膨胀。
+///
+/// 文件名带「当前 10 分钟时间窗」前缀（UTC，与日志行内毫秒时间戳同源），
+/// 形如 `probe_20260912_1330.log`。调用方无需持有句柄——每次按时间窗算出文件名
+/// 后追加即可，跨进程重启/跨午夜/跨整点都能正确新建文件。
 fn write_raw(s: &str) {
     if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
         let dir = std::path::PathBuf::from(dir).join("SysOverlayC");
         let _ = std::fs::create_dir_all(&dir);
+        // 当前 10 分钟时间窗起点（ms）。
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let win = now_ms / (10 * 60_000);
+        let win_start_ms = win * 10 * 60_000;
+        let name = windowed_name(win_start_ms);
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(dir.join("probe.log"))
+            .open(dir.join(name))
         {
             let _ = f.write_all(s.as_bytes());
         }
+    }
+}
+
+/// 把 Unix 毫秒转成 `probe_YYYYMMDD_HHMM.log` 文件名（UTC，无外部依赖）。
+fn windowed_name(ms: u64) -> String {
+    let secs = (ms / 1000) as i64;
+    let days = secs / 86400; // 1970-01-01 起的日数（epoch 之后恒为正）
+    let rem = secs.rem_euclid(86400);
+    let hh = rem / 3600;
+    let mm = (rem % 3600) / 60;
+    // days -> Y/M/D（Howard Hinnant 的 civil_from_days，整数截断向零）
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("probe_{:04}{:02}{:02}_{:02}{:02}.log", y, m, d, hh, mm)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::windowed_name;
+
+    #[test]
+    fn epoch_maps_to_19700101_0000() {
+        assert_eq!(windowed_name(0), "probe_19700101_0000.log");
+    }
+
+    #[test]
+    fn ten_minute_floor_keeps_window_start() {
+        // 模拟 write_raw 的 10 分钟取整：文件名取当前窗起点（分钟为 10 的倍数）。
+        let floor10 = |ms: u64| {
+            let w = ms / (10 * 60_000);
+            w * 10 * 60_000
+        };
+        // 2026-09-12 13:27:35 UTC 落在 13:20 窗内 → 文件名取窗起点 1320。
+        let secs = 1_789_219_655; // 2026-09-12 13:27:35 UTC
+        assert_eq!(
+            windowed_name(floor10(secs * 1000)),
+            "probe_20260912_1320.log"
+        );
+        // 同一窗内再晚一点（仍 ≤13:29:59）仍落在 1320 窗。
+        assert_eq!(
+            windowed_name(floor10((secs + 2 * 60) * 1000)),
+            "probe_20260912_1320.log"
+        );
+        // 越过 13:30 边界（13:27:35 + 3min = 13:30:35）→ 进入 1330 窗。
+        assert_eq!(
+            windowed_name(floor10((secs + 3 * 60) * 1000)),
+            "probe_20260912_1330.log"
+        );
     }
 }

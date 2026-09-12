@@ -46,6 +46,8 @@ unsafe impl Send for Ring0 {}
 unsafe impl Sync for Ring0 {}
 
 static RING0: OnceLock<Option<Ring0>> = OnceLock::new();
+/// teardown 后置位：本会话内驱动已卸载，所有 MSR 访问短路返回 None（不热恢复）。
+static RING0_TORN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// CPU 厂商/家族（CPUID），探针与 MSR 选择用。
 struct CpuId {
@@ -72,7 +74,11 @@ fn cpuid_info() -> &'static CpuId {
 }
 
 /// 创建/启动驱动服务并打开设备（一次性）。
+/// 已 teardown（行关闭卸载）后永久返回 None——本会话不热恢复，重开行显示 `--`。
 fn ring0() -> Option<&'static Ring0> {
+    if RING0_TORN.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     RING0.get_or_init(|| unsafe {
         use windows::Win32::Foundation::{
             CloseHandle, GetLastError, GENERIC_READ, GENERIC_WRITE, ERROR_SERVICE_ALREADY_RUNNING, HANDLE,
@@ -189,6 +195,51 @@ fn ring0() -> Option<&'static Ring0> {
         Some(Ring0 { dev })
     })
     .as_ref()
+}
+
+/// 卸载 MSR 后端（v3「行关即完全停止」）：
+/// 1. 置位 torn 标志 → 后续所有采样短路返回 None（行显示 `--`）；
+/// 2. 关闭设备句柄；
+/// 3. `ControlService(STOP)` 停止并从内核卸载 WinRing0 驱动（服务注册保留，
+///    下次应用启动会按需重新 Start；本会话内不热恢复，重开行时由设置页提示重启）。
+///
+/// 幂等：重复调用无副作用。由采样线程在 Power 行 falling-edge 时调用。
+pub fn teardown() {
+    use std::sync::atomic::Ordering;
+    if RING0_TORN.swap(true, Ordering::SeqCst) {
+        return; // 已卸载
+    }
+    // 关设备句柄（若已初始化）
+    if let Some(Some(r)) = RING0.get() {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(r.dev);
+        }
+    }
+    // 停止内核驱动服务
+    unsafe {
+        use windows::Win32::System::Services::{
+            CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW, SC_MANAGER_ALL_ACCESS,
+            SERVICE_ALL_ACCESS, SERVICE_CONTROL_STOP,
+        };
+        let Ok(scm) = OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS) else {
+            probe::log("msr teardown: OpenSCManager failed（非管理员？驱动服务保留未停止）");
+            return;
+        };
+        let svc_name = windows::core::w!("SysOverlayWinRing0");
+        match OpenServiceW(scm, svc_name, SERVICE_ALL_ACCESS) {
+            Ok(svc) => {
+                let mut status = Default::default();
+                if ControlService(svc, SERVICE_CONTROL_STOP, &mut status).is_err() {
+                    probe::log("msr teardown: ControlService STOP failed（可能未运行）");
+                } else {
+                    probe::log("msr teardown: driver service stopped");
+                }
+                let _ = CloseServiceHandle(svc);
+            }
+            Err(_) => probe::log("msr teardown: service not found（本就未安装）"),
+        }
+        let _ = CloseServiceHandle(scm);
+    }
 }
 
 fn read_msr(r: &Ring0, index: u32) -> Option<u64> {

@@ -14,10 +14,10 @@ use std::io::Write;
 use std::thread;
 use std::time::Duration;
 
-use sysoverlay_core::cadence::{DELTA_ENTER, DELTA_EXIT, EXIT_TICKS, IDLE_MAX_MS, REFRESH_FLOOR_MS, TICK_MS, ACTIVE_CPU_PCT, ACTIVE_NET_BPS};
+use sysoverlay_core::cadence::{DELTA_ENTER, DELTA_EXIT, EXIT_TICKS, IDLE_MAX_MS, REFRESH_FLOOR_MS, ACTIVE_CPU_PCT, ACTIVE_NET_BPS};
 use sysoverlay_core::scheduler::Scheduler;
 use sysoverlay_core::scheduler::Source;
-use sysoverlay_win::window::{get_shared_seq, publish_schedule_cfg, schedule_cfg, schedule_power, setup_resume_channel, snap_store};
+use sysoverlay_win::window::{get_shared_seq, publish_schedule_cfg, schedule_cfg, setup_resume_channel, snap_store, wait_cfg_change};
 use sysoverlay_win::OverlayWindow;
 use sysoverlay_win::SystemSampler;
 use sysoverlay_win::dpi;
@@ -153,7 +153,9 @@ fn main() {
 
         let name = windows::core::w!("SysOverlay_SingleInstance_Mutex");
         let elevated = std::env::args().any(|a| a == "--elevated");
-        let attempts = if elevated { 30 } else { 1 };
+        let restart = std::env::args().any(|a| a == "--restart");
+        // 管理员重启 / 托盘「快速重启」路径：带重试抢互斥体，等旧进程让位。
+        let attempts = if elevated || restart { 30 } else { 1 };
         let mut owned: Option<HANDLE> = None;
         for _ in 0..attempts {
             let m = CreateMutexW(None, true, windows::core::PCWSTR(name.as_ptr()));
@@ -287,10 +289,10 @@ fn main() {
             let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         }
         let exclude_virtual = cfg_for_thread.exclude_virtual_nic;
-        let power_interval = cfg_for_thread.power_interval_ms;
-        let mut sampler = SystemSampler::new(exclude_virtual, power_interval);
-        let (interval_ms, auto, _) = schedule_cfg();
+        let mut sampler = SystemSampler::new(exclude_virtual);
+        let (interval_ms, auto, _, power_iv) = schedule_cfg();
         let mut sched = Scheduler::new(interval_ms, auto);
+        sched.set_power_interval(power_iv);
         let overlay_hwnd = windows::Win32::Foundation::HWND(hwnd_addr as *mut _);
 
         let now_init = get_tick_count_ms();
@@ -305,8 +307,17 @@ fn main() {
         let mut pending: sysoverlay_win::Snapshot = sysoverlay_win::Snapshot::placeholder(now_init);
         let mut seq: u64 = 0;
 
+        // v3 按需睡眠：上一轮的源启用掩码（检测启停转换 → teardown/基线重置）、
+        // 配置代际（设置改动即时唤醒）、Power 行刚关闭的一次性 flush 标记。
+        let mut prev_enabled: [bool; 5] = {
+            let (_, _, en, _) = schedule_cfg();
+            en
+        };
+        let mut cfg_gen: u64 = 0;
+        let mut need_flush = false;
+
         loop {
-            // 覆盖层隐藏时完全停止采样：省 CPU + 彻底消除 AFMF 冲突（数值不更新，DWM 无合成）。
+            // 覆盖层隐藏时完全停止采样：省 CPU（数值不更新，DWM 无合成）。
             unsafe {
                 use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
                 while !IsWindowVisible(overlay_hwnd).as_bool() {
@@ -324,15 +335,33 @@ fn main() {
                 sampler.reset_backoff();
             }
 
-            // 设置改动即时生效（原子镜像，无锁）
-            let (interval_ms, auto, enabled) = schedule_cfg();
+            // 设置改动即时生效（原子镜像，无锁；改动态代际 +1 会从 wait_cfg_change 提前唤醒）
+            let (interval_ms, auto, enabled, power_iv) = schedule_cfg();
             sched.set_user(interval_ms, auto);
+            sched.set_power_interval(power_iv);
 
             let now_ms = get_tick_count_ms();
 
+            // 源启停转换：禁用 → 释放后端资源（驱动服务/厂商库/缓存）；
+            // 启用 → 重置基线防毛刺。Power 行刚关时置 flush 标记，
+            // 下一帧把 prev 快照里的旧瓦数覆盖成 Unavailable（行显示 --）。
+            if enabled != prev_enabled {
+                sampler.on_schedule_change(&prev_enabled, &enabled);
+                if prev_enabled[4] && !enabled[4] {
+                    need_flush = true;
+                }
+                prev_enabled = enabled;
+            }
+
             let plan = sched.plan(now_ms, &enabled);
-            let power_on = schedule_power();
-            let snap = sampler.sample(&plan, Some(&pending), now_ms, power_on);
+            let power_on = enabled[4];
+            // 空计划零开销：无源到期且无需 flush → 不克隆快照、不进采样器。
+            let snap = if plan.any() || need_flush {
+                need_flush = false;
+                sampler.sample(&plan, Some(&pending), now_ms, power_on)
+            } else {
+                pending.clone()
+            };
             let after_ms = get_tick_count_ms();
 
             if plan.cpu {
@@ -423,20 +452,30 @@ fn main() {
                 }
             }
 
-            let sleep_ms = TICK_MS;
+            // v3 按需睡眠：睡到下一个源到期（next_wake_ms），配置改动从
+            // wait_cfg_change 立即唤醒。全部源关闭 → 30s 慢心跳兜底
+            // （可见性变化/系统唤醒走各自的通道，不依赖本循环高频轮询）。
+            let now_after = get_tick_count_ms();
+            let any_enabled = enabled.iter().any(|&x| x);
+            let timeout_ms = if any_enabled {
+                sched.next_wake_ms(now_after, &enabled).saturating_sub(now_after).min(30_000).max(1)
+            } else {
+                30_000
+            };
             sysoverlay_win::probe::log_lazy(|| {
                 format!(
-                    "sleep_ms={} auto={} plan={}{}{}{} mode={}",
-                    sleep_ms,
+                    "sleep_ms={} auto={} plan={}{}{}{}{} mode={}",
+                    timeout_ms,
                     auto as u8,
                     plan.cpu as u8,
                     plan.mem as u8,
                     plan.gpu as u8,
                     plan.net as u8,
+                    plan.power as u8,
                     mode_active as u8,
                 )
             });
-            thread::sleep(Duration::from_millis(sleep_ms));
+            cfg_gen = wait_cfg_change(cfg_gen, timeout_ms);
         }
     });
 

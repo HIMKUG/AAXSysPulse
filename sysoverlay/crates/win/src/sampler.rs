@@ -35,10 +35,6 @@ pub struct SystemSampler {
     /// Sequence number for the next snapshot.
     seq: u64,
 
-    /// Power 独立采样间隔（默认 3000ms，来自 config.power_interval_ms）。
-    power_interval_ms: u64,
-    /// Power 上次采样时间（毫秒 tick）。
-    last_power_ms: u64,
     /// Net 上次采样时间（低频档分频用，v3 性能档）。
     last_net_ms: u64,
 }
@@ -49,9 +45,9 @@ const NET_LOW_FREQ_MS: u64 = 2000;
 impl SystemSampler {
     /// `exclude_virtual` controls whether loopback/Hyper-V/WSL2 nics are counted.
     ///
-    /// `power_interval_ms` 是 Power 源的独立采样间隔（它不走 SamplePlan 分频，
-    /// 因为功耗读数与刷新率无耦合）。
-    pub fn new(exclude_virtual: bool, power_interval_ms: u32) -> Self {
+    /// Power 的分频已上收至调度器（`Source::Power` + 用户配置的独立间隔），
+    /// 采样器只按 `plan.power` 执行。
+    pub fn new(exclude_virtual: bool) -> Self {
         Self {
             cpu: CpuSampler::new(),
             mem: MemSampler::new(),
@@ -61,9 +57,43 @@ impl SystemSampler {
             diag: SamplerDiag::new(),
             backoff: [Backoff::default(); 5],
             seq: 0,
-            power_interval_ms: power_interval_ms.clamp(500, 60_000) as u64,
-            last_power_ms: 0,
             last_net_ms: 0,
+        }
+    }
+
+    /// 监控项启停转换钩子（v3「关闭即完全停止」的执行端）。
+    ///
+    /// 禁用 → 释放该源的后端资源（句柄/内核服务/厂商库/拓扑缓存）；
+    /// 启用 → 重置采样基线，避免跨大间隔的陈旧 delta 造成数值毛刺。
+    /// 由采样线程在检测到 `schedule_cfg()` 掩码变化时调用（单线程所有权，无锁）。
+    pub fn on_schedule_change(&mut self, prev: &[bool; 5], cur: &[bool; 5]) {
+        // Power 行关：关闭 MSR 设备句柄并停止内核驱动服务（真正的服务级停止）。
+        // 重开本会话不热恢复（teardown 一次性）→ 采样返回 None → 行显示 `--`；
+        // 设置页在关闭瞬间已弹原生提示框告知「重启应用恢复」。
+        if prev[4] && !cur[4] {
+            crate::msr::teardown();
+            crate::power_system::store_cpu_watts(None);
+            self.backoff[SamplerId::Power as usize].reset();
+            self.diag.push(sysoverlay_core::sampler::DiagEntry {
+                sampler: SamplerId::Power,
+                outcome: SampleOutcome::Skipped,
+                code: 0,
+                seq: self.seq as u32,
+            });
+        }
+        // GPU 行关：卸载厂商库（NVML/ADL）并失效 D3DKMT 拓扑缓存。
+        // 重开：D3DKMT 查询无状态、拓扑缓存自动重建；厂商库本会话不热恢复（走 D3DKMT 兜底）。
+        if prev[2] && !cur[2] {
+            crate::gpu_vendor::teardown();
+            crate::proc_gpu::invalidate_topology();
+        }
+        // Net 重开：重置字节基线（速率 = Δbytes/Δt，跨大间隔必毛刺）。
+        if !prev[3] && cur[3] {
+            self.net.reset_baselines();
+        }
+        // CPU 重开：重置 GetSystemTimes 前值。
+        if !prev[0] && cur[0] {
+            self.cpu.reset_baseline();
         }
     }
 
@@ -143,10 +173,9 @@ impl SystemSampler {
             self.push_diag(SamplerId::Net, SampleOutcome::Skipped, 0);
         }
 
-        // Power：整机功耗（用户拍板公式），独立 interval；
+        // Power：整机功耗（用户拍板公式），分频由调度器 `Source::Power` 驱动；
         // CPU 实测不可用（无管理员/无驱动）→ 整行关闭（Unavailable = 不显示不计算）
-        if power_enabled && now_ms.saturating_sub(self.last_power_ms) >= self.power_interval_ms {
-            self.last_power_ms = now_ms;
+        if plan.power {
             let t = crate::perf::begin();
             match self.syspower.sample(now_ms) {
                 Some(w) => {
@@ -162,8 +191,8 @@ impl SystemSampler {
             // 发布 CPU 实测功率（供进程榜做功耗分摊，跨线程原子共享）
             crate::power_system::store_cpu_watts(self.syspower.cpu_watts());
         } else if !power_enabled {
-            // 查询被禁用（性能页 power_query 关 / 行开关关）：显式置 Unavailable，
-            // 覆盖 prev 带来的旧值 → 功耗行显示 `--` 而非冻结的旧瓦数。
+            // 查询被禁用（行开关关 / 性能页 power_query 关 / teardown 后重开）：
+            // 显式置 Unavailable，覆盖 prev 带来的旧值 → 功耗行显示 `--` 而非冻结的旧瓦数。
             snap.power = Metric::Unavailable;
         }
 
@@ -220,6 +249,6 @@ impl SystemSampler {
 
 impl Default for SystemSampler {
     fn default() -> Self {
-        Self::new(true, 3000)
+        Self::new(true)
     }
 }

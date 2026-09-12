@@ -105,43 +105,86 @@ pub fn get_shared_seq() -> &'static AtomicU64 {
 
 static SCHED_AUTO: AtomicBool = AtomicBool::new(true);
 static SCHED_INTERVAL_MS: AtomicU32 = AtomicU32::new(1000);
-/// 位 0..4 = cpu/mem/gpu/net 启用。
-static SCHED_ENABLED: AtomicU32 = AtomicU32::new(0b1111);
-/// Power 开关（独立于 SamplePlan，采样器自己按 power_interval_ms 分频）。
-static SCHED_POWER: AtomicBool = AtomicBool::new(false);
+/// 位 0..4 = cpu/mem/gpu/net/power 启用（位 4 = 功耗采样门 = power_enabled ∧ power_query）。
+static SCHED_ENABLED: AtomicU32 = AtomicU32::new(0b1_1111);
+/// Power 独立采样间隔（毫秒，与刷新率解耦）。
+static SCHED_POWER_INTERVAL_MS: AtomicU32 = AtomicU32::new(3000);
 /// Net 低频采样开关（独立分频 2s，速率按真实 Δt 计算不失真）。
 static SCHED_NET_LOW: AtomicBool = AtomicBool::new(true);
+
+// 配置代际：设置改动 → 代际 +1 并唤醒采样线程（全关停车后靠它唤醒）。
+static CFG_GEN: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+static CFG_CV: std::sync::Condvar = std::sync::Condvar::new();
+
+/// 采样线程睡眠等待：直到配置代际变化或 `timeout_ms` 到期。
+/// 返回最新代际。`timeout_ms = 0` 表示纯停车（无限等待，仅被配置变更唤醒）。
+pub fn wait_cfg_change(last_gen: u64, timeout_ms: u64) -> u64 {
+    let mut gen = CFG_GEN.lock().unwrap_or_else(|e| e.into_inner());
+    if *gen != last_gen {
+        return *gen;
+    }
+    if timeout_ms == 0 {
+        loop {
+            gen = CFG_CV.wait(gen).unwrap_or_else(|e| e.into_inner());
+            if *gen != last_gen {
+                break;
+            }
+        }
+    } else {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        while *gen == last_gen {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let (g, _) = CFG_CV
+                .wait_timeout(gen, deadline - now)
+                .unwrap_or_else(|e| e.into_inner());
+            gen = g;
+        }
+    }
+    *gen
+}
 
 /// 把当前配置发布给采样线程（启动与每次设置改动后调用）。
 pub fn publish_schedule_cfg(cfg: &Config) {
     SCHED_AUTO.store(cfg.refresh_auto, Ordering::Relaxed);
     SCHED_INTERVAL_MS.store(cfg.interval_ms, Ordering::Relaxed);
+    // 功耗采样门 = 行开关 ∧ 查询开关（性能页）：query 关 → 跳过 MSR 内核查询，
+    // 采样器把 Snapshot.power 显式置 Unavailable（功耗行显示 --）。
+    let power_gate = cfg.power_enabled && cfg.power_query;
     let mask = (cfg.show_cpu as u32)
         | ((cfg.show_mem as u32) << 1)
         | ((cfg.show_gpu as u32) << 2)
-        | ((cfg.show_net as u32) << 3);
+        | ((cfg.show_net as u32) << 3)
+        | ((power_gate as u32) << 4);
     SCHED_ENABLED.store(mask, Ordering::Relaxed);
-    // 功耗采样门 = 行开关 ∧ 查询开关（性能页）：query 关 → 跳过 MSR 内核查询，
-    // 采样器把 Snapshot.power 显式置 Unavailable（功耗行显示 --）。
-    SCHED_POWER.store(cfg.power_enabled && cfg.power_query, Ordering::Relaxed);
+    SCHED_POWER_INTERVAL_MS.store(cfg.power_interval_ms, Ordering::Relaxed);
     SCHED_NET_LOW.store(cfg.net_low_freq, Ordering::Relaxed);
     // GPU 查询范围（主适配器/3D 引擎 only）随配置即时生效
     crate::proc_gpu::set_gpu_scope(cfg.gpu_primary_only, cfg.gpu_3d_only);
+    // 唤醒采样线程（含全关停车状态）
+    let mut gen = CFG_GEN.lock().unwrap_or_else(|e| e.into_inner());
+    *gen += 1;
+    CFG_CV.notify_all();
+    drop(gen);
 }
 
-/// 采样线程读取当前调度参数：(interval_ms, auto, [cpu, mem, gpu, net])。
-pub fn schedule_cfg() -> (u32, bool, [bool; 4]) {
+/// 采样线程读取当前调度参数：(interval_ms, auto, [cpu, mem, gpu, net, power], power_interval_ms)。
+pub fn schedule_cfg() -> (u32, bool, [bool; 5], u32) {
     let mask = SCHED_ENABLED.load(Ordering::Relaxed);
     (
         SCHED_INTERVAL_MS.load(Ordering::Relaxed),
         SCHED_AUTO.load(Ordering::Relaxed),
-        [mask & 1 != 0, mask & 2 != 0, mask & 4 != 0, mask & 8 != 0],
+        [
+            mask & 1 != 0,
+            mask & 2 != 0,
+            mask & 4 != 0,
+            mask & 8 != 0,
+            mask & 16 != 0,
+        ],
+        SCHED_POWER_INTERVAL_MS.load(Ordering::Relaxed),
     )
-}
-
-/// 采样线程读取 Power 开关（设置页改动即时生效）。
-pub fn schedule_power() -> bool {
-    SCHED_POWER.load(Ordering::Relaxed)
 }
 
 /// 采样线程读取 Net 低频开关（设置页改动即时生效）。
@@ -247,7 +290,7 @@ unsafe extern "system" fn wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
-        // 明确拒绝激活：防抢游戏前台 + AFMF 破坏路径 1（抢焦点）。
+        // 明确拒绝激活：不抢前台应用焦点。
         WM_MOUSEACTIVATE => LRESULT(3), // MA_NOACTIVATE = 3
 
         // 命中测试：整个客户区返回 HTCLIENT（原样）。
@@ -465,6 +508,7 @@ unsafe extern "system" fn wndproc(
                     if let Some(cmd) = crate::menu::show_tray_menu(hwnd) {
                         match cmd {
                             crate::menu::IDM_SETTINGS => crate::settings::open_settings(hwnd),
+                            crate::menu::IDM_RESTART => crate::restart::quick_restart(),
                             crate::menu::IDM_QUIT => {
                                 let _ = DestroyWindow(hwnd);
                             }
