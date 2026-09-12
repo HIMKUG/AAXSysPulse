@@ -31,6 +31,20 @@ pub enum IconKind {
     About,
     /// 窗口控制按钮「固定」。
     Pin,
+    // ── Fluent 图标（S6 接入，坐标已归一化到 1024 空间）──
+    // 尚无 UI 消费方（供后续控件使用），消费后移除 allow。
+    #[allow(dead_code)]
+    ChevronUp,
+    #[allow(dead_code)]
+    ChevronDown,
+    #[allow(dead_code)]
+    ChevronRight,
+    #[allow(dead_code)]
+    Copy,
+    #[allow(dead_code)]
+    Dismiss,
+    #[allow(dead_code)]
+    Checkmark,
 }
 
 impl IconKind {
@@ -54,12 +68,18 @@ impl IconKind {
             IconKind::Performance => 4,
             IconKind::About => 5,
             IconKind::Pin => 7,
+            IconKind::ChevronUp => 8,
+            IconKind::ChevronDown => 9,
+            IconKind::ChevronRight => 10,
+            IconKind::Copy => 11,
+            IconKind::Dismiss => 12,
+            IconKind::Checkmark => 13,
         }
     }
 }
 
 /// 内嵌 SVG 源（顺序与 [`IconKind::index`] 一致）。
-const SOURCES: [&str; 8] = [
+const SOURCES: [&str; 14] = [
     include_str!("icons_svg/settings.svg"),
     include_str!("icons_svg/layout.svg"),
     include_str!("icons_svg/palette.svg"),
@@ -70,11 +90,17 @@ const SOURCES: [&str; 8] = [
     // 使 Pin 的下标稳定不变）。
     include_str!("icons_svg/reset.svg"),
     include_str!("icons_svg/pin.svg"),
+    include_str!("icons_svg/chevron_up.svg"),
+    include_str!("icons_svg/chevron_down.svg"),
+    include_str!("icons_svg/chevron_right.svg"),
+    include_str!("icons_svg/copy.svg"),
+    include_str!("icons_svg/dismiss.svg"),
+    include_str!("icons_svg/checkmark.svg"),
 ];
 
-static PATHS: OnceLock<[Vec<PathSeg>; 8]> = OnceLock::new();
+static PATHS: OnceLock<[Vec<PathSeg>; 14]> = OnceLock::new();
 
-fn paths() -> &'static [Vec<PathSeg>; 8] {
+fn paths() -> &'static [Vec<PathSeg>; 14] {
     PATHS.get_or_init(|| std::array::from_fn(|i| parse(svg_path_data(SOURCES[i]))))
 }
 
@@ -500,12 +526,13 @@ mod tests {
                 mxx = mxx.max(x);
                 mxy = mxy.max(y);
             });
+            let w = mxx - mnx;
             assert!(mnx >= -EPS && mny >= -EPS, "icon #{i} 越出 viewBox 左上 ({mnx},{mny})");
             assert!(
                 mxx <= VIEW + EPS && mxy <= VIEW + EPS,
                 "icon #{i} 越出 viewBox 右下 ({mxx},{mxy})"
             );
-            assert!(mxx - mnx > VIEW * 0.3, "icon #{i} 宽度异常（解析可能截断）");
+            assert!(w > VIEW * 0.3, "icon #{i} 宽度异常（解析可能截断）w={} VIEW*0.3={}", w, VIEW * 0.3);
         }
     }
 
