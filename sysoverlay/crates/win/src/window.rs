@@ -414,6 +414,10 @@ unsafe extern "system" fn wndproc(
                     let mut rect = RECT::default();
                     if GetWindowRect(hwnd, &mut rect).as_bool() {
                         state.cfg.window_pos = Some((rect.left, rect.top));
+                        // 用户自由拖动 → 解除贴角：让保存的位置成为唯一定位来源，
+                        // 否则残留的 snap_corner<=3 会在下次启动把窗口强行拉回旧角，
+                        // 表现为"不记忆窗口位置"。与 WM_EXITSIZEMOVE 的清理逻辑一致。
+                        state.cfg.snap_corner = sysoverlay_core::config::SNAP_CORNER_FREE;
                     }
                     state.pos_dirty = false;
                 }
@@ -850,7 +854,7 @@ pub fn setup_resume_channel() -> std::sync::mpsc::Receiver<()> {
 
 impl OverlayWindow {
     pub fn new(cfg: Config) -> Result<Self, WinError> {
-        let state = Box::new(ThreadState::new(cfg));
+        let mut state = Box::new(ThreadState::new(cfg));
         // GWLP_USERDATA pointer — must stay valid for the lifetime of the window.
         let state_ptr = &*state as *const ThreadState as isize;
 
@@ -943,8 +947,18 @@ impl OverlayWindow {
             let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
         }
 
-        // v5 窗口页新增：启动时应用贴角与鼠标穿透（报告 §5）。
-        if state.cfg.snap_corner <= 3 {
+        // 启动定位优先级（修复"每次启动都回到右下角 / 不记忆窗口位置"）：
+        //   1) 已保存自由定位 window_pos 存在 → 直接采用（CreateWindowExW 已用此值创建窗口），
+        //      并把遗留的贴角标记 snap_corner 归位为 FREE，使二者不再冲突。
+        //      （贴角 UI 已在设置页删除，任何残留的 snap_corner<=3 都是历史遗留，
+        //        不应再盖过用户拖到的位置。）
+        //   2) 否则若仍显式选了贴角（snap_corner<=3 且 window_pos 为空）→ 贴到该角。
+        //   3) 都没有 → 保留 CreateWindowExW 给出的默认位（screen_w/4, 24）。
+        if state.cfg.window_pos.is_some() {
+            if state.cfg.snap_corner != sysoverlay_core::config::SNAP_CORNER_FREE {
+                state.cfg.snap_corner = sysoverlay_core::config::SNAP_CORNER_FREE;
+            }
+        } else if state.cfg.snap_corner <= 3 {
             snap_overlay_to_corner(hwnd, state.cfg.snap_corner);
         }
         if state.cfg.click_through {
