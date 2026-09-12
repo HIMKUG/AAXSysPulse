@@ -1279,4 +1279,37 @@ mod tests {
         let h3 = StripRenderer.frame_hash(&Snapshot::placeholder(0), &cfg, 400, 36, 90);
         assert_eq!(h2, h3, "同一秒内指纹必须稳定");
     }
+
+    /// `layout` 预算门禁（恢复计划 P4.3，照 build_pages 门禁模式）：
+    /// layout 是渲染线程**每帧**路径（P0 实测 seg_layout p50=6µs / max=16µs），
+    /// 预算锁回归——有人往 build_rows / cell_sig 循环里塞分配/重活立刻可见，
+    /// 并在 release 下打印真实耗时供决策参考。
+    #[test]
+    fn overlay_layout_is_within_budget() {
+        let snap = demo_snap();
+        let cfg = demo_cfg();
+        // 预热（首跑含查表/分配冷路径，不代表稳态）。
+        let _ = StripRenderer.layout(&snap, &cfg, 400, 36);
+        let _ = VerticalRenderer.layout(&snap, &cfg, 400, 400);
+
+        // 两个渲染器各测 50 次取最小值（排除调度抖动）。
+        let mut best_strip = f64::MAX;
+        let mut best_vertical = f64::MAX;
+        for _ in 0..50 {
+            let t = std::time::Instant::now();
+            let _ = StripRenderer.layout(&snap, &cfg, 400, 36);
+            best_strip = best_strip.min(t.elapsed().as_secs_f64() * 1e6);
+
+            let t = std::time::Instant::now();
+            let _ = VerticalRenderer.layout(&snap, &cfg, 400, 400);
+            best_vertical = best_vertical.min(t.elapsed().as_secs_f64() * 1e6);
+        }
+        println!(
+            "overlay layout strip={best_strip:.0}µs vertical={best_vertical:.0}µs (release 下供参考)"
+        );
+        // 预算先实测再定值：release 实测 ~6µs（P0 seg_layout）。500µs ≈ 80× 余量，
+        // debug 测试构建也远够——锁「往每帧路径加重活」的回归即可。
+        assert!(best_strip < 500.0, "横版布局超预算：{best_strip:.0}µs");
+        assert!(best_vertical < 500.0, "竖版布局超预算：{best_vertical:.0}µs");
+    }
 }
