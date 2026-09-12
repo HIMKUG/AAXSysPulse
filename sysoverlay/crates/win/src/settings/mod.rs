@@ -21,6 +21,7 @@ mod cfg_ref;
 mod icons;
 mod layout;
 mod motion;
+mod scrollbar;
 mod state;
 mod tasks;
 mod widget;
@@ -40,7 +41,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClientRect,
+    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, GetClientRect,
     LoadCursorW, PostMessageW, RegisterClassExW, SetCursor, SetWindowPos, ShowWindow, HCURSOR,
     IDC_HAND, MINMAXINFO, SW_HIDE, SW_SHOW, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOSIZE, WINDOW_EX_STYLE, WNDCLASSEXW, WS_MINIMIZEBOX, WS_POPUP,
@@ -58,8 +59,8 @@ use cfg_ref::{CfgRef, Value};
 use layout::{
     build_pages, content_origin, content_viewport, page_caption, s, CARD_PAD, CARD_RADIUS,
     CAPTION_GAP, CAPTION_H, FOOTNOTE_H,
-    MAX_H, MAX_W, MIN_H, MIN_W, ROW_H, SB_ICON, SB_ICON_TEXT_GAP, SB_ITEM_GAP, SB_ITEM_H,
-    SIDEBAR_PAD, SIDEBAR_W, SCROLLBAR_INSET, SCROLLBAR_W,
+    ROW_H, SB_ICON, SB_ICON_TEXT_GAP, SB_ITEM_GAP, SB_ITEM_H,
+    SIDEBAR_PAD, SIDEBAR_W,
 };
 use state::pt_in;
 use widget::{metric_font_status_restore_rect, sw_custom, sw_follow, sw_n, value_box_rect};
@@ -95,15 +96,8 @@ const WM_MOUSEWHEEL: u32 = 0x020A;
 const HTCAPTION: u32 = 2;
 const HTCLIENT: u32 = 1;
 const HTTRANSPARENT: i32 = -1;
-// 边框热区（WM_NCHITTEST 返回值，与 WinUser.h 数值一致）。
-const HTLEFT: i32 = 10;
-const HTRIGHT: i32 = 11;
-const HTTOP: i32 = 12;
-const HTTOPLEFT: i32 = 13;
-const HTTOPRIGHT: i32 = 14;
-const HTBOTTOM: i32 = 15;
-const HTBOTTOMLEFT: i32 = 16;
-const HTBOTTOMRIGHT: i32 = 17;
+// 说明：边框 resize 的命中码（HTLEFT/HTRIGHT/HT* 等）已全部移除 ——
+// 设置窗口不支持调整大小，见 WM_NCHITTEST 分支的说明。
 
 /// 诊断点击目标：颜色页 CPU 开关（build_pages 中第一个指标 Toggle 的 id）。
 const IDC_DIAG_CPU: i32 = 200;
@@ -228,9 +222,15 @@ struct SettingsCtx {
     /// 松手后被拖卡自己的落位弹簧（逐指标）：从拖动偏移量 spring 到 0，
     /// 弹簧收敛后才触发真正的 rebuild_pages（确保卡槽无空隙）。
     metric_release: [motion::Spring; 6],
-    /// 滚动条拖拽状态：Some(grab) = 正在拖，grab = 按下点相对滑块顶缘的偏移
-    /// （client px）。None = 未在拖。拖拽中鼠标 y 直接映射 scroll_y。
+    /// 滚动条拖拽状态：`Some(grab)` = 正在拖，`grab` = 按下点相对拇指顶缘的偏移
+    /// （client px）。None = 未在拖。
+    ///
+    /// 拖拽期间**只更新 `pages[page].scroll_y` 一项状态**，不触发任何布局重建：
+    /// 滚动是纯坐标平移，不需要重新排版控件树。旧实现在拖拽路径里会走到
+    /// `rebuild_pages`，一帧的排版加上 SetCapture 下的消息洪泛直接把界面拖死。
     sb_drag: Option<f32>,
+    /// 鼠标是否悬停在滚动条命中带上（驱动加宽/提亮反馈）。
+    sb_hover: bool,
 }
 
 /// 翻页动画进行中标记（进度由弹簧推进，见 `anim_params`）。
@@ -555,6 +555,7 @@ fn create_dialog(overlay: HWND) {
             drag_release: None,
             metric_release: [motion::Spring::new(0.0); 6],
             sb_drag: None,
+            sb_hover: false,
         };
         ctx.rebuild_pages();
         crate::probe::log(&format!(
@@ -748,18 +749,36 @@ fn card_drag_move(ctx: &mut SettingsCtx, cpt: ContentPt) {
     }
 }
 
-/// 滚动条拖拽中：鼠标 client y 直接映射 scroll_y（贴手，越界钳到 0..max，
-/// 不做橡胶回弹 —— 拖拽是精确操作，回弹只属于滚轮惯性）。
-/// 同时清零惯性速度并对齐滚动弹簧，避免 H4 动量投射与拖拽打架。
+/// 滚动条拖拽中：鼠标 y 直接映射拇指位移 → `scroll_y`（贴手）。
+///
+/// **方向约定**（唯一一处）：鼠标向下 → 位移变大 → `scroll_y` 变大 →
+/// `content_origin` 的 `-scroll_y` 变小 → 内容上移。这与「拖滚动条向下 = 看下面」
+/// 的直觉一致，也就是旧实现写反的那一处。
+///
+/// 越界不夹持，改用橡胶带（拖出轨道会有可拉的阻尼感，松手回弹），
+/// 但**绝不**在拖拽路径里触发布局重建 —— 那是旧实现卡死的直接原因。
 fn scrollbar_drag_scroll(ctx: &mut SettingsCtx, y: i32) {
     let Some(grab) = ctx.sb_drag else { return };
     let page = ctx.page;
     let (win_w, win_h) = ctx.client_size;
-    let Some(g) = scrollbar_geom(ctx.dpi, win_w, win_h, ctx.pages[page].h) else {
+    let Some(g) = scrollbar::geom(ctx.dpi, win_w, win_h, ctx.pages[page].h) else {
         return;
     };
-    let ratio = ((y as f32 - grab - g.inset) / (g.track_h - g.thumb_h)).clamp(0.0, 1.0);
-    ctx.pages[page].scroll_y = (-(ratio * g.max_scroll)).round() as i32;
+
+    // 鼠标 y → 未夹持的拇指位移
+    let raw_off = scrollbar::offset_from_drag(&g, y, grab);
+    // 位移 → 进度 → scroll_y，越界走橡胶带压缩
+    let vp_h = win_h as f32;
+    let scroll = if raw_off < 0.0 {
+        -motion::rubber_band(-raw_off, vp_h, 0.55)
+    } else if raw_off > g.travel {
+        g.max_scroll + motion::rubber_band(raw_off - g.travel, vp_h, 0.55)
+    } else {
+        g.scroll_from_ratio(g.ratio_from_offset(raw_off))
+    };
+
+    ctx.pages[page].scroll_y = scroll.round() as i32;
+    // 拖拽是精确操作：清零惯性、对齐弹簧，避免动量投射与手指打架。
     ctx.scroll_vel = 0.0;
     ctx.scroll_spring.set(ctx.pages[page].scroll_y as f32);
 }
@@ -1566,14 +1585,36 @@ unsafe extern "system" fn settings_wndproc(
         }
         WM_ERASEBKGND => LRESULT(1),
         WM_GETMINMAXINFO => {
-            // resize 钳制：客户区最小/最大尺寸（经 DPI 缩放）。
+            // 尺寸**锁死**：设置窗口不支持调整大小（用户要求），因此把
+            // 最小与最大跟踪尺寸都钉在「当前客户区尺寸」上 —— 任何路径
+            //（边框拖拽 / 系统最大化 / 外部 SetWindowPos）都无法改变窗口尺寸。
+            // 这是禁用拉伸的第二道保险（第一道见 WM_NCHITTEST 边框分支）。
             let mm = lparam.0 as *mut MINMAXINFO;
             if !mm.is_null() {
-                let d = crate::dpi::get_system_dpi();
-                (*mm).ptMinTrackSize.x = s(d, MIN_W);
-                (*mm).ptMinTrackSize.y = s(d, MIN_H);
-                (*mm).ptMaxTrackSize.x = s(d, MAX_W);
-                (*mm).ptMaxTrackSize.y = s(d, MAX_H);
+                let mut r = RECT::default();
+                let _ = GetClientRect(hwnd, &mut r);
+                let (mut cw, mut ch) = (r.right - r.left, r.bottom - r.top);
+                if cw <= 0 || ch <= 0 {
+                    // 窗口尚未布局（首帧前）：退回配置尺寸，避免钉到 0。
+                    let d = ctx_of(hwnd).map(|c| c.dpi).unwrap_or_else(crate::dpi::get_system_dpi);
+                    let (cfg_w, cfg_h) = ctx_of(hwnd)
+                        .and_then(|c| window::get_config_of(c.overlay))
+                        .map(|c| c.settings_size)
+                        .unwrap_or((layout::DEFAULT_W, layout::DEFAULT_H));
+                    cw = s(d, cfg_w.clamp(layout::MIN_W, layout::MAX_W));
+                    ch = s(d, cfg_h.clamp(layout::MIN_H, layout::MAX_H));
+                }
+                // 非客户区补偿：WM_GETMINMAXINFO 的 track size 含边框，
+                // 用 AdjustWindowRectEx 把客户区目标换算成窗口目标（保持观感一致）。
+                let mut wrect = RECT { left: 0, top: 0, right: cw, bottom: ch };
+                let style = WS_POPUP | WS_MINIMIZEBOX;
+                let _ = AdjustWindowRectEx(&mut wrect, style, false, WINDOW_EX_STYLE(0));
+                let tw = wrect.right - wrect.left;
+                let th = wrect.bottom - wrect.top;
+                (*mm).ptMinTrackSize.x = tw;
+                (*mm).ptMinTrackSize.y = th;
+                (*mm).ptMaxTrackSize.x = tw;
+                (*mm).ptMaxTrackSize.y = th;
             }
             LRESULT(0)
         }
@@ -1599,7 +1640,8 @@ unsafe extern "system" fn settings_wndproc(
         }
         WM_MOUSEWHEEL => {
             // 仅当光标位于内容区时滚动（侧边栏不接受滚轮）。
-            // H4：越界用橡胶位移（可再挪一点后回弹），并记录速度供惯性吸附。
+            // 方向约定：滚轮**向前/向上**（raw > 0）→ scroll_y 变小 → 内容下移；
+            // 向后/向下（raw < 0）→ scroll_y 变大 → 内容上移。与 Windows 一致。
             if let Some(ctx) = ctx_of(hwnd) {
                 let mut sc = POINT {
                     x: (lparam.0 & 0xFFFF) as i16 as i32,
@@ -1608,26 +1650,34 @@ unsafe extern "system" fn settings_wndproc(
                 let _ = ScreenToClient(hwnd, &mut sc);
                 let mut cr = RECT::default();
                 let _ = GetClientRect(hwnd, &mut cr);
-                // 拖动中允许滚轮滚动内容（滚轮滚动 scroll_y → card_drag_move 用
-                // 当前 scroll_y 重新计算 grab_dy → 被拖卡基准正确跟随，无跳位）。
+                // 拖动卡片/滚动条期间也允许滚轮滚动内容
+                //（滚动条自身的拖拽态下滚轮仍生效，符合「滚轮随手可用」预期）。
                 if in_content(ctx.dpi, cr.right - cr.left, ClientPt(sc)) {
                     let raw = ((wparam.0 >> 16) & 0xFFFF) as i16 as i32;
                     let d = ctx.dpi;
                     let (_, vp_h) = content_viewport(d, ctx.client_size.0, ctx.client_size.1);
-                    let max = (ctx.pages[ctx.page].h - vp_h).max(0);
-                    let delta_px = raw / 120 * s(d, 48);
-                    let nv = ctx.pages[ctx.page].scroll_y - delta_px;
-                    ctx.pages[ctx.page].scroll_y = if nv < 0 {
-                        -motion::rubber_band((-nv) as f32, vp_h as f32, 0.55) as i32
+                    let content_h = ctx.pages[ctx.page].h;
+
+                    // 一步 = 行高，并把 notch 数（raw/120）整倍数化，
+                    // 高精度滚轮（触控板）的小增量也被正确保留。
+                    let step = scrollbar::wheel_step(d);
+                    let delta = raw as f32 / 120.0 * step;
+                    // 减号：向上滚 → scroll_y 减小（修复旧实现的符号反）。
+                    let max = (content_h - vp_h).max(0) as f32;
+                    let nv = ctx.pages[ctx.page].scroll_y as f32 - delta;
+
+                    let clamped = if nv < 0.0 {
+                        -motion::rubber_band(-nv, vp_h as f32, 0.55)
                     } else if nv > max {
-                        max + motion::rubber_band((nv - max) as f32, vp_h as f32, 0.55) as i32
+                        max + motion::rubber_band(nv - max, vp_h as f32, 0.55)
                     } else {
                         nv
                     };
-                    // 惯性速度（px/s），供帧内动量投射。
-                    ctx.scroll_vel = -(raw as f32) / 120.0 * s(d, 48) as f32 * 12.0;
+                    ctx.pages[ctx.page].scroll_y = clamped.round() as i32;
+                    // 惯性速度（px/s），方向与 delta 相反（减）。
+                    ctx.scroll_vel = -delta / 0.033;
                     ctx.scroll_spring.set(ctx.pages[ctx.page].scroll_y as f32);
-                    invalidate_settings();
+                    let _ = InvalidateRect(hwnd, None, false);
                 }
             }
             LRESULT(0)
@@ -1643,20 +1693,18 @@ unsafe extern "system" fn settings_wndproc(
             let d = crate::dpi::get_system_dpi();
             let mut r = RECT::default();
             let _ = GetClientRect(hwnd, &mut r);
-            let (cw, ch) = (r.right - r.left, r.bottom - r.top);
-            // (a) 边框热区：WS_THICKFRAME 原生 resize（先判角，再判边）。
-            let b = s(d, 6);
-            let (on_l, on_r) = (pt.0.x < b, pt.0.x >= cw - b);
-            let (on_t, on_b) = (pt.0.y < b, pt.0.y >= ch - b);
-            if on_t && on_l { return LRESULT(HTTOPLEFT as isize); }
-            if on_t && on_r { return LRESULT(HTTOPRIGHT as isize); }
-            if on_b && on_l { return LRESULT(HTBOTTOMLEFT as isize); }
-            if on_b && on_r { return LRESULT(HTBOTTOMRIGHT as isize); }
-            if on_t { return LRESULT(HTTOP as isize); }
-            if on_b { return LRESULT(HTBOTTOM as isize); }
-            if on_l { return LRESULT(HTLEFT as isize); }
-            if on_r { return LRESULT(HTRIGHT as isize); }
-            // (b) 标题栏：按钮区 HTCLIENT（收鼠标消息），空白 HTCAPTION（拖动）。
+            let cw = r.right - r.left;
+            // (a) 边框：**禁用**拉伸/调整大小。
+            //
+            // 窗口样式里本来就没有 WS_THICKFRAME，但这里主动返回 HTLEFT / HTRIGHT /
+            // HTBOTTOMRIGHT 等边框码，等于用手工热区把 resize 又**加了回来**
+            //（边框命中码归 DefWindowProc 处理后即为原生 resize）。
+            // 用户反馈「设置窗口仍可拉伸并引发渲染问题」正是此因 —— 三处（样式表、
+            // 运行时剥样式、这里的手工热区）只要有一处漏了，拉伸就复活。
+            // 现在这一处永久返回 HTCLIENT，边框不再有 resize 语义。
+            //
+            // (b) 标题栏：按钮区 HTCLIENT（收鼠标消息），空白 HTCAPTION（拖动窗口）。
+            // 注意 HTCAPTION 只赋予**拖动**能力，不赋予缩放能力。
             if titlebar::in_title_bar(d, pt.0) {
                 if ctx_of(hwnd).map(|c| c.tb.pinned).unwrap_or(false) {
                     if titlebar::hit_button(d, cw, pt.0, true).is_some() {
@@ -1685,10 +1733,31 @@ unsafe extern "system" fn settings_wndproc(
                     None
                 };
                 // 滚动条拖拽中：贴手滚动（SetCapture 下鼠标 y 直接映射 scroll_y）。
+                // 只改滚动状态 + 请求重绘，不做布局重建 —— 保证拖拽流畅不阻塞。
                 if ctx.sb_drag.is_some() {
                     scrollbar_drag_scroll(ctx, pt.0.y);
                     let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
+                }
+                // 滚动条悬停态（用于加宽/提亮反馈；仅在标题栏以下探测，避免误触发）
+                if !titlebar::in_title_bar(ctx.dpi, pt.0) {
+                    let (win_w, win_h) = ctx.client_size;
+                    let content_h = ctx.pages[ctx.page].h;
+                    let hot = scrollbar::geom(ctx.dpi, win_w, win_h, content_h)
+                        .map(|g| {
+                            let offset = g.offset_from_ratio(
+                                g.ratio_from_scroll(ctx.pages[ctx.page].scroll_y as f32),
+                            );
+                            scrollbar::hit_test(&g, win_w, pt.0, offset).is_some()
+                        })
+                        .unwrap_or(false);
+                    if hot != ctx.sb_hover {
+                        ctx.sb_hover = hot;
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                } else if ctx.sb_hover {
+                    ctx.sb_hover = false;
+                    let _ = InvalidateRect(hwnd, None, false);
                 }
                 // 拖动中：按当前 x 绝对落值（不再累积、不再看 origin）
                 if let Interaction::Dragging { widget: idx, .. } = &ctx.interaction {
@@ -1777,6 +1846,9 @@ unsafe extern "system" fn settings_wndproc(
                 ctx.tb.over = false;
                 ctx.tb.hover = None;
                 ctx.nav_hover = None;
+                // 光标离窗：滚动条热态复位（拖拽态不清 —— SetCapture 期间
+                // 鼠标移出窗口仍应继续滚动，离窗只是不再算「悬停」）。
+                ctx.sb_hover = false;
                 // 光标离窗：步进器长按连发停止。
                 ctx.stepper_hold = None;
                 kill_timer(hwnd, STEPPER_TIMER);
@@ -1833,34 +1905,28 @@ unsafe extern "system" fn settings_wndproc(
                 return LRESULT(0);
             }
             // 2.5) 滚动条（浮于内容之上，先于控件命中）：贴手拖拽 + 轨道点击跳转。
-            // 拿住滑块按 grab 偏移拖动；点在轨道上则滑块中心跳到点击处。
+            // 几何与命中全部走 scrollbar 模块，命中带 = 可见条 + 向内容侧外扩的隐形区。
             {
                 let win_w = ctx.client_size.0;
                 let win_h = ctx.client_size.1;
                 let content_h = ctx.pages[ctx.page].h;
-                let scroll_y = ctx.pages[ctx.page].scroll_y;
-                if let Some(g) = scrollbar_geom(ctx.dpi, win_w, win_h, content_h) {
-                    let x = win_w as f32 - g.inset - g.w;
-                    let in_x = (pt.0.x as f32) >= x - s(ctx.dpi, 6) as f32;
-                    let in_track =
-                        (pt.0.y as f32) >= g.inset && (pt.0.y as f32) <= g.inset + g.track_h;
-                    if in_x && in_track {
-                        let ratio = ((-scroll_y) as f32 / g.max_scroll).clamp(0.0, 1.0);
-                        let thumb_top = g.inset + ratio * (g.track_h - g.thumb_h);
-                        let grab = if (pt.0.y as f32) >= thumb_top
-                            && (pt.0.y as f32) <= thumb_top + g.thumb_h
-                        {
-                            pt.0.y as f32 - thumb_top // 拿住滑块：保持抓取点
-                        } else {
-                            g.thumb_h / 2.0 // 轨道点击：滑块中心跳到点击处
+                if let Some(g) = scrollbar::geom(ctx.dpi, win_w, win_h, content_h) {
+                    let offset = g.offset_from_ratio(
+                        g.ratio_from_scroll(ctx.pages[ctx.page].scroll_y as f32),
+                    );
+                    if let Some(hit) = scrollbar::hit_test(&g, win_w, pt.0, offset) {
+                        let grab = match hit {
+                            // 拿住拇指：保持按下点相对拇指顶缘的偏移 → 贴手无跳变
+                            scrollbar::SbHit::Thumb { grab } => grab,
+                            // 点击轨道空白：拇指中心跳到点击处（grab = 半拇指高）
+                            scrollbar::SbHit::Track => g.thumb_h / 2.0,
                         };
                         ctx.sb_drag = Some(grab);
+                        ctx.sb_hover = true;
                         let _ = SetCapture(hwnd);
                         scrollbar_drag_scroll(ctx, pt.0.y);
                         let _ = InvalidateRect(hwnd, None, false);
-                        // 重绘饥饿补丁：拖拽中必须有人驱动 16ms 主时钟
-                        //（此前 ANIM_TIMER 只在帧末 animating 为真时续表，
-                        //  而拖拽态不在 animating 条件里 → 拖拽无重绘）。
+                        // 拖拽需要连续重绘：驱动 16ms 主时钟（帧末 animating 会续表）
                         start_timer(hwnd, ANIM_TIMER, 16);
                         return LRESULT(0);
                     }
@@ -1991,8 +2057,12 @@ unsafe extern "system" fn settings_wndproc(
         }
         WM_LBUTTONUP => {
             if let Some(ctx) = ctx_of(hwnd) {
-                // 滚动条拖拽收尾（SetCapture 随 UP 自动释放）。
-                ctx.sb_drag = None;
+                // 滚动条拖拽收尾：SetCapture 随 UP 自动释放；把越界回弹交给弹簧。
+                // 这里显式 ReleaseCapture，避免与后续控件命中共享捕获状态。
+                if ctx.sb_drag.is_some() {
+                    ctx.sb_drag = None;
+                    let _ = ReleaseCapture();
+                }
                 // 卡片拖拽排序收尾：moved → 弹簧落位动画；未动 → 按点击处理（展开/收起）。
                 // 注意：保留 card_drag（不为 None），这样 paint_page 知道在拖；
                 // step_drag_release 收敛后才清空并触发 rebuild_pages。
@@ -2076,9 +2146,15 @@ unsafe extern "system" fn settings_wndproc(
         }
         WM_CAPTURECHANGED => {
             if let Some(ctx) = ctx_of(hwnd) {
-                // 捕获丢失（被系统打断）：长按连发与卡片拖拽一并停止。
+                // 捕获丢失（被系统打断/窗口失活）：长按连发与卡片拖拽一并停止。
                 ctx.stepper_hold = None;
                 kill_timer(hwnd, STEPPER_TIMER);
+                // 滚动条：捕获被夺走时必须清掉拖拽态，否则滚动条会「粘」在
+                // 最后一次鼠标位置、再也响应不了新的按下（表现为滚动条卡死）。
+                if ctx.sb_drag.is_some() {
+                    ctx.sb_drag = None;
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
                 // 若拖拽中被打断：启动落位动画（与正常松手同处理路径）。
                 if ctx.card_drag.is_some() {
                     let d = ctx.card_drag.unwrap();
@@ -2377,18 +2453,25 @@ fn paint_d2d(hwnd: HWND) -> bool {
     let release_moving = ctx.drag_release.is_some() && !step_drag_release(ctx, dt);
 
     // H4：滚动惯性——动量投射 → 行吸附 → 弹簧趋近（收敛即停）。
+    // 滚轮惯性：动量投射 → 行吸附 → 弹簧趋近（收敛即停）。
+    // 方向约定：scroll_vel 与 scroll_y 同号（正值 = 继续向下滚）。
     if ctx.scroll_vel.abs() > 1.0 {
         let (_, vp_h) = content_viewport(dpi, ctx.client_size.0, ctx.client_size.1);
         let page = &mut ctx.pages[ctx.page];
         let max = (page.h - vp_h).max(0);
-        let projected = motion::project(ctx.scroll_vel);
-        let row = s(dpi, ROW_H) as f32;
-        let raw = (page.scroll_y as f32 + projected).clamp(0.0, max as f32);
-        let snapped = if row > 0.0 { (raw / row).round() * row } else { raw };
-        let target = snapped.clamp(0.0, max as f32);
-        let settled = ctx.scroll_spring.step(target, dt, motion::K_SHEET, motion::C_SHEET);
-        page.scroll_y = ctx.scroll_spring.x.round() as i32;
-        if settled {
+        // 拖拽滚动条期间不做动量投射：手指还在轨道上，惯性会跟手打架。
+        if ctx.sb_drag.is_none() {
+            let projected = motion::project(ctx.scroll_vel);
+            let row = s(dpi, ROW_H) as f32;
+            let raw = (page.scroll_y as f32 + projected).clamp(0.0, max as f32);
+            let snapped = if row > 0.0 { (raw / row).round() * row } else { raw };
+            let target = snapped.clamp(0.0, max as f32);
+            let settled = ctx.scroll_spring.step(target, dt, motion::K_SHEET, motion::C_SHEET);
+            page.scroll_y = ctx.scroll_spring.x.round() as i32;
+            if settled {
+                ctx.scroll_vel = 0.0;
+            }
+        } else {
             ctx.scroll_vel = 0.0;
         }
     }
@@ -2415,6 +2498,8 @@ fn paint_d2d(hwnd: HWND) -> bool {
     let nav_t = ctx.nav_sel.x;
     // 瞬态状态提示文案（窗口层绘制，不随内容滚动）。
     let status_msg = ctx.status.as_ref().map(|(s, _)| s.clone());
+    // 滚动条热态：悬停命中带 **或** 正在拖拽 —— 两者都给加宽/提亮反馈。
+    let sb_hot = ctx.sb_hover || ctx.sb_drag.is_some();
     // 置 true 表示本帧仍有未收敛的过渡弹簧 → 需再请求一帧。
     let mut anim_active = false;
 
@@ -2469,8 +2554,14 @@ fn paint_d2d(hwnd: HWND) -> bool {
         gfx.reset_transform(rt);
         unsafe { rt.PopAxisAlignedClip() };
 
-        // 滚动条（内容溢出时淡入，浮于内容之上）
-        paint_scrollbar(rt, gfx, &theme, dpi, win_w, win_h, scroll_y, pages[page_idx].h);
+        // 滚动条（内容溢出时显示，浮于内容之上）。
+        // sb_offset 由 scroll_y 经几何换算得到（正值向下），绘制/命中同源。
+        let sb_offset = scrollbar::geom(dpi, win_w, win_h, pages[page_idx].h)
+            .map(|g| g.offset_from_ratio(g.ratio_from_scroll(scroll_y as f32)))
+            .unwrap_or(0.0);
+        paint_scrollbar(
+            rt, gfx, &theme, dpi, win_w, win_h, sb_offset, sb_hot, pages[page_idx].h,
+        );
         // 窗口控制按钮（右上角，浮于内容区之上，不占布局高度）
         paint_window_controls(rt, gfx, &theme, dpi, win_w, tb);
 
@@ -2506,6 +2597,8 @@ fn paint_d2d(hwnd: HWND) -> bool {
     // 16ms 表实际抖到 ~31ms）；收敛即停表并恢复，防引用计数泄漏与空转烧 CPU。
     // 拖拽态（滑杆/卡片/滚动条/按压）同样续表：交互即时反馈不能依赖
     // WM_PAINT（最低优先级，会被持续 mousemove 无限推迟 → 视觉冻结）。
+    // 滚动条**悬停**不续表：热态是离散状态，靠 InvalidateRect 单次重绘即可，
+    // 若纳入会变成「鼠标停在滚动条上就 60fps 空转」。
     let interaction_dragging = matches!(
         ctx.interaction,
         Interaction::Dragging { .. } | Interaction::Pressing { .. }
@@ -2519,8 +2612,7 @@ fn paint_d2d(hwnd: HWND) -> bool {
             || release_moving
             || ctx.card_drag.is_some()
             || ctx.sb_drag.is_some()
-            || interaction_dragging);
-    if animating && !ctx.hires {
+            || interaction_dragging);    if animating && !ctx.hires {
         unsafe {
             windows::Win32::Media::timeBeginPeriod(1);
             start_timer(hwnd, ANIM_TIMER, 16);
@@ -2711,32 +2803,12 @@ fn paint_sidebar(
     }
 }
 
-/// 浮动滚动条（D3f）：仅当内容高于视口时显示；
-/// 拇指位置 = (-scroll_y) / max_scroll，拇指高 = 视口/内容比例。
+/// 浮动滚动条：仅当内容高于视口时显示。
+///
+/// 几何与坐标换算全部委托 [`scrollbar`] 模块（唯一真值来源），本函数只负责
+/// 把几何「画出来」：轨道 + 拇指。`sb_offset` 是拇指位移（正值向下），
+/// 由 `SettingsCtx` 从 `scroll_y` 换算后传入 —— 绘制侧不再碰 `scroll_y` 的符号。
 #[allow(clippy::too_many_arguments)]
-/// 滚动条几何（paint_scrollbar 与拖拽命中共用一套公式，防止漂移）。
-struct SbGeom {
-    inset: f32,
-    w: f32,
-    track_h: f32,
-    thumb_h: f32,
-    max_scroll: f32,
-}
-
-fn scrollbar_geom(dpi: u32, _win_w: i32, win_h: i32, content_h: i32) -> Option<SbGeom> {
-    if content_h <= win_h {
-        return None;
-    }
-    let inset = s(dpi, SCROLLBAR_INSET) as f32;
-    let w = s(dpi, SCROLLBAR_W) as f32;
-    let track_h = win_h as f32 - 2.0 * inset;
-    let max_scroll = (content_h - win_h) as f32;
-    let thumb_h = (track_h * win_h as f32 / content_h as f32)
-        .max(s(dpi, 24) as f32)
-        .min(track_h);
-    Some(SbGeom { inset, w, track_h, thumb_h, max_scroll })
-}
-
 fn paint_scrollbar(
     rt: &windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget,
     gfx: &mut Gfx,
@@ -2744,20 +2816,32 @@ fn paint_scrollbar(
     dpi: u32,
     win_w: i32,
     win_h: i32,
-    scroll_y: i32,
+    sb_offset: f32,
+    sb_hot: bool,
     content_h: i32,
 ) {
-    let Some(g) = scrollbar_geom(dpi, win_w, win_h, content_h) else {
+    let Some(g) = scrollbar::geom(dpi, win_w, win_h, content_h) else {
         return;
     };
-    let ratio = ((-scroll_y) as f32 / g.max_scroll).clamp(0.0, 1.0);
-    let top = g.inset + ratio * (g.track_h - g.thumb_h);
-    let x = win_w as f32 - g.inset - g.w;
+
+    // 轨道：常态极淡（存在感只够暗示可滚动），悬停/拖拽时抬亮。
+    let track_a = if sb_hot { 0.16 } else { 0.08 };
+    let (tl, tt, tr, tb) = g.track_rect(win_w);
     gfx.fill_round(
         rt,
-        RectF::new(x, top, x + g.w, top + g.thumb_h),
-        g.w / 2.0,
-        c(t, t.secondary).with_alpha(0.45),
+        RectF::new(tl, tt, tr, tb),
+        g.w * 0.5,
+        c(t, t.secondary).with_alpha(track_a),
+    );
+
+    // 拇指：悬停/拖拽加宽 + 提亮，给「抓到了」的即时反馈。
+    let (l, top, r, bottom) = g.thumb_rect(win_w, sb_offset, sb_hot);
+    let thumb_a = if sb_hot { 0.80 } else { 0.55 };
+    gfx.fill_round(
+        rt,
+        RectF::new(l, top, r, bottom),
+        (r - l) * 0.5,
+        c(t, t.secondary).with_alpha(thumb_a),
     );
 }
 

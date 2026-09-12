@@ -108,8 +108,18 @@ pub const LABEL_W: i32 = 120;
 pub const TOGGLE_W: i32 = 40;
 pub const VALUEBOX_W: i32 = 64;
 pub const FOOTNOTE_H: i32 = 60;
-pub const SCROLLBAR_W: i32 = 3;
+/// 滚动条**可见**宽度（逻辑 px）。3px 时代用户根本抓不住，
+/// 这里给到 12px —— 既符合 Windows「细滚动条」观感，也够手指/指针稳定命中。
+pub const SCROLLBAR_W: i32 = 12;
+/// 滚动条**命中**宽度（逻辑 px）。可见宽度之外再向内容侧外扩，
+/// 形成一条隐形但可点的「抓取带」（Apple HIG 建议最小 20pt 命中目标）。
+pub const SCROLLBAR_HIT_W: i32 = 20;
+/// 悬停/拖拽时拇指扩张到的宽度（逻辑 px）：状态反馈 + 进一步降低抓取难度。
+pub const SCROLLBAR_W_HOT: i32 = 16;
+/// 滚动条距窗口右缘/上下缘的内缩（逻辑 px）。
 pub const SCROLLBAR_INSET: i32 = 4;
+/// 拇指最小高度（逻辑 px）：内容极长时拇指仍要有可抓的实体。
+pub const SCROLLBAR_MIN_THUMB: i32 = 40;
 
 /// **统一控件列**：分段 / 滑杆 / 色板等「大控件」右对齐到同一条右边缘（操作边缘），
 /// 且左侧只在必要时向左扩（窗口变宽时控件不跟着无限拉长）。
