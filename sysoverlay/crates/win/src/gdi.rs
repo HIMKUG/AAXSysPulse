@@ -13,6 +13,26 @@
 //! 悬停↔非悬停切换时按 [`Config::anim_ms`] 动画到目标透明度，曲线为
 //! 三次方缓出（`1-(1-t)^3`，非线性：起步快、收尾慢）。动画期间用
 //! `SetTimer(16ms)` 驱动逐帧重绘，到达目标后 `KillTimer` 归零开销。
+//!
+//! # 适用边界（对抗性审查 §3 结论 + A/B 实测钉死，勿推广到别处）
+//!
+//! 「内容指纹跳过 + 脏区上传」架构只在以下前提下成立；每条都有 2026-09-12
+//! 实测背书（见 docs/悬浮窗性能恢复计划.md 与 PERF_ANALYSIS.md 顶部勘误）：
+//!
+//! 1. **空间稀疏**：脏区必须物理上小于整窗。`show_time` 开启时时钟每秒变化，
+//!    脏区 = 整窗（0.3 实验 pct=100%，n=113 无一例外）→ Rect 上传零收益。
+//!    这是物理现实不是 bug，别再去"修"它。
+//! 2. **时间稀疏**：内容在两次采样间稳定。跳帧率对内容节奏敏感（实测 9% 与
+//!    0% 两现）——高频变更内容下跳过率归零，收益消失。
+//! 3. **ULWIndirect 语义**：整窗 DIB 的 `pptSrc` 必须 = (0,0)（窗口左上角在源
+//!    DC 中的对齐点），写脏区左上角会与 `prcDirty` 叠加成 2× 偏移。这是本模块
+//!    全部 Rect 上传的根基——任何新增上传路径都照抄（upload_dib / present 两处
+//!    已一致），别凭直觉改。
+//! 4. **收益已到顶**：整条管线空闲 1.3% 单核；P0 分解 seg_draw=1274µs 是 D2D
+//!    引擎固有成本、无单点肥肉，P2 已依红线关闭。不要为再挤 1% 动架构。
+//! 5. **引擎正确性**：D2D↔GDI 引擎切换必须强制整窗（`ENGINE_HASH_XOR` 让指纹
+//!    不共享）；设置面板重绘强制整窗（`force_full_refresh`）；panic 后下一帧
+//!    强制整窗（防陈旧帧）。这些是正确性要求，不是性能选择。
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicU32, Ordering as AtomicOrdering};
 use std::sync::{LazyLock, Mutex, OnceLock};
@@ -798,10 +818,14 @@ fn present(
             .is_ok()
         } else if let Dirty::Rect(r) = dirty {
             // 脏矩形上传：只更新 r 对应子区，DWM 只重混这一小块。
-            // ppsrc = 子区在 DIB 中的源起点；prcDirty = 窗口客户区的脏区（同坐标）。
+            // ⚠️ pptSrc 语义 = 窗口左上角在源 DC 中的对齐点：整窗 DIB 必须写 (0,0)。
+            // 写 (r.left, r.top) 会与窗口坐标的 prcDirty 叠加成 2× 偏移——ULW 返回
+            // 成功但贴错像素，即历史「时钟冻结」根因（对照实验见
+            // docs/悬浮窗性能恢复计划.md）。本 GDI 兜底路径与 upload_dib（D2D 路径）
+            // 必须保持一致——D2D 被禁用/回退 GDI 的机器更依赖这里。
             // prcDirty 非空时 psize/pptDst 被忽略；psize 给整窗尺寸是规范姿势。
             let psize = SIZE { cx: width, cy: height };
-            let ppsrc = POINT { x: r.left, y: r.top };
+            let ppsrc = POINT { x: 0, y: 0 };
             let prc = RECT {
                 left: r.left,
                 top: r.top,
