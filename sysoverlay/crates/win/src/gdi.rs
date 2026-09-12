@@ -80,11 +80,16 @@ static CLOCK_TIMER_ON: AtomicBool = AtomicBool::new(false);
 /// 仍走脏区优化。
 static LAST_PRESENTED_SEC: AtomicU32 = AtomicU32::new(u32::MAX);
 
-/// 距下一个秒边界的毫秒数（+8ms 余量保证醒来时秒已翻转）。
+/// 距下一个**墙钟**秒边界的毫秒数（+8ms 余量保证醒来时秒已翻转）。
+///
+/// ⚠️ 必须对齐 `GetLocalTime` 的毫秒位，而不是 GetTickCount64 的秒边界：
+/// tick 秒边界与墙钟秒边界只在开机瞬间对齐，此后相差一个固定相位
+/// （本机实测 ~0.308s）。按 tick 对齐会让每次触发落在墙钟翻秒前 ~300ms，
+/// 渲染读到旧秒 → 内容指纹未变 → 整帧被跳过 → 新秒要等下一拍才显示，
+/// 表现为秒显示忽快忽慢（2026-09-12 相位直方图实测：绘制主峰 700-799ms）。
 fn ms_to_next_second() -> u32 {
-    use windows::Win32::System::SystemInformation::GetTickCount64;
-    let t = (unsafe { GetTickCount64() } % 1000) as u32;
-    (1000 - t).max(1) + 8
+    let ms = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() }.wMilliseconds;
+    (1000 - u32::from(ms)).max(1) + 8
 }
 
 /// 按 `show_time` 同步 CLOCK 定时器启停（render 每帧调用；swap 保证只切一次）。
