@@ -48,6 +48,10 @@ static HAS_DATA: AtomicBool = AtomicBool::new(false);
 /// 最近渲染帧耗时样本（恢复计划 0.4）：聚合时算 p50/p99，报告后清空。
 /// 上限 2048 帧——5s 窗口内即帧率 400fps 也装得下。
 static RENDER_US: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// 段级耗时样本（[`note_section`]）的聚合缓冲：纯内存，随聚合窗口批量落盘。
+/// 上限 16k 条（5s 窗口 × 高帧率 × 多段也装得下），超出丢弃，防探针撑爆内存。
+static SECTION_SAMPLES: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+const SECTION_SAMPLES_MAX: usize = 16_384;
 
 /// 高精度计时起点（开关关闭时返回 0）。
 pub fn begin() -> u64 {
@@ -146,10 +150,17 @@ fn maybe_report() {
         0
     };
 
-    let line = format!(
+    let mut line = format!(
         "frames={:<6} skipped={:<6} skip_pct={:<3}% avg_us={:<6} p50_us={:<6} p99_us={:<6} max_us={:<6}\n",
         frames, skipped, skip_pct, avg, p50, p99, max
     );
+    // 段级样本批量落盘（观察者效应修复）：与聚合行同窗口、同一次 open/write/close。
+    // 丢弃策略：缓冲溢出（>16k）时旧样本已被截断，此处照常落盘现有样本。
+    if let Ok(mut v) = SECTION_SAMPLES.lock() {
+        for (l, u) in v.drain(..) {
+            line.push_str(&format!("section {l} us={u}\n"));
+        }
+    }
     if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
         let dir = std::path::PathBuf::from(dir).join("SysOverlayC");
         let _ = std::fs::create_dir_all(&dir);
@@ -295,15 +306,22 @@ fn write_line(line: &str) {
     }
 }
 
-/// 通用耗时探针：`label` 超过阈值（20ms）时立即落盘一次。
-/// 用于采样器/进程扫描等**非消息**路径的开销观测。
+/// 通用耗时探针：`label` 段从 `start` 到现在的耗时，**聚合进内存缓冲**，
+/// 5s 窗口末尾随聚合行一起落盘（与 maybe_report 同窗口、同一次 open/write/close）。
+/// 用于渲染四段分解（seg_layout/hash/draw/upload）等**非消息**路径的开销观测。
+///
+/// 观察者效应修复（P0 实测）：旧实现每段一次文件 open/write/close，
+/// 4 段 × 每帧 = 每秒 4 次文件 I/O，使 frame p50 +30%（PROBE 开启时）。
+/// 改为纯内存 push 后，逐帧成本只剩一次 `Mutex::lock` + `Vec::push`。
 pub fn note_section(label: &str, start: u64) {
     if !enabled() || start == 0 {
         return;
     }
     let us = elapsed_us(start);
-    if true {
-        write_line(&format!("section {} us={}\n", label, us));
+    if let Ok(mut v) = SECTION_SAMPLES.lock() {
+        if v.len() < SECTION_SAMPLES_MAX {
+            v.push((label.to_string(), us));
+        }
     }
 }
 
