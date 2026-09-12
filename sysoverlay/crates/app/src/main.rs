@@ -338,6 +338,13 @@ fn main() {
                 sampler.reset_backoff();
             }
 
+            // 会话锁定（BUG-1）：锁屏安全桌面不显示悬浮窗，采样纯烧 CPU。
+            // 挂起等待解锁信号（window 线程 UNLOCK 时发 resume），零轮询；
+            // 解锁唤醒后 reset_backoff 并直达采样——立即补采消除数据空白窗口。
+            if sysoverlay_win::window::session_locked() && resume_rx.recv().is_ok() {
+                sampler.reset_backoff();
+            }
+
             // 设置改动即时生效（原子镜像，无锁；改动态代际 +1 会从 wait_cfg_change 提前唤醒）
             let (interval_ms, auto, enabled, power_iv) = schedule_cfg();
             sched.set_user(interval_ms, auto);

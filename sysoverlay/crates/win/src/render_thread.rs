@@ -58,6 +58,10 @@ pub fn start() {
                 }));
                 if outcome.is_err() {
                     crate::probe::log("rt: PANIC caught, thread survives");
+                    // BUG-3：panic 可能把 prev-cells/帧指纹停在半新半旧——
+                    // 下一帧哈希可能误判「内容未变」而跳过上传，画面从此
+                    // 停在 panic 时刻。强制下一帧整窗重绘，把自愈做完整。
+                    crate::gdi::force_full_refresh();
                 }
             }
         });

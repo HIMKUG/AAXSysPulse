@@ -283,6 +283,14 @@ pub fn is_window_hovered(hwnd: HWND) -> bool {
 /// Notifies the app's sampling thread of a system resume event via a oneshot.
 static RESUME_NOTIFY: OnceLock<std::sync::mpsc::Sender<()>> = OnceLock::new();
 
+/// 会话锁定状态（BUG-1）：锁定时采样线程挂起，解锁立即补采。
+static SESSION_LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 采样线程查询：会话是否处于锁定状态（锁屏安全桌面不显示悬浮窗，采样纯烧 CPU）。
+pub fn session_locked() -> bool {
+    SESSION_LOCKED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 unsafe extern "system" fn wndproc(
     hwnd: HWND,
     msg: u32,
@@ -574,8 +582,12 @@ unsafe extern "system" fn wndproc(
 
         // Self-heal: system resume → notify sampling thread to reset backoff
         WM_POWERBROADCAST => {
+            // BUG-2：0x0007 = PBT_APMRESUMESUSPEND（用户输入唤醒，前面还有一发
+            // 0x0012）；0x0012 = PBT_APMRESUMEAUTOMATIC（定时/计划任务唤醒**只发
+            // 此码**）。只听 0x0007 会让定时唤醒的机器漏掉采样退避重置。
             const PBT_APMRESUMESUSPEND: u32 = 0x0007;
-            if lparam.0 as u32 == PBT_APMRESUMESUSPEND {
+            const PBT_APMRESUMEAUTOMATIC: u32 = 0x0012;
+            if matches!(lparam.0 as u32, PBT_APMRESUMESUSPEND | PBT_APMRESUMEAUTOMATIC) {
                 if let Some(tx) = RESUME_NOTIFY.get() {
                     let _ = tx.send(());
                 }
@@ -583,13 +595,25 @@ unsafe extern "system" fn wndproc(
             LRESULT(1)
         }
 
-        // Self-heal: session lock → pause repaints (stop WM_TIMER briefly)
+        // Self-heal: session lock → 暂停采样（BUG-1）；unlock → 清标志并唤醒补采
         WM_WTSSESSION_CHANGE => {
             const WTS_SESSION_LOCK: u32 = 0x7;
-            if lparam.0 as u32 == WTS_SESSION_LOCK {
-                // Could pause sampling here if we had a pause flag.
-                // For now, just stop the timer.
-                // The message loop's PeekMessage will keep running without invalidating.
+            const WTS_SESSION_UNLOCK: u32 = 0x8;
+            match lparam.0 as u32 {
+                WTS_SESSION_LOCK => {
+                    SESSION_LOCKED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    crate::probe::log("session locked -> sampler paused");
+                }
+                WTS_SESSION_UNLOCK => {
+                    SESSION_LOCKED.store(false, std::sync::atomic::Ordering::Relaxed);
+                    // 复用 resume 通道：唤醒挂起中的采样线程 + 顺带重置退避，
+                    // 解锁后第一个采样周期立即补采，消除数据空白窗口。
+                    if let Some(tx) = RESUME_NOTIFY.get() {
+                        let _ = tx.send(());
+                    }
+                    crate::probe::log("session unlocked -> sampler resumed");
+                }
+                _ => {}
             }
             LRESULT(0)
         }
@@ -597,6 +621,10 @@ unsafe extern "system" fn wndproc(
         WM_ERASEBKGND => LRESULT(1),
 
         WM_DESTROY => {
+            unsafe {
+                use windows::Win32::System::RemoteDesktop::WTSUnRegisterSessionNotification;
+                let _ = WTSUnRegisterSessionNotification(hwnd);
+            }
             crate::tray::remove(hwnd);
             PostQuitMessage(0);
             LRESULT(0)
@@ -868,6 +896,14 @@ impl OverlayWindow {
 
         unsafe {
             let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA.0, state_ptr);
+        }
+
+        // 会话锁/解锁通知（BUG-1）：没有这个注册，WM_WTSSESSION_CHANGE 永远不会到达。
+        unsafe {
+            use windows::Win32::System::RemoteDesktop::{
+                WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
+            };
+            let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
         }
 
         // v5 窗口页新增：启动时应用贴角与鼠标穿透（报告 §5）。

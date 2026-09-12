@@ -45,6 +45,9 @@ static MAX_US: AtomicU64 = AtomicU64::new(0);
 static WINDOW_START_MS: AtomicU64 = AtomicU64::new(0);
 /// 报告窗口内是否已有累计（避免刚启动就打一行 0 帧）。
 static HAS_DATA: AtomicBool = AtomicBool::new(false);
+/// 最近渲染帧耗时样本（恢复计划 0.4）：聚合时算 p50/p99，报告后清空。
+/// 上限 2048 帧——5s 窗口内即帧率 400fps 也装得下。
+static RENDER_US: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
 /// 高精度计时起点（开关关闭时返回 0）。
 pub fn begin() -> u64 {
@@ -65,6 +68,11 @@ pub fn end_render(start: u64) {
     FRAMES.fetch_add(1, Ordering::Relaxed);
     TOTAL_US.fetch_add(us, Ordering::Relaxed);
     HAS_DATA.store(true, Ordering::Relaxed);
+    if let Ok(mut q) = RENDER_US.lock() {
+        if q.len() < 2048 {
+            q.push(us);
+        }
+    }
     // max：CAS 更新（无锁）
     let mut cur = MAX_US.load(Ordering::Relaxed);
     while us > cur {
@@ -117,10 +125,30 @@ fn maybe_report() {
     let total = TOTAL_US.swap(0, Ordering::Relaxed);
     let max = MAX_US.swap(0, Ordering::Relaxed);
     let avg = total.checked_div(frames).unwrap_or(0);
+    // 恢复计划 0.4：聚合行带 p50/p99 与跳帧率——分布比均值诚实。
+    let (p50, p99) = match RENDER_US.lock() {
+        Ok(mut q) => {
+            q.sort_unstable();
+            let pick = |f: f64| -> u64 {
+                if q.is_empty() {
+                    0
+                } else {
+                    q[(((q.len() - 1) as f64) * f).round() as usize]
+                }
+            };
+            (pick(0.50), pick(0.99))
+        }
+        Err(_) => (0, 0),
+    };
+    let skip_pct = if frames + skipped > 0 {
+        skipped * 100 / (frames + skipped)
+    } else {
+        0
+    };
 
     let line = format!(
-        "frames={:<6} skipped={:<6} avg_us={:<6} max_us={:<6}\n",
-        frames, skipped, avg, max
+        "frames={:<6} skipped={:<6} skip_pct={:<3}% avg_us={:<6} p50_us={:<6} p99_us={:<6} max_us={:<6}\n",
+        frames, skipped, skip_pct, avg, p50, p99, max
     );
     if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
         let dir = std::path::PathBuf::from(dir).join("SysOverlayC");

@@ -352,7 +352,7 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
             && alpha_pct_x100 == RENDERED_PCT_X100.load(AtomicOrdering::Relaxed)
         {
             perf::note_skipped();
-            perf::end_render(t0);
+            // 不调 end_render：跳过帧不是渲染帧，混入会污染 p50/p99（0.4 修正）。
             return;
         }
 
@@ -928,7 +928,10 @@ fn render_d2d(
     unsafe {
         // 布局（与性能模式同一套 cell 几何/文字）→ 门面指纹；
         // 异或 ENGINE_HASH_XOR 让引擎切换强制整窗重绘（同内容不同像素不能共享跳过）。
+        // P0-0.2 四段分解：seg_layout / seg_hash / seg_draw / seg_upload。
+        let t_layout = perf::begin();
         let (nat_w, nat_h, cells) = renderer.layout(snap, cfg, width, height);
+        perf::note_section("seg_layout", t_layout);
         // 诊断探针（D2D 侧）：悬浮窗渲染实际读到的指标颜色。
         crate::probe::log_lazy(|| {
             format!(
@@ -947,6 +950,7 @@ fn render_d2d(
             return true; // 扩窗续帧（非失败）
         }
 
+        let t_hash = perf::begin();
         let base = renderer.frame_hash(snap, cfg, width, height, src_alpha);
         // 本帧已受理当前纪元（见 GDI 分支同名注释）。
         HANDLED_EPOCH.store(RENDER_EPOCH.load(AtomicOrdering::Relaxed), AtomicOrdering::Relaxed);
@@ -976,6 +980,7 @@ fn render_d2d(
         if cfg.show_time && LAST_PRESENTED_SEC.load(AtomicOrdering::Relaxed) != present_sec {
             dirty = Dirty::Full;
         }
+        perf::note_section("seg_hash", t_hash);
         crate::probe::log_lazy(|| {
             let kind = match &dirty {
                 Dirty::Full => "Full".to_string(),
@@ -1011,6 +1016,7 @@ fn render_d2d(
                 return false; // 失败：调用方走 GDI 分支兜底
             }
         };
+        let t_draw = perf::begin();
         surface.begin_draw();
         surface.clear();
         paint_cells(&mut surface, &cells, cfg.font_weight);
@@ -1026,6 +1032,7 @@ fn render_d2d(
             LAST_FRAME_HASH.store(u64::MAX, AtomicOrdering::Relaxed);
             return false;
         }
+        perf::note_section("seg_draw", t_draw);
         let need_w = (text_right + 12.0).ceil() as i32;
         // 收缩目标取 max(DWrite 实测, 布局自然宽)：扩（guard 用 nat_w）与缩
         // （此处用 need_w）的目标若互相错开 8~32px 会形成扩缩循环，取 max
@@ -1065,11 +1072,31 @@ fn render_d2d(
         // std Mutex 不可重入——上一轮补 begin_draw 后 end_draw 成功、执行流抵达
         // upload_dib，若仍持有锁即同线程死锁（悬浮窗线程卡死 → 重启仍卡 → 设置打不开）。
         drop(dib);
-        if !upload_dib(hwnd, width, height, src_alpha, &dirty) {
+        let t_upload = perf::begin();
+        let uploaded = upload_dib(hwnd, width, height, src_alpha, &dirty);
+        // 恢复计划 0.3 实验：脏区面积占比。区分两个假设——
+        // ① pct≈100：脏区物理上≈整窗，prcDirty 无罪，接受现状；
+        // ② pct 很小但耗时未降：ULWIndirect 的 prcDirty 分支有问题 → 真优化机会。
+        let dirty_pct = match &dirty {
+            Dirty::Full => 100u64,
+            Dirty::Rect(r) => {
+                let dw = (r.right - r.left).max(0) as u64;
+                let dh = (r.bottom - r.top).max(0) as u64;
+                (dw * dh * 100)
+                    .checked_div((width.max(0) as u64) * (height.max(0) as u64))
+                    .unwrap_or(100)
+                    .min(100)
+            }
+        };
+        perf::note_section(&format!("seg_upload pct={dirty_pct}"), t_upload);
+        if !uploaded {
             LAST_FRAME_HASH.store(u64::MAX, AtomicOrdering::Relaxed);
         } else {
             LAST_PRESENTED_SEC.store(present_sec, AtomicOrdering::Relaxed);
         }
+        // P0-0.1：D2D 是生产引擎，必须喂给 end_render——此前 perf.log 聚合
+        // 只统计 GDI 兜底帧，监控数字长期失真（PERF_ANALYSIS 勘误 §6）。
+        perf::end_render(t0);
 
         RENDERED_PCT_X100.store((alpha_pct_f.clamp(1.0, 100.0) * 100.0) as u32, AtomicOrdering::Relaxed);
         if animating {
