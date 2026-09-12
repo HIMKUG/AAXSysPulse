@@ -45,6 +45,8 @@ pub struct SystemPower {
     gpu_watts_ema: Option<f32>,
     /// 最近一轮 CPU 实测功率（供进程分摊）。
     last_cpu_w: Option<f32>,
+    /// GPU 瓦数缺失状态（**仅在翻转时**记探针，避免每帧刷屏）。
+    gpu_watts_missing: bool,
 }
 
 impl Default for SystemPower {
@@ -68,6 +70,7 @@ impl SystemPower {
             gpu_watts: None,
             gpu_watts_ema: None,
             last_cpu_w: None,
+            gpu_watts_missing: false,
         };
         probe::log(&format!(
             "syspower init ram={} disks={} ram_est_w={} board_w={EST_MAINBOARD_W} disk_w={}",
@@ -109,6 +112,18 @@ impl SystemPower {
             self.gpu_watts_ema = None;
             0.0
         };
+        // 可观测性（BUG-4 的教训）：GPU 瓦数缺失时整机功耗会**静默漏掉整个显卡项**
+        // （曾经的成因是 GPU 行开关误当采样门）。这里在状态翻转时记一行，
+        // 让"功耗是否完整"从日志即可判定，而不是靠用户拿硬件监控对账才发现。
+        let missing = self.gpu_watts.is_none();
+        if missing != self.gpu_watts_missing {
+            self.gpu_watts_missing = missing;
+            probe::log(if missing {
+                "syspower gpu watts unavailable → 显卡项按 0 并入（整机功耗偏低，查 gpu_vendor 读数）"
+            } else {
+                "syspower gpu watts available → 显卡项已纳入整机功耗"
+            });
+        }
         let total = cpu
             + gpu
             + self.ram_est_w

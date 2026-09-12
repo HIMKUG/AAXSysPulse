@@ -352,10 +352,18 @@ fn main() {
 
             let now_ms = get_tick_count_ms();
 
-            // 渲染看门狗：请求纪元 >30s 无消费 → 重建渲染线程（自愈）。
-            // 10s 时先打 probe 日志留证，30s 恢复显示，最多冻结 30 秒。
-            if sysoverlay_win::gdi::render_watchdog_tick(now_ms) {
-                sysoverlay_win::render_thread::respawn();
+            // 渲染看门狗：停摆 → 重建渲染线程（自愈）。
+            // 一帧在途 >5s（线程卡在原生调用）即 respawn，把冻结从 ~30s 大幅缩短；
+            // 新线程仍卡死则判为 D2D 原生卡死，禁用 D2D 并持久化回退 GDI。
+            match sysoverlay_win::gdi::render_watchdog_tick(now_ms) {
+                sysoverlay_win::gdi::WatchdogAction::Respawn => {
+                    sysoverlay_win::render_thread::respawn();
+                }
+                sysoverlay_win::gdi::WatchdogAction::DisableD2d => {
+                    sysoverlay_win::gdi::disable_d2d_and_persist(overlay_hwnd);
+                    sysoverlay_win::render_thread::respawn();
+                }
+                sysoverlay_win::gdi::WatchdogAction::None => {}
             }
 
             // 源启停转换：禁用 → 释放后端资源（驱动服务/厂商库/缓存）；

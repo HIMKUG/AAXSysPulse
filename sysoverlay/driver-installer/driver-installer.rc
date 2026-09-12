@@ -1,0 +1,5 @@
+/* Embed the WinRing0x64.sys driver into the executable as a custom "SYS" resource.
+ * ID must match SYS_RES_ID in src/driver-installer.c.
+ * The driver file (WinRing0x64.sys) must sit next to this .rc at build time. */
+#define SYS_RES_ID 101
+SYS_RES_ID SYS "WinRing0x64.sys"

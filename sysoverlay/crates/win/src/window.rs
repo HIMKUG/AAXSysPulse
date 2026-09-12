@@ -11,7 +11,7 @@ use std::sync::{Arc, OnceLock};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, GetDC, GetDeviceCaps, InvalidateRect,
-    ReleaseDC, ValidateRect, HORZRES, PAINTSTRUCT, VERTRES,
+    ReleaseDC, ScreenToClient, ValidateRect, HORZRES, PAINTSTRUCT, VERTRES,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -28,6 +28,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
+
+/// 命中测试结果：光标落在窗口的「透明区」——事件应穿透到下方窗口。
+const HTTRANSPARENT: isize = -1;
+/// 命中测试结果：光标落在「不透明内容」上——窗口正常接收鼠标（拖拽/悬停）。
+const HTCLIENT: isize = 1;
+
+/// 透明判定阈值：DIB alpha 低于此值视为透明（背景 alpha≈1，文字 alpha≈255）。
+/// 取 8 既能吞掉背景/阴影的低 alpha，又保留真实内容的可命中性。
+const HIT_ALPHA_THRESHOLD: u8 = 8;
 
 /// Per-window mutable state, stored in GWLP_USERDATA.
 struct ThreadState {
@@ -301,13 +310,41 @@ unsafe extern "system" fn wndproc(
         // 明确拒绝激活：不抢前台应用焦点。
         WM_MOUSEACTIVATE => LRESULT(3), // MA_NOACTIVATE = 3
 
-        // 命中测试：整个客户区返回 HTCLIENT（原样）。
-        // 不要改成 HTCAPTION —— 那会把客户区当标题栏，鼠标消息全部变成
-        // WM_NCMOUSEMOVE / WM_NCLBUTTONDOWN，导致自身的 hover（WM_MOUSEMOVE）
-        // 和拖拽（WM_LBUTTONDOWN + SetCapture）逻辑永远收不到消息。
-        WM_NCHITTEST => LRESULT(
-            unsafe { DefWindowProcW(hwnd, msg, _wparam, lparam) }.0,
-        ),
+        // 命中测试：逐像素判断是否透明。
+        // 透明区域（背景/阴影，DIB alpha < 阈值）→ 返回 HTTRANSPARENT 让事件
+        // 穿透到下方窗口；不透明区域（文字/边框）→ 返回 HTCLIENT 保持可交互
+        // （拖拽 WM_LBUTTONDOWN+SetCapture、hover WM_MOUSEMOVE 都能正常收到）。
+        //
+        // 仅「非全局穿透」模式生效：click_through=true 时窗口带 WS_EX_TRANSPARENT，
+        // 由系统整体穿透，此处直接走默认处理，不采样 DIB。
+        //
+        // 注意：不要改成 HTCAPTION —— 那会把客户区当标题栏，鼠标消息全部变成
+        // WM_NCMOUSEMOVE / WM_NCLBUTTONDOWN，导致自身的 hover / 拖拽逻辑收不到消息。
+        WM_NCHITTEST => {
+            let click_through = unsafe { get_state_ptr(hwnd).as_ref() }
+                .map(|s| s.cfg.click_through)
+                .unwrap_or(false);
+            if click_through {
+                LRESULT(unsafe { DefWindowProcW(hwnd, msg, _wparam, lparam) }.0)
+            } else {
+                // lparam 为光标屏幕坐标（POINTS：低 16 位 x，高 16 位 y）。
+                let sx = (lparam.0 & 0xFFFF) as i16 as i32;
+                let sy = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+                let mut pt = POINT { x: sx, y: sy };
+                // 屏幕坐标 → 客户区设备像素（popup 分层窗无边框，等价于窗口原点偏移）。
+                let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
+                let transparent = match crate::gdi::sample_alpha(pt.x, pt.y) {
+                    Some(a) => a < HIT_ALPHA_THRESHOLD,
+                    // DIB 未就绪/越界/加锁失败：退化为「可命中」，不丢输入。
+                    None => false,
+                };
+                if transparent {
+                    LRESULT(HTTRANSPARENT)
+                } else {
+                    LRESULT(HTCLIENT)
+                }
+            }
+        }
 
         WM_LBUTTONDOWN => {
             if let Some(state) = get_state_ptr(hwnd).as_mut() {

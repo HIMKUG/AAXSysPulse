@@ -236,24 +236,139 @@ static WATCHDOG_PENDING_MS: AtomicU64 = AtomicU64::new(0);
 /// 停摆 >10s 的日志只打一次（直到恢复）。
 static WATCHDOG_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// 采样线程每轮调用：检测渲染线程停摆（挂起/死亡/静默跳过）。
-/// 判据 = 请求纪元领先受理纪元持续不消（任何被消费的帧——完整渲染或
-/// HASH-SKIP——都会把 HANDLED_EPOCH 追平）。
-/// 返回 true = 停摆超过 30s，调用方应 [`crate::render_thread::respawn`]。
-pub fn render_watchdog_tick(now_ms: u64) -> bool {
+/// 帧在途标记：当前是否有渲染线程正在画一帧，以及该帧开始时刻。
+///
+/// 语义：**0 = 无在途帧**（空闲/健康）；非 0 = 有帧在途。
+/// 只由当前渲染线程写入；`respawn` 后旧线程（仍卡在原生调用里）若回写，
+/// 会被 `render_frame_end` 用世代号拦下（见下）。
+static FRAME_START_MS: AtomicU64 = AtomicU64::new(0);
+/// 当前「活跃渲染线程」的世代号，由 [`crate::render_thread::start`] 自增。
+/// 旧线程的 gen 落后于它 → 其心跳被视为过期、丢弃。
+static RENDER_GEN: AtomicU64 = AtomicU64::new(0);
+/// 已为「本次停摆」触发过 respawn（幂等闸门）：避免一次卡死被每个采样 tick
+/// 重复 respawn 出多个线程。帧恢复完成后清零。
+static WEDGE_RESPAWNED: AtomicBool = AtomicBool::new(false);
+/// 软停摆日志只打一次（直到帧恢复清零）。
+static WATCHDOG_WEDGED: AtomicBool = AtomicBool::new(false);
+
+/// 开启新一代渲染线程：由 [`crate::render_thread::start`] 调用。
+/// 让旧线程的迟到心跳失效（世代 +1），并把「在途帧」清空——新线程从
+/// **无在途帧**的干净状态起步（否则旧线程遗留的 FRAME_START_MS 会让看门狗
+/// 误以为新线程一直卡着，从而误禁 D2D）。
+///
+/// 幂等闸门保留：一次停摆只 respawn 一次；新线程若又卡死，其**自己**会在
+/// 5s 后写入新的 FRAME_START_MS，看门狗据此走 D2D 回退分支。
+pub fn begin_render_generation() -> u64 {
+    let g = RENDER_GEN.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+    // 新世代从无在途帧开始：清掉旧线程的残留时间戳。
+    FRAME_START_MS.store(0, AtomicOrdering::Relaxed);
+    g
+}
+
+/// 当前世代号（`render_thread` 启动时捕获，随每次帧心跳回写）。
+pub fn render_generation() -> u64 {
+    RENDER_GEN.load(AtomicOrdering::Relaxed)
+}
+
+/// 标记一帧开始（render 线程进入 [`render`] 前调用，携带本线程捕获的世代号）。
+/// 旧线程若在此处写入，`render_frame_end` 的世代检查会使其自相矛盾——
+/// 所以这里只在 gen == 当前世代时才写，杜绝旧线程刷新在途时间。
+pub fn render_frame_begin(gen: u64) {
+    // 只有当前活跃世代才允许开启新在途帧；旧线程的调用直接丢弃。
+    if gen != RENDER_GEN.load(AtomicOrdering::Relaxed) {
+        return;
+    }
+    // ⚠️ 必须与看门狗调用方传入的 now_ms 同一时钟（GetTickCount64 = 系统运行毫秒）。
+    // 曾用 SystemTime::now()（UNIX 纪元毫秒，~1.789e12）：与 tick 毫秒（~1e7）相减
+    // saturating 归零 → 5s 软停摆从未触发，每次卡死都掉回 30s 纪元路径。
+    // 2026-09-12 深夜两次带探针复现（probe_1350/1400）抓出，编译与单测均无法发现。
+    FRAME_START_MS.store(
+        unsafe { windows::Win32::System::SystemInformation::GetTickCount64() },
+        AtomicOrdering::Relaxed,
+    );
+}
+
+/// 标记一帧结束（render 返回后调用）。**只有当前世代的线程才能清标记**——
+/// 旧线程（已被 respawn 淘汰）的迟到写入必须被忽略，否则会误清新线程的在途帧。
+pub fn render_frame_end(gen: u64) {
+    if gen != RENDER_GEN.load(AtomicOrdering::Relaxed) {
+        return; // 旧世代：丢弃
+    }
+    FRAME_START_MS.store(0, AtomicOrdering::Relaxed);
+}
+
+/// 帧恢复（当前世代已在途帧归零）时清零软停摆闸门，允许未来重新检测。
+fn clear_wedge_gate() {
+    WEDGE_RESPAWNED.store(false, AtomicOrdering::Relaxed);
+    WATCHDOG_WEDGED.store(false, AtomicOrdering::Relaxed);
+}
+
+/// 看门狗动作：告诉调用方（采样线程）该做什么。调用方持有 overlay hwnd，
+/// 才能做「禁用 D2D + 持久化配置」这类需要 hwnd 的收尾工作。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WatchdogAction {
+    /// 健康，什么都不做。
+    None,
+    /// 渲染线程停摆 → 重建渲染线程（respawn）。
+    Respawn,
+    /// 新线程也卡死 → 禁用 D2D 并持久化回退 GDI（调用方需 hwnd）。
+    DisableD2d,
+}
+
+/// 采样线程每轮调用：检测渲染线程停摆（挂起/死亡/卡在原生调用）。
+/// 判据一 = 请求纪元领先受理纪元持续不消（30s → 线程没消费请求）。
+/// 判据二（更快）= 当前世代有一帧在途超过 5s（线程活着但卡在原生调用里）。
+pub fn render_watchdog_tick(now_ms: u64) -> WatchdogAction {
     const STALL_LOG_MS: u64 = 10_000;
     const STALL_RESPAWN_MS: u64 = 30_000;
+    // ── 软停摆快检（优先于纪元判据）──
+    // 一帧超过阈值没画完 = 渲染线程卡在某个原生调用里（不是死、是阻塞，旧线程
+    // 无法被取消）。阈值远小于 30s 纪元阈值，把「悬浮窗冻结」大幅缩短。
+    // ⚠️ 幂等：同一次停摆只 respawn 一次（WEDGE_RESPAWNED 闸门），否则每个采样
+    // tick 都会新建线程，造成线程泄漏。
+    // ⚠️ 世代隔离：只认当前世代的帧心跳。旧线程（卡在原生调用里）迟到的
+    // render_frame_end 带旧 gen，被 render_frame_end 忽略，不会误清新线程的标记。
+    const HARD_STALL_MS: u64 = 5_000;
+    let f_start = FRAME_START_MS.load(AtomicOrdering::Relaxed);
+    if f_start != 0 {
+        let fage = now_ms.saturating_sub(f_start);
+        if fage > HARD_STALL_MS {
+            if !WATCHDOG_WEDGED.swap(true, AtomicOrdering::Relaxed) {
+                crate::probe::log(&format!(
+                    "render watchdog: frame in-progress for {fage}ms (render thread wedged in native call?)"
+                ));
+            }
+            // 幂等闸门：本次停摆只触发一次 respawn。旧线程即使永不返回，
+            // 也不会被反复重开（不会无限泄漏线程）。
+            if !WEDGE_RESPAWNED.swap(true, AtomicOrdering::Relaxed) {
+                return WatchdogAction::Respawn; // 触发一次 respawn
+            }
+            // 已 respawn 过但当前世代仍在途超过阈值 → 新线程也卡住了。
+            // 优先按「D2D 原生调用卡死」处置：禁用 D2D 并持久化回退 GDI。
+            // 若本来就是 GDI 引擎（D2D 已禁），不误报，退化为等纪元判据。
+            if !D2D_BROKEN.load(AtomicOrdering::Relaxed) {
+                crate::probe::log(
+                    "render watchdog: fresh thread also wedged -> disable D2D (persist GDI)",
+                );
+                return WatchdogAction::DisableD2d;
+            }
+            return WatchdogAction::None; // 不再重复 respawn
+        }
+    } else {
+        // 当前世代无在途帧 → 渲染线程空闲且健康，清零闸门，允许未来重新检测。
+        clear_wedge_gate();
+    }
     let pending = RENDER_EPOCH.load(AtomicOrdering::Relaxed)
         != HANDLED_EPOCH.load(AtomicOrdering::Relaxed);
     if !pending {
         WATCHDOG_PENDING_MS.store(0, AtomicOrdering::Relaxed);
         WATCHDOG_LOGGED.store(false, AtomicOrdering::Relaxed);
-        return false;
+        return WatchdogAction::None;
     }
     let first = WATCHDOG_PENDING_MS.load(AtomicOrdering::Relaxed);
     if first == 0 {
         WATCHDOG_PENDING_MS.store(now_ms, AtomicOrdering::Relaxed);
-        return false;
+        return WatchdogAction::None;
     }
     let stalled_for = now_ms.saturating_sub(first);
     if stalled_for > STALL_LOG_MS && !WATCHDOG_LOGGED.swap(true, AtomicOrdering::Relaxed) {
@@ -261,7 +376,11 @@ pub fn render_watchdog_tick(now_ms: u64) -> bool {
             "render watchdog: epoch unhandled for {stalled_for}ms (render thread stalled?)"
         ));
     }
-    stalled_for > STALL_RESPAWN_MS
+    if stalled_for > STALL_RESPAWN_MS {
+        WatchdogAction::Respawn
+    } else {
+        WatchdogAction::None
+    }
 }
 
 /// 请求悬浮窗重绘：纪元自增 + 消息唤醒。
@@ -298,6 +417,11 @@ fn invalidate_present_size() {
 /// 并回退 Gdi——否则配置持久为 `render_engine=D2d` 时重启也会进 D2D 卡死，
 /// 用户无法从设置里改回来（「设置也打不开」）。
 static D2D_BROKEN: AtomicBool = AtomicBool::new(false);
+
+/// 看门狗 DisableD2d 动作的公开入口（供采样线程在持有 hwnd 时调用）。
+pub fn disable_d2d_and_persist(hwnd: HWND) {
+    mark_d2d_broken_and_persist_gdi(hwnd);
+}
 
 /// D2D 渲染失败后的自愈合：本会话禁用 D2D，并把持久配置回退为 Gdi。
 fn mark_d2d_broken_and_persist_gdi(hwnd: HWND) {
@@ -415,7 +539,10 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
         // ⚠️ 自愈合：D2D 绑 DIB 内存 DC 在部分驱动/显卡上可能死锁或 panic（见
         // render_d2d 注释）。用 catch_unwind 兜住 panic；一旦失败本会话禁用 D2D
         // 并回退 Gdi（否则下次启动仍进 D2D → 卡死，用户无法自救）。
-        if cfg.render_engine == RenderEngine::D2d && !D2D_BROKEN.load(AtomicOrdering::Relaxed) {
+        // 诊断探针（冻结定位）：确认 render 前导段已走完（GetLocalTime/clock/
+    // sync_clock/compute_alpha/get_window_size/layout），卡点在其后。
+    crate::probe::log_lazy(|| "render preamble done".to_string());
+    if cfg.render_engine == RenderEngine::D2d && !D2D_BROKEN.load(AtomicOrdering::Relaxed) {
             static ANNOUNCED: AtomicBool = AtomicBool::new(false);
             if !ANNOUNCED.swap(true, AtomicOrdering::Relaxed) {
                 crate::probe::log("engine=D2d (high quality) — first frame");
@@ -688,6 +815,33 @@ pub fn invalidate_dib_cache() {
     }
 }
 
+/// 命中测试用：返回窗口设备像素坐标 `(x, y)` 处**当前 DIB 帧**的 alpha（0..=255）。
+///
+/// 透明区域（背景，alpha≈1/255）与不透明内容（文字/边框，alpha≈255）在此区分，
+/// 供 `WM_NCHITTEST` 决定返回 `HTTRANSPARENT`（穿透到下方窗口）还是 `HTCLIENT`
+/// （可交互：拖拽/悬停）。
+///
+/// - 越界、DIB 尚未创建、或加锁失败（渲染线程正持有）→ 返回 `None`，
+///   调用方应退化为「可命中」（保持原行为，不丢输入）。
+/// - DIB 为 top-down 32 位 BGRA（`biHeight = -h`），alpha 在每个像素的第 4 字节。
+/// - `try_lock` 而非 `lock`：命中测试在 UI 线程高频触发，绝不阻塞等待渲染线程。
+pub fn sample_alpha(x: i32, y: i32) -> Option<u8> {
+    let dib = DIB.get()?;
+    let guard = dib.try_lock().ok()?;
+    if guard.bits == 0 || guard.w <= 0 || guard.h <= 0 {
+        return None;
+    }
+    if x < 0 || y < 0 || x >= guard.w || y >= guard.h {
+        return None;
+    }
+    let stride = guard.w as usize * 4;
+    let off = (y as usize) * stride + (x as usize) * 4 + 3;
+    let bits = guard.bits as *const u8;
+    // SAFETY: 0 <= off < w*h*4，落在 CreateDIBSection 分配的缓冲区内。
+    let alpha = unsafe { *bits.add(off) };
+    Some(alpha)
+}
+
 impl DibCache {
     unsafe fn free(&mut self) {
         if self.old_bmp != 0 && self.dc != 0 {
@@ -955,6 +1109,7 @@ fn render_d2d(
     t0: u64,
 ) -> bool {
     unsafe {
+        crate::probe::log_lazy(|| "d2d enter".to_string());
         // 布局（与性能模式同一套 cell 几何/文字）→ 门面指纹；
         // 异或 ENGINE_HASH_XOR 让引擎切换强制整窗重绘（同内容不同像素不能共享跳过）。
         // P0-0.2 四段分解：seg_layout / seg_hash / seg_draw / seg_upload。

@@ -908,8 +908,12 @@ fn dispatch(ctx: &mut SettingsCtx, action: Action) {
                             // 本会话重开不热恢复 → 原生弹窗告知重启恢复。
                             show_teardown_notice(overlay, "TeardownPower");
                         }
-                        CfgRef::ShowGpu if !cfg.show_gpu => {
-                            // v3：厂商驱动库（NVML/ADL）被卸载，本会话不热恢复。
+                        CfgRef::ShowGpu
+                            if !cfg.show_gpu && !(cfg.power_enabled && cfg.power_query) =>
+                        {
+                            // 厂商驱动库（NVML/ADL）只在「GPU 行与功耗行**都**关」时才卸载。
+                            // 功耗行仍开着时，厂商库会继续保留（它要供整机功耗的 GPU 瓦数），
+                            // 此时不能弹"需重启恢复"——那句话不成立。
                             show_teardown_notice(overlay, "TeardownGpu");
                         }
                         _ => {}

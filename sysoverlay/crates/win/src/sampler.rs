@@ -80,11 +80,22 @@ impl SystemSampler {
                 code: 0,
                 seq: self.seq as u32,
             });
+            // GPU 行也关着 → 厂商库已无使用者（它只为功耗行的瓦数而继续留存），一并卸载。
+            if !cur[2] {
+                crate::gpu_vendor::teardown();
+                self.syspower.set_gpu_watts(None);
+            }
         }
-        // GPU 行关：卸载厂商库（NVML/ADL）并失效 D3DKMT 拓扑缓存。
-        // 重开：D3DKMT 查询无状态、拓扑缓存自动重建；厂商库本会话不热恢复（走 D3DKMT 兜底）。
+        // GPU 行关：失效 D3DKMT 拓扑缓存；厂商库（NVML/ADL）**只在功耗行也关时**卸载
+        // —— 功耗行仍需要 GPU 实测瓦数（整机功耗 = CPU + GPU + …），
+        //    "不显示占用率"不等于"不测显卡功耗"。
+        // 重开：D3DKMT 查询无状态、拓扑缓存自动重建；厂商库被卸载后本会话不热恢复（走 D3DKMT 兜底）。
         if prev[2] && !cur[2] {
-            crate::gpu_vendor::teardown();
+            if !cur[4] {
+                crate::gpu_vendor::teardown();
+                // 厂商瓦数随后端卸载而失效：清掉陈旧读数，避免整机功耗冻结在旧值上。
+                self.syspower.set_gpu_watts(None);
+            }
             crate::proc_gpu::invalidate_topology();
         }
         // Net 重开：重置字节基线（速率 = Δbytes/Δt，跨大间隔必毛刺）。
@@ -133,24 +144,36 @@ impl SystemSampler {
 
         // GPU：厂商模块优先（NVML/ADL/IGCL，用户拍板），成功时直接用，跳过 D3DKMT（省约 74ms）。
         // vendor 失败则 D3DKMT 补充（首次或恢复时用一次，后续由 vendor 缓存覆盖）。
-        if plan.gpu {
+        //
+        // ⚠️ 采样门 = GPU 行 ∨ 功耗行（用户拍板：功耗开着就要拿到完整数据）。
+        // 整机功耗 = CPU实测 + GPU实测 + …，所以「GPU 行关」只代表**不显示占用率**，
+        // 不能连显卡瓦数一起停掉——那样整机功耗会静默漏掉整个显卡项。
+        // GPU 行关闭时：照常跑厂商采样取瓦数，但不回写 snap.gpu、不跑 D3DKMT 兜底。
+        if plan.gpu || plan.power {
             let t = crate::perf::begin();
             let (v_util, v_watts) = gpu_vendor::sample();
+            // 瓦数无条件发布：功耗行（plan.power）依赖它
             self.syspower.set_gpu_watts(v_watts);
-            // vendor 有值：写入快照并缓存，短路 D3DKMT 调用
-            if let Some(u) = v_util {
-                gpu_vendor::set_cached_util(u);
-                snap.gpu = Metric::Value(u.clamp(0.0, 100.0));
-                crate::perf::note_section("sample_gpu", t);
-                self.push_diag(SamplerId::Gpu, SampleOutcome::Ok, 0);
-            } else {
-                // vendor 不可用：从缓存恢复；若缓存也无则用 D3DKMT
-                let gpu_out = self.gpu.sample(prev, now_ms, &mut snap);
-                crate::perf::note_section("sample_gpu", t);
-                if let Some(u) = gpu_vendor::cached_util() {
+            if plan.gpu {
+                // vendor 有值：写入快照并缓存，短路 D3DKMT 调用
+                if let Some(u) = v_util {
+                    gpu_vendor::set_cached_util(u);
                     snap.gpu = Metric::Value(u.clamp(0.0, 100.0));
+                    crate::perf::note_section("sample_gpu", t);
+                    self.push_diag(SamplerId::Gpu, SampleOutcome::Ok, 0);
+                } else {
+                    // vendor 不可用：从缓存恢复；若缓存也无则用 D3DKMT
+                    let gpu_out = self.gpu.sample(prev, now_ms, &mut snap);
+                    crate::perf::note_section("sample_gpu", t);
+                    if let Some(u) = gpu_vendor::cached_util() {
+                        snap.gpu = Metric::Value(u.clamp(0.0, 100.0));
+                    }
+                    self.push_diag(SamplerId::Gpu, gpu_out, 0);
                 }
-                self.push_diag(SamplerId::Gpu, gpu_out, 0);
+            } else {
+                // 功耗行专供：只要瓦数，不要占用率（也不付 D3DKMT 那 74ms）
+                crate::perf::note_section("sample_gpu", t);
+                self.push_diag(SamplerId::Gpu, SampleOutcome::Skipped, 0);
             }
         } else {
             self.push_diag(SamplerId::Gpu, SampleOutcome::Skipped, 0);

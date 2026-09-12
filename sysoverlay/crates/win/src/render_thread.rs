@@ -47,6 +47,11 @@ pub fn start() {
         *g = Some(tx);
     }
     RENDER_QUEUED.store(false, Ordering::Relaxed);
+    // 开启新世代：让旧线程（可能仍卡在原生调用里）的迟到帧心跳失效，
+    // 防止它清掉新线程的在途标记而使看门狗失明。
+    crate::gdi::begin_render_generation();
+    // 本线程捕获自己的世代号（此后不再变），随每次帧心跳回写。
+    let my_gen = crate::gdi::render_generation();
     let _ = std::thread::Builder::new()
         .name("overlay-render".into())
         .spawn(move || {
@@ -62,7 +67,7 @@ pub fn start() {
                 // panic 兜底：此前线程 panic 会静默死亡 → 悬浮窗永久冻结
                 // （采样线程继续发请求但无人消费）。捕获后记日志继续跑。
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    render_once(hwnd_addr);
+                    render_once(hwnd_addr, my_gen);
                 }));
                 if outcome.is_err() {
                     crate::probe::log("rt: PANIC caught, thread survives");
@@ -78,7 +83,7 @@ pub fn start() {
 /// 单次渲染：读配置镜像 + 快照 → gdi::render。
 /// RENDER_CFG 中毒（一次性 panic 污染）时 `into_inner` 恢复，
 /// 不再 `continue` 静默跳过（那会让后续所有帧永久消失）。
-fn render_once(hwnd_addr: isize) {
+fn render_once(hwnd_addr: isize, gen: u64) {
     let cfg = match RENDER_CFG.lock() {
         Ok(g) => *g,
         Err(p) => {
@@ -89,7 +94,12 @@ fn render_once(hwnd_addr: isize) {
     let Some(cfg) = cfg else { return };
     let snap = crate::window::snap_get();
     let hwnd = HWND(hwnd_addr as *mut _);
+    // 帧在途标记：watchdog 据此区分「线程死了」与「线程活着但卡在原生调用里」。
+    // 携带本线程的世代号——旧线程（被 respawn 淘汰）的迟到写入会被 frame_end 忽略。
+    // 包在 catch_unwind 外层——panic 被兜住后本函数仍会返回，frame_end 照常调用。
+    crate::gdi::render_frame_begin(gen);
     crate::gdi::render(hwnd, &snap, &cfg);
+    crate::gdi::render_frame_end(gen);
 }
 
 /// 看门狗自愈入口：渲染线程停摆（挂起/死亡）>30s 后重建通道与线程。
@@ -106,14 +116,22 @@ pub fn request(hwnd: HWND, cfg: &Config) {
     if let Ok(mut g) = RENDER_CFG.lock() {
         *g = Some(*cfg);
     }
-    if RENDER_QUEUED.load(Ordering::Relaxed) {
+    // ⚠️ 先原子占位、后发送（store 在 send 之前）。旧实现 send 之后再
+    // store(true)，渲染线程的 store(false) 可插进两者之间——stale true
+    // 从此永久吞掉后续所有请求（配置镜像还在更新、epoch 还在 +1，但
+    // 通道里再无消息）→ HANDLED_EPOCH 永不追平 → 30s 纪元冻结，只有
+    // respawn 复位。2026-09-12 实测 8 次停摆中 5 次的根因（签名：
+    // upload-end 后静默、无 rt wake、必须等 respawn）。
+    if RENDER_QUEUED.swap(true, Ordering::Relaxed) {
         return; // 已有请求排队：配置镜像已更新，在途那次渲染即为最新
     }
     let tx = RENDER_TX.lock().ok().and_then(|g| g.clone());
-    if let Some(tx) = tx {
-        // 生产者只有 UI 线程：load→send→store 无竞争。
-        if tx.send(hwnd.0 as isize).is_ok() {
-            RENDER_QUEUED.store(true, Ordering::Relaxed);
-        }
+    let send_ok = match tx {
+        Some(tx) => tx.send(hwnd.0 as isize).is_ok(),
+        None => false,
+    };
+    if !send_ok {
+        // 通道不可用（未启动/正在 respawn）：交还排队权，下一个请求重试。
+        RENDER_QUEUED.store(false, Ordering::Relaxed);
     }
 }

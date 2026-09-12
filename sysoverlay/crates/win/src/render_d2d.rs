@@ -467,9 +467,12 @@ impl D2DSurface {
 impl RenderTarget for D2DSurface {
     fn clear(&mut self) {
         unsafe {
-            // ⚠️ alpha = 1/255 而非 0：分层窗口对 alpha=0 像素点击穿透，
-            // 全透明底导致悬浮窗只能按在文字上拖动。alpha=1 不可见但可命中，
-            // 整个窗口矩形都能拖拽/悬停（与 GDI 软件光栅底色保持一致）。
+            // 背景填成 alpha=1/255（极接近全透明、肉眼不可见）而非 0：
+            // 这样 DIB 里背景像素的 alpha 是一个稳定、可区分的「近 0」值。
+            // 真正的透明穿透由 WM_NCHITTEST 逐像素命中测试决定——window.rs 的
+            // sample_alpha() 读到背景 alpha(<阈值) 即返回 HTTRANSPARENT，让鼠标
+            // 穿透到下方窗口；文字/边框(alpha≈255) 返回 HTCLIENT，保持可拖拽/悬停。
+            // 与 GDI 软件光栅底色保持一致。
             self.rt
                 .Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 / 255.0 }));
         }

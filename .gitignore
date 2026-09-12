@@ -5,6 +5,13 @@
 *.o
 *.a
 *.lib
+*.res
+
+# Third-party driver binary (embedded into driver-installer at build time; not committed)
+WinRing0x64.sys
+
+# driver-installer build intermediates
+sysoverlay/driver-installer/obj/
 
 # Image files
 *.png
