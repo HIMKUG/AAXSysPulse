@@ -13,6 +13,9 @@
 *.gif
 *.ico
 
+# 基线截图必须入库（S0 回归对比锚点），豁免上面的全局图片忽略
+!sysoverlay/docs/baseline/*.png
+
 # Configuration and cache
 .AppData/
 .vscode/
