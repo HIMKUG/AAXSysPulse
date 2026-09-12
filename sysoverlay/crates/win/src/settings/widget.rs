@@ -397,21 +397,6 @@ fn lerp2(a: (f32, f32), b: (f32, f32), t: f32) -> (f32, f32) {
     (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t)
 }
 
-/// 通用悬停高亮：以 `hover_t` 为进度叠加淡底（无专属 hover 色的控件共用）。
-fn hover_overlay(
-    gfx: &mut Gfx,
-    rt: &windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget,
-    t: &Theme,
-    r: RectF,
-    radius: f32,
-    hover_t: f32,
-) {
-    if hover_t <= 0.01 {
-        return;
-    }
-    gfx.fill_round(rt, r, radius, c(t, t.button_bg_hover).with_alpha(0.55 * hover_t));
-}
-
 /// 控件绘制总入口（内容坐标 + 内容区原点）。
 #[allow(clippy::too_many_arguments)]
 pub fn paint_widget(
@@ -535,11 +520,20 @@ fn paint_segmented(
     labels: &[String],
     px: f32,
 ) {
+    let ft = if t.dark {
+        &super::fluent::tokens::FLUENT.dark
+    } else {
+        &super::fluent::tokens::FLUENT.light
+    };
     let n = labels.len().max(1);
     let seg_w = r.w() / n as f32;
     let m = super::layout::s(dpi, 2) as f32;
-    hover_overlay(gfx, rt, t, r, super::layout::s(dpi, 7) as f32, state.hover_t);
-    gfx.fill_round(rt, r, super::layout::s(dpi, 7) as f32, c(t, t.segmented_bg));
+    let hovered = state.hover_t > 0.5;
+    // 底=color_neutral_background3，悬停加一层 subtle hover
+    gfx.fill_round(rt, r, super::layout::s(dpi, 4) as f32, ft.color_neutral_background3);
+    if hovered {
+        gfx.fill_round(rt, r, super::layout::s(dpi, 4) as f32, ft.color_subtle_background_hover);
+    }
     // 选中片沿「动画下标」滑动（而非逐格跳变）；无选中态（未贴角）不画胶囊。
     let sel = state.anim_v.clamp(0.0, (n - 1) as f32);
     let active = (sel.round() as usize).min(n - 1);
@@ -550,13 +544,14 @@ fn paint_segmented(
             r.l + (sel + 1.0) * seg_w - m,
             r.b - m,
         );
-        gfx.fill_round(rt, ir, super::layout::s(dpi, 5) as f32, c(t, t.seg_selected));
-        gfx.stroke_round(rt, ir, super::layout::s(dpi, 5) as f32, c(t, t.seg_selected_stroke), 1.0);
+        let sel_fill = if t.dark { ft.color_neutral_background6 } else { ft.color_neutral_background1 };
+        gfx.fill_round(rt, ir, super::layout::s(dpi, 3) as f32, sel_fill);
+        gfx.stroke_round(rt, ir, super::layout::s(dpi, 3) as f32, ft.color_neutral_stroke1, 1.0);
     }
     for (i, label) in labels.iter().enumerate() {
         let seg = RectF::new(r.l + i as f32 * seg_w, r.t, r.l + (i + 1) as f32 * seg_w, r.b);
         let is_active = state.has_sel && i == active;
-        let color = if is_active { c(t, t.label) } else { c(t, t.secondary) };
+        let color = if is_active { ft.color_neutral_foreground1 } else { ft.color_neutral_foreground2 };
         // 轴对齐裁剪：英文标签比中文宽，溢出不再压入相邻分段。
         unsafe {
             rt.PushAxisAlignedClip(&seg.d2d(), windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
@@ -584,11 +579,21 @@ fn paint_button(
         gfx.text(rt, label, px, 400, HAlign::Center, r, color, true);
         return;
     }
-    // 次级：常态极淡、悬停才浮起，避免抢注意力（设置页无主 CTA，C05）。
-    let (fill, text) = (
-        lerp_color(c(t, t.button_bg), c(t, t.button_bg_hover), state.hover_t),
-        c(t, t.label),
-    );
+    // 次级按钮：Fluent 离散端点色（hover/pressed 各一套 token）。
+    let ft = if t.dark {
+        &super::fluent::tokens::FLUENT.dark
+    } else {
+        &super::fluent::tokens::FLUENT.light
+    };
+    let hovered = state.hover_t > 0.5;
+    let pressed = state.press_t > 0.5;
+    let fill = if pressed { ft.color_neutral_background1_pressed }
+        else if hovered { ft.color_neutral_background1_hover }
+        else { ft.color_neutral_background1 };
+    let stroke = if pressed { ft.color_neutral_stroke1_pressed }
+        else if hovered { ft.color_neutral_stroke1_hover }
+        else { ft.color_neutral_stroke1 };
+    let text = ft.color_neutral_foreground1;
     let sc = 1.0 - 0.02 * state.press_t;
     let cx = (r.l + r.r) / 2.0;
     let cy = (r.t + r.b) / 2.0;
@@ -598,7 +603,8 @@ fn paint_button(
         cx + r.w() / 2.0 * sc,
         cy + r.h() / 2.0 * sc,
     );
-    gfx.fill_round(rt, rr, super::layout::s(dpi, 7) as f32, fill);
+    gfx.fill_round(rt, rr, super::layout::s(dpi, 4) as f32, fill);
+    gfx.stroke_round(rt, rr, super::layout::s(dpi, 4) as f32, stroke, 1.0);
     // 轴对齐裁剪：英文按钮文字溢出不再画出按钮边界（EN 本地化保护）。
     unsafe {
         rt.PushAxisAlignedClip(&rr.d2d(), windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
@@ -619,11 +625,22 @@ fn paint_stepper(
     min: f64,
     max: f64,
 ) {
+    let ft = if t.dark {
+        &super::fluent::tokens::FLUENT.dark
+    } else {
+        &super::fluent::tokens::FLUENT.light
+    };
+    let hovered = state.hover_t > 0.5;
+    let pressed = state.press_t > 0.5;
     let vbh = super::layout::s(dpi, 24) as f32;
     let box_r = RectF::new(r.l, r.t + (r.h() - vbh) / 2.0, r.r, r.t + (r.h() + vbh) / 2.0);
-    hover_overlay(gfx, rt, t, box_r, super::layout::s(dpi, 6) as f32, state.hover_t);
-    gfx.fill_round(rt, box_r, super::layout::s(dpi, 6) as f32, c(t, t.button_bg));
-    gfx.stroke_round(rt, box_r, super::layout::s(dpi, 6) as f32, c(t, t.card_stroke), 1.0);
+    // 容器：填充=neutral_background1（悬停替换为 subtle hover），边框=stroke1，圆角 s(dpi,4)。
+    // 层序：先填充后描边——悬停填充若画在描边之后会把不透明底压在边框上。
+    gfx.fill_round(rt, box_r, super::layout::s(dpi, 4) as f32, ft.color_neutral_background1);
+    if hovered {
+        gfx.fill_round(rt, box_r, super::layout::s(dpi, 4) as f32, ft.color_subtle_background_hover);
+    }
+    gfx.stroke_round(rt, box_r, super::layout::s(dpi, 4) as f32, ft.color_neutral_stroke1, 1.0);
 
     let minus = RectF::from_win32(stepper_minus_rect(
         &windows::Win32::Foundation::RECT {
@@ -639,17 +656,16 @@ fn paint_stepper(
         },
         dpi,
     ));
-    // 按钮符号（次级色；触底/触顶时禁用色）。
+    // 按钮符号颜色：hover/pressed 各一套端点色，触底/触顶=disabled
     let val = state.value_f;
-    let dim = c(t, t.secondary).with_alpha(0.45);
-    let glyph = |at_min: bool, at_max: bool| {
-        // 返回 (−, ＋) 各自的颜色：到达边界的一侧降透明度（禁用感）。
-        (
-            if at_min { dim } else { c(t, t.label) },
-            if at_max { dim } else { c(t, t.label) },
-        )
+    let glyph_color = |at_limit: bool| -> ColorF {
+        if at_limit { ft.color_neutral_foreground_disabled }
+        else if pressed { ft.color_neutral_foreground3_pressed }
+        else if hovered { ft.color_neutral_foreground3_hover }
+        else { ft.color_neutral_foreground3 }
     };
-    let (cm, cp) = glyph(val <= min + 1e-6, val >= max - 1e-6);
+    let cm = glyph_color(val <= min + 1e-6);
+    let cp = glyph_color(val >= max - 1e-6);
     let k = super::layout::s(dpi, 5) as f32;
     let my = (minus.t + minus.b) / 2.0;
     let mx = (minus.l + minus.r) / 2.0;
@@ -662,7 +678,7 @@ fn paint_stepper(
     // 值（中间，居中；整数直出，C-02：无 "40.0" 式浮点直出）。
     let value_r = RectF::new(minus.r, box_r.t, plus.l, box_r.b);
     let show = format!("{}", val.round() as i64);
-    gfx.text(rt, &show, super::layout::s(dpi, 12) as f32, 500, HAlign::Center, value_r, c(t, t.label), true);
+    gfx.text(rt, &show, super::layout::s(dpi, 12) as f32, 500, HAlign::Center, value_r, ft.color_neutral_foreground1, true);
 }
 
 /// 色块选中态双层环（React Aria 规范，报告 C03）：内白边 + 外深环
@@ -704,20 +720,25 @@ fn paint_swatches(
     r: RectF,
     palette: &[(u8, u8, u8)],
 ) {
+    let ft = if t.dark {
+        &super::fluent::tokens::FLUENT.dark
+    } else {
+        &super::fluent::tokens::FLUENT.light
+    };
     let n = palette.len().max(1);
     let wd = r.w() / n as f32;
     let m = super::layout::s(dpi, 3) as f32;
     for (i, &(cr, cg, cb)) in palette.iter().enumerate() {
         let sw = RectF::new(r.l + i as f32 * wd, r.t, r.l + (i + 1) as f32 * wd, r.b);
         let inner = RectF::new(sw.l + m, sw.t + m, sw.r - m, sw.b - m);
-        gfx.fill_round(rt, inner, super::layout::s(dpi, 5) as f32, ColorF::rgba(cr, cg, cb, 1.0));
-        gfx.stroke_round(rt, inner, super::layout::s(dpi, 5) as f32, c(t, t.card_stroke), 1.0);
+        gfx.fill_round(rt, inner, super::layout::s(dpi, 4) as f32, ColorF::rgba(cr, cg, cb, 1.0));
+        gfx.stroke_round(rt, inner, super::layout::s(dpi, 4) as f32, ft.color_neutral_stroke2, 1.0);
     }
     // 选中态：双层环（内白边 + 外深环，报告 C03），沿动画下标滑动。
     let sel = state.anim_v.clamp(0.0, (n - 1) as f32);
     let cell = RectF::new(r.l + sel * wd, r.t, r.l + (sel + 1.0) * wd, r.b);
     let inner_sel = RectF::new(cell.l + m, cell.t + m, cell.r - m, cell.b - m);
-    swatch_selected_ring(gfx, rt, dpi, inner_sel, super::layout::s(dpi, 5) as f32);
+    swatch_selected_ring(gfx, rt, dpi, inner_sel, super::layout::s(dpi, 4) as f32);
 }
 
 fn paint_metric_swatches(
@@ -730,6 +751,11 @@ fn paint_metric_swatches(
     px: f32,
     auto: bool,
 ) {
+    let ft = if t.dark {
+        &super::fluent::tokens::FLUENT.dark
+    } else {
+        &super::fluent::tokens::FLUENT.light
+    };
     let n = sw_n(auto);
     let follow_i = sw_follow(auto);
     let custom_i = sw_custom(auto);
@@ -741,7 +767,7 @@ fn paint_metric_swatches(
         if i < SW_COLORS {
             let (cr, cg, cb) = METRIC_SWATCHES[i];
             gfx.fill_round(rt, inner, super::layout::s(dpi, 4) as f32, ColorF::rgba(cr, cg, cb, 1.0));
-            gfx.stroke_round(rt, inner, super::layout::s(dpi, 4) as f32, c(t, t.card_stroke), 1.0);
+            gfx.stroke_round(rt, inner, super::layout::s(dpi, 4) as f32, ft.color_neutral_stroke2, 1.0);
         } else if auto && i == SW_AUTO {
             // 自动色：中性底框 + 「A」（占用率分档变色：<60 绿 / 60~85 橙 / ≥85 红）。
             gfx.fill_round(rt, inner, super::layout::s(dpi, 4) as f32, c(t, t.card));
