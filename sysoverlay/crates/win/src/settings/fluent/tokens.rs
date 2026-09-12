@@ -28,19 +28,31 @@ pub struct FluentTokens {
 pub struct FluentPalette {
     // ── 颜色 ──────────────────────────────────────────────
     pub color_neutral_background1: ColorF,         // 窗口/卡片底（白/深灰）
+    pub color_neutral_background1_hover: ColorF,   // 按钮填充悬停
+    pub color_neutral_background1_pressed: ColorF, // 按钮填充按压
     pub color_neutral_background3: ColorF,         // 控件底（灰/深灰）
     pub color_neutral_background6: ColorF,          // 深色选中片底
+    pub color_neutral_background_disabled: ColorF, // 禁用填充
     pub color_brand_background: ColorF,             // 品牌色（蓝）
     pub color_brand_background_hover: ColorF,       // 品牌悬停
     pub color_brand_background_pressed: ColorF,     // 品牌按下
     pub color_compound_brand_background: ColorF,    // switch 填充色
     pub color_compound_brand_background_hover: ColorF,   // switch 填充悬停
     pub color_compound_brand_background_pressed: ColorF, // switch 填充按压
+    pub color_neutral_foreground1: ColorF,          // 主文字
+    pub color_neutral_foreground2: ColorF,          // 次级文字（分段未选中标签）
+    pub color_neutral_foreground3: ColorF,          // stepper 符号
+    pub color_neutral_foreground3_hover: ColorF,
+    pub color_neutral_foreground3_pressed: ColorF,
+    pub color_neutral_foreground_disabled: ColorF,  // 禁用文字/符号
     pub color_neutral_foreground_inverted: ColorF,   // 白色（旋钮）
     pub color_neutral_stroke_accessible: ColorF,    // switch 关闭描边
     pub color_neutral_stroke_accessible_hover: ColorF,   // switch 关闭描边悬停
     pub color_neutral_stroke_accessible_pressed: ColorF, // switch 关闭描边按压
-    pub color_neutral_stroke1: ColorF,              // 描边 1
+    pub color_neutral_stroke1: ColorF,              // 描边 1（次级按钮边框）
+    pub color_neutral_stroke1_hover: ColorF,
+    pub color_neutral_stroke1_pressed: ColorF,
+    pub color_neutral_stroke_disabled: ColorF,      // 禁用描边
     pub color_neutral_stroke2: ColorF,              // 描边 2（分隔线）
     pub color_subtle_background_hover: ColorF,      // 按钮悬停背景
 
@@ -96,19 +108,31 @@ const fn fluent_light() -> FluentPalette {
     FluentPalette {
         // 颜色：逐值转录自 Quel'Thalas theme.rs web_light()（唯一真值，勿凭记忆改）。
         color_neutral_background1: c(255, 255, 255),          // #ffffff
+        color_neutral_background1_hover: c(245, 245, 245),     // #f5f5f5
+        color_neutral_background1_pressed: c(224, 224, 224),   // #e0e0e0
         color_neutral_background3: c(245, 245, 245),           // #f5f5f5
         color_neutral_background6: c(230, 230, 230),           // #e6e6e6
+        color_neutral_background_disabled: c(240, 240, 240),   // #f0f0f0
         color_brand_background: c(15, 108, 189),               // #0f6cbd
         color_brand_background_hover: c(17, 94, 163),          // #115ea3
         color_brand_background_pressed: c(12, 59, 94),         // #0c3b5e
         color_compound_brand_background: c(15, 108, 189),      // #0f6cbd switch 填充
         color_compound_brand_background_hover: c(17, 94, 163),  // #115ea3
         color_compound_brand_background_pressed: c(15, 84, 140),// #0f548c
+        color_neutral_foreground1: c(36, 36, 36),              // #242424 主文字
+        color_neutral_foreground2: c(66, 66, 66),              // #424242 次级文字
+        color_neutral_foreground3: c(97, 97, 97),              // #616161
+        color_neutral_foreground3_hover: c(66, 66, 66),        // #424242
+        color_neutral_foreground3_pressed: c(51, 51, 51),      // #333333
+        color_neutral_foreground_disabled: c(189, 189, 189),   // #bdbdbd
         color_neutral_foreground_inverted: c(255, 255, 255),   // #ffffff 旋钮
         color_neutral_stroke_accessible: c(97, 97, 97),        // #616161 switch 关闭描边
         color_neutral_stroke_accessible_hover: c(87, 87, 87),   // #575757
         color_neutral_stroke_accessible_pressed: c(77, 77, 77), // #4d4d4d
         color_neutral_stroke1: c(209, 209, 209),               // #d1d1d1（浅灰，不是黑！）
+        color_neutral_stroke1_hover: c(199, 199, 199),         // #c7c7c7
+        color_neutral_stroke1_pressed: c(179, 179, 179),       // #b3b3b3
+        color_neutral_stroke_disabled: c(224, 224, 224),       // #e0e0e0
         color_neutral_stroke2: c(224, 224, 224),               // #e0e0e0 分隔线
         color_subtle_background_hover: c(245, 245, 245),       // #f5f5f5
 
@@ -151,19 +175,31 @@ const fn fluent_dark() -> FluentPalette {
         // 颜色：逐值转录自 Quel'Thalas theme.rs web_dark()（唯一真值，勿凭记忆改）。
         // 注意：dark 控件底 background3 比 background1 更暗；旋钮 fg_inverted 是深灰。
         color_neutral_background1: c(41, 41, 41),            // #292929 深灰
+        color_neutral_background1_hover: c(61, 61, 61),       // #3d3d3d
+        color_neutral_background1_pressed: c(31, 31, 31),     // #1f1f1f
         color_neutral_background3: c(20, 20, 20),            // #141414 控件底（比背景更暗）
         color_neutral_background6: c(51, 51, 51),            // #333333 选中片底
+        color_neutral_background_disabled: c(20, 20, 20),     // #141414
         color_brand_background: c(17, 94, 163),               // #115ea3（深蓝，非 Material 浅蓝）
         color_brand_background_hover: c(15, 108, 189),        // #0f6cbd
         color_brand_background_pressed: c(12, 59, 94),        // #0c3b5e
         color_compound_brand_background: c(71, 158, 245),     // #479ef5 switch 填充
         color_compound_brand_background_hover: c(98, 171, 245),// #62abf5
         color_compound_brand_background_pressed: c(40, 134, 222),// #2886de
+        color_neutral_foreground1: c(255, 255, 255),          // #ffffff 主文字
+        color_neutral_foreground2: c(214, 214, 214),          // #d6d6d6 次级文字
+        color_neutral_foreground3: c(173, 173, 173),          // #adadad
+        color_neutral_foreground3_hover: c(214, 214, 214),    // #d6d6d6
+        color_neutral_foreground3_pressed: c(235, 235, 235),  // #ebebeb
+        color_neutral_foreground_disabled: c(92, 92, 92),     // #5c5c5c
         color_neutral_foreground_inverted: c(36, 36, 36),     // #242424 旋钮=深灰（非白！）
         color_neutral_stroke_accessible: c(173, 173, 173),    // #adadad switch 关闭描边
         color_neutral_stroke_accessible_hover: c(189, 189, 189),// #bdbdbd
         color_neutral_stroke_accessible_pressed: c(179, 179, 179),// #b3b3b3
         color_neutral_stroke1: c(102, 102, 102),              // #666666（非白！）
+        color_neutral_stroke1_hover: c(117, 117, 117),        // #757575
+        color_neutral_stroke1_pressed: c(107, 107, 107),      // #6b6b6b
+        color_neutral_stroke_disabled: c(61, 61, 61),         // #3d3d3d
         color_neutral_stroke2: c(82, 82, 82),                 // #525252 分隔线
         color_subtle_background_hover: c(56, 56, 56),         // #383838
 
