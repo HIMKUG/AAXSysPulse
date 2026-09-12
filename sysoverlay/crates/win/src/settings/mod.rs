@@ -223,6 +223,11 @@ struct SettingsCtx {
     /// 换位时把「对面那张卡」弹到它的旧视觉位置，再由弹簧滑回新槽位 ——
     /// 这就是「一张张卡片挪动」的非线性动画。
     card_slide: [motion::Spring; 6],
+    /// 拖拽释放时的落位弹簧动画状态（None = 无进行中释放动画）。
+    drag_release: Option<ReleaseInfo>,
+    /// 松手后被拖卡自己的落位弹簧（逐指标）：从拖动偏移量 spring 到 0，
+    /// 弹簧收敛后才触发真正的 rebuild_pages（确保卡槽无空隙）。
+    metric_release: [motion::Spring; 6],
 }
 
 /// 翻页动画进行中标记（进度由弹簧推进，见 `anim_params`）。
@@ -245,6 +250,13 @@ struct CardDrag {
     y_off: i32,
     /// 是否已超过拖动阈值（false = 抬手视为点击展开）。
     moved: bool,
+}
+
+/// 拖拽释放时的落位弹簧动画状态：仅记录被拖卡指标（弹簧初值由 WM_LBUTTONUP 写入 metric_release）。
+#[derive(Clone, Copy)]
+struct ReleaseInfo {
+    /// 被拖卡指标下标（用于索引 metric_release 弹簧）。
+    metric: usize,
 }
 
 /// 单个控件的过渡弹簧组（H2）。
@@ -537,6 +549,8 @@ fn create_dialog(overlay: HWND) {
             stepper_hold: None,
             card_drag: None,
             card_slide: [motion::Spring::new(0.0); 6],
+            drag_release: None,
+            metric_release: [motion::Spring::new(0.0); 6],
         };
         ctx.rebuild_pages();
         crate::probe::log(&format!(
@@ -699,7 +713,7 @@ fn card_drag_move(ctx: &mut SettingsCtx, cpt: ContentPt) {
 
     if npos != pos {
         // 换位：order 更新 → 按 preview 顺序重建布局（rect = 新 base）
-        // → 反推 y_off_new 保持贴手 → 后处理偏移到光标处。
+        // → 用原始 grab_dy 反推 y_off_new 保持贴手（光标相对卡顶的抓取点恒定）→ 偏移到光标处。
         // 被挤开的邻卡：记录它换位前的旧视觉顶缘，重建后它落在新槽位，
         // 由 card_slide 弹簧从旧顶缘滑回新槽位（非线性、「一张张挪动」动画）。
         let neighbor_metric = order[npos] as usize;
@@ -708,6 +722,7 @@ fn card_drag_move(ctx: &mut SettingsCtx, cpt: ContentPt) {
         ctx.card_drag = Some(CardDrag { metric, order, grab_dy, y_off: 0, moved: true });
         ctx.rebuild_pages();
         let npos_now = order.iter().position(|&m| m as usize == metric).unwrap_or(npos);
+        // 注意：用原始 drag_top（cpt.0.y - grab_dy），不要重置 grab_dy —— 否则换位后卡会脱离光标。
         let base_new = ctx.pages[page_idx].cards[npos_now].rect.top;
         let y_off_new = drag_top - base_new;
         if let Some(d) = ctx.card_drag.as_mut() {
@@ -727,6 +742,25 @@ fn card_drag_move(ctx: &mut SettingsCtx, cpt: ContentPt) {
         }
         shift_card(ctx, page_idx, pos, delta);
     }
+}
+
+/// 拖拽释放弹簧动画：被拖卡从拖动偏移量（y_off）spring 到 0，
+/// 收敛后清理状态（rebuild 已在 WM_LBUTTONUP 落位起点做过，无空隙）。
+///
+/// 期间 `card_drag` 保持非 None（`paint_page` 用它判断是否在拖）。
+/// 弹簧目标恒为 0，初值 = 抬起瞬间的 y_off（见 WM_LBUTTONUP）。
+fn step_drag_release(ctx: &mut SettingsCtx, dt: f32) -> bool {
+    let release_info = match ctx.drag_release.as_ref() {
+        Some(info) => *info,
+        None => return false,
+    };
+    let settled = ctx.metric_release[release_info.metric].step(0.0, dt, motion::K_SHEET, motion::C_SHEET);
+    if settled {
+        ctx.drag_release = None;
+        ctx.card_drag = None;
+        ctx.metric_release = [motion::Spring::new(0.0); 6];
+    }
+    settled
 }
 
 // ── 单向数据流：Action 分派（唯一写入口） ────────────────
@@ -1512,8 +1546,9 @@ unsafe extern "system" fn settings_wndproc(
                 let _ = ScreenToClient(hwnd, &mut sc);
                 let mut cr = RECT::default();
                 let _ = GetClientRect(hwnd, &mut cr);
-                // 卡片拖拽中不接受滚轮（滚动会改变内容坐标 → 被拖卡跳位）。
-                if ctx.card_drag.is_none() && in_content(ctx.dpi, cr.right - cr.left, ClientPt(sc)) {
+                // 拖动中允许滚轮滚动内容（滚轮滚动 scroll_y → card_drag_move 用
+                // 当前 scroll_y 重新计算 grab_dy → 被拖卡基准正确跟随，无跳位）。
+                if in_content(ctx.dpi, cr.right - cr.left, ClientPt(sc)) {
                     let raw = ((wparam.0 >> 16) & 0xFFFF) as i16 as i32;
                     let d = ctx.dpi;
                     let (_, vp_h) = content_viewport(d, ctx.client_size.0, ctx.client_size.1);
@@ -1610,7 +1645,9 @@ unsafe extern "system" fn settings_wndproc(
                     return LRESULT(0);
                 }
                 // 卡片拖拽排序（监控项页）：贴手预览 + 越中点换位，每帧自重建。
-                if ctx.card_drag.is_some() {
+                // 释放落位动画进行中（drag_release 非空）不接管鼠标移动 —— 避免
+                // 松手后移动鼠标又触发一次拖拽，造成状态冲突 / 卡死。
+                if ctx.card_drag.is_some() && ctx.drag_release.is_none() {
                     card_drag_move(ctx, cpt);
                     let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
@@ -1802,6 +1839,9 @@ unsafe extern "system" fn settings_wndproc(
                         .downcast_ref::<widget::MetricHeaderWidget>()
                         .filter(|_| !any_expanded)
                     {
+                        // 开始新的拖拽前，清理可能残留的释放落位动画（避免新旧状态打架）。
+                        ctx.drag_release = None;
+                        ctx.metric_release = [motion::Spring::new(0.0); 6];
                         let mi = mh.index;
                         let order = ctx
                             .card_drag
@@ -1845,23 +1885,33 @@ unsafe extern "system" fn settings_wndproc(
         }
         WM_LBUTTONUP => {
             if let Some(ctx) = ctx_of(hwnd) {
-                // 卡片拖拽排序收尾：moved → 顺序落盘；未动 → 按点击处理（展开/收起）。
-                if let Some(d) = ctx.card_drag.take() {
+                // 卡片拖拽排序收尾：moved → 弹簧落位动画；未动 → 按点击处理（展开/收起）。
+                // 注意：保留 card_drag（不为 None），这样 paint_page 知道在拖；
+                // step_drag_release 收敛后才清空并触发 rebuild_pages。
+                if ctx.card_drag.is_some() {
+                    let d = ctx.card_drag.unwrap(); // 借来读数据（card_drag 保留，不要 take）
                     ctx.interaction = Interaction::Idle;
                     let _ = ReleaseCapture();
                     if d.moved {
-                        let order = d.order;
+                        // 先落盘顺序，再立即重建布局 → 清掉所有拖动偏移，让 card.rect 回到基准位置。
+                        // 释放落位动画完全由 metric_release 弹簧（初值 = 抬起瞬间 y_off，目标 0）接管绘制偏移，
+                        // 因此 no 双重偏移、no 空隙。
                         apply_config(ctx, |cfg| {
-                            if cfg.metric_order != order {
-                                cfg.metric_order = order;
+                            if cfg.metric_order != d.order {
+                                cfg.metric_order = d.order;
                                 true
                             } else {
                                 false
                             }
                         });
-                        // card_drag 已清 → rebuild 用落盘后的 metric_order（去拖动偏移）。
                         ctx.rebuild_pages();
+                        ctx.metric_release[d.metric].set(d.y_off as f32);
+                        ctx.drag_release = Some(ReleaseInfo { metric: d.metric });
+                        // card_drag 留在位（paint_page / step_drag_release 需要），
+                        // 直到 step_drag_release 收敛才清。
                     } else {
+                        // 未动：直接清理，无动画。
+                        ctx.card_drag = None;
                         let pt = ClientPt(POINT {
                             x: (lparam.0 & 0xFFFF) as i16 as i32,
                             y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
@@ -1920,8 +1970,26 @@ unsafe extern "system" fn settings_wndproc(
             if let Some(ctx) = ctx_of(hwnd) {
                 // 捕获丢失（被系统打断）：长按连发与卡片拖拽一并停止。
                 ctx.stepper_hold = None;
-                ctx.card_drag = None;
                 kill_timer(hwnd, STEPPER_TIMER);
+                // 若拖拽中被打断：启动落位动画（与正常松手同处理路径）。
+                if ctx.card_drag.is_some() {
+                    let d = ctx.card_drag.unwrap();
+                    if d.moved {
+                        apply_config(ctx, |cfg| {
+                            if cfg.metric_order != d.order {
+                                cfg.metric_order = d.order;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        ctx.rebuild_pages();
+                        ctx.metric_release[d.metric].set(d.y_off as f32);
+                        ctx.drag_release = Some(ReleaseInfo { metric: d.metric });
+                    } else {
+                        ctx.card_drag = None;
+                    }
+                }
                 if matches!(ctx.interaction, Interaction::Dragging { .. } | Interaction::Pressing { .. }) {
                     ctx.interaction = Interaction::Idle;
                 }
@@ -2194,6 +2262,9 @@ fn paint_d2d(hwnd: HWND) -> bool {
     // 换位滑动弹簧：拖动排序时邻卡从旧位置滑入新槽位（非线性动画）。
     let slide_moving = step_card_slide(ctx, dt);
 
+    // 拖拽释放弹簧：被拖卡从当前偏移量 spring 到 0，收敛后 rebuild + 落盘。
+    let release_moving = !step_drag_release(ctx, dt);
+
     // H4：滚动惯性——动量投射 → 行吸附 → 弹簧趋近（收敛即停）。
     if ctx.scroll_vel.abs() > 1.0 {
         let (_, vp_h) = content_viewport(dpi, ctx.client_size.0, ctx.client_size.1);
@@ -2278,6 +2349,8 @@ fn paint_d2d(hwnd: HWND) -> bool {
             drag_pos,
             transitions,
             card_slide,
+            ctx.drag_release.as_ref(),
+            &ctx.metric_release,
             dt,
             ctx.focus,
             ctx.keyboard_mode,
@@ -2321,7 +2394,7 @@ fn paint_d2d(hwnd: HWND) -> bool {
     // 动画期间提升系统时钟精度到 1ms（SetTimer 粒度默认 15.6ms，不提升则
     // 16ms 表实际抖到 ~31ms）；收敛即停表并恢复，防引用计数泄漏与空转烧 CPU。
     let animating = presented
-        && (anim_active || moving || slide_moving || ctx.page_anim.is_some() || ctx.scroll_vel.abs() > 1.0);
+        && (anim_active || moving || ctx.page_anim.is_some() || ctx.scroll_vel.abs() > 1.0 || slide_moving || release_moving);
     if animating && !ctx.hires {
         unsafe {
             windows::Win32::Media::timeBeginPeriod(1);
@@ -2566,6 +2639,8 @@ fn paint_page(
     drag_pos: Option<usize>,
     transitions: &mut std::collections::HashMap<(usize, i32), Transition>,
     card_slide: &[motion::Spring; 6],
+    drag_release: Option<&ReleaseInfo>,
+    metric_release: &[motion::Spring; 6],
     dt: f32,
     focus: Option<usize>,
     keyboard_mode: bool,
@@ -2630,6 +2705,14 @@ fn paint_page(
                     .map(|mh| mh.index)
             });
         let slide_y = card_metric.map(|m| card_slide[m].x).unwrap_or(0.0);
+        // 被拖卡在释放动画中：用 metric_release 弹簧的当前值（非 card_slide，
+        // 因为那张卡在拖动期已经用 shift_card 偏移过了，rebuild 后基准为 0）。
+        let release_y = if Some(ci) == drag_pos && drag_release.is_some() {
+            metric_release[card_metric.unwrap_or(0)].x
+        } else {
+            0.0
+        };
+        let total_y = slide_y + release_y;
         // 分节标题：左缘与卡片/页标题对齐（不再额外 +2，避免与卡片错开一格）。
         let cap = RectF::new(
             card.rect.left as f32 + ox,
@@ -2641,7 +2724,7 @@ fn paint_page(
 
         // 圆角卡片
         let card_rect = RectF::from_i32(card.rect.left, card.rect.top, card.rect.right, card.rect.bottom)
-            .offset(ox, oy + slide_y);
+            .offset(ox, oy + total_y);
         // 被拖卡：先画一层向下偏移的柔和投影再画卡体（浮起观感）。
         if Some(ci) == drag_pos {
             let sh = card_rect.offset(0.0, s(dpi, 3) as f32);
@@ -2661,7 +2744,7 @@ fn paint_page(
 
         // 行（行高可变：位置由布局写入 row.y_off / row.base_h）
         for (ri, row) in card.rows.iter().enumerate() {
-            let row_top = (card.rect.top + s(dpi, CARD_PAD)) as f32 + row.y_off as f32 + oy + slide_y;
+            let row_top = (card.rect.top + s(dpi, CARD_PAD)) as f32 + row.y_off as f32 + oy + total_y;
             // row_top 是**控件带**顶；行与行之间的 ROW_GAP 在其上方。
             let text_l = (card.rect.left + s(dpi, CARD_PAD)) as f32 + ox;
             let text_r = (card.rect.right - s(dpi, CARD_PAD)) as f32 + ox;
@@ -2745,7 +2828,7 @@ fn paint_page(
                 ws.editing = matches!(interaction, Interaction::Editing { widget } if *widget == wi);
                 // 键盘焦点环仅键盘模式绘制（报告 §7.1 should_draw_focus_ring）。
                 ws.focused = keyboard_mode && focus == Some(wi);
-                widget::paint_widget(rt, gfx, &page.widgets[wi], &ws, dpi, t, ox, oy + slide_y, body, caption, edit, cfg);
+                widget::paint_widget(rt, gfx, &page.widgets[wi], &ws, dpi, t, ox, oy + total_y, body, caption, edit, cfg);
             }
         }
 
@@ -2755,7 +2838,7 @@ fn paint_page(
                 + card.rows_h as f32
                 + s(dpi, layout::ROW_GAP) as f32
                 + oy
-                + slide_y;
+                + total_y;
             let fr = RectF::new(
                 (card.rect.left + s(dpi, CARD_PAD)) as f32 + ox,
                 rows_bottom,

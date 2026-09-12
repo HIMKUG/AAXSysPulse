@@ -151,8 +151,8 @@ fn rasterize_char(face: &IDWriteFontFace, c: u32) -> Option<[u8; 16]> {
             if val < 128 {
                 continue;
             }
-            let ox = (b2.left + ax as i32) as i32;
-            let oy = (b2.top + ay as i32) as i32;
+            let ox = b2.left + ax as i32;
+            let oy = b2.top + ay as i32;
             if ox < 0 || ox >= CELL_W as i32 || oy < 0 || oy >= CELL_H as i32 {
                 continue;
             }

@@ -776,8 +776,10 @@ fn paint_slider(
         dpi,
     ));
 
-    // 轨道固定在行顶 +8 逻辑 px（端点标注画在其下方）。
-    let track_y = r.t + super::layout::s(dpi, 8) as f32;
+    // 控件线 = 首 28 行（标签行）的垂直中心 —— 与左侧标签同一基线。
+    // 用户反馈：数值框原来按整行矩形居中，滑杆行 46 时比标签低 16px，看着不齐。
+    let ctrl_cy = r.t + super::layout::s(dpi, super::layout::ROW_H) as f32 / 2.0;
+    let track_y = ctrl_cy;
     let th = super::layout::s(dpi, 2).max(1) as f32;
     gfx.line(rt, tr.l, track_y, tr.r, track_y, c(t, t.segmented_bg), th);
     let frac = slider_t_from_value(anim as f64, min as f64, max as f64);
@@ -796,9 +798,11 @@ fn paint_slider(
     }
 
     // 端点标注（报告 B-05：每个滑块必须有可见的 min / max 端点）。
-    // 位于轨道下方；小字号 + 次级色。
-    let ep_t = track_y + super::layout::s(dpi, 7) as f32;
-    let ep_b = ep_t + small_px * 1.3;
+    // 画在**数值框下方**（仍在滑杆行高内）；行内 hint 从行高之后起画，
+    // 因此不再被下方说明文字压住（用户反馈：12 / 72 被下边的字遮挡）。
+    let vbh = super::layout::s(dpi, super::layout::VALUEBOX_H) as f32;
+    let ep_t = ctrl_cy + vbh / 2.0 + super::layout::s(dpi, 2) as f32;
+    let ep_b = ep_t + small_px * 1.15;
     let min_s = format!("{}", min.round() as i64);
     let max_s = format!("{}", max.round() as i64);
     gfx.text(rt, &min_s, small_px, 400, HAlign::Leading,
@@ -807,8 +811,8 @@ fn paint_slider(
              RectF::new(tr.r - super::layout::s(dpi, 40) as f32, ep_t, tr.r, ep_b), c(t, t.secondary), true);
 
     // 数值显示：普通滑杆带圆角底框；个性化页字号滑杆用纯文本（理想布局）。
-    let vbh = super::layout::s(dpi, 24) as f32;
-    let vbr = RectF::new(vb.l, r.t + (r.h() - vbh) / 2.0, vb.r, r.t + (r.h() + vbh) / 2.0);
+    // 纵向中心 = 控件线（ctrl_cy），与左侧标签同一基线。
+    let vbr = RectF::new(vb.l, ctrl_cy - vbh / 2.0, vb.r, ctrl_cy + vbh / 2.0);
     let content = if metric_style {
         // 纯文本右对齐，右侧留少量内边距。
         RectF::new(vb.l, vbr.t, vb.r - super::layout::s(dpi, 4) as f32, vbr.b)
@@ -1031,13 +1035,13 @@ fn paint_about_header(
     }
 }
 
-/// 旧字号换算（关于页头部等处按 DPI 取字号的小工具）。
+/// 字号取 `layout` 的单一来源（避免此处再抄一份 13/11）。
 fn body_px(dpi: u32) -> f32 {
-    13.0 * dpi as f32 / 72.0
+    super::layout::body_px(dpi)
 }
 
 fn caption_px(dpi: u32) -> f32 {
-    11.0 * dpi as f32 / 72.0
+    super::layout::caption_px(dpi)
 }
 
 #[cfg(test)]

@@ -233,8 +233,6 @@ impl Scheduler {
 mod tests {
     use super::*;
 
-    const ALL_ON: EnabledMask = [true, true, true, true];
-
     #[test]
     fn test_ema_smoothing() {
         let mut s = Scheduler::new(100, true);

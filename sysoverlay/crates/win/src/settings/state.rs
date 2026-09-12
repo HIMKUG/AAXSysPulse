@@ -13,7 +13,9 @@ pub type WidgetId = i32;
 
 /// 统一交互状态机（替代旧 drag/edit/hover 三职独立字段）。
 #[derive(Debug, Clone, PartialEq)]
+#[derive(Default)]
 pub enum Interaction {
+    #[default]
     Idle,
     /// 悬停中的控件（widgets 下标）。
     Hover { widget: usize },
@@ -25,11 +27,6 @@ pub enum Interaction {
     Editing { widget: usize },
 }
 
-impl Default for Interaction {
-    fn default() -> Self {
-        Interaction::Idle
-    }
-}
 
 /// 输入框编辑态。
 #[derive(Clone)]
@@ -105,6 +102,12 @@ pub struct Row {
     pub hint2: Option<&'static str>,
     /// 行顶相对「卡内行区顶部」的物理偏移（行高可变，由布局写入）。
     pub y_off: i32,
+    /// 本行**控件带**高度（物理像素，由布局写入）= 行高 − hint 行数 × HINT_EXTRA。
+    ///
+    /// 行内 hint 必须从控件带**之后**起画，两端都不能偏：
+    ///   - 按固定 `ROW_H`(28) 起画 → 滑杆行（控件带 46）的 12/72 端点标注被压住；
+    ///   - 按整行高起画 → 溢出到下一行，压住下一行的标签（整页错位）。
+    pub base_h: i32,
 }
 
 #[derive(Debug, Default)]
@@ -195,7 +198,7 @@ impl SpatialGrid {
         let max_r = (rect.bottom / self.cell_size).max(0).min(self.rows - 1) as usize;
         for r in min_r..=max_r {
             for c in min_c..=max_c {
-                let idx = (r * self.cols as usize + c) as usize;
+                let idx = r * self.cols as usize + c;
                 self.cells[idx].push(widget_idx);
             }
         }

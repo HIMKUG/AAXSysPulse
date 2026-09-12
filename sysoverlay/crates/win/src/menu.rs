@@ -37,7 +37,7 @@ pub fn show_tray_menu(hwnd: HWND) -> Option<u16> {
         let cmd = TrackPopupMenu(
             menu,
             TPM_LEFTALIGN | TPM_RETURNCMD
-                | windows::Win32::UI::WindowsAndMessaging::TRACK_POPUP_MENU_FLAGS(PA_NOACTIVATE as u32),
+                | windows::Win32::UI::WindowsAndMessaging::TRACK_POPUP_MENU_FLAGS(PA_NOACTIVATE),
             pt.x,
             pt.y,
             0,

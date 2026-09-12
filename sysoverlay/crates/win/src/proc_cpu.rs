@@ -44,7 +44,7 @@ impl Sampler for CpuSampler {
             let mut kernel = FILETIME::default();
             let mut user = FILETIME::default();
 
-            if !GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)).is_ok() {
+            if GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)).is_err() {
                 return SampleOutcome::Transient;
             }
 

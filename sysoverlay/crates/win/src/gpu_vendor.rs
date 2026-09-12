@@ -545,7 +545,7 @@ impl Adl {
                         for (t, name) in [(ADL_OD6_TOTAL, "total"), (ADL_OD6_PPT, "ppt")] {
                             let mut v = 0i32;
                             if od6(self.ctx, adapter_index, t, &mut v) == 0 && v > 0 {
-                                card_w = Some(((v >> 8) as i32).max(0) as f32);
+                                card_w = Some((v >> 8).max(0) as f32);
                                 probe::log(&format!(
                                     "adl od6_power idx={adapter_index} type={name} raw8_8={v} watts={:?}",
                                     card_w

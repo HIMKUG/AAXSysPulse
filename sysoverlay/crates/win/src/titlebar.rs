@@ -130,6 +130,10 @@ pub fn hit_button(dpi_value: u32, win_w: i32, pt: POINT, pinned: bool) -> Option
 // ── 绘制 ──────────────────────────────────────────────────
 
 /// 绘制标题栏（底色 + 标题 + 按钮）。`title` 为 None 时不画标题文字。
+///
+/// # Safety
+///
+/// `hdc` must be a valid HDC, and `font` must be a valid HFONT.
 pub unsafe fn draw(
     hdc: HDC,
     theme: &Theme,

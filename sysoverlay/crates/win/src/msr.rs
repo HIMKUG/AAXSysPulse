@@ -247,6 +247,12 @@ pub struct MsrPower {
     invalid: u8,
 }
 
+impl Default for MsrPower {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MsrPower {
     pub fn new() -> Self {
         Self { prev: None, unit_j: 0.0, ready: false, dram_ok: false, last_watts: None, invalid: 0 }
@@ -266,9 +272,9 @@ impl MsrPower {
         let r = ring0()?;
         let amd = cpuid_info().amd;
         let pkg_idx = if amd { MSR_AMD_PKG_ENERGY } else { MSR_INTEL_PKG_ENERGY };
-        let pkg = read_msr(r, pkg_idx)? as u64;
+        let pkg = read_msr(r, pkg_idx)?;
         let dram = if self.dram_ok {
-            read_msr(r, MSR_INTEL_DRAM_ENERGY).unwrap_or(0) as u64
+            read_msr(r, MSR_INTEL_DRAM_ENERGY).unwrap_or(0)
         } else {
             0
         };

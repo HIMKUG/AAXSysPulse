@@ -50,6 +50,7 @@ impl Snapshot {
 
 /// A metric value with optional staleness information.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Default)]
 pub enum Metric<T> {
     /// Fresh value.
     Value(T),
@@ -57,14 +58,10 @@ pub enum Metric<T> {
     /// for `stale_for` sampling cycles.
     Stale { value: T, stale_for: u32 },
     /// No data available (sensor unavailable, etc.).
+    #[default]
     Unavailable,
 }
 
-impl<T> Default for Metric<T> {
-    fn default() -> Self {
-        Metric::Unavailable
-    }
-}
 
 impl<T: Copy> Metric<T> {
     /// Returns the value if present, otherwise `None`.

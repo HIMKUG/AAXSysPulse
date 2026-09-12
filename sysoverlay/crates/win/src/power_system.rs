@@ -47,6 +47,12 @@ pub struct SystemPower {
     last_cpu_w: Option<f32>,
 }
 
+impl Default for SystemPower {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SystemPower {
     pub fn new() -> Self {
         let msr = MsrPower::new();

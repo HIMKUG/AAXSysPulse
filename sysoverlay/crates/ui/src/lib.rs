@@ -19,6 +19,7 @@ pub mod offscreen;
 pub mod font;
 pub mod palette;
 pub mod renderer;
+pub mod clock;
 
 // 常用类型重导出
 pub use font::{render_char, render_str_scaled, render_str_scaled_f, scale_of_font};

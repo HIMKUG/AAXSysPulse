@@ -59,11 +59,11 @@ mod tests {
 
     #[test]
     fn tick_is_divisor_of_refresh_floor() {
-        assert!(REFRESH_FLOOR_MS % TICK_MS == 0);
+        const _: () = assert!(REFRESH_FLOOR_MS.is_multiple_of(TICK_MS));
     }
 
     #[test]
     fn idle_max_exceeds_refresh_floor() {
-        assert!(IDLE_MAX_MS > REFRESH_FLOOR_MS);
+        const _: () = assert!(IDLE_MAX_MS > REFRESH_FLOOR_MS);
     }
 }

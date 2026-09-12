@@ -254,21 +254,6 @@ fn probe_font_family(dwrite: &IDWriteFactory) -> Vec<u16> {
     fallback
 }
 
-#[cfg(test)]
-mod font_tests {
-    use super::*;
-
-    #[test]
-    fn probe_returns_null_terminated_wide() {
-        unsafe {
-            let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).unwrap();
-            let fam = probe_font_family(&dwrite);
-            assert!(!fam.is_empty(), "字族名不应为空");
-            assert_eq!(*fam.last().unwrap(), 0, "须为空结尾 UTF-16 串");
-        }
-    }
-}
-
 /// 把归一化路径段按 `rect` 线性缩放，构建 D2D 路径几何。
 ///
 /// `view` = SVG viewBox 边长（本项目统一 1024）。坐标为 viewBox 单位。
@@ -612,7 +597,7 @@ impl Gfx {
         // 克隆句柄以结束对 self.paths 的借用（COM 引用计数，代价极低）。
         let Some(geom) = self.paths.get(&ck).cloned() else { return };
         if let Some(b) = self.brush(rt, color) {
-            unsafe { let _ = rt.FillGeometry(&geom, &b, None); }
+            unsafe { rt.FillGeometry(&geom, &b, None); }
         }
     }
 
@@ -710,7 +695,7 @@ impl Gfx {
     }
 
     pub fn pop_fade(&self, rt: &ID2D1HwndRenderTarget) {
-        unsafe { let _ = rt.PopLayer(); };
+        unsafe { rt.PopLayer(); };
     }
 
     /// 整帧水平平移（翻页滑入）。`dx` 为物理像素。
@@ -757,6 +742,21 @@ impl Gfx {
                 presentOptions: D2D1_PRESENT_OPTIONS_NONE,
             };
             self.d2d.CreateHwndRenderTarget(&props, &hwnd_props).ok()
+        }
+    }
+}
+
+#[cfg(test)]
+mod font_tests {
+    use super::*;
+
+    #[test]
+    fn probe_returns_null_terminated_wide() {
+        unsafe {
+            let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).unwrap();
+            let fam = probe_font_family(&dwrite);
+            assert!(!fam.is_empty(), "字族名不应为空");
+            assert_eq!(*fam.last().unwrap(), 0, "须为空结尾 UTF-16 串");
         }
     }
 }

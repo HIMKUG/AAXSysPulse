@@ -243,7 +243,9 @@ impl Appearance {
     }
 }
 
-/// 可逐项调色的指标。顺序即悬浮窗自左到右 / 自上而下的排列顺序。
+/// 可逐项调色的指标。顺序即配置数组的下标序（**不是**悬浮窗的显示序 ——
+/// 显示序由 [`Config` 的 `metric_order`](crate::config::Config) 决定）。
+/// `Time` 是时钟行（非采样指标），配色/字号槽位复用同一套逐项数组。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Metric {
     Cpu,
@@ -251,11 +253,19 @@ pub enum Metric {
     Gpu,
     Net,
     Power,
+    Time,
 }
 
 impl Metric {
-    /// 所有合法值（顺序即排列顺序）。
-    pub const ALL: [Metric; 5] = [Metric::Cpu, Metric::Mem, Metric::Gpu, Metric::Net, Metric::Power];
+    /// 所有合法值（下标序）。
+    pub const ALL: [Metric; 6] = [
+        Metric::Cpu,
+        Metric::Mem,
+        Metric::Gpu,
+        Metric::Net,
+        Metric::Power,
+        Metric::Time,
+    ];
 
     /// 配置键里的短名：`mc_cpu_lbl` / `mc_mem_val` 等。
     pub fn key_name(self) -> &'static str {
@@ -265,6 +275,7 @@ impl Metric {
             Metric::Gpu => "gpu",
             Metric::Net => "net",
             Metric::Power => "power",
+            Metric::Time => "time",
         }
     }
 }
@@ -273,7 +284,7 @@ impl Metric {
 ///
 /// `None` = 跟随全局文字色（`Config::fg`），这是默认值；
 /// `Some(rgb)` = 该槽独立颜色。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MetricColors {
     /// 指标名称（如 "CPU"/"内存"）颜色。
     pub label: Option<Rgb>,
@@ -282,16 +293,6 @@ pub struct MetricColors {
     /// 数值槽「自动色」：按占用率分档变色（<60% 绿 / 60~85% 橙 / ≥85% 红）。
     /// 开启时忽略 `value` 的自定义色（用户反馈 2026-09-11）。
     pub value_auto: bool,
-}
-
-impl Default for MetricColors {
-    fn default() -> Self {
-        Self {
-            label: None,
-            value: None,
-            value_auto: false,
-        }
-    }
 }
 
 /// 网速单位。C 版数值序：**0=KB/s 1=MB/s 2=GB/s**。

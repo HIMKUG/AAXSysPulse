@@ -43,9 +43,9 @@ const MIN_DT_MS: u64 = 50;
 static TOPO_INVALID: AtomicBool = AtomicBool::new(false);
 
 /// GPU 查询范围开关（v3 性能档，默认最佳性能）：
-/// - `PRIMARY_ONLY`：只查节点数最大的适配器（= 主 dGPU），跳过虚拟/副卡；
-/// - `ENGINE_3D_ONLY`：只查节点 0（3D 引擎），不再逐引擎取 max。
-/// 两者叠加时每周期仅 **1 次**内核查询（~1.4ms）。
+///   - `PRIMARY_ONLY`：只查节点数最大的适配器（= 主 dGPU），跳过虚拟/副卡；
+///   - `ENGINE_3D_ONLY`：只查节点 0（3D 引擎），不再逐引擎取 max。
+///   两者叠加时每周期仅 **1 次**内核查询（~1.4ms）。
 static PRIMARY_ONLY: AtomicBool = AtomicBool::new(true);
 static ENGINE_3D_ONLY: AtomicBool = AtomicBool::new(true);
 

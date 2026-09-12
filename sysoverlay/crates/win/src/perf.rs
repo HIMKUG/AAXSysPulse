@@ -116,7 +116,7 @@ fn maybe_report() {
     let skipped = SKIPPED.swap(0, Ordering::Relaxed);
     let total = TOTAL_US.swap(0, Ordering::Relaxed);
     let max = MAX_US.swap(0, Ordering::Relaxed);
-    let avg = if frames > 0 { total / frames } else { 0 };
+    let avg = total.checked_div(frames).unwrap_or(0);
 
     let line = format!(
         "frames={:<6} skipped={:<6} avg_us={:<6} max_us={:<6}\n",
@@ -170,7 +170,7 @@ pub fn msg_end(start: u64, hwnd: usize, msg: u32) {
     // 消息洪流采样：每 5000 条记一笔 (hwnd,msg)，定位是谁在被疯狂唤醒
     if crate::probe::enabled() {
         let n = MSG_COUNT.load(Ordering::Relaxed);
-        if n % 5_000 == 0 && n < 100_000 {
+        if n.is_multiple_of(5_000) && n < 100_000 {
             crate::probe::log(&format!("msgbit n={n} hwnd={hwnd:#x} msg=0x{msg:04X} us={}", elapsed_us(start)));
         }
     }

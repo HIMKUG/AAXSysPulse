@@ -267,7 +267,7 @@ const fn weight_tables_init() -> [[[u8; 16]; 96]; 3] {
     t
 }
 thread_local! {
-    static FONT_WEIGHT_TABLES: RefCell<[[[u8; 16]; 96]; 3]> = RefCell::new(weight_tables_init());
+    static FONT_WEIGHT_TABLES: RefCell<[[[u8; 16]; 96]; 3]> = const { RefCell::new(weight_tables_init()) };
 }
 
 // 当前渲染生效的字重（0 细 / 1 中 / 2 粗）。默认粗 = 历史原样观感；

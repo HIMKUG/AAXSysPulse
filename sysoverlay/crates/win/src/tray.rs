@@ -36,7 +36,7 @@ unsafe fn make_icon() -> windows::Win32::UI::WindowsAndMessaging::HICON {
     // AND 掩码全 0：交给 XOR 的 alpha 通道
     let and = [0u8; W * H / 8];
 
-    match CreateIcon(
+    CreateIcon(
         None,
         W as i32,
         H as i32,
@@ -44,10 +44,7 @@ unsafe fn make_icon() -> windows::Win32::UI::WindowsAndMessaging::HICON {
         32,
         and.as_ptr(),
         xor.as_ptr(),
-    ) {
-        Ok(h) => h,
-        Err(_) => windows::Win32::UI::WindowsAndMessaging::HICON::default(),
-    }
+    ).unwrap_or_default()
 }
 
 /// 注册托盘图标。

@@ -186,7 +186,7 @@ mod tests {
         assert_ne!(LIGHT.card, DARK.card);
         assert_eq!(LIGHT.accent, rgb(0, 122, 255), "systemBlue 浅色");
         assert_eq!(DARK.accent, rgb(10, 132, 255), "systemBlue 深色");
-        assert!(!LIGHT.dark && DARK.dark);
+        const _: () = assert!(!LIGHT.dark && DARK.dark);
     }
 
     #[test]
