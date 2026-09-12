@@ -61,20 +61,10 @@ pub struct Theme {
     pub accent_hover: u32,
     /// 开关打开色
     pub toggle_on: u32,
-    /// 开关关闭底色
-    pub toggle_off: u32,
-    /// 开关关闭描边
-    pub toggle_off_stroke: u32,
     /// 分段控件底
     pub segmented_bg: u32,
-    /// 分段控件选中片
-    pub seg_selected: u32,
-    /// 分段控件选中片描边
-    pub seg_selected_stroke: u32,
     /// 开关滑块
     pub knob: u32,
-    /// 滑块描边
-    pub knob_stroke: u32,
     /// 步进器 / 次级按钮底
     pub button_bg: u32,
     /// 次级按钮悬停
@@ -101,13 +91,8 @@ pub const LIGHT: Theme = Theme {
     accent: rgb(0, 122, 255),        // systemBlue
     accent_hover: rgb(0, 98, 204),
     toggle_on: rgb(52, 199, 89),     // systemGreen
-    toggle_off: rgb(233, 233, 236),
-    toggle_off_stroke: rgb(216, 216, 220),
     segmented_bg: rgb(235, 235, 238),
-    seg_selected: rgb(255, 255, 255),
-    seg_selected_stroke: rgb(214, 214, 219),
     knob: rgb(255, 255, 255),
-    knob_stroke: rgb(214, 214, 219),
     button_bg: rgb(235, 235, 238),
     button_bg_hover: rgb(224, 224, 228),
     sidebar_bg: rgb(246, 246, 248),
@@ -127,13 +112,8 @@ pub const DARK: Theme = Theme {
     accent: rgb(10, 132, 255),
     accent_hover: rgb(64, 156, 255),
     toggle_on: rgb(48, 209, 88),
-    toggle_off: rgb(80, 80, 85),
-    toggle_off_stroke: rgb(96, 96, 101),
     segmented_bg: rgb(68, 68, 73),
-    seg_selected: rgb(99, 99, 102), // iOS dark selected segment
-    seg_selected_stroke: rgb(99, 99, 102),
     knob: rgb(255, 255, 255),
-    knob_stroke: rgb(255, 255, 255),
     button_bg: rgb(68, 68, 73),
     button_bg_hover: rgb(84, 84, 89),
     sidebar_bg: rgb(44, 44, 46),
