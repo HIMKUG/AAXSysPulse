@@ -34,8 +34,12 @@ pub struct FluentPalette {
     pub color_brand_background_hover: ColorF,       // 品牌悬停
     pub color_brand_background_pressed: ColorF,     // 品牌按下
     pub color_compound_brand_background: ColorF,    // switch 填充色
+    pub color_compound_brand_background_hover: ColorF,   // switch 填充悬停
+    pub color_compound_brand_background_pressed: ColorF, // switch 填充按压
     pub color_neutral_foreground_inverted: ColorF,   // 白色（旋钮）
     pub color_neutral_stroke_accessible: ColorF,    // switch 关闭描边
+    pub color_neutral_stroke_accessible_hover: ColorF,   // switch 关闭描边悬停
+    pub color_neutral_stroke_accessible_pressed: ColorF, // switch 关闭描边按压
     pub color_neutral_stroke1: ColorF,              // 描边 1
     pub color_neutral_stroke2: ColorF,              // 描边 2（分隔线）
     pub color_subtle_background_hover: ColorF,      // 按钮悬停背景
@@ -98,8 +102,12 @@ const fn fluent_light() -> FluentPalette {
         color_brand_background_hover: c(17, 94, 163),          // #115ea3
         color_brand_background_pressed: c(12, 59, 94),         // #0c3b5e
         color_compound_brand_background: c(15, 108, 189),      // #0f6cbd switch 填充
+        color_compound_brand_background_hover: c(17, 94, 163),  // #115ea3
+        color_compound_brand_background_pressed: c(15, 84, 140),// #0f548c
         color_neutral_foreground_inverted: c(255, 255, 255),   // #ffffff 旋钮
         color_neutral_stroke_accessible: c(97, 97, 97),        // #616161 switch 关闭描边
+        color_neutral_stroke_accessible_hover: c(87, 87, 87),   // #575757
+        color_neutral_stroke_accessible_pressed: c(77, 77, 77), // #4d4d4d
         color_neutral_stroke1: c(209, 209, 209),               // #d1d1d1（浅灰，不是黑！）
         color_neutral_stroke2: c(224, 224, 224),               // #e0e0e0 分隔线
         color_subtle_background_hover: c(245, 245, 245),       // #f5f5f5
@@ -149,8 +157,12 @@ const fn fluent_dark() -> FluentPalette {
         color_brand_background_hover: c(15, 108, 189),        // #0f6cbd
         color_brand_background_pressed: c(12, 59, 94),        // #0c3b5e
         color_compound_brand_background: c(71, 158, 245),     // #479ef5 switch 填充
+        color_compound_brand_background_hover: c(98, 171, 245),// #62abf5
+        color_compound_brand_background_pressed: c(40, 134, 222),// #2886de
         color_neutral_foreground_inverted: c(36, 36, 36),     // #242424 旋钮=深灰（非白！）
         color_neutral_stroke_accessible: c(173, 173, 173),    // #adadad switch 关闭描边
+        color_neutral_stroke_accessible_hover: c(189, 189, 189),// #bdbdbd
+        color_neutral_stroke_accessible_pressed: c(179, 179, 179),// #b3b3b3
         color_neutral_stroke1: c(102, 102, 102),              // #666666（非白！）
         color_neutral_stroke2: c(82, 82, 82),                 // #525252 分隔线
         color_subtle_background_hover: c(56, 56, 56),         // #383838

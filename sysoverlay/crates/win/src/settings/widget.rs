@@ -475,22 +475,54 @@ fn paint_toggle(
     t: &Theme,
     r: RectF,
 ) {
-    // 报告 §2/§4.1 规格：34×20 胶囊，右对齐到操作边缘（行矩形可能略大）。
-    let tw = super::layout::s(dpi, 34) as f32;
+    // Fluent 2 switch（Quel'Thalas switch.rs 拆壳移植，S2 试点）：
+    // 轨道 40×20 胶囊（layout 预留 TOGGLE_W=40），旋钮 ⌀14 = 20 − 2×(描边1+间隙2)。
+    // 关 = 无填充 + accessible 描边；开 = compound brand 填充淡入、描边淡出；
+    // 旋钮色从描边色渐变到 inverted（dark 主题是深灰 #242424，不是白）。
+    // 悬停/按压端点色按 Fluent 语义离散切换（hover_t/press_t 弹簧收敛到 0/1 后判定），
+    // 位置与交叉渐变仍由 `anim_v` 弹簧连续驱动 —— 单一弹簧语言不变。
+    let ft = if t.dark {
+        &super::fluent::tokens::FLUENT.dark
+    } else {
+        &super::fluent::tokens::FLUENT.light
+    };
+    let tw = super::layout::s(dpi, 40) as f32;
     let th = super::layout::s(dpi, 20) as f32;
     let r = RectF::new(r.r - tw, (r.t + r.b - th) / 2.0, r.r, (r.t + r.b + th) / 2.0);
-    // 旋钮位置 + 轨道配色都随 `anim_v` 连续变化（开关是「滑」过去的）。
     let k = state.anim_v.clamp(0.0, 1.0);
-    let radius = r.h() / 2.0;
-    hover_overlay(gfx, rt, t, r, radius, state.hover_t);
-    let fill = lerp_color(c(t, t.toggle_off), c(t, t.toggle_on), k);
-    let stroke = lerp_color(c(t, t.toggle_off_stroke), c(t, t.toggle_on), k);
-    gfx.fill_round(rt, r, radius, fill);
-    gfx.stroke_round(rt, r, radius, stroke, 1.0);
-    let m = super::layout::s(dpi, 2) as f32;
-    let d = r.h() - 2.0 * m;
-    let kx = r.l + m + (r.w() - 2.0 * m - d) * k;
-    gfx.fill_ellipse(rt, RectF::new(kx, r.t + m, kx + d, r.b - m), c(t, t.knob));
+    let hovered = state.hover_t > 0.5;
+    let pressed = state.press_t > 0.5;
+    let stroke_off = if pressed {
+        ft.color_neutral_stroke_accessible_pressed
+    } else if hovered {
+        ft.color_neutral_stroke_accessible_hover
+    } else {
+        ft.color_neutral_stroke_accessible
+    };
+    let fill_on = if pressed {
+        ft.color_compound_brand_background_pressed
+    } else if hovered {
+        ft.color_compound_brand_background_hover
+    } else {
+        ft.color_compound_brand_background
+    };
+    let radius = th / 2.0;
+    // 轨道填充：开态淡入（关态无填充）。
+    gfx.fill_round(rt, r, radius, fill_on.with_alpha(k));
+    // 描边：关态可见，随开态淡出。
+    gfx.stroke_round(rt, r, radius, stroke_off.with_alpha(1.0 - k), 1.0);
+    // 旋钮：两端圆心之间滑动，颜色从描边色渐变到 inverted。
+    let thumb_d = th - 2.0 * (super::layout::s(dpi, 1) + super::layout::s(dpi, 2)) as f32;
+    let off_x = r.l + radius;
+    let on_x = r.l + tw - radius;
+    let thumb_x = off_x + (on_x - off_x) * k;
+    let thumb_color = lerp_color(stroke_off, ft.color_neutral_foreground_inverted, k);
+    let cy = (r.t + r.b) / 2.0;
+    gfx.fill_ellipse(
+        rt,
+        RectF::new(thumb_x - thumb_d / 2.0, cy - thumb_d / 2.0, thumb_x + thumb_d / 2.0, cy + thumb_d / 2.0),
+        thumb_color,
+    );
 }
 
 fn paint_segmented(
