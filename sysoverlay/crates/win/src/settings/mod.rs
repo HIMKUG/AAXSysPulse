@@ -1937,12 +1937,13 @@ unsafe extern "system" fn settings_wndproc(
             if let Some(idx) = widget_at(ctx, cpt) {
                 if ctx.cfg().is_some() {
                     // 滑杆：值框内 → 编辑；否则按下即跳值 + 进入拖动
-                    let is_slider = ctx.pages[ctx.page].widgets[idx]
+                    // 一次 downcast 同时驱动「是否滑杆」与后续取参；
+                    // 用 if-let 而非 unwrap——绘制路径 panic 会跨 FFI 边界终止进程。
+                    let slider = ctx.pages[ctx.page].widgets[idx]
                         .kind
                         .as_any()
-                        .downcast_ref::<widget::SliderWidget>()
-                        .is_some();
-                    if is_slider {
+                        .downcast_ref::<widget::SliderWidget>();
+                    if let Some(s) = slider {
                         if pt_in(&value_box_rect(&ctx.pages[ctx.page].widgets[idx].rect, d), cpt.0) {
                             begin_edit(ctx, idx);
                             ctx.invalidate_widget(idx);
@@ -1952,11 +1953,6 @@ unsafe extern "system" fn settings_wndproc(
                             return LRESULT(0);
                         }
                         // 按下即跳值 + 进入拖动（Apple「按下即反馈」）
-                        let s = ctx.pages[ctx.page].widgets[idx]
-                            .kind
-                            .as_any()
-                            .downcast_ref::<widget::SliderWidget>()
-                            .unwrap();
                         let r = ctx.pages[ctx.page].widgets[idx].rect;
                         let tr = widget::track_rect(&r, ctx.dpi);
                         let new = widget::slider_value_from_x(

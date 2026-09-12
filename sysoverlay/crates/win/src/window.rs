@@ -860,11 +860,11 @@ impl OverlayWindow {
             )
         };
 
-        if hwnd.is_err() {
-            return Err(WinError::new("Failed to create window"));
-        }
-
-        let hwnd = hwnd.unwrap();
+        // 不用 unwrap：创建失败路径统一走 Err，避免任何残留的 panic 面。
+        let hwnd = match hwnd {
+            Ok(h) => h,
+            Err(_) => return Err(WinError::new("Failed to create window")),
+        };
 
         unsafe {
             let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA.0, state_ptr);

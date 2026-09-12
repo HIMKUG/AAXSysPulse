@@ -602,7 +602,7 @@ fn compute_dirty_in(
         return (Dirty::Full, all());
     }
     match union {
-        Some(_) => {
+        Some(u) => {
             // 邻接传播至不动点（cell ≤ 10，代价可忽略）
             loop {
                 let mut grew = false;
@@ -624,7 +624,7 @@ fn compute_dirty_in(
                     break;
                 }
             }
-            (Dirty::Rect(union.unwrap()), changed)
+            (Dirty::Rect(u), changed)
         }
         // 有 cell 内容变化 → 上传其并集；否则（理论不可达）保守整窗
         None => (Dirty::Full, all()),

@@ -1,9 +1,0 @@
-[package]
-name = "sysoverlay-ui"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]
-sysoverlay-core = { path = "../core" }
-png = "0.17"
