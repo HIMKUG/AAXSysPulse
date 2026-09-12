@@ -169,7 +169,7 @@ fn main() {
                 break;
             }
             let _ = CloseHandle(h);
-            if elevated {
+            if elevated || restart {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
@@ -178,6 +178,9 @@ fn main() {
             std::process::exit(0);
         };
     };
+
+    // （重试间隔在循环内：`--restart` 与 `--elevated` 一样需要 100ms 间隔，
+    //   否则 30 次重试在 1ms 内耗尽，旧进程尚未释放互斥体 → 重启静默失败。）
 
     // ── 2. Load config ─────────────────────────────────────────────────────
     let mut cfg = config_io::load_config();

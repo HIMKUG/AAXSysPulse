@@ -27,10 +27,14 @@ pub fn quick_restart() {
     let params: Vec<u16> = "--restart\0".encode_utf16().collect();
 
     unsafe {
-        use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_DEFAULT, SHELLEXECUTEINFOW};
+        use windows::Win32::UI::Shell::{
+            ShellExecuteExW, SEE_MASK_DEFAULT, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW,
+        };
         let mut sei = SHELLEXECUTEINFOW {
             cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-            fMask: SEE_MASK_DEFAULT,
+            // NOASYNC：同步等待 Shell 真正派生新进程后再返回，
+            // 保证 exit(0) 时新实例已存在并进入互斥体重试。
+            fMask: SEE_MASK_DEFAULT | SEE_MASK_NOASYNC,
             lpFile: windows::core::PCWSTR(exe_w.as_ptr()),
             lpParameters: windows::core::PCWSTR(params.as_ptr()),
             nShow: 1,

@@ -453,10 +453,13 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
             dirty = Dirty::Full;
             changed = vec![true; cells.len()];
         }
-        // 时钟秒变化：v3 起恢复 clock.rs 设计的脏矩形上传（此前因 AFMF 兼容
-        // 强制 Full；AFMF 兼容已整体取消，局部 ULW 的合成器问题不再迁就）。
-        // compute_dirty 已把秒变化的 time cell 并进脏区，无需额外处理。
+        // 时钟秒变化 → 强制整窗（实测本机 AMD 驱动 + DWM：Rect 局部上传
+        // ULW 返回成功但不重混子区，时间永远冻结在最后一次 Full 上传；
+        // 探针日志 2026-09-12 证实每秒 Rect ok=true 而画面不更新）。
         let present_sec = sysoverlay_ui::clock::get().2;
+        if cfg.show_time && LAST_PRESENTED_SEC.load(AtomicOrdering::Relaxed) != present_sec {
+            dirty = Dirty::Full;
+        }
 
         // 绘制（A3：仅首帧/alpha/布局变化才整画布清零，否则只清脏区 cell）
         renderer.paint(
@@ -931,10 +934,12 @@ fn render_d2d(
         if take_force_full() || present_size_changed(width, height) {
             dirty = Dirty::Full;
         }
-        // 时钟秒变化：v3 起恢复 clock.rs 设计的脏矩形上传（此前因 AFMF 兼容
-        // 强制 Full；AFMF 兼容已整体取消，局部 ULW 的合成器问题不再迁就）。
-        // compute_dirty_in 已把秒变化的 time cell 并进脏区，无需额外处理。
+        // 时钟秒变化 → 强制整窗（同 GDI 分支：本机 Rect 局部上传不重混，
+        // 探针日志证实每秒 Rect ok=true 而画面不更新）。
         let present_sec = sysoverlay_ui::clock::get().2;
+        if cfg.show_time && LAST_PRESENTED_SEC.load(AtomicOrdering::Relaxed) != present_sec {
+            dirty = Dirty::Full;
+        }
         crate::probe::log_lazy(|| {
             let kind = match &dirty {
                 Dirty::Full => "Full".to_string(),
