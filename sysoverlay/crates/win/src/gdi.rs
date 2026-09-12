@@ -489,13 +489,11 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
             dirty = Dirty::Full;
             changed = vec![true; cells.len()];
         }
-        // 时钟秒变化 → 强制整窗（实测本机 AMD 驱动 + DWM：Rect 局部上传
-        // ULW 返回成功但不重混子区，时间永远冻结在最后一次 Full 上传；
-        // 探针日志 2026-09-12 证实每秒 Rect ok=true 而画面不更新）。
+        // 时钟秒变化 → 曾强制整窗（旧注释：Rect 局部上传 ULW 成功但不重混）。
+        // ✅ 根因已修（2026-09-12）：那不是驱动/DWM 问题，是 upload_dib 里
+        // pptSrc 坐标语义错误（2× 偏移），对照实验见 docs/悬浮窗性能恢复计划.md。
+        // Rect 局部上传恢复信任，时钟秒走正常脏区路径。
         let present_sec = sysoverlay_ui::clock::get().2;
-        if cfg.show_time && LAST_PRESENTED_SEC.load(AtomicOrdering::Relaxed) != present_sec {
-            dirty = Dirty::Full;
-        }
 
         // 绘制（A3：仅首帧/alpha/布局变化才整画布清零，否则只清脏区 cell）
         renderer.paint(
@@ -882,9 +880,16 @@ unsafe fn upload_dib(hwnd: HWND, width: i32, height: i32, src_alpha: u8, dirty: 
         )
         .is_ok()
     } else if let Dirty::Rect(r) = dirty {
+        // ✅ 根因修复（2026-09-12 对照实验钉死，见 docs/悬浮窗性能恢复计划.md）：
+        // pptSrc 语义 = 「窗口左上角在 hdcSrc 中的对齐点」。整窗 DIB 的正确值是
+        // (0,0)。旧代码写 (r.left, r.top)，与窗口坐标的 prcDirty 叠加后源像素
+        // 被 2× 偏移，读到 DIB 中错误内容/越界——API 返回成功但贴错像素，
+        // 即历史「Rect ok=true 而画面不更新」的根因。对照实验：
+        //   旧值 → 时间格像素两次截图哈希相同（冻结复现）
+        //   (0,0) → 哈希变化（时钟恢复走秒）
+        let ppsrc = POINT { x: 0, y: 0 };
         // prcDirty 非空时 psize/pptDst 被忽略；psize 给整窗尺寸是规范姿势。
         let psize = SIZE { cx: width, cy: height };
-        let ppsrc = POINT { x: r.left, y: r.top };
         let prc = RECT { left: r.left, top: r.top, right: r.right, bottom: r.bottom };
         let info = UPDATELAYEREDWINDOWINFO {
             cbSize: std::mem::size_of::<UPDATELAYEREDWINDOWINFO>() as u32,
@@ -974,12 +979,9 @@ fn render_d2d(
         if take_force_full() || present_size_changed(width, height) {
             dirty = Dirty::Full;
         }
-        // 时钟秒变化 → 强制整窗（同 GDI 分支：本机 Rect 局部上传不重混，
-        // 探针日志证实每秒 Rect ok=true 而画面不更新）。
+        // 时钟秒变化 → 曾强制整窗（根因同 GDI 分支注释：pptSrc 坐标语义错误
+        // 已修复，Rect 局部上传恢复信任，见 docs/悬浮窗性能恢复计划.md）。
         let present_sec = sysoverlay_ui::clock::get().2;
-        if cfg.show_time && LAST_PRESENTED_SEC.load(AtomicOrdering::Relaxed) != present_sec {
-            dirty = Dirty::Full;
-        }
         perf::note_section("seg_hash", t_hash);
         crate::probe::log_lazy(|| {
             let kind = match &dirty {
