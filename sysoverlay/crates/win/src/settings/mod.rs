@@ -18,6 +18,7 @@
 //! - 离开本窗口 = `SettingsCtx` Drop = 全部 D2D/DWrite 资源释放，零残留。
 
 mod cfg_ref;
+mod fluent;
 mod icons;
 mod layout;
 mod motion;

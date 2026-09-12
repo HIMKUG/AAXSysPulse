@@ -52,7 +52,7 @@ use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 // ── 基础值类型 ─────────────────────────────────────────────
 
 /// D2D 颜色（RGBA 0..1）。`key()` 用作画刷缓存键（alpha 量化到 u8）。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ColorF(D2D1_COLOR_F);
 
 impl ColorF {

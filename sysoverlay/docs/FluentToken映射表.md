@@ -76,51 +76,53 @@
 
 ## 3. `fluent_tokens.rs` 新增 Token（Fluent 专用，Theme 不含）
 
-以下 Fluent token 在现有 Theme 中无对应项，需在 `settings/fluent/tokens.rs` 新建：
+> ⚠️ **色值/数值的唯一真值 = Quel'Thalas `qt/src/theme.rs` 的 `web_light()` / `web_dark()`**。
+> 下表数值已与源码逐值核对（2026-09-12 高智审阅修正版）。禁止凭"印象中的 Fluent"填值
+> ——首轮转录曾混入 Fluent 1 的 `#0078D4` 与 Material Design 的 `#4FC3F7`，已由测试锁定拦截。
 
 ```
-// 颜色
-color_neutral_background1          // 窗口/卡片底（白/深灰）
-color_neutral_background3          // 控件底（灰/深灰）
-color_neutral_background6          // 深色选中片底
-color_brand_background            // 品牌色（蓝）
-color_brand_background_hover      // 品牌悬停
-color_brand_background_pressed    // 品牌按下
-color_compound_brand_background   // switch 填充色
-color_neutral_foreground_inverted  // 白色（旋钮）
-color_neutral_stroke_accessible   // switch 关闭描边
-color_neutral_stroke1             // 描边 1
-color_neutral_stroke2             // 描边 2（分隔线）
-color_subtle_background_hover     // 按钮悬停背景
+// 颜色（浅色 ← web_light / 深色 ← web_dark）
+color_neutral_background1          // #ffffff / #292929
+color_neutral_background3          // #f5f5f5 / #141414（dark 控件底比背景更暗！）
+color_neutral_background6          // #e6e6e6 / #333333
+color_brand_background             // #0f6cbd / #115ea3（不是 Fluent1 #0078D4，不是 Material #4FC3F7）
+color_brand_background_hover       // #115ea3 / #0f6cbd
+color_brand_background_pressed     // #0c3b5e / #0c3b5e
+color_compound_brand_background    // #0f6cbd / #479ef5（switch 填充）
+color_neutral_foreground_inverted  // #ffffff / #242424（dark 旋钮=深灰，不是白！）
+color_neutral_stroke_accessible    // #616161 / #adadad（switch 关闭描边）
+color_neutral_stroke1              // #d1d1d1 / #666666（light 不是黑，dark 不是白！）
+color_neutral_stroke2              // #e0e0e0 / #525252
+color_subtle_background_hover      // #f5f5f5 / #383838
 
 // 尺寸
-stroke_width_thin: 1.0            // 边框宽
-border_radius_medium: 4.0         // 卡片圆角 ← 注意：现有 10 → S5 统一改
-border_radius_small: 2.0          // 控件圆角
+stroke_width_thin: 1.0
+border_radius_medium: 4.0          // 卡片圆角 ← 现有 10 → S5 统一改
+border_radius_small: 2.0
 
 // 字体
 font_family_base: "Segoe UI"
 font_weight_regular: 400
 font_weight_semibold: 600
-font_size_base200: 12.0           // ← 现有 caption_px(96dpi) ≈ 11，统一改 12
-font_size_base300: 14.0           // ← 现有 body_px(96dpi) ≈ 13，统一改 14
-font_size_base400: 16.0           // 分组标题
-line_height_base200: 22.0
+font_size_base200: 12.0
+font_size_base300: 14.0
+font_size_base400: 16.0
+line_height_base200: 16.0          // ← 修正：首轮误写 22.0（那是 base400 的值）
 line_height_base300: 20.0
 
-// 间距（按 layout.rs 4px 刻度校准后的值）
-spacing_horizontal_s: 4.0         // ← 侧边栏项内间距（Fluent 原值 4）
-spacing_horizontal_m: 12.0        // ← 内容区内边距 20 > Fluent xl=16，保留 20？不，改为 12
-spacing_horizontal_l: 16.0        // 卡片内边距 ← 等于现有 CARD_PAD=16 ✓
-spacing_vertical_s: 8.0             // ← 等于现有 CAPTION_GAP ✓
-spacing_vertical_m: 8.0            // ← 等于现有 ROW_GAP=12？冲突，保留 12
+// 间距（ Quel'Thalas 原值；vertical_m=12 恰与 layout ROW_GAP=12 一致，无冲突）
+spacing_horizontal_s: 8.0          // ← 修正：首轮误写 4.0（那是 xs 的值）
+spacing_horizontal_m: 12.0
+spacing_horizontal_l: 16.0         // = 现有 CARD_PAD
+spacing_vertical_s: 8.0            // = 现有 CAPTION_GAP
+spacing_vertical_m: 12.0           // = 现有 ROW_GAP
 spacing_vertical_l: 16.0
 
-// 动效
-duration_faster: 0.050            // 50ms（WAM 等效）
-duration_normal: 0.167             // 167ms（WAM 等效）
-curve_easy_ease: [0.16, 1.0, 0.3, 1.0]  // Fluent 标准曲线
-curve_decelerate_mid: [0.8, 0.0, 0.8, 1.0]
+// 动效（WAM 真值，durations 以秒计）
+duration_faster: 0.1               // ← 修正：首轮误写 0.050
+duration_normal: 0.2               // ← 修正：首轮误写 0.167
+curve_easy_ease: [0.33, 0.0, 0.67, 1.0]        // ← 修正：首轮误写 [0.16,1,0.3,1]
+curve_decelerate_mid: [0.0, 0.0, 0.0, 1.0]     // ← 修正：首轮误写 [0.8,0,0.8,1]
 ```
 
 ---
