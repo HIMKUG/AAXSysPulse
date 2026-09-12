@@ -228,6 +228,9 @@ struct SettingsCtx {
     /// 松手后被拖卡自己的落位弹簧（逐指标）：从拖动偏移量 spring 到 0，
     /// 弹簧收敛后才触发真正的 rebuild_pages（确保卡槽无空隙）。
     metric_release: [motion::Spring; 6],
+    /// 滚动条拖拽状态：Some(grab) = 正在拖，grab = 按下点相对滑块顶缘的偏移
+    /// （client px）。None = 未在拖。拖拽中鼠标 y 直接映射 scroll_y。
+    sb_drag: Option<f32>,
 }
 
 /// 翻页动画进行中标记（进度由弹簧推进，见 `anim_params`）。
@@ -551,6 +554,7 @@ fn create_dialog(overlay: HWND) {
             card_slide: [motion::Spring::new(0.0); 6],
             drag_release: None,
             metric_release: [motion::Spring::new(0.0); 6],
+            sb_drag: None,
         };
         ctx.rebuild_pages();
         crate::probe::log(&format!(
@@ -742,6 +746,22 @@ fn card_drag_move(ctx: &mut SettingsCtx, cpt: ContentPt) {
         }
         shift_card(ctx, page_idx, pos, delta);
     }
+}
+
+/// 滚动条拖拽中：鼠标 client y 直接映射 scroll_y（贴手，越界钳到 0..max，
+/// 不做橡胶回弹 —— 拖拽是精确操作，回弹只属于滚轮惯性）。
+/// 同时清零惯性速度并对齐滚动弹簧，避免 H4 动量投射与拖拽打架。
+fn scrollbar_drag_scroll(ctx: &mut SettingsCtx, y: i32) {
+    let Some(grab) = ctx.sb_drag else { return };
+    let page = ctx.page;
+    let (win_w, win_h) = ctx.client_size;
+    let Some(g) = scrollbar_geom(ctx.dpi, win_w, win_h, ctx.pages[page].h) else {
+        return;
+    };
+    let ratio = ((y as f32 - grab - g.inset) / (g.track_h - g.thumb_h)).clamp(0.0, 1.0);
+    ctx.pages[page].scroll_y = (-(ratio * g.max_scroll)).round() as i32;
+    ctx.scroll_vel = 0.0;
+    ctx.scroll_spring.set(ctx.pages[page].scroll_y as f32);
 }
 
 /// 拖拽释放弹簧动画：被拖卡从拖动偏移量（y_off）spring 到 0，
@@ -1664,6 +1684,12 @@ unsafe extern "system" fn settings_wndproc(
                 } else {
                     None
                 };
+                // 滚动条拖拽中：贴手滚动（SetCapture 下鼠标 y 直接映射 scroll_y）。
+                if ctx.sb_drag.is_some() {
+                    scrollbar_drag_scroll(ctx, pt.0.y);
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return LRESULT(0);
+                }
                 // 拖动中：按当前 x 绝对落值（不再累积、不再看 origin）
                 if let Interaction::Dragging { widget: idx, .. } = &ctx.interaction {
                     let idx = *idx;
@@ -1806,6 +1832,40 @@ unsafe extern "system" fn settings_wndproc(
                 let _ = InvalidateRect(hwnd, None, false);
                 return LRESULT(0);
             }
+            // 2.5) 滚动条（浮于内容之上，先于控件命中）：贴手拖拽 + 轨道点击跳转。
+            // 拿住滑块按 grab 偏移拖动；点在轨道上则滑块中心跳到点击处。
+            {
+                let win_w = ctx.client_size.0;
+                let win_h = ctx.client_size.1;
+                let content_h = ctx.pages[ctx.page].h;
+                let scroll_y = ctx.pages[ctx.page].scroll_y;
+                if let Some(g) = scrollbar_geom(ctx.dpi, win_w, win_h, content_h) {
+                    let x = win_w as f32 - g.inset - g.w;
+                    let in_x = (pt.0.x as f32) >= x - s(ctx.dpi, 6) as f32;
+                    let in_track =
+                        (pt.0.y as f32) >= g.inset && (pt.0.y as f32) <= g.inset + g.track_h;
+                    if in_x && in_track {
+                        let ratio = ((-scroll_y) as f32 / g.max_scroll).clamp(0.0, 1.0);
+                        let thumb_top = g.inset + ratio * (g.track_h - g.thumb_h);
+                        let grab = if (pt.0.y as f32) >= thumb_top
+                            && (pt.0.y as f32) <= thumb_top + g.thumb_h
+                        {
+                            pt.0.y as f32 - thumb_top // 拿住滑块：保持抓取点
+                        } else {
+                            g.thumb_h / 2.0 // 轨道点击：滑块中心跳到点击处
+                        };
+                        ctx.sb_drag = Some(grab);
+                        let _ = SetCapture(hwnd);
+                        scrollbar_drag_scroll(ctx, pt.0.y);
+                        let _ = InvalidateRect(hwnd, None, false);
+                        // 重绘饥饿补丁：拖拽中必须有人驱动 16ms 主时钟
+                        //（此前 ANIM_TIMER 只在帧末 animating 为真时续表，
+                        //  而拖拽态不在 animating 条件里 → 拖拽无重绘）。
+                        start_timer(hwnd, ANIM_TIMER, 16);
+                        return LRESULT(0);
+                    }
+                }
+            }
             // 3) 控件（内容坐标）
             if let Some(idx) = widget_at(ctx, cpt) {
                 if ctx.cfg().is_some() {
@@ -1844,6 +1904,8 @@ unsafe extern "system" fn settings_wndproc(
                         let _ = SetCapture(hwnd);
                         ctx.invalidate_widget(idx);
                         let _ = InvalidateRect(hwnd, None, false);
+                        // 重绘饥饿补丁：拖拽态驱动 16ms 主时钟（见滚动条分支注释）。
+                        start_timer(hwnd, ANIM_TIMER, 16);
                         return LRESULT(0);
                     }
                     // 步进器：按下即 ±1 并进入长按连发（350ms 首延迟 → 60ms/步）；
@@ -1907,6 +1969,8 @@ unsafe extern "system" fn settings_wndproc(
                             y_off: 0,
                             moved: false,
                         });
+                        // 重绘饥饿补丁：拖拽态驱动 16ms 主时钟（见滚动条分支注释）。
+                        start_timer(hwnd, ANIM_TIMER, 16);
                     }
                     // H2：按下即进入 Pressing（视觉反馈），抬起且仍命中才触发动作。
                     ctx.interaction = Interaction::Pressing { widget: idx };
@@ -1927,6 +1991,8 @@ unsafe extern "system" fn settings_wndproc(
         }
         WM_LBUTTONUP => {
             if let Some(ctx) = ctx_of(hwnd) {
+                // 滚动条拖拽收尾（SetCapture 随 UP 自动释放）。
+                ctx.sb_drag = None;
                 // 卡片拖拽排序收尾：moved → 弹簧落位动画；未动 → 按点击处理（展开/收起）。
                 // 注意：保留 card_drag（不为 None），这样 paint_page 知道在拖；
                 // step_drag_release 收敛后才清空并触发 rebuild_pages。
@@ -2438,8 +2504,22 @@ fn paint_d2d(hwnd: HWND) -> bool {
     // H2/H3/H4：仍有未收敛动画 → 维持 ANIM_TIMER(16ms) 主时钟直画下一帧。
     // 动画期间提升系统时钟精度到 1ms（SetTimer 粒度默认 15.6ms，不提升则
     // 16ms 表实际抖到 ~31ms）；收敛即停表并恢复，防引用计数泄漏与空转烧 CPU。
+    // 拖拽态（滑杆/卡片/滚动条/按压）同样续表：交互即时反馈不能依赖
+    // WM_PAINT（最低优先级，会被持续 mousemove 无限推迟 → 视觉冻结）。
+    let interaction_dragging = matches!(
+        ctx.interaction,
+        Interaction::Dragging { .. } | Interaction::Pressing { .. }
+    );
     let animating = presented
-        && (anim_active || moving || ctx.page_anim.is_some() || ctx.scroll_vel.abs() > 1.0 || slide_moving || release_moving);
+        && (anim_active
+            || moving
+            || ctx.page_anim.is_some()
+            || ctx.scroll_vel.abs() > 1.0
+            || slide_moving
+            || release_moving
+            || ctx.card_drag.is_some()
+            || ctx.sb_drag.is_some()
+            || interaction_dragging);
     if animating && !ctx.hires {
         unsafe {
             windows::Win32::Media::timeBeginPeriod(1);
@@ -2634,6 +2714,29 @@ fn paint_sidebar(
 /// 浮动滚动条（D3f）：仅当内容高于视口时显示；
 /// 拇指位置 = (-scroll_y) / max_scroll，拇指高 = 视口/内容比例。
 #[allow(clippy::too_many_arguments)]
+/// 滚动条几何（paint_scrollbar 与拖拽命中共用一套公式，防止漂移）。
+struct SbGeom {
+    inset: f32,
+    w: f32,
+    track_h: f32,
+    thumb_h: f32,
+    max_scroll: f32,
+}
+
+fn scrollbar_geom(dpi: u32, _win_w: i32, win_h: i32, content_h: i32) -> Option<SbGeom> {
+    if content_h <= win_h {
+        return None;
+    }
+    let inset = s(dpi, SCROLLBAR_INSET) as f32;
+    let w = s(dpi, SCROLLBAR_W) as f32;
+    let track_h = win_h as f32 - 2.0 * inset;
+    let max_scroll = (content_h - win_h) as f32;
+    let thumb_h = (track_h * win_h as f32 / content_h as f32)
+        .max(s(dpi, 24) as f32)
+        .min(track_h);
+    Some(SbGeom { inset, w, track_h, thumb_h, max_scroll })
+}
+
 fn paint_scrollbar(
     rt: &windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget,
     gfx: &mut Gfx,
@@ -2644,23 +2747,16 @@ fn paint_scrollbar(
     scroll_y: i32,
     content_h: i32,
 ) {
-    if content_h <= win_h {
+    let Some(g) = scrollbar_geom(dpi, win_w, win_h, content_h) else {
         return;
-    }
-    let inset = s(dpi, SCROLLBAR_INSET) as f32;
-    let w = s(dpi, SCROLLBAR_W) as f32;
-    let track_h = win_h as f32 - 2.0 * inset;
-    let max_scroll = (content_h - win_h) as f32;
-    let thumb_h = (track_h * win_h as f32 / content_h as f32)
-        .max(s(dpi, 24) as f32)
-        .min(track_h);
-    let ratio = ((-scroll_y) as f32 / max_scroll).clamp(0.0, 1.0);
-    let top = inset + ratio * (track_h - thumb_h);
-    let x = win_w as f32 - inset - w;
+    };
+    let ratio = ((-scroll_y) as f32 / g.max_scroll).clamp(0.0, 1.0);
+    let top = g.inset + ratio * (g.track_h - g.thumb_h);
+    let x = win_w as f32 - g.inset - g.w;
     gfx.fill_round(
         rt,
-        RectF::new(x, top, x + w, top + thumb_h),
-        w / 2.0,
+        RectF::new(x, top, x + g.w, top + g.thumb_h),
+        g.w / 2.0,
         c(t, t.secondary).with_alpha(0.45),
     );
 }
