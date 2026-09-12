@@ -57,13 +57,19 @@
 | `HINT_EXTRA = 22` | `line_height_base200` ≈ 22 | 22 | ✓ 字阶一致 |
 | `CARD_GAP = 24` | `spacing_horizontal_xxl` | 20 | **冲突**：卡片间距 24 > Fluent xxl=20。<br>**决策**：卡片间距保留 24 |
 
-### 2.3 字号映射
+### 2.3 字号映射（S5 执行时已修订，见决策记录）
 
 | layout.rs 函数 | Fluent Token | 96dpi 值 | 备注 |
 |---|---|---|---|
-| `body_px(dpi)` → 13pt | `font_size_base300` | 14 | 差 1pt，**决策**：统一改为 14（font_size_base300） |
-| `caption_px(dpi)` → 11pt | `font_size_base200` | 12 | 差 1pt，**决策**：统一改为 12（font_size_base200） |
-| 分组标题 | `font_size_base400` | 16 | **新增**：Fluent subtitle |
+| `body_px(dpi)` → 原 13pt(17.33px) | `font_size_base400` | 16 | **S5 修订**：原定 base300(14) 破坏纵向节奏不变式，改取 base400 |
+| `caption_px(dpi)` → 原 11pt(14.67px) | `font_size_base300` | 14 | **S5 修订**：同步上调，配合 HINT_EXTRA 22→20 |
+| 分组标题 | `font_size_base400` | 16 | 用 caption_px 位阶 + 600 字重 |
+
+> **决策修订记录（S5，2026-09-12）**：原映射 body→base300(14)/caption→base200(12)
+> 与"ROW_H=34 保留"决策冲突——纵向节奏不变式（测试 `vertical_rhythm_includes_the_divider`）
+> 要求 body+caption = ROW_H+HINT_EXTRA−24，14+12=26 ≠ 32，强行执行必须连动重排
+> 滑杆行/折叠头/滚轮步长。修订为 base400/base300 + HINT_EXTRA 22→20，
+> 不变式保持成立（9+3=12），改动面收敛为 3 个常量。
 
 ### 2.4 圆角与边框
 

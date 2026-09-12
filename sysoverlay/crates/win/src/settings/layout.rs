@@ -79,7 +79,7 @@ pub const SUB_CARD_GAP: i32 = 14;
 
 /// 卡片四周内边距（上下左右同值）。
 pub const CARD_PAD: i32 = 16;
-/// 分组标题带高度（≥ 标题字号 14.67，否则字会被下一条挤住）。
+/// 分组标题带高度（≥ 标题字号 caption_px(14)，否则字会被下一条挤住）。
 pub const CAPTION_H: i32 = 18;
 /// 分组标题 → 卡片顶缘（小间距，标题属于下面的卡片）。
 pub const CAPTION_GAP: i32 = 8;
@@ -87,9 +87,11 @@ pub const CAPTION_GAP: i32 = 8;
 /// 基础行高 = **控件带**高度（标签 + 控件垂直居中于其中）。
 pub const ROW_H: i32 = 34;
 /// 行内说明（hint）每行附加高度。
-/// 22 > 说明字号 14.67，行盒上下各留 ~3.7px，与标签之间自然形成 ~12px 视觉间距
-/// （旧值 20 与标签几乎贴住）。
-pub const HINT_EXTRA: i32 = 22;
+/// 20 > 说明字号 14（Fluent base300），行盒上下各留 ~3px。
+/// S5 字阶 Fluent 化时由 22 调来：body(16)+caption(14)=30 后，
+/// 需 ROW_H+HINT_EXTRA = 24+30 = 54 才能维持纵向节奏不变式
+/// （label_pad + hint_pad = ROW_GAP，见 vertical_rhythm 测试）。
+pub const HINT_EXTRA: i32 = 20;
 /// 行与行之间的空隙（卡片内部）。分隔线画在空隙正中。
 pub const ROW_GAP: i32 = 12;
 /// 滑杆行控件带高度：控件线（居中于首 ROW_H）+ 下方 min/max 端点标注。
@@ -103,7 +105,9 @@ pub const ROW_HEADER_H: i32 = 52;
 /// 下列沿用：
 pub const BOTTOM_MARGIN: i32 = 20;
 pub const WIDGET_H: i32 = 24;
-pub const CARD_RADIUS: i32 = 10;
+/// 卡片圆角（逻辑 px）。S5 起 = Fluent border_radius_medium（4），
+/// 与按钮/步进器/分段控件的 4px 统一。
+pub const CARD_RADIUS: i32 = 4;
 pub const LABEL_W: i32 = 120;
 pub const TOGGLE_W: i32 = 40;
 pub const VALUEBOX_W: i32 = 64;
@@ -153,14 +157,17 @@ pub fn label_band(base_h: i32, dpi: u32) -> i32 {
 
 // ── 字号（DIP；全设置页唯一来源，mod/widget 一律从这里取） ──
 
-/// 正文字号（13pt @ 96dpi）。
+/// 正文字号 = Fluent `font_size_base400`（16 DIP）。
+/// S5 决策记录：映射表原定 base300(14)，但纵向节奏不变式要求
+/// body+caption = ROW_H+HINT_EXTRA−24（原 17.33+14.67=32），14+12 会破坏节奏
+/// 且迫使 ROW_H 连动重排。故取最接近现有尺寸的 base400，"字号偏小"反馈史不背刺。
 pub fn body_px(dpi: u32) -> f32 {
-    13.0 * dpi as f32 / 72.0
+    super::fluent::tokens::FLUENT.light.font_size_base400 * dpi as f32 / 96.0
 }
 
-/// 说明 / 次级字号（11pt @ 96dpi）。
+/// 说明 / 次级字号 = Fluent `font_size_base300`（14 DIP）。
 pub fn caption_px(dpi: u32) -> f32 {
-    11.0 * dpi as f32 / 72.0
+    super::fluent::tokens::FLUENT.light.font_size_base300 * dpi as f32 / 96.0
 }
 
 /// 分隔线相对下一行顶缘的**上移量**（物理像素）。
@@ -169,14 +176,14 @@ pub fn caption_px(dpi: u32) -> f32 {
 /// 线上方是上一行的最后一行字、下方是下一行的标签，两侧视觉距离必须相等。
 ///
 /// 行盒都是 vcenter 的，墨迹上下各留 `(盒高 − 字号) / 2`：
-///   - 上方有说明 = 说明行盒 `HINT_EXTRA`(22) 与说明字号(14.67) → 3.7
-///   - 上方无说明 = 控件带 `ROW_H`(34) 与标签字号(17.33) → 8.3
-///   - 下方恒为 控件带 `ROW_H` 与标签字号 → 8.3
+///   - 上方有说明 = 说明行盒 `HINT_EXTRA`(20) 与说明字号(14) → 3
+///   - 上方无说明 = 控件带 `ROW_H`(34) 与标签字号(16) → 9
+///   - 下方恒为 控件带 `ROW_H` 与标签字号 → 9
 ///
 /// 在 ROW_GAP 中点的基础上再补两侧留白差值的一半：
 /// `rise = ROW_GAP/2 − (pad_below − pad_above)/2`。
 ///
-/// 当前字号下（96 dpi）说明在上方时 rise = 3.67，于是
+/// 当前字号下（96 dpi）说明在上方时 rise = 3，于是
 /// 「说明墨迹底 → 线」=「线 → 标签墨迹顶」=「标签墨迹底 → 说明墨迹顶」= **12**，
 /// 全页每一个纵向间隔都相等 —— 这才叫「间距相同」。
 pub fn divider_rise(dpi: u32, above_has_hint: bool) -> f32 {
@@ -1132,8 +1139,9 @@ mod spacing_tests {
         assert!(ROW_GAP < CARD_PAD);
         assert!(CARD_PAD < CARD_GAP);
         // 行盒必须放得下自己的字号，否则字会被行盒挤住（「贴到一起」的根因之一）。
-        assert!((HINT_EXTRA as f32) > 14.67, "说明行高放不下说明字号");
-        assert!((CAPTION_H as f32) > 14.67, "分组标题带放不下标题字号");
-        assert!((ROW_H as f32) > 17.34, "基础行高放不下正文标签");
+        // 直接引用字号函数（而非写字面量）——字阶调整时测试自动跟随。
+        assert!((HINT_EXTRA as f32) > caption_px(D), "说明行高放不下说明字号");
+        assert!((CAPTION_H as f32) > caption_px(D), "分组标题带放不下标题字号");
+        assert!((ROW_H as f32) > body_px(D), "基础行高放不下正文标签");
     }
 }
