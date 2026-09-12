@@ -32,30 +32,61 @@ static RENDER_QUEUED: AtomicBool = AtomicBool::new(false);
 static RENDER_CFG: Mutex<Option<Config>> = Mutex::new(None);
 
 /// 启动渲染线程。**必须在窗口创建前调用**，否则首帧渲染请求无人消费。
+/// 幂等：看门狗自愈（[`respawn`]）复用同一路径重建通道 + 线程。
 pub fn start() {
     let (tx, rx) = mpsc::channel::<isize>();
     if let Ok(mut g) = RENDER_TX.lock() {
         *g = Some(tx);
     }
+    RENDER_QUEUED.store(false, Ordering::Relaxed);
     let _ = std::thread::Builder::new()
         .name("overlay-render".into())
         .spawn(move || {
-            while let Ok(hwnd_addr) = rx.recv() {
+            loop {
+                let Ok(hwnd_addr) = rx.recv() else {
+                    crate::probe::log("rt: channel closed -> exit");
+                    return;
+                };
                 // 先清「已排队」标记再渲染：渲染期间到达的新请求会重新入队，
                 // 不会被本次渲染吞掉。
                 RENDER_QUEUED.store(false, Ordering::Relaxed);
-                let cfg = match RENDER_CFG.lock() {
-                    Ok(g) => match *g {
-                        Some(c) => c,
-                        None => continue,
-                    },
-                    Err(_) => continue,
-                };
-                let snap = crate::window::snap_get();
-                let hwnd = HWND(hwnd_addr as *mut _);
-                crate::gdi::render(hwnd, &snap, &cfg);
+                crate::probe::log_lazy(|| format!("rt wake hwnd={hwnd_addr}"));
+                // panic 兜底：此前线程 panic 会静默死亡 → 悬浮窗永久冻结
+                // （采样线程继续发请求但无人消费）。捕获后记日志继续跑。
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    render_once(hwnd_addr);
+                }));
+                if outcome.is_err() {
+                    crate::probe::log("rt: PANIC caught, thread survives");
+                }
             }
         });
+}
+
+/// 单次渲染：读配置镜像 + 快照 → gdi::render。
+/// RENDER_CFG 中毒（一次性 panic 污染）时 `into_inner` 恢复，
+/// 不再 `continue` 静默跳过（那会让后续所有帧永久消失）。
+fn render_once(hwnd_addr: isize) {
+    let cfg = match RENDER_CFG.lock() {
+        Ok(g) => *g,
+        Err(p) => {
+            crate::probe::log("rt: RENDER_CFG poisoned -> recovering inner value");
+            *p.into_inner()
+        }
+    };
+    let Some(cfg) = cfg else { return };
+    let snap = crate::window::snap_get();
+    let hwnd = HWND(hwnd_addr as *mut _);
+    crate::gdi::render(hwnd, &snap, &cfg);
+}
+
+/// 看门狗自愈入口：渲染线程停摆（挂起/死亡）>30s 后重建通道与线程。
+/// 旧线程若仍挂起则遗留（不再触碰新通道）；DIB/D2D RT 由新线程
+/// 首次渲染时的尺寸检查自愈。由采样线程在
+/// [`crate::gdi::render_watchdog_tick`] 返回 true 时调用。
+pub fn respawn() {
+    crate::probe::log("rt respawn: rebuilding render thread after stall");
+    start();
 }
 
 /// UI 线程调用：发布最新配置 + 投递渲染请求（同帧多次请求合并为一次）。

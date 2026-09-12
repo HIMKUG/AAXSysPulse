@@ -211,6 +211,38 @@ fn take_force_full() -> bool {
 /// 「确有新请求」与「秒对齐时钟的例行唤醒」——后者若无事可做直接返回。
 static RENDER_EPOCH: AtomicU64 = AtomicU64::new(0);
 static HANDLED_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// 渲染看门狗：请求纪元首次领先受理纪元的时刻（0 = 无积压）。
+static WATCHDOG_PENDING_MS: AtomicU64 = AtomicU64::new(0);
+/// 停摆 >10s 的日志只打一次（直到恢复）。
+static WATCHDOG_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 采样线程每轮调用：检测渲染线程停摆（挂起/死亡/静默跳过）。
+/// 判据 = 请求纪元领先受理纪元持续不消（任何被消费的帧——完整渲染或
+/// HASH-SKIP——都会把 HANDLED_EPOCH 追平）。
+/// 返回 true = 停摆超过 30s，调用方应 [`crate::render_thread::respawn`]。
+pub fn render_watchdog_tick(now_ms: u64) -> bool {
+    const STALL_LOG_MS: u64 = 10_000;
+    const STALL_RESPAWN_MS: u64 = 30_000;
+    let pending = RENDER_EPOCH.load(AtomicOrdering::Relaxed)
+        != HANDLED_EPOCH.load(AtomicOrdering::Relaxed);
+    if !pending {
+        WATCHDOG_PENDING_MS.store(0, AtomicOrdering::Relaxed);
+        WATCHDOG_LOGGED.store(false, AtomicOrdering::Relaxed);
+        return false;
+    }
+    let first = WATCHDOG_PENDING_MS.load(AtomicOrdering::Relaxed);
+    if first == 0 {
+        WATCHDOG_PENDING_MS.store(now_ms, AtomicOrdering::Relaxed);
+        return false;
+    }
+    let stalled_for = now_ms.saturating_sub(first);
+    if stalled_for > STALL_LOG_MS && !WATCHDOG_LOGGED.swap(true, AtomicOrdering::Relaxed) {
+        crate::probe::log(&format!(
+            "render watchdog: epoch unhandled for {stalled_for}ms (render thread stalled?)"
+        ));
+    }
+    stalled_for > STALL_RESPAWN_MS
+}
 
 /// 请求悬浮窗重绘：纪元自增 + 消息唤醒。
 /// 所有非时钟驱动的重绘请求（快照推送 / 设置变更 / 自愈扩缩窗）都必须走
@@ -288,6 +320,10 @@ const MAX_WIN: i32 = 2048;
 /// 不 `UpdateLayeredWindow`。静止的机器上这会把渲染开销打到 0。
 pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
     let t0 = perf::begin();
+    // 渲染入口探针（14:44:04 冻结定位）：rt wake 有而本行无 → 挂在
+    // render_once 预处理（RENDER_CFG/snap_get）；本行有而 d2d render cfg
+    // 无 → 挂在下方 gap（alpha/尺寸/引擎检测）。
+    crate::probe::log_lazy(|| "render enter".to_string());
     unsafe {
         // 本地时钟 → ui::clock（时间行数据源）。每次渲染前同步；
         // 时间文本进 cell 指纹，秒变化经脏检查只重绘时间 cell（脏渲染）。

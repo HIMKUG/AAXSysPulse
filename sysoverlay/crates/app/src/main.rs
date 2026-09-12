@@ -345,6 +345,12 @@ fn main() {
 
             let now_ms = get_tick_count_ms();
 
+            // 渲染看门狗：请求纪元 >30s 无消费 → 重建渲染线程（自愈）。
+            // 10s 时先打 probe 日志留证，30s 恢复显示，最多冻结 30 秒。
+            if sysoverlay_win::gdi::render_watchdog_tick(now_ms) {
+                sysoverlay_win::render_thread::respawn();
+            }
+
             // 源启停转换：禁用 → 释放后端资源（驱动服务/厂商库/缓存）；
             // 启用 → 重置基线防毛刺。Power 行刚关时置 flush 标记，
             // 下一帧把 prev 快照里的旧瓦数覆盖成 Unavailable（行显示 --）。
