@@ -1144,4 +1144,34 @@ mod spacing_tests {
         assert!((CAPTION_H as f32) > caption_px(D), "分组标题带放不下标题字号");
         assert!((ROW_H as f32) > body_px(D), "基础行高放不下正文标签");
     }
+
+    /// `build_pages` 重建预算（后端体检 P1 的测量门禁）：
+    /// 重建是事件驱动（配置变更/折叠/拖拽落位/切语言），不逐帧执行，
+    /// 因此预算宽松——目的是**锁住回归**（有人往循环里塞分配/重活立刻可见），
+    /// 并在 release 下打印真实耗时供决策参考。
+    #[test]
+    fn page_rebuild_is_within_budget() {
+        // 预热（首跑含页标题查表等冷路径，不代表稳态）。
+        let _ = build_all(0.0);
+        let _ = build_all(1.0);
+
+        // 两种展开态各测 50 次取最小值（排除调度抖动）。
+        let mut best_collapsed = f64::MAX;
+        let mut best_expanded = f64::MAX;
+        for _ in 0..50 {
+            let t = std::time::Instant::now();
+            let _ = build_all(0.0);
+            best_collapsed = best_collapsed.min(t.elapsed().as_secs_f64() * 1e6);
+
+            let t = std::time::Instant::now();
+            let _ = build_all(1.0);
+            best_expanded = best_expanded.min(t.elapsed().as_secs_f64() * 1e6);
+        }
+        println!(
+            "rebuild_pages collapsed={best_collapsed:.0}µs expanded={best_expanded:.0}µs (release 下供参考)"
+        );
+        // 全部 6 页 × 全部控件的整体重建 < 5ms（release 实测通常远低于此）。
+        // 超预算说明有人在 build_pages 循环里加了重活，先测量再优化。
+        assert!(best_expanded < 5_000.0, "页面重建超预算：{best_expanded:.0}µs");
+    }
 }
