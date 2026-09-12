@@ -88,9 +88,100 @@ fn svg_path_data(src: &str) -> &str {
     }
 }
 
-/// 极简 SVG path 解析：支持 `M/m L/l H/h V/v C/c S/s Q/q T/t Z/z`。
-/// 二次贝塞尔（Q/T）统一升阶为三次（C），因此下游只需一种曲线段。
-/// 未知命令（如圆弧 A）的参数会被跳过，不影响其余子路径。
+/// SVG 椭圆弧端点参数化 → 圆心参数化（W3C 规范 F.6.5），切分 ≤90° 段，
+/// 每段升为三次贝塞尔（kappa = 4/3·tan(Δθ/4)）。PathSeg 无弧段类型，
+/// 这是 Fluent 图标（大量圆弧）能被本模块消费的唯一通路。
+fn arc_to_cubics(
+    out: &mut Vec<PathSeg>,
+    x1: f32,
+    y1: f32,
+    rx: f32,
+    ry: f32,
+    rot_deg: f32,
+    large: bool,
+    sweep: bool,
+    x2: f32,
+    y2: f32,
+) {
+    if rx <= 0.0 || ry <= 0.0 {
+        out.push(PathSeg::Line(x2, y2));
+        return;
+    }
+    let (rx, ry) = (rx.abs(), ry.abs());
+    let phi = rot_deg.to_radians();
+    let (sin_phi, cos_phi) = phi.sin_cos();
+    // F.6.5.1：端点 → 椭圆局部坐标
+    let (dx2, dy2) = ((x1 - x2) / 2.0, (y1 - y2) / 2.0);
+    let x1p = cos_phi * dx2 + sin_phi * dy2;
+    let y1p = -sin_phi * dx2 + cos_phi * dy2;
+    // F.6.5.2：半径不足以跨越弦长时等比放大
+    let lambda = x1p * x1p / (rx * rx) + y1p * y1p / (ry * ry);
+    let (rx, ry) = if lambda > 1.0 {
+        let s = lambda.sqrt();
+        (rx * s, ry * s)
+    } else {
+        (rx, ry)
+    };
+    // F.6.5.3：圆心
+    let sign = if large != sweep { 1.0 } else { -1.0 };
+    let num = rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p;
+    let den = rx * rx * y1p * y1p + ry * ry * x1p * x1p;
+    let co = if den.abs() < 1e-12 {
+        0.0
+    } else {
+        sign * (num / den).max(0.0).sqrt()
+    };
+    let cxp = co * rx * y1p / ry;
+    let cyp = -co * ry * x1p / rx;
+    let cx0 = cos_phi * cxp - sin_phi * cyp + (x1 + x2) / 2.0;
+    let cy0 = sin_phi * cxp + cos_phi * cyp + (y1 + y2) / 2.0;
+    // F.6.5.4：起角与扫角
+    let angle = |ux: f32, uy: f32, vx: f32, vy: f32| -> f32 {
+        let dot = ux * vx + uy * vy;
+        let len = (ux * ux + uy * uy).sqrt() * (vx * vx + vy * vy).sqrt();
+        let mut a = (if len.abs() < 1e-12 { 0.0 } else { dot / len })
+            .clamp(-1.0, 1.0)
+            .acos();
+        if ux * vy - uy * vx < 0.0 {
+            a = -a;
+        }
+        a
+    };
+    let (ux1, uy1) = ((x1p - cxp) / rx, (y1p - cyp) / ry);
+    let (ux2, uy2) = ((-x1p - cxp) / rx, (-y1p - cyp) / ry);
+    let theta1 = angle(1.0, 0.0, ux1, uy1);
+    let mut dtheta = angle(ux1, uy1, ux2, uy2);
+    if !sweep && dtheta > 0.0 {
+        dtheta -= 2.0 * std::f32::consts::PI;
+    } else if sweep && dtheta < 0.0 {
+        dtheta += 2.0 * std::f32::consts::PI;
+    }
+    // 切分 ≤90° 并升阶。注意 sin_cos() 返回 (sin, cos)，先解构再按正余弦使用。
+    let n = ((dtheta.abs() / (std::f32::consts::FRAC_PI_2)).ceil() as usize).max(1);
+    let delta = dtheta / n as f32;
+    let t = 4.0 / 3.0 * (delta / 4.0).tan();
+    let mut th = theta1;
+    for _ in 0..n {
+        let th2 = th + delta;
+        let (s1, c1) = th.sin_cos();
+        let (s2, c2) = th2.sin_cos();
+        let px = |ex: f32, ey: f32| {
+            (
+                cx0 + rx * ex * cos_phi - ry * ey * sin_phi,
+                cy0 + rx * ex * sin_phi + ry * ey * cos_phi,
+            )
+        };
+        let (ex, ey) = px(c2, s2);
+        let (c1x, c1y) = px(c1 - t * s1, s1 + t * c1);
+        let (c2x, c2y) = px(c2 + t * s2, s2 - t * c2);
+        out.push(PathSeg::Cubic(c1x, c1y, c2x, c2y, ex, ey));
+        th = th2;
+    }
+}
+
+/// 极简 SVG path 解析：支持 `M/m L/l H/h V/v C/c S/s Q/q T/t A/a Z/z`。
+/// 二次贝塞尔（Q/T）与椭圆弧（A，W3C F.6.5 升阶）统一转为三次（C），
+/// 因此下游只需一种曲线段。未知命令的参数会被跳过，不影响其余子路径。
 fn parse(d: &str) -> Vec<PathSeg> {
     let mut out: Vec<PathSeg> = Vec::new();
     let bytes = d.as_bytes();
@@ -144,6 +235,30 @@ fn parse(d: &str) -> Vec<PathSeg> {
             return None;
         }
         d[s..*i].parse::<f32>().ok()
+    };
+
+    // 读取弧标记（恰一个 '0'/'1' 字符）。SVG 允许标记与后续数字紧邻（如 "01.5"），
+    // 用 read_num 读会把 "01" 吞成一个数，必须按单字符读。
+    let read_flag = |i: &mut usize| -> Option<bool> {
+        while *i < bytes.len() {
+            let c = bytes[*i] as char;
+            if c == ',' || c.is_ascii_whitespace() {
+                *i += 1;
+            } else {
+                break;
+            }
+        }
+        match bytes.get(*i) {
+            Some(b'0') => {
+                *i += 1;
+                Some(false)
+            }
+            Some(b'1') => {
+                *i += 1;
+                Some(true)
+            }
+            _ => None,
+        }
     };
 
     // 二次 → 三次升阶。
@@ -301,7 +416,28 @@ fn parse(d: &str) -> Vec<PathSeg> {
                 cx = sx;
                 cy = sy;
             }
-            // 未支持命令（如 A 圆弧）：跳过其参数，保持解析继续。
+            'a' => {
+                // SVG 椭圆弧（Fluent 图标大量使用）→ 升为 ≤90° 的三次贝塞尔段。
+                // 参数组：rx ry rot large sweep x y，可连续重复（隐式重复同一命令）。
+                loop {
+                    let (Some(rx), Some(ry), Some(rot)) =
+                        (read_num(&mut i), read_num(&mut i), read_num(&mut i))
+                    else {
+                        break;
+                    };
+                    let (Some(large), Some(sweep)) = (read_flag(&mut i), read_flag(&mut i)) else {
+                        break;
+                    };
+                    let (Some(ax), Some(ay)) = (read_num(&mut i), read_num(&mut i)) else {
+                        break;
+                    };
+                    let (ex, ey) = if rel { (cx + ax, cy + ay) } else { (ax, ay) };
+                    arc_to_cubics(&mut out, cx, cy, rx, ry, rot, large, sweep, ex, ey);
+                    cx = ex;
+                    cy = ey;
+                }
+            }
+            // 未支持命令：跳过其参数，保持解析继续。
             _ => {
                 while i < bytes.len() && !(bytes[i] as char).is_ascii_alphabetic() {
                     i += 1;
@@ -387,5 +523,49 @@ mod tests {
         assert_eq!(segs[1], PathSeg::Line(15.0, 10.0));
         assert_eq!(segs[2], PathSeg::Line(15.0, 15.0));
         assert_eq!(segs[3], PathSeg::Close);
+    }
+
+    #[test]
+    fn semicircle_arc_becomes_two_cubics() {
+        // 半圆（弦长 = 直径）切成两段 90° 贝塞尔，终点精确落位。
+        let segs = parse("M0 0A1 1 0 0 1 2 0");
+        assert_eq!(segs[0], PathSeg::Move(0.0, 0.0));
+        let n_cubic = segs.iter().filter(|s| matches!(s, PathSeg::Cubic(..))).count();
+        assert_eq!(n_cubic, 2, "半圆应切成两段 90° 贝塞尔，实际 {segs:?}");
+        if let Some(PathSeg::Cubic(_, _, _, _, x, y)) = segs.last() {
+            assert!((x - 2.0).abs() < 1e-4 && y.abs() < 1e-4, "弧终点漂移 ({x},{y})");
+        }
+        // sweep=1 在 y-down 坐标系里应向上（负 y）隆起。
+        if let Some(PathSeg::Cubic(_, _, _, _, x, y)) = segs.get(1) {
+            assert!((x - 1.0).abs() < 1e-4 && *y < -0.9, "隆起方向错误 ({x},{y})");
+        }
+    }
+
+    #[test]
+    fn zero_radius_arc_degrades_to_line() {
+        let segs = parse("M0 0A0 0 0 0 1 5 5");
+        assert_eq!(segs[1], PathSeg::Line(5.0, 5.0));
+    }
+
+    #[test]
+    fn fluent_chevron_down_16_parses_with_arcs() {
+        // Quel'Thalas chevron_down_16_regular 原串：相对命令 + 紧邻小数 + 弧标记。
+        let d = "M3.15 5.65c.2-.2.5-.2.7 0L8 9.79l4.15-4.14a.5.5 0 0 1 .7.7l-4.5 4.5a.5.5 0 0 1-.7 0l-4.5-4.5a.5.5 0 0 1 0-.7Z";
+        let segs = parse(d);
+        assert_eq!(*segs.last().unwrap(), PathSeg::Close, "解析中断，{segs:?}");
+        let n_cubic = segs.iter().filter(|s| matches!(s, PathSeg::Cubic(..))).count();
+        // 弧1 弦长0.99≈直径→164°切2段；弧2/3 弦长0.7→89°各1段；加起始 1 段贝塞尔 = 5。
+        assert_eq!(n_cubic, 5, "实际 {n_cubic}");
+        // 锚点全部落在 0..16 viewBox 内（圆弧升阶无信息漂移）。
+        for s in segs {
+            let check = |x: f32, y: f32| {
+                assert!((-0.1..=16.1).contains(&x) && (-0.1..=16.1).contains(&y), "越界 ({x},{y})");
+            };
+            match s {
+                PathSeg::Move(x, y) | PathSeg::Line(x, y) => check(x, y),
+                PathSeg::Cubic(_, _, _, _, x, y) => check(x, y),
+                PathSeg::Close => {}
+            }
+        }
     }
 }

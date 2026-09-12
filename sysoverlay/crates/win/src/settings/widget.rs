@@ -838,21 +838,45 @@ fn paint_slider(
     // 用户反馈：数值框原来按整行矩形居中，滑杆行 46 时比标签低 16px，看着不齐。
     let ctrl_cy = r.t + super::layout::s(dpi, super::layout::ROW_H) as f32 / 2.0;
     let track_y = ctrl_cy;
-    let th = super::layout::s(dpi, 2).max(1) as f32;
-    gfx.line(rt, tr.l, track_y, tr.r, track_y, c(t, t.segmented_bg), th);
+    // Fluent slider 几何（slider.rs 拆壳移植，S3）：轨道 4px 圆角胶囊，
+    // 旋钮 ⌀20 = 外圈 1px + 白盘 ⌀18 + 品牌内点 ⌀12；悬停/按压切 compound 端点色。
+    let ft = if t.dark {
+        &super::fluent::tokens::FLUENT.dark
+    } else {
+        &super::fluent::tokens::FLUENT.light
+    };
+    let hovered = state.hover_t > 0.5;
+    let pressed = state.press_t > 0.5;
+    let brand = if pressed {
+        ft.color_compound_brand_background_pressed
+    } else if hovered {
+        ft.color_compound_brand_background_hover
+    } else {
+        ft.color_compound_brand_background
+    };
+    let rail_h = super::layout::s(dpi, 4).max(1) as f32;
+    let rail_r = rail_h / 2.0;
+    let rail_fill = if metric_style { c(t, t.segmented_bg) } else { ft.color_neutral_stroke_accessible };
+    gfx.fill_round(rt, RectF::new(tr.l, track_y - rail_r, tr.r, track_y + rail_r), rail_r, rail_fill);
     let frac = slider_t_from_value(anim as f64, min as f64, max as f64);
     let cx = (tr.l + frac * tr.w()).clamp(tr.l, tr.r);
-    let fill_color = if metric_style { c(t, t.toggle_on) } else { c(t, t.accent) };
+    let fill_color = if metric_style { c(t, t.toggle_on) } else { brand };
     if cx > tr.l + 0.5 {
-        gfx.line(rt, tr.l, track_y, cx, track_y, fill_color, th);
+        gfx.fill_round(rt, RectF::new(tr.l, track_y - rail_r, cx, track_y + rail_r), rail_r, fill_color);
     }
-    let thumb_d = super::layout::s(dpi, 13) as f32;
-    let thumb_r = RectF::new(cx - thumb_d / 2.0, track_y - thumb_d / 2.0, cx + thumb_d / 2.0, track_y + thumb_d / 2.0);
+    // 旋钮三层圆盘（Gfx 无描边椭圆，外圈用大盘压出细环）。
+    let thumb_d = super::layout::s(dpi, 20) as f32;
+    let dot_d = super::layout::s(dpi, 12) as f32;
+    let mid_d = thumb_d - 2.0 * super::layout::s(dpi, 1) as f32;
+    let disc = |d: f32| RectF::new(cx - d / 2.0, track_y - d / 2.0, cx + d / 2.0, track_y + d / 2.0);
     if metric_style {
-        // 白圈滑块（理想布局）。
-        gfx.fill_ellipse(rt, thumb_r, c(t, t.knob));
+        // 个性化页「白圈滑块」（用户反馈样式）：白盘 + 绿内点，无灰环。
+        gfx.fill_ellipse(rt, disc(thumb_d), c(t, t.knob));
+        gfx.fill_ellipse(rt, disc(dot_d), c(t, t.toggle_on));
     } else {
-        gfx.fill_ellipse(rt, thumb_r, c(t, t.accent));
+        gfx.fill_ellipse(rt, disc(thumb_d), ft.color_neutral_stroke1);
+        gfx.fill_ellipse(rt, disc(mid_d), ft.color_neutral_background1);
+        gfx.fill_ellipse(rt, disc(dot_d), brand);
     }
 
     // 端点标注（报告 B-05：每个滑块必须有可见的 min / max 端点）。
