@@ -177,6 +177,13 @@ fn main() {
                 owned = Some(h);
                 break;
             }
+            // 第二次启动（正常模式，非 restart/elevated）：持有互斥体期间通知
+            // 主实例显示/开设置，然后立即退出。
+            if !elevated && !restart {
+                let _ = aaxsyspulse_win::window::handle_second_instance();
+                let _ = CloseHandle(h);
+                std::process::exit(0);
+            }
             let _ = CloseHandle(h);
             if elevated || restart {
                 std::thread::sleep(std::time::Duration::from_millis(100));

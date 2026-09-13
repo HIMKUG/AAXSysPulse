@@ -25,7 +25,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, DestroyWindow,
-    IsWindowVisible, PostQuitMessage, RegisterClassExW,
+    GetClassNameW, IsWindowVisible, PostQuitMessage, RegisterClassExW,
     SetWindowPos, ShowWindow,
     TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW,
     LoadCursorW, MSG, SWP_NOACTIVATE, SWP_NOZORDER, SWP_NOSIZE,
@@ -1031,4 +1031,80 @@ impl Drop for OverlayWindow {
         }
         // state Box drops here automatically
     }
+}
+
+/// 用 FindWindowW 按窗口类名找悬浮窗句柄（第二次启动时主实例已运行，无需新建）。
+/// 返回值需要用户确认存在后再使用；句柄不归调用方所有，无需 CloseHandle。
+fn find_overlay_hwnd() -> Option<HWND> {
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+        use windows::Win32::Foundation::BOOL;
+        use std::sync::Mutex;
+
+        let result: Box<Mutex<Option<HWND>>> = Box::new(Mutex::new(None));
+        // Box 指针转 u64 再塞进 LPARAM，避免 LPARAM 包装类型的 as 转换限制。
+        let result_ptr = Box::into_raw(result) as u64;
+
+        extern "system" {
+            fn EnumWindows(
+                lpEnumFunc: Option<unsafe extern "system" fn(HWND, LPARAM) -> BOOL>,
+                lParam: LPARAM,
+            ) -> BOOL;
+        }
+
+        unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            // LPARAM → Box：lparam.0 拿内层 i64，转 u64 再转回裸指针
+            let raw = lparam.0 as isize as u64;
+            let result = &*(raw as *const Mutex<Option<HWND>>);
+            let mut buf = [0u16; 256];
+            let len = GetClassNameW(hwnd, &mut buf);
+            let class_name = windows::core::w!("AAXSysPulse_WndClass");
+            let matches = len > 0
+                && buf[..len as usize]
+                    .iter()
+                    .zip(class_name.as_wide().iter())
+                    .all(|(a, b)| (*a as u8).to_ascii_lowercase() == (*b as u8).to_ascii_lowercase());
+            if matches {
+                if let Ok(mut r) = result.lock() {
+                    *r = Some(hwnd);
+                }
+                return BOOL(0);
+            }
+            BOOL(1)
+        }
+
+        let _ = EnumWindows(Some(enum_proc), LPARAM(result_ptr as isize));
+        // 回调已执行完，reconstruct Box 并取结果
+        let result = Box::from_raw(result_ptr as *mut Mutex<Option<HWND>>);
+        result.lock().ok().and_then(|g| *g)
+    }
+}
+
+/// 第二次启动时的行为决策：
+/// - 悬浮窗隐藏 → 显示悬浮窗（用户可能想查看数据）
+/// - 悬浮窗显示 → 打开设置页（用户明确想改设置）
+///
+/// 返回值：第二实例应立即退出（老窗口已处理）。
+pub fn handle_second_instance() -> bool {
+    match find_overlay_hwnd() {
+        Some(hwnd) => {
+            let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
+            crate::probe::log(&format!(
+                "second_instance: hwnd={:#x} visible={} -> {}",
+                hwnd.0 as usize, visible,
+                if visible { "open settings" } else { "show overlay" }
+            ));
+            if visible {
+                crate::settings::open_settings(hwnd);
+            } else {
+                unsafe { let _ = ShowWindow(hwnd, SW_SHOW); }
+            }
+        }
+        None => {
+            // 找不到窗口：主实例还在初始化（尚未 RegisterClassEx）。
+            // 第二实例退出，让主实例继续；下次双击时窗口已就绪。
+            crate::probe::log("second_instance: hwnd not found (main still starting?)");
+        }
+    }
+    true
 }

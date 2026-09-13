@@ -52,9 +52,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect,
-    LoadCursorW, PostMessageW, RegisterClassExW, SetCursor, SetWindowPos, ShowWindow, HCURSOR,
-    IDC_HAND, MINMAXINFO, SW_HIDE, SW_SHOW, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, WINDOW_EX_STYLE, WNDCLASSEXW, WS_MINIMIZEBOX, WS_POPUP,
+    LoadCursorW, PostMessageW, RegisterClassExW, SetCursor, SetForegroundWindow, SetWindowPos,
+    ShowWindow, HCURSOR, HWND_TOP, IDC_HAND, MINMAXINFO, SW_HIDE, SW_SHOW, HWND_NOTOPMOST,
+    HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WINDOW_EX_STYLE, WNDCLASSEXW,
+    WS_MINIMIZEBOX, WS_POPUP,
 };
 
 use crate::gfx_d2d::{ColorF, Gfx, HAlign, RectF};
@@ -441,6 +442,9 @@ pub fn open_settings(overlay: HWND) {
                 // 取消延迟销毁定时器（用户主动重新打开 = 保留窗口）。
                 kill_timer(hwnd, DESTROY_TIMER);
                 let _ = ShowWindow(hwnd, SW_SHOW);
+                // 置于前台：overlay 是 TOPMOST，settings 需要主动抢焦点。
+                let _ = SetForegroundWindow(hwnd);
+                let _ = SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
             }
             return;
         }
@@ -590,6 +594,9 @@ fn create_dialog(overlay: HWND) {
         SETTINGS_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
         crate::probe::log(&format!("settings hwnd=0x{:x} w={w} h={h}", hwnd.0 as usize));
         let _ = ShowWindow(hwnd, SW_SHOW);
+        // 置于前台：overlay 是 TOPMOST，settings 需要主动抢焦点。
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
     }
 }
 
