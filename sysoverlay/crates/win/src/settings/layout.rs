@@ -24,7 +24,7 @@
 use aaxsyspulse_core::config::Config;
 use aaxsyspulse_core::types::Lang;
 
-use super::cfg_ref::{CfgRef, Value};
+use super::cfg_ref::CfgRef;
 use super::state::{Card, Page, Row, Widget};
 use super::widget::{
     AboutHeaderWidget, ButtonAction, ButtonKind, ButtonWidget, DisclosureWidget,
@@ -546,8 +546,6 @@ fn page_metrics(
             }
             let e = expand.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
             let expanded = e > 0.5;
-            // 该指标是否显示：折叠头据此画「已关闭」标记（开关本身在展开区）。
-            let on = matches!(metric_cfg[i].get(cfg), Value::Bool(true));
             let mut rows: Vec<RowDef> = Vec::new();
             // 折叠头：抓手点阵 + 标题（画在 MetricHeaderWidget 内）
             // + 圆形展开按钮（贴右缘）。
@@ -563,7 +561,7 @@ fn page_metrics(
                 items: vec![
                     ux.item(
                         208 + i as i32 * 10,
-                        Box::new(MetricHeaderWidget { index: i, on, lang: ux.lang }),
+                        Box::new(MetricHeaderWidget { index: i, lang: ux.lang }),
                         ux.rows_l,
                         ux.widget_r - ICON_BTN as f32,
                         true,
