@@ -546,6 +546,16 @@ fn main() {
                         max_delta,
                         mode_active as u32,
                     );
+                    if aaxsyspulse_win::probe::enabled() {
+                        aaxsyspulse_win::probe::log(&format!(
+                            "commit seq={seq} mode={} max_delta={max_delta:.1} util={:?} power={:?} net={} cpu={:?}",
+                            mode_active as u8,
+                            committed.util,
+                            committed.power,
+                            committed.net.rx_bps.saturating_add(committed.net.tx_bps),
+                            committed.cpu,
+                        ));
+                    }
                     // 快照推送 = 确有新内容：走 request_render（自增渲染纪元），
                     // 悬浮窗快速跳过路径据此区分新快照与时钟例行唤醒。
                     aaxsyspulse_win::gdi::request_render(overlay_hwnd);
