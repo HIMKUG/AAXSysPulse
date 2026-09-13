@@ -1,7 +1,7 @@
 //! 托盘「快速重启」：杀掉当前进程并以同路径拉起新实例。
 //!
 //! 新实例走正常启动路径（main.rs），会重新加载 MSR 驱动服务
-//! （`SysOverlayWinRing0`，`msr.rs` 幂等 `OpenService`+`StartService`）与采样线程，
+//! （`AAXSysPulseWinRing0`，`msr.rs` 幂等 `OpenService`+`StartService`）与采样线程，
 //! 因此「杀掉并拉起所有驱动及其服务」由一次干净的重启天然保证。
 
 use std::os::windows::ffi::OsStrExt;

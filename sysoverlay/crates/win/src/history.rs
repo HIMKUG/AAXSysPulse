@@ -5,8 +5,8 @@
 use std::sync::{Arc, OnceLock};
 
 use arc_swap::ArcSwap;
-use sysoverlay_core::history::Trends;
-use sysoverlay_core::snapshot::Snapshot;
+use aaxsyspulse_core::history::Trends;
+use aaxsyspulse_core::snapshot::Snapshot;
 
 static SHARED: OnceLock<ArcSwap<Trends>> = OnceLock::new();
 

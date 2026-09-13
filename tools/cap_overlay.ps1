@@ -9,7 +9,7 @@ public class Win {
     public struct RECT { public int L, T, R, B; }
 }
 "@
-$p = Get-Process sysoverlay-app -ErrorAction Stop
+$p = Get-Process AAXSysPulse -ErrorAction Stop
 $hwnd = $p.MainWindowHandle
 if ($hwnd -eq [IntPtr]::Zero) { throw "no main window" }
 $r = New-Object Win+RECT

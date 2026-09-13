@@ -22,8 +22,8 @@
 //! 平时每帧只做必需的逐引擎 RunningTime 查询（~2–8ms）。
 
 use crate::probe;
-use sysoverlay_core::sampler::{SampleOutcome, Sampler, SamplerId};
-use sysoverlay_core::snapshot::{Metric, Snapshot};
+use aaxsyspulse_core::sampler::{SampleOutcome, Sampler, SamplerId};
+use aaxsyspulse_core::snapshot::{Metric, Snapshot};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::OnceLock;
 use windows::Win32::Foundation::LUID;

@@ -1,6 +1,6 @@
 //! 本地时钟源（悬浮窗「时间」行的数据来源）。
 //!
-//! # 为什么时钟不放 [`Snapshot`](sysoverlay_core::snapshot::Snapshot)
+//! # 为什么时钟不放 [`Snapshot`](aaxsyspulse_core::snapshot::Snapshot)
 //!
 //! 采样间隔最长 5s（`INTERVAL_MS_ALLOWED[0]`），若时钟随快照走，
 //! 秒数会 5s 一跳，完全不可用。时钟由平台层（`win`）在**每次渲染前**

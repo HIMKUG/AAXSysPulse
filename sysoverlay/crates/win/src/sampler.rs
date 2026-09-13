@@ -13,9 +13,9 @@ use crate::proc_mem::MemSampler;
 use crate::proc_net::NetSampler;
 use crate::gpu_vendor;
 use crate::power_system::SystemPower;
-use sysoverlay_core::sampler::{Backoff, SampleOutcome, Sampler, SamplerDiag, SamplerId};
-use sysoverlay_core::scheduler::SamplePlan;
-use sysoverlay_core::snapshot::{Metric, Snapshot};
+use aaxsyspulse_core::sampler::{Backoff, SampleOutcome, Sampler, SamplerDiag, SamplerId};
+use aaxsyspulse_core::scheduler::SamplePlan;
+use aaxsyspulse_core::snapshot::{Metric, Snapshot};
 
 /// Composite sampler that drives all metric collectors.
 pub struct SystemSampler {
@@ -74,7 +74,7 @@ impl SystemSampler {
             crate::msr::teardown();
             crate::power_system::store_cpu_watts(None);
             self.backoff[SamplerId::Power as usize].reset();
-            self.diag.push(sysoverlay_core::sampler::DiagEntry {
+            self.diag.push(aaxsyspulse_core::sampler::DiagEntry {
                 sampler: SamplerId::Power,
                 outcome: SampleOutcome::Skipped,
                 code: 0,
@@ -232,7 +232,7 @@ impl SystemSampler {
             self.backoff[idx].reset();
         }
 
-        self.diag.push(sysoverlay_core::sampler::DiagEntry {
+        self.diag.push(aaxsyspulse_core::sampler::DiagEntry {
             sampler: id,
             outcome,
             code,

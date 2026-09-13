@@ -16,7 +16,7 @@ public class EW2 {
 }
 "@
 if ($TargetPid -le 0) {
-    $pr = Get-Process sysoverlay-app -ErrorAction SilentlyContinue | Select-Object -First 1
+    $pr = Get-Process AAXSysPulse -ErrorAction SilentlyContinue | Select-Object -First 1
     $TargetPid = [int]$pr.Id
 }
 Write-Output ("PID=$TargetPid")

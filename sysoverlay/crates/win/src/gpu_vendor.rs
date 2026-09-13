@@ -18,6 +18,16 @@
 //! - **多显卡共同工作**：每张独显各读一次功耗并累加（整机显存总功耗），
 //!   利用率以主卡（第一张）为准；Intel 后端为骨架暂不读功耗；
 //! - 每次失败都记探针（`SYSOVERLAY_PROBE=1`）。
+//!
+//! # Safety（本文件 unsafe 汇总）
+//!
+//! - 三家后端全部 `GetProcAddress` 动态加载：函数指针经 `as_fn` 校验非空后才
+//!   调用，签名与厂商 SDK 头逐一对照手写（结构体版本号盲写风险见上方注释）；
+//! - ADL 内存回调 `adl_alloc` **必须用 CRT `malloc`**——ADL 内部以 CRT `free`
+//!   释放，改用 Rust 全局分配器即跨堆释放（UB/堆损坏），详见回调处注释；
+//! - 单线程约定：`OnceLock` 懒初始化后仅采样线程调用，无并发 FFI；
+//! - 厂商 DLL 内部的原生崩溃无法被 Rust 捕获（外部 UB）——已接受的风险，
+//!   靠探针日志与「失败永久降级」策略兜底。
 
 use crate::gpu_detect;
 use crate::perf;
@@ -341,8 +351,15 @@ impl Adl {
                 unsafe extern "system" fn adl_alloc(size: i32) -> *mut c_void {
                     if size <= 0 { std::ptr::null_mut() }
                     else {
-                        let layout = std::alloc::Layout::from_size_align(size as usize, 8).unwrap();
-                        std::alloc::alloc(layout) as *mut c_void
+                        // ⚠️ 必须走 CRT malloc，不能用 std::alloc::alloc：
+                        // ADL 内部用 CRT `free` 释放本回调返回的内存（SDK 官方示例
+                        // 的回调就是 malloc 配对）。Rust 全局分配器在 MSVC 上是
+                        // HeapAlloc(进程堆)，UCRT 的 free 管不到它 —— 跨堆释放
+                        // 是 UB / 堆损坏。
+                        extern "C" {
+                            fn malloc(size: usize) -> *mut c_void;
+                        }
+                        malloc(size as usize)
                     }
                 }
                 if c2(adl_alloc, 1, &mut ctx) == 0 && !ctx.is_null() {

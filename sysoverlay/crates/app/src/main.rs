@@ -1,5 +1,5 @@
 #![windows_subsystem = "windows"]
-//! SysOverlay Application Entry Point
+//! AAX SysPulse Application Entry Point
 //!
 //! Responsibilities:
 //! 1. Single-instance enforcement via `CreateMutexW`
@@ -10,19 +10,18 @@
 //! 6. Panic minidump on crash
 //! 7. Self-heal: resume notification resets sampler backoff
 
-use std::io::Write;
 use std::thread;
 use std::time::Duration;
 
-use sysoverlay_core::cadence::{DELTA_ENTER, DELTA_EXIT, EXIT_TICKS, IDLE_MAX_MS, REFRESH_FLOOR_MS, ACTIVE_CPU_PCT, ACTIVE_NET_BPS};
-use sysoverlay_core::scheduler::Scheduler;
-use sysoverlay_core::scheduler::Source;
-use sysoverlay_win::window::{get_shared_seq, publish_schedule_cfg, schedule_cfg, setup_resume_channel, snap_store, wait_cfg_change};
-use sysoverlay_win::OverlayWindow;
-use sysoverlay_win::SystemSampler;
-use sysoverlay_win::dpi;
-use sysoverlay_win::config_io;
-use sysoverlay_win::{tray, autostart};
+use aaxsyspulse_core::cadence::{DELTA_ENTER, DELTA_EXIT, EXIT_TICKS, IDLE_MAX_MS, REFRESH_FLOOR_MS, ACTIVE_CPU_PCT, ACTIVE_NET_BPS};
+use aaxsyspulse_core::scheduler::Scheduler;
+use aaxsyspulse_core::scheduler::Source;
+use aaxsyspulse_win::window::{get_shared_seq, publish_schedule_cfg, schedule_cfg, setup_resume_channel, snap_store, wait_cfg_change};
+use aaxsyspulse_win::OverlayWindow;
+use aaxsyspulse_win::SystemSampler;
+use aaxsyspulse_win::dpi;
+use aaxsyspulse_win::config_io;
+use aaxsyspulse_win::{tray, autostart};
 
 mod pre_launch_checks;
 use pre_launch_checks::run_pre_launch_checks;
@@ -41,16 +40,14 @@ fn setup_panic_hook() {
             .or_else(|| panic_info.payload().downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "unknown panic".to_string());
 
-        eprintln!("[SysOverlay] PANIC at {}: {}", location, message);
+        // stderr 只写一次：eprintln 自带换行与 flush；此前在 minidump 之后又
+        // write_all 了同一条消息，属纯重复输出。
+        eprintln!("[AAX SysPulse] PANIC at {}: {}", location, message);
 
         #[cfg(feature = "minidump")]
         {
             write_minidump(&location, &message);
         }
-
-        let _ = std::io::stderr().write_all(
-            format!("[SysOverlay] PANIC at {}: {}\n", location, message).as_bytes(),
-        );
     }));
 }
 
@@ -58,48 +55,35 @@ fn setup_panic_hook() {
 fn write_minidump(_location: &str, _message: &str) {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
-    use std::time::SystemTime;
+    use windows::Win32::Foundation::{CloseHandle, GENERIC_WRITE, HANDLE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, CREATE_ALWAYS, FILE_SHARE_READ,
+    };
     use windows::Win32::System::Diagnostics::Debug::{
         MiniDumpWriteDump, MiniDumpNormal, MiniDumpWithIndirectlyReferencedMemory,
-        MINIDUMP_EXCEPTION_INFORMATION,
     };
-    use windows::Win32::Foundation::{GetCurrentProcess, HANDLE};
-    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::System::SystemInformation::GetLocalTime;
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId};
 
-    // Build minidump path: %LOCALAPPDATA%\SysOverlayC\dumps\
+    // Build minidump path: %LOCALAPPDATA%\AAXSysPulseC\dumps\
     let dump_dir = std::env::var_os("LOCALAPPDATA")
         .map(|p| {
             std::path::PathBuf::from(p)
-                .join("SysOverlayC")
+                .join("AAXSysPulseC")
                 .join("dumps")
         })
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-    // Format: SysOverlay_YYYY-MM-DD_HH-MM-SS_PID.dmp
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()
-        .map(|d| {
-            let secs = d.as_secs();
-            let (y, m, d, hh, mm, ss) = (
-                ((secs / 31556926 + 1970) as u16),          // year
-                ((secs % 31556926) / 2629746 + 1) as u8,   // month
-                (((secs % 31556926) % 2629746) / 86400 + 1) as u8, // day
-                ((secs % 86400) / 3600) as u8,             // hour
-                (((secs % 86400) % 3600) / 60) as u8,      // minute
-                ((secs % 86400) % 3600 % 60) as u8,        // second
-            );
-            (y, m, d, hh, mm, ss)
-        });
-
-    let Some((y, m, d, hh, mm, ss)) = now else {
-        return;
-    };
+    // Format: AAXSysPulse_YYYY-MM-DD_HH-MM-SS_PID.dmp
+    // 本地日历日期必须用 GetLocalTime（与 win::gdi 同源，同样零依赖）。
+    // ⚠️ 勿改回 epoch 秒手算年月日：平均年/月长度（31556926s / 2629746s）与
+    // 真实日历的偏差会随时间累积，数月后文件名日期就会漂移出真实日期。
+    let st = unsafe { GetLocalTime() };
 
     let pid = unsafe { GetCurrentProcessId() };
     let name = format!(
-        "SysOverlay_{:04}-{:02}-{:02}_{:02}-{:02}-{:02}_{}.dmp",
-        y, m, d, hh, mm, ss, pid,
+        "AAXSysPulse_{:04}-{:02}-{:02}_{:02}-{:02}-{:02}_{}.dmp",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, pid,
     );
 
     if std::fs::create_dir_all(&dump_dir).is_err() {
@@ -112,35 +96,60 @@ fn write_minidump(_location: &str, _message: &str) {
         .chain(Some(0))
         .collect();
 
-    let process = unsafe { GetCurrentProcess() };
-    // MiniDumpWriteDump takes a HANDLE (which wraps a raw pointer in windows-rs)
-    let process_handle = HANDLE(process.0);
-
+    // panic hook 里没有异常上下文：exception / user-stream / callback 一律 None。
+    // GetCurrentProcess() 返回伪句柄，无需 CloseHandle。
+    let process_handle = unsafe { GetCurrentProcess() };
     let dump_type = MiniDumpNormal | MiniDumpWithIndirectlyReferencedMemory;
 
-    // panic hook — no exception context available, pass null
-    let exception_info = std::ptr::null::<MINIDUMP_EXCEPTION_INFORMATION>();
-
-    let result = unsafe {
-        MiniDumpWriteDump(
-            process_handle,
-            pid,
+    // ⚠️ MiniDumpWriteDump 的 hfile 吃的是**文件句柄**，不是路径字符串指针。
+    // 旧实现把路径 PCWSTR 直接当 hfile 传——该特性此前从未对本 windows 版本
+    // 编译通过，无从暴露；现先 CreateFileW 建文件再传句柄，写完即关。
+    let file: HANDLE = match unsafe {
+        CreateFileW(
             windows::core::PCWSTR(path_wide.as_ptr()),
-            dump_type,
-            exception_info,
+            GENERIC_WRITE.0,
+            FILE_SHARE_READ,
             None,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
             None,
         )
+    } {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("[AAX SysPulse] Failed to create minidump file: {e}");
+            return;
+        }
     };
 
+    let result = unsafe { MiniDumpWriteDump(process_handle, pid, file, dump_type, None, None, None) };
+    unsafe {
+        let _ = CloseHandle(file);
+    }
+
     if result.is_ok() {
-        eprintln!("[SysOverlay] Minidump written to: {:?}", dump_path);
+        eprintln!("[AAX SysPulse] Minidump written to: {:?}", dump_path);
     } else {
-        eprintln!("[SysOverlay] Failed to write minidump");
+        eprintln!("[AAX SysPulse] Failed to write minidump");
     }
 }
 
 fn main() {
+    // ── 0a. 提权辅助模式：只增删计划任务，做完立即退出 ──────────────────
+    // ⚠️ 必须在单实例互斥体**之前**：辅助进程由运行中的主进程拉起，
+    // 若先抢互斥体就会因"已有实例"静默退出 → 任务永远删不掉（关不掉的自启）。
+    if let Some(op) = std::env::args()
+        .find(|a| a == autostart::ARG_TASK_CREATE || a == autostart::ARG_TASK_REMOVE)
+    {
+        let ok = if op == autostart::ARG_TASK_CREATE {
+            autostart::create_task()
+        } else {
+            autostart::delete_task()
+        };
+        aaxsyspulse_win::probe::log(&format!("autostart helper: {op} ok={ok}"));
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+
     setup_panic_hook();
 
     // ── 0. DPI awareness (must be before any window creation) ─────────────
@@ -151,7 +160,7 @@ fn main() {
         use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
         use windows::Win32::System::Threading::CreateMutexW;
 
-        let name = windows::core::w!("SysOverlay_SingleInstance_Mutex");
+        let name = windows::core::w!("AAXSysPulse_SingleInstance_Mutex");
         let elevated = std::env::args().any(|a| a == "--elevated");
         let restart = std::env::args().any(|a| a == "--restart");
         // 管理员重启 / 托盘「快速重启」路径：带重试抢互斥体，等旧进程让位。
@@ -159,11 +168,10 @@ fn main() {
         let mut owned: Option<HANDLE> = None;
         for _ in 0..attempts {
             let m = CreateMutexW(None, true, windows::core::PCWSTR(name.as_ptr()));
-            if m.is_err() {
-                eprintln!("[SysOverlay] Failed to create single-instance mutex");
+            let Ok(h) = m else {
+                eprintln!("[AAX SysPulse] Failed to create single-instance mutex");
                 std::process::exit(1);
-            }
-            let h: HANDLE = m.unwrap();
+            };
             if GetLastError() != ERROR_ALREADY_EXISTS {
                 owned = Some(h);
                 break;
@@ -174,7 +182,7 @@ fn main() {
             }
         }
         let Some(_handle) = owned else {
-            eprintln!("[SysOverlay] Another instance is already running. Exiting.");
+            eprintln!("[AAX SysPulse] Another instance is already running. Exiting.");
             std::process::exit(0);
         };
     };
@@ -186,15 +194,15 @@ fn main() {
     let mut cfg = config_io::load_config();
     // 调试日志开关：按配置初始化（必须在下面任何 probe::log 之前，
     // 否则本次启动的 cfg / 启动头会被自己吞掉）。设置面板可实时改。
-    sysoverlay_win::probe::set_debug(cfg.debug_log);
+    aaxsyspulse_win::probe::set_debug(cfg.debug_log);
     // 探针：记录运行时实际生效的配置（裁决「power 分支没跑」这类问题）
     {
         let appdata = std::env::var_os("APPDATA");
         let cfg_exists = appdata
             .as_ref()
-            .map(|a| std::path::PathBuf::from(a).join("SysOverlayC\\config.txt").exists())
+            .map(|a| std::path::PathBuf::from(a).join("AAXSysPulseC\\config.txt").exists())
             .unwrap_or(false);
-        sysoverlay_win::probe::log(&format!(
+        aaxsyspulse_win::probe::log(&format!(
             "cfg show_cpu={} show_mem={} show_gpu={} show_net={} power={} interval={} auto={} exclude_virtual={} power_interval={} appdata_set={} cfg_file_exists={}",
             cfg.show_cpu as u8, cfg.show_mem as u8, cfg.show_gpu as u8, cfg.show_net as u8,
             cfg.power_enabled as u8, cfg.interval_ms, cfg.refresh_auto,
@@ -203,25 +211,53 @@ fn main() {
         ));
     }
 
+    // 全局语言同步：托盘提示、提权弹窗等"窗口外"文案依赖它。
+    // 默认 En，这里按配置对齐；设置页切换语言时会再同步一次。
+    aaxsyspulse_win::i18n::set_global_lang(cfg.lang);
+
     // ── 2b. Pre-launch checks: admin & driver status ──────────────────────
-    // Shows warning dialogs for admin/driver status.
-    // User can click Continue (up to 3 times per check) or Exit.
-    // Each check is only shown once per week.
-    let config_changed = run_pre_launch_checks(&mut cfg);
-    if config_changed {
-        // Save updated continue counts and dates
-        let _ = config_io::save_config(&cfg);
+    // 登录自启（--autostart）时**完全静默**：登录瞬间不该弹任何模态框，
+    // 也不该因为用户点了「取消」就让自启变成「启动了但立刻退出」。
+    let at_logon = autostart::launched_at_logon();
+    if at_logon {
+        aaxsyspulse_win::probe::log("pre-launch checks skipped (--autostart quiet mode)");
+    } else {
+        let outcome = run_pre_launch_checks(&mut cfg);
+        if outcome.changed {
+            // Save updated continue counts and dates
+            let _ = config_io::save_config(&cfg);
+        }
+        if !outcome.proceed {
+            // 弹窗承诺 "Click Cancel to exit" —— 旧实现把它当成"配置没改"，
+            // 用户点了取消程序照样启动（语义错位）。
+            aaxsyspulse_win::probe::log("pre-launch: user chose exit");
+            return;
+        }
     }
 
     // ── 2c. 管理员权限（用户拍板：无权限提示+runas 重启，拒绝则关闭 Power 行）──
-    if cfg.power_enabled && !sysoverlay_win::elevate::is_admin() {
-        if sysoverlay_win::elevate::prompt_and_relaunch() {
-            // 已发起管理员重启：立即退出让位（新进程带 --elevated 重试抢互斥体）
-            std::process::exit(0);
+    // 自启进程例外：`Run` 项启动**拿不到管理员**，此处不弹 UAC、也**不落盘**
+    // 关闭 Power —— 只在本次会话里关掉功耗行，用户下次手动以管理员启动时
+    // 功耗照常回来（否则"开了自启 → 功耗监控永久消失"）。
+    let mut power_restore_at_exit: Option<bool> = None;
+    if cfg.power_enabled && !aaxsyspulse_win::elevate::is_admin() {
+        if at_logon {
+            aaxsyspulse_win::probe::log(
+                "autostart: not elevated -> power row off for this session only (not persisted)",
+            );
+            power_restore_at_exit = Some(cfg.power_enabled);
+            cfg.power_enabled = false;
+        } else {
+            // 传入配置里的语言：本弹窗在启动阶段显示，早于设置页，
+            // 全局语言此时还是默认值，必须显式传。
+            if aaxsyspulse_win::elevate::prompt_and_relaunch(cfg.lang) {
+                // 已发起管理员重启：立即退出让位（新进程带 --elevated 重试抢互斥体）
+                std::process::exit(0);
+            }
+            // 拒绝提权：强制关闭 Power 行（不显示、不计算）
+            cfg.power_enabled = false;
+            aaxsyspulse_win::probe::log("elevate declined -> power_enabled forced off");
         }
-        // 拒绝提权：强制关闭 Power 行（不显示、不计算）
-        cfg.power_enabled = false;
-        sysoverlay_win::probe::log("elevate declined -> power_enabled forced off");
     }
 
     // ── 3. Set up resume notification channel ────────────────────────────────
@@ -229,18 +265,29 @@ fn main() {
 
     // ── 4. Create overlay window（先于采样线程：线程需要 hwnd 推送消息）────
     // P1：渲染线程必须先于窗口创建启动，否则首帧渲染请求无人消费。
-    sysoverlay_win::render_thread::start();
+    aaxsyspulse_win::render_thread::start();
     let window = match OverlayWindow::new(cfg) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("[SysOverlay] Failed to create overlay window: {}", e);
+            eprintln!("[AAX SysPulse] Failed to create overlay window: {}", e);
             std::process::exit(1);
         }
     };
 
     // ── 4b. Tray icon + autostart sync + 调度参数发布 ─────────────────────
     tray::add(window.hwnd());
-    autostart::apply(cfg.autostart);
+    // 启动时幂等同步一次：既修「exe 被移动/改名后路径失效」，
+    // 也修「上次关闭没写成功」的注册表残留。结果记进日志便于排障。
+    let autostart_ok = autostart::apply(cfg.autostart);
+    aaxsyspulse_win::probe::log(&format!(
+        "autostart: sync want={} ok={} mode={:?} os_state={:?} elevated={} launched_at_logon={}",
+        cfg.autostart,
+        autostart_ok,
+        autostart::mode(),
+        autostart::state(),
+        aaxsyspulse_win::elevate::is_admin(),
+        at_logon
+    ));
     publish_schedule_cfg(&cfg);
 
     // ── 4b'. 诊断模式：SYSOVERLAY_DIAG 自动打开辅助窗口（子串匹配）──
@@ -254,18 +301,18 @@ fn main() {
         diag == "1" || diag == "all" || diag.split(',').any(|t| t == token)
     };
     if diag_on("settings") {
-        sysoverlay_win::settings::open_settings(window.hwnd());
+        aaxsyspulse_win::settings::open_settings(window.hwnd());
         if diag_on("click") {
-            sysoverlay_win::probe::log("diag: auto click loop started");
+            aaxsyspulse_win::probe::log("diag: auto click loop started");
             thread::spawn(move || {
                 // 先等设置窗口完成首帧，再每 3s 模拟点击一次 CPU 开关（共 10 次）
                 thread::sleep(Duration::from_millis(2_500));
-                sysoverlay_win::probe::log("diag: first click");
-                sysoverlay_win::settings::diag_click_cpu();
+                aaxsyspulse_win::probe::log("diag: first click");
+                aaxsyspulse_win::settings::diag_click_cpu();
                 for i in 0..9 {
                     thread::sleep(Duration::from_millis(3_000));
-                    sysoverlay_win::probe::log(&format!("diag: click #{}", i + 2));
-                    sysoverlay_win::settings::diag_click_cpu();
+                    aaxsyspulse_win::probe::log(&format!("diag: click #{}", i + 2));
+                    aaxsyspulse_win::settings::diag_click_cpu();
                 }
             });
         }
@@ -275,15 +322,15 @@ fn main() {
     // 分频调度：GPU/Net 不快于 1s（计数器本身 1s 才更新），
     // Auto 档刷新上限 = 启用源的最大有效间隔，成本超标自动降档。
     // 事件驱动 NIC 重枚举：注册一次网卡变更通知（取代 10s 轮询 GetIfTable2）。
-    sysoverlay_win::proc_net::init_net_notify();
+    aaxsyspulse_win::proc_net::init_net_notify();
     let cfg_for_thread = cfg;
     let shared_seq = get_shared_seq();
     // HWND 不是 Send：跨线程只传裸地址，线程内重建
     let hwnd_addr = window.hwnd().0 as isize;
     let _sampling_thread = thread::spawn(move || {
-        sysoverlay_win::probe::log_startup();
+        aaxsyspulse_win::probe::log_startup();
         // P0-1：采样线程一次性绑到 0 号逻辑核，MSR 读数语义一致且零强制迁移。
-        sysoverlay_win::msr::pin_sampling_thread();
+        aaxsyspulse_win::msr::pin_sampling_thread();
         // P1-16：采样线程降优先级，后台采集不与前台交互抢 CPU。
         unsafe {
             use windows::Win32::System::Threading::{
@@ -307,7 +354,7 @@ fn main() {
         let mut ema_net_committed = 0f32;
         let mut quiet_ticks: u32 = 0;
         let mut mode_active = false;
-        let mut pending: sysoverlay_win::Snapshot = sysoverlay_win::Snapshot::placeholder(now_init);
+        let mut pending: aaxsyspulse_win::Snapshot = aaxsyspulse_win::Snapshot::placeholder(now_init);
         let mut seq: u64 = 0;
 
         // v3 按需睡眠：上一轮的源启用掩码（检测启停转换 → teardown/基线重置）、
@@ -341,7 +388,7 @@ fn main() {
             // 会话锁定（BUG-1）：锁屏安全桌面不显示悬浮窗，采样纯烧 CPU。
             // 挂起等待解锁信号（window 线程 UNLOCK 时发 resume），零轮询；
             // 解锁唤醒后 reset_backoff 并直达采样——立即补采消除数据空白窗口。
-            if sysoverlay_win::window::session_locked() && resume_rx.recv().is_ok() {
+            if aaxsyspulse_win::window::session_locked() && resume_rx.recv().is_ok() {
                 sampler.reset_backoff();
             }
 
@@ -355,15 +402,15 @@ fn main() {
             // 渲染看门狗：停摆 → 重建渲染线程（自愈）。
             // 一帧在途 >5s（线程卡在原生调用）即 respawn，把冻结从 ~30s 大幅缩短；
             // 新线程仍卡死则判为 D2D 原生卡死，禁用 D2D 并持久化回退 GDI。
-            match sysoverlay_win::gdi::render_watchdog_tick(now_ms) {
-                sysoverlay_win::gdi::WatchdogAction::Respawn => {
-                    sysoverlay_win::render_thread::respawn();
+            match aaxsyspulse_win::gdi::render_watchdog_tick(now_ms) {
+                aaxsyspulse_win::gdi::WatchdogAction::Respawn => {
+                    aaxsyspulse_win::render_thread::respawn();
                 }
-                sysoverlay_win::gdi::WatchdogAction::DisableD2d => {
-                    sysoverlay_win::gdi::disable_d2d_and_persist(overlay_hwnd);
-                    sysoverlay_win::render_thread::respawn();
+                aaxsyspulse_win::gdi::WatchdogAction::DisableD2d => {
+                    aaxsyspulse_win::gdi::disable_d2d_and_persist(overlay_hwnd);
+                    aaxsyspulse_win::render_thread::respawn();
                 }
-                sysoverlay_win::gdi::WatchdogAction::None => {}
+                aaxsyspulse_win::gdi::WatchdogAction::None => {}
             }
 
             // 源启停转换：禁用 → 释放后端资源（驱动服务/厂商库/缓存）；
@@ -459,20 +506,20 @@ fn main() {
                     seq += 1;
                     shared_seq.store(committed.seq, std::sync::atomic::Ordering::Relaxed);
                     snap_store(committed.clone());
-                    sysoverlay_win::history::push(&committed);
+                    aaxsyspulse_win::history::push(&committed);
                     last_refresh = after_ms;
                     ema_cpu_committed = ema_cpu;
                     ema_mem_committed = ema_mem;
                     ema_gpu_committed = ema_gpu;
                     ema_net_committed = ema_net;
-                    sysoverlay_win::perf::note_barrier_commit(
+                    aaxsyspulse_win::perf::note_barrier_commit(
                         seq,
                         max_delta,
                         mode_active as u32,
                     );
                     // 快照推送 = 确有新内容：走 request_render（自增渲染纪元），
                     // 悬浮窗快速跳过路径据此区分新快照与时钟例行唤醒。
-                    sysoverlay_win::gdi::request_render(overlay_hwnd);
+                    aaxsyspulse_win::gdi::request_render(overlay_hwnd);
                 }
             }
 
@@ -486,7 +533,7 @@ fn main() {
             } else {
                 30_000
             };
-            sysoverlay_win::probe::log_lazy(|| {
+            aaxsyspulse_win::probe::log_lazy(|| {
                 format!(
                     "sleep_ms={} auto={} plan={}{}{}{}{} mode={}",
                     timeout_ms,
@@ -507,9 +554,17 @@ fn main() {
     window.run_message_loop();
 
     // ── 6. Save config on exit ────────────────────────────────────────────
-    let final_cfg = window.get_config();
+    let mut final_cfg = window.get_config();
+    // 自启静默模式下的「会话内关闭功耗行」不是用户意图 → 退出时还原，不落盘。
+    // 若用户在会话里**主动**开了功耗（值已是 true），则以用户为准，不覆盖。
+    if let Some(orig) = power_restore_at_exit {
+        if !final_cfg.power_enabled {
+            final_cfg.power_enabled = orig;
+            aaxsyspulse_win::probe::log("exit: restored power_enabled (autostart session-only off)");
+        }
+    }
     if !config_io::save_config(&final_cfg) {
-        eprintln!("[SysOverlay] Warning: failed to save config on exit");
+        eprintln!("[AAX SysPulse] Warning: failed to save config on exit");
     }
 }
 

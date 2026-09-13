@@ -1,4 +1,4 @@
-//! SysOverlay Core Library
+//! AAXSysPulse Core Library
 //!
 //! Pure Rust core library for the system overlay application.
 //! Contains data structures, metrics computation, layout calculation,
@@ -7,7 +7,7 @@
 //! # 分层约束
 //!
 //! 本 crate 是**纯逻辑层**：零平台依赖、零 `unsafe`。
-//! 所有 `windows::...` 调用只允许出现在 `sysoverlay_win`。
+//! 所有 `windows::...` 调用只允许出现在 `aaxsyspulse_win`。
 //!
 //! # 模块依赖方向
 //!

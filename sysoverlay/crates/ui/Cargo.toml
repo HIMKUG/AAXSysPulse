@@ -1,9 +1,13 @@
 [package]
-name = "sysoverlay-ui"
+name = "aaxsyspulse-ui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-sysoverlay-core = { path = "../core" }
+aaxsyspulse-core = { path = "../core" }
+
+[dev-dependencies]
+# 仅 offscreen.rs 的 PNG 对拍测试使用（to_png 为 #[cfg(test)]）。
+# 勿移回 [dependencies]：生产构建不应引入 png（ARCHITECTURE_DESIGN §6 的既定状态）。
 png = "0.17"

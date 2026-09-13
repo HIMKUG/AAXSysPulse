@@ -31,7 +31,7 @@ use std::sync::Mutex;
 
 use windows::Win32::Foundation::HWND;
 
-use sysoverlay_core::config::Config;
+use aaxsyspulse_core::config::Config;
 
 static RENDER_TX: Mutex<Option<mpsc::Sender<isize>>> = Mutex::new(None);
 static RENDER_QUEUED: AtomicBool = AtomicBool::new(false);
@@ -113,9 +113,17 @@ pub fn respawn() {
 
 /// UI 线程调用：发布最新配置 + 投递渲染请求（同帧多次请求合并为一次）。
 pub fn request(hwnd: HWND, cfg: &Config) {
-    if let Ok(mut g) = RENDER_CFG.lock() {
-        *g = Some(*cfg);
-    }
+    // 中毒恢复与 render_once 对称：锁内只是 Copy 赋值，panic 源实际不存在，
+    // 但一旦中毒若不 into_inner，配置镜像会永久冻结在旧值（快照照常更新、
+    // 配置永不生效）。
+    let mut cfg_slot = match RENDER_CFG.lock() {
+        Ok(g) => g,
+        Err(p) => {
+            crate::probe::log("rt: RENDER_CFG poisoned in request -> recovering inner value");
+            p.into_inner()
+        }
+    };
+    *cfg_slot = Some(*cfg);
     // ⚠️ 先原子占位、后发送（store 在 send 之前）。旧实现 send 之后再
     // store(true)，渲染线程的 store(false) 可插进两者之间——stale true
     // 从此永久吞掉后续所有请求（配置镜像还在更新、epoch 还在 +1，但

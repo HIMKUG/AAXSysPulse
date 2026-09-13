@@ -189,8 +189,12 @@ pub fn offset_from_drag(g: &SbGeom, mouse_y: i32, grab: f32) -> f32 {
 }
 
 /// 行步长（滚轮一格）。与列表行高对齐 → 滚轮滚动有「逐行推进」的确定感。
+/// 滚轮一个 notch 滚动的像素距离。
+///
+/// 原为"一整行高"（48px@96dpi），用户反馈一次滚太多、灵敏度过高；
+/// 现降为行高的 1/4（≈12px@96dpi），与常见应用的细粒度滚动手感一致。
 pub fn wheel_step(dpi: u32) -> f32 {
-    s(dpi, super::layout::ROW_H) as f32
+    s(dpi, super::layout::ROW_H) as f32 / 4.0
 }
 
 #[cfg(test)]

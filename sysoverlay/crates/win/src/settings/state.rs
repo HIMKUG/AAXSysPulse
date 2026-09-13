@@ -139,7 +139,7 @@ pub struct Page {
 use std::any::Any;
 
 use super::cfg_ref::Value;
-use sysoverlay_core::config::Config;
+use aaxsyspulse_core::config::Config;
 
 /// 统一控件 trait：每个控件**持有自己的 [`CfgRef`]**，
 /// sync 只有一行 `cfg.get(...)`，不再有散落的巨型 match。

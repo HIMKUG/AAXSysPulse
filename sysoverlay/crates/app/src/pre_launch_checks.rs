@@ -17,7 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 /// Service name for the MSR driver (must match msr.rs)
-const SERVICE_NAME: &str = "SysOverlayWinRing0";
+const SERVICE_NAME: &str = "AAXSysPulseWinRing0";
 
 /// Number of continue clicks before permanently skipping a check
 const CONTINUE_LIMIT: u8 = 3;
@@ -130,11 +130,21 @@ fn show_message_box(title: &str, message: &str, flags: windows::Win32::UI::Windo
     }
 }
 
-/// Run the pre-launch check sequence
+/// 预检结果。
 ///
-/// Returns `true` if the application should continue launching,
-/// `false` if the user chose to exit.
-pub fn run_pre_launch_checks(cfg: &mut sysoverlay_core::config::Config) -> bool {
+/// 旧实现只用 `bool` 表示"是否继续"，调用方却把它当成"配置是否有改动"用，
+/// 导致「点了取消也不退出」（弹窗承诺的 "Click Cancel to exit" 落空）。
+/// 两个语义拆开，各归各。
+pub struct Outcome {
+    /// 是否继续启动（`false` = 用户选了取消，应退出）。
+    pub proceed: bool,
+    /// 预检是否改动了配置（继续计数 / 上次检查日期）→ 调用方需落盘。
+    pub changed: bool,
+}
+
+/// Run the pre-launch check sequence.
+pub fn run_pre_launch_checks(cfg: &mut aaxsyspulse_core::config::Config) -> Outcome {
+    let mut changed = false;
     // Convert last check dates to milliseconds for comparison
     let admin_last_ms = date_to_ms(cfg.admin_check_last_date);
     let driver_last_ms = date_to_ms(cfg.driver_check_last_date);
@@ -150,7 +160,7 @@ pub fn run_pre_launch_checks(cfg: &mut sysoverlay_core::config::Config) -> bool 
             && (cfg.admin_check_last_date == 0 || week_passed_admin);
 
         if should_check {
-            let title = "SysOverlay - Administrator Privileges Required";
+            let title = "AAXSysPulse - Administrator Privileges Required";
             let message = "[Admin Privileges Required]\n\n\
                            Administrator privileges are required for power monitoring functionality.\n\
                            Without admin rights, power monitoring will be disabled.\n\n\
@@ -165,10 +175,11 @@ pub fn run_pre_launch_checks(cfg: &mut sysoverlay_core::config::Config) -> bool 
                 // User clicked Continue
                 cfg.admin_check_continue_count += 1;
                 cfg.admin_check_last_date = today;
+                changed = true;
                 // Proceed to check 2
             } else {
                 // User clicked Cancel or closed dialog
-                return false;
+                return Outcome { proceed: false, changed: true };
             }
         }
     }
@@ -182,9 +193,9 @@ pub fn run_pre_launch_checks(cfg: &mut sysoverlay_core::config::Config) -> bool 
             && (cfg.driver_check_last_date == 0 || week_passed_driver);
 
         if should_check {
-            let title = "SysOverlay - Driver Not Loaded";
+            let title = "AAXSysPulse - Driver Not Loaded";
             let message = "[MSR Driver Not Loaded]\n\n\
-                           SysOverlay WinRing0 MSR driver is not installed or not running.\n\
+                           AAXSysPulse WinRing0 MSR driver is not installed or not running.\n\
                            Power monitoring will be unavailable until the driver is installed.\n\n\
                            Click Continue to launch anyway (power monitoring will be disabled).\n\
                            Click Cancel to exit.\n\n\
@@ -197,15 +208,16 @@ pub fn run_pre_launch_checks(cfg: &mut sysoverlay_core::config::Config) -> bool 
                 // User clicked Continue
                 cfg.driver_check_continue_count += 1;
                 cfg.driver_check_last_date = today;
+                changed = true;
                 // Proceed to main app
             } else {
                 // User clicked Cancel or closed dialog
-                return false;
+                return Outcome { proceed: false, changed: true };
             }
         }
     }
 
-    true
+    Outcome { proceed: true, changed }
 }
 
 /// Convert YYYYMMDD date to milliseconds since UNIX_EPOCH (approximate)

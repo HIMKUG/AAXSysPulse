@@ -11,8 +11,8 @@
 
 use windows::Win32::Foundation::RECT;
 
-use sysoverlay_core::config::Config;
-use sysoverlay_core::types::Lang;
+use aaxsyspulse_core::config::Config;
+use aaxsyspulse_core::types::Lang;
 
 use crate::gfx_d2d::{ColorF, Gfx, HAlign, RectF};
 use crate::theme::Theme;
@@ -72,12 +72,13 @@ pub enum ButtonAction {
     ResetAllColors,
     /// 展开/收起指定指标的配置卡。
     ToggleMetricExpand(usize),
+    /// 将指定指标的四项文字偏移（名称X/Y、数值X/Y）复位为 0。
+    ResetMetricOffset(usize),
     /// 打开日志文件所在目录（报告 C-01：路径降级为动作，不出现在文案）。
     OpenLogFolder,
-    /// 检查更新（无更新服务，反馈「已是最新」状态提示）。
-    CheckUpdate,
-    /// 复制版本信息到剪贴板。
-    CopyVersion,
+    /// 用系统默认浏览器打开外部链接（关于页「哔哩哔哩主页」）。
+    /// 存 `&'static str` 以保持 `Copy`（URL 均为编译期常量）。
+    OpenUrl(&'static str),
 }
 
 /// 按钮视觉级别。
@@ -256,7 +257,7 @@ impl IWidget for SwatchesWidget {
                 .and_then(|rgb| {
                     palette
                         .iter()
-                        .position(|&(r, g, b)| sysoverlay_core::color::Rgb::new(r, g, b) == rgb)
+                        .position(|&(r, g, b)| aaxsyspulse_core::color::Rgb::new(r, g, b) == rgb)
                 })
                 .unwrap_or(0);
         }
@@ -282,7 +283,7 @@ impl IWidget for MetricSwatchesWidget {
                 Some(rgb) => {
                     st.selected = METRIC_SWATCHES
                         .iter()
-                        .position(|&(r, g, b)| sysoverlay_core::color::Rgb::new(r, g, b) == rgb)
+                        .position(|&(r, g, b)| aaxsyspulse_core::color::Rgb::new(r, g, b) == rgb)
                         .unwrap_or(sw_custom(has_auto));
                     st.value_f = 0.0;
                 }
@@ -1079,7 +1080,7 @@ fn paint_metric_header(
     }
 }
 
-/// 关于页头部：Logo 方块 + 应用名 + 版本（报告 §11 关于页布局）。
+/// 关于页头部：应用图标 + 应用名 + 版本（报告 §11 关于页布局）。
 fn paint_about_header(
     rt: &windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget,
     gfx: &mut Gfx,
@@ -1088,20 +1089,25 @@ fn paint_about_header(
     r: RectF,
     lang: Lang,
 ) {
-    let side = super::layout::s(dpi, 22) as f32;
+    let side = super::layout::s(dpi, 32) as f32;
     let cy = (r.t + r.b) / 2.0;
     let logo = RectF::new(r.l, cy - side / 2.0, r.l + side, cy + side / 2.0);
-    gfx.fill_round(rt, logo, super::layout::s(dpi, 6) as f32, c(t, t.label));
-    gfx.text(
-        rt,
-        crate::i18n::t(lang, "AboutLogo"),
-        super::layout::s(dpi, 9) as f32,
-        700,
-        HAlign::Center,
-        logo,
-        c(t, t.card),
-        true,
-    );
+    // 应用图标：内嵌 ICO 的 64×64 帧，经 WIC 解码成 D2D 位图后按 logo 区域缩放绘制。
+    // 解码失败（WIC 不可用等）时退回圆角占位块，保证关于页始终有内容。
+    match crate::app_icon::d2d_bitmap(rt) {
+        Some(bmp) => {
+            use windows::Win32::Graphics::Direct2D::D2D1_BITMAP_INTERPOLATION_MODE_LINEAR;
+            let dst = logo.d2d();
+            unsafe {
+                rt.DrawBitmap(&bmp, Some(&dst), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+            }
+        }
+        // 兜底只画一圈淡化描边 —— 绝不再填纯色块：
+        // 深色主题下 label 为白，填色块会被看成「纯白图片」。
+        None => {
+            gfx.stroke_round(rt, logo, super::layout::s(dpi, 6) as f32, c(t, t.secondary), 1.0);
+        }
+    }
     // 应用名 + 版本（版本次级色，紧跟名称）。
     let name = crate::i18n::t(lang, "AboutName");
     let name_r = RectF::new(logo.r + super::layout::s(dpi, 10) as f32, r.t, r.r, r.b);

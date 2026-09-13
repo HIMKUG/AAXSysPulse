@@ -13,6 +13,15 @@
 //! 上传——与性能模式的通道完全一致，只是"画进 DIB"的来源不同。
 //!
 //! **性能模式零行为变化**：本模块不被性能模式调用，像素块路径原样保留，帧哈希一致。
+//!
+//! # Safety（本文件 unsafe 汇总）
+//!
+//! - `D2D1_FACTORY_TYPE_SINGLE_THREADED` 工厂 ⇒ 本模块的 D2D 对象只在渲染线程
+//!   创建与使用，`D2DSurface` 不跨线程传递；DWrite 虽用 SHARED 工厂，其对象
+//!   同样只在渲染线程触碰；
+//! - COM 对象生命周期由 `D2DSurface` 持有、Drop 统一释放，无裸指针逃逸；
+//! - `BindDC` 的 HDC 来自 gdi.rs 的 DIB 缓存，由同一渲染线程在同一帧内使用，
+//!   不存在跨线程 DC 共享。
 
 use std::collections::HashMap;
 use std::cell::RefCell;
@@ -39,8 +48,8 @@ use windows::Win32::Graphics::DirectWrite::{
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::HDC;
 
-use sysoverlay_ui::Rgba;
-use sysoverlay_ui::{Rect, RenderTarget};
+use aaxsyspulse_ui::Rgba;
+use aaxsyspulse_ui::{Rect, RenderTarget};
 
 // ── 进程级工厂（与设置页的 Gfx 独立，悬浮窗独占） ──────────
 
@@ -406,7 +415,7 @@ impl D2DSurface {
         let actual_w = tm.widthIncludingTrailingWhitespace;
         // 右对齐修正：布局锚点 = x + 位图度量宽（与 cell_sig 用同一度量函数）。
         let base_x = if right_align {
-            x as f32 + sysoverlay_ui::font::measure_scaled_f(text, scale) as f32 - actual_w
+            x as f32 + aaxsyspulse_ui::font::measure_scaled_f(text, scale) as f32 - actual_w
         } else {
             x as f32
         };
@@ -467,14 +476,14 @@ impl D2DSurface {
 impl RenderTarget for D2DSurface {
     fn clear(&mut self) {
         unsafe {
-            // 背景填成 alpha=1/255（极接近全透明、肉眼不可见）而非 0：
-            // 这样 DIB 里背景像素的 alpha 是一个稳定、可区分的「近 0」值。
-            // 真正的透明穿透由 WM_NCHITTEST 逐像素命中测试决定——window.rs 的
-            // sample_alpha() 读到背景 alpha(<阈值) 即返回 HTTRANSPARENT，让鼠标
-            // 穿透到下方窗口；文字/边框(alpha≈255) 返回 HTCLIENT，保持可拖拽/悬停。
-            // 与 GDI 软件光栅底色保持一致。
+            // 背景必须是 alpha == 0（不是 1/255 之类的近零值）：分层窗口的命中
+            // 测试由系统按像素 alpha 判定，只有 alpha 恰为 0 的像素才把鼠标事件
+            // 放给下方窗口；alpha=1 的像素会被本窗口吞掉点击，而 WM_NCHITTEST
+            // 返回 HTTRANSPARENT 只对同线程窗口有效，跨进程救不回来（点击被吃掉）。
+            // 文字/描边/阴影(alpha>0) 保持命中 → 可拖拽、可悬停。
+            // 与 GDI 软件光栅底色保持一致（SoftwareSurface::clear 同为全 0）。
             self.rt
-                .Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 / 255.0 }));
+                .Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
         }
     }
 
@@ -524,12 +533,12 @@ impl RenderTarget for D2DSurface {
         }
     }
 
-    fn draw_text(&mut self, s: &str, at: Rect, color: Rgba, _font: sysoverlay_ui::FontSpec) {
+    fn draw_text(&mut self, s: &str, at: Rect, color: Rgba, _font: aaxsyspulse_ui::FontSpec) {
         // 调用方使用 draw_glyphs（含阴影/描边）；单色直绘兜底（默认粗、左对齐）。
         self.draw_glyphs(s, at.x, at.y, 1.0, 2, color, Rgba::transparent(), false, false, false);
     }
 
-    fn measure_text(&self, s: &str, _font: sysoverlay_ui::FontSpec) -> (i32, i32) {
+    fn measure_text(&self, s: &str, _font: aaxsyspulse_ui::FontSpec) -> (i32, i32) {
         // 一次性 format（不走缓存：&self；此方法在 cell 绘制路径不被调用，仅为 trait 完整性）。
         let fallback = (s.len() as i32 * 8, 16);
         let fmt: IDWriteTextFormat = match unsafe {
@@ -578,7 +587,7 @@ impl RenderTarget for D2DSurface {
 /// `weight` ∈ 0..3（0 细 / 1 中 / 2 粗），决定整帧统一使用的 DIN 字重档。
 pub fn paint_cells(
     surface: &mut D2DSurface,
-    cells: &[sysoverlay_ui::renderer::CellSig],
+    cells: &[aaxsyspulse_ui::renderer::CellSig],
     weight: u8,
 ) {
     for c in cells {

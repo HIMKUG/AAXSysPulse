@@ -13,7 +13,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::System::Registry::{RegGetValueW, RRF_RT_REG_DWORD};
 
-use sysoverlay_core::types::Appearance;
+use aaxsyspulse_core::types::Appearance;
 
 impl Theme {
     /// 读取系统当前主题（跟随系统；读取失败回落浅色）。

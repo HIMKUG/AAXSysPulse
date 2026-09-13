@@ -2,9 +2,9 @@
 
 use windows::Win32::Foundation::FILETIME;
 use windows::Win32::System::Threading::GetSystemTimes;
-use sysoverlay_core::metrics::cpu_usage;
-use sysoverlay_core::sampler::{SampleOutcome, Sampler, SamplerId};
-use sysoverlay_core::snapshot::Snapshot;
+use aaxsyspulse_core::metrics::cpu_usage;
+use aaxsyspulse_core::sampler::{SampleOutcome, Sampler, SamplerId};
+use aaxsyspulse_core::snapshot::Snapshot;
 
 /// CPU sampler using GetSystemTimes API.
 pub struct CpuSampler {

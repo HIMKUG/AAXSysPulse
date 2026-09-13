@@ -21,8 +21,8 @@
 //! 展开态标记（箭头朝向）按 `expand[i] > 0.5` 判定；
 //! 卡内内容行按展开后的固定位置排布，由 `paint_page` 按卡片矩形**裁剪**露出。
 
-use sysoverlay_core::config::Config;
-use sysoverlay_core::types::Lang;
+use aaxsyspulse_core::config::Config;
+use aaxsyspulse_core::types::Lang;
 
 use super::cfg_ref::{CfgRef, Value};
 use super::state::{Card, Page, Row, Widget};
@@ -105,9 +105,15 @@ pub const ROW_HEADER_H: i32 = 52;
 /// 下列沿用：
 pub const BOTTOM_MARGIN: i32 = 20;
 pub const WIDGET_H: i32 = 24;
-/// 卡片圆角（逻辑 px）。S5 起 = Fluent border_radius_medium（4），
-/// 与按钮/步进器/分段控件的 4px 统一。
-pub const CARD_RADIUS: i32 = 4;
+/// 设置页**全局圆角**（逻辑 px）。
+///
+/// 卡片 / 按钮 / 步进器 / 分段控件 / 滑杆数值框 / 色板 / 标题栏按钮统一取它；
+/// 实际绘制时按各自几何钳位（半径不超过短边一半，见 `gfx_d2d::RectF::rounded`），
+/// 因此胶囊、圆形控件（开关轨道、滚动条拇指、侧边栏胶囊）不受影响。
+/// 生效点在 `gfx_d2d::Gfx::set_global_radius`（绘制前逐帧按 DPI 写入）。
+pub const RADIUS: i32 = 30;
+/// 卡片圆角。与全局圆角同源（卡片是最主要的圆角面）。
+pub const CARD_RADIUS: i32 = RADIUS;
 pub const LABEL_W: i32 = 120;
 pub const TOGGLE_W: i32 = 40;
 pub const VALUEBOX_W: i32 = 64;
@@ -137,10 +143,15 @@ pub const STEPPER_W: i32 = 96;
 /// 滑杆范围（用户要求拓宽：字号 4..128；间距沿用配置钳位 0..64）。
 /// 字号区间直接引用 core 的落盘钳位常量 —— 两处必须同源，否则「滑杆能拉、
 /// 重启被截断」。
-pub const FONT_MIN: f32 = sysoverlay_core::config::FONT_PX_MIN;
-pub const FONT_MAX: f32 = sysoverlay_core::config::FONT_PX_MAX;
+pub const FONT_MIN: f32 = aaxsyspulse_core::config::FONT_PX_MIN;
+pub const FONT_MAX: f32 = aaxsyspulse_core::config::FONT_PX_MAX;
 pub const GAP_MIN: f32 = 0.0;
 pub const GAP_MAX: f32 = 64.0;
+
+/// 逐指标文字偏移范围（像素，可为负）。与 core 落盘钳位同源，
+/// 否则「步进器能拨到、重启被截断」。
+pub const OFF_MIN: f32 = aaxsyspulse_core::config::OFFSET_MIN as f32;
+pub const OFF_MAX: f32 = aaxsyspulse_core::config::OFFSET_MAX as f32;
 
 /// DPI 缩放（逻辑像素 → 物理像素）。
 pub fn s(dpi: u32, v: i32) -> i32 {
@@ -311,6 +322,595 @@ fn hint_row_def(text: &'static str) -> RowDef {
 
 // ── 页面构建（纯函数） ───────────────────────────────────
 
+/// 行构建辅助：几何 + 语言 + 控件构造，供各 `page_*` 共用。
+/// （原为 `build_pages` 内的闭包；拆出后各页函数不再重复捕获。）
+struct Ux {
+    lang: Lang,
+    rows_l: f32,
+    widget_r: f32,
+    ctrl_l: f32,
+}
+
+impl Ux {
+    fn tr(&self, k: &'static str) -> &'static str {
+        crate::i18n::t(self.lang, k)
+    }
+    fn seg(&self, labels: &[&'static str], cfg: CfgRef) -> SegmentedWidget {
+        SegmentedWidget {
+            labels: labels.iter().map(|k| self.tr(k).to_string()).collect::<Vec<_>>().into(),
+            cfg,
+        }
+    }
+    fn item(&self, id: i32, kind: Box<dyn super::state::IWidget>, l: f32, r: f32, tall: bool) -> ItemDef {
+        ItemDef { id, kind, l, r, tall }
+    }
+    fn ctrl_item(&self, id: i32, kind: Box<dyn super::state::IWidget>) -> ItemDef {
+        let tall = kind.as_any().is::<SliderWidget>();
+        self.item(id, kind, self.ctrl_l, self.widget_r, tall)
+    }
+    fn toggle_item(&self, id: i32, cfg: CfgRef) -> ItemDef {
+        self.item(id, Box::new(ToggleWidget{ cfg }), self.widget_r - TOGGLE_W as f32, self.widget_r, false)
+    }
+    fn stepper_item(&self, id: i32, cfg: CfgRef) -> ItemDef {
+        self.item(
+            id,
+            Box::new(StepperWidget{ min: GAP_MIN as f64, max: GAP_MAX as f64, step: 1.0, cfg }),
+            self.widget_r - STEPPER_W as f32,
+            self.widget_r,
+            false,
+        )
+    }
+    fn off_stepper_item(&self, id: i32, cfg: CfgRef) -> ItemDef {
+        self.item(
+            id,
+            Box::new(StepperWidget{ min: OFF_MIN as f64, max: OFF_MAX as f64, step: 1.0, cfg }),
+            self.widget_r - STEPPER_W as f32,
+            self.widget_r,
+            false,
+        )
+    }
+    fn font_slider_item(&self, id: i32, cfg: CfgRef, l: f32, r: f32, metric: bool) -> ItemDef {
+        ItemDef {
+            id,
+            kind: Box::new(SliderWidget{ min: FONT_MIN, max: FONT_MAX, step: 1.0, dp: 0, unit: "px", cfg, metric_style: metric }),
+            l,
+            r,
+            tall: true,
+        }
+    }
+}
+
+type Group = (&'static str, Vec<RowDef>, Option<&'static str>, i32);
+
+fn page_prefs(
+    ux: &Ux,
+    _cfg: &Config,
+    _expand: &[f32; 6],
+    _order: &[u8; 6],
+    groups: &mut Vec<Group>,
+) {
+        // ── 偏好：显示 / 启动 / 诊断（报告 §11 w1） ──
+        groups.push((
+            ux.tr("GrpDisplay"),
+            vec![
+                row_def(
+                    ux.tr("LblLang"),
+                    Some(ux.tr("HintLanguage")),
+                    vec![ux.ctrl_item(230, Box::new(ux.seg(&["SegEn", "SegZh"], CfgRef::Lang)))],
+                ),
+                row_def(
+                    ux.tr("LblAppearance"),
+                    Some(ux.tr("HintAppearance")),
+                    vec![ux.ctrl_item(
+                        234,
+                        Box::new(ux.seg(
+                            &["SegAppearanceSystem", "SegAppearanceLight", "SegAppearanceDark"],
+                            CfgRef::Appearance,
+                        )),
+                    )],
+                ),
+            ],
+            None,
+            CARD_GAP,
+        ));
+        groups.push((
+            ux.tr("GrpStartup"),
+            vec![row_def(
+                ux.tr("LblAutostart"),
+                Some(ux.tr("HintAutostart")),
+                vec![ux.toggle_item(231, CfgRef::AutoStart)],
+            )],
+            None,
+            CARD_GAP,
+        ));
+        groups.push((
+            ux.tr("GrpDiagnostics"),
+            vec![
+                row_def(
+                    ux.tr("LblDebug"),
+                    Some(ux.tr("HintDebugLog")),
+                    vec![ux.toggle_item(233, CfgRef::DebugLog)],
+                ),
+                // 日志文件：路径降级为按钮动作（报告 C-01/C-03）。
+                row_def(
+                    ux.tr("LblLogFolder"),
+                    None,
+                    vec![ux.ctrl_item(
+                        235,
+                        Box::new(ButtonWidget {
+                            label: ux.tr("ActOpenLogFolder").to_string(),
+                            action: ButtonAction::OpenLogFolder,
+                            kind: ButtonKind::Secondary,
+                        }),
+                    )],
+                ),
+            ],
+            None,
+            CARD_GAP,
+        ));
+}
+
+fn page_layout(
+    ux: &Ux,
+    _cfg: &Config,
+    _expand: &[f32; 6],
+    _order: &[u8; 6],
+    groups: &mut Vec<Group>,
+) {
+        // ── 布局：排列 / 文字效果（报告 §11 w2） ──
+        // 「数据格式」（内存单位 / 网络显示）已下放到「监控项」页对应卡片，
+        // 就近配置（用户反馈：与内存/网络无关的页放这些选项很跳）。
+        groups.push((
+            ux.tr("GrpArrange"),
+            vec![
+                row_def(
+                    ux.tr("LblStyle"),
+                    Some(ux.tr("HintStyle")),
+                    vec![ux.ctrl_item(150, Box::new(ux.seg(&["SegHorizontal", "SegVertical"], CfgRef::Style)))],
+                ),
+                row_def(
+                    ux.tr("LblFontSize"),
+                    Some(ux.tr("HintFontSizeGlobal")),
+                    vec![ux.ctrl_item(152, {
+                        let mut it = Box::new(SliderWidget {
+                            min: FONT_MIN, max: FONT_MAX, step: 1.0, dp: 0, unit: "px",
+                            cfg: CfgRef::FontSize,
+                            metric_style: false,
+                        }) as Box<dyn super::state::IWidget>;
+                        let _ = &mut it;
+                        it
+                    })],
+                ),
+                row_def(
+                    ux.tr("LblGapMetric"),
+                    Some(ux.tr("HintItemGap")),
+                    vec![ux.stepper_item(153, CfgRef::MetricGap)],
+                ),
+                row_def(
+                    ux.tr("LblGapLabel"),
+                    Some(ux.tr("HintNvGap")),
+                    vec![ux.stepper_item(154, CfgRef::LabelValueGap)],
+                ),
+            ],
+            None,
+            CARD_GAP,
+        ));
+        groups.push((
+            ux.tr("GrpTextEffects"),
+            vec![
+                row_def(
+                    ux.tr("LblFontWeight"),
+                    None,
+                    vec![ux.ctrl_item(168, Box::new(ux.seg(&["SegThin", "SegMedium", "SegBold"], CfgRef::FontWeight)))],
+                ),
+                row_def(
+                    ux.tr("LblShadow"),
+                    Some(ux.tr("HintTextShadow")),
+                    vec![ux.toggle_item(158, CfgRef::TextShadow)],
+                ),
+                row_def(
+                    ux.tr("LblOutline"),
+                    Some(ux.tr("HintTextStroke")),
+                    vec![ux.toggle_item(159, CfgRef::TextOutline)],
+                ),
+            ],
+            None,
+            CARD_GAP,
+        ));
+}
+
+fn page_metrics(
+    ux: &Ux,
+    cfg: &Config,
+    expand: &[f32; 6],
+    order: &[u8; 6],
+    groups: &mut Vec<Group>,
+) {
+        // ── 监控项：每项一张**独立卡**（按 metric_order 排列，可拖动排序） ──
+        let metric_cfg: [CfgRef; 6] = [
+            CfgRef::ShowCpu,
+            CfgRef::ShowMem,
+            CfgRef::ShowGpu,
+            CfgRef::ShowNet,
+            CfgRef::PowerEnabled,
+            CfgRef::ShowTime,
+        ];
+        // 折叠头只保留 抓手 + 名称 + 贴右缘的圆形展开按钮；
+        // 总开关移入展开菜单首行（「显示」）。
+        // 位置 k ← order[k] = 指标下标。控件 id 跟随**指标下标**（不随
+        // 位置变化），过渡弹簧按 (页, id) 键控 → 重排不串动画。
+        for &mi in order.iter() {
+            let i = mi as usize;
+            if i >= metric_cfg.len() {
+                continue;
+            }
+            let e = expand.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+            let expanded = e > 0.5;
+            // 该指标是否显示：折叠头据此画「已关闭」标记（开关本身在展开区）。
+            let on = matches!(metric_cfg[i].get(cfg), Value::Bool(true));
+            let mut rows: Vec<RowDef> = Vec::new();
+            // 折叠头：抓手点阵 + 标题（画在 MetricHeaderWidget 内）
+            // + 圆形展开按钮（贴右缘）。
+            // 两项都置 tall：矩形纵跨整行 → 头部拖动热区 = 100% 行高，
+            // 展开按钮 28×48 → 圆形按短边取半径、垂直居中于行。
+            rows.push(RowDef {
+                label: "",
+                hint_text: None,
+                hint2: None,
+                divider: false,
+                hint_only: false,
+                header: true,
+                items: vec![
+                    ux.item(
+                        208 + i as i32 * 10,
+                        Box::new(MetricHeaderWidget { index: i, on, lang: ux.lang }),
+                        ux.rows_l,
+                        ux.widget_r - ICON_BTN as f32,
+                        true,
+                    ),
+                    ux.item(
+                        207 + i as i32 * 10,
+                        Box::new(DisclosureWidget {
+                            expanded,
+                            action: ButtonAction::ToggleMetricExpand(i),
+                        }),
+                        ux.widget_r - ICON_BTN as f32,
+                        ux.widget_r,
+                        true,
+                    ),
+                ],
+            });
+
+            if e > 0.001 {
+                // 首行 = 总开关（用户反馈：开关从折叠头移入展开菜单，命名「显示」）。
+                rows.push(row_def(
+                    ux.tr("LblShow"),
+                    None,
+                    vec![ux.toggle_item(200 + i as i32 * 10, metric_cfg[i])],
+                ));
+                // Time 卡：显示秒开关紧随总开关（该卡最常用的选项）。
+                if i == 5 {
+                    rows.push(row_def(
+                        ux.tr("LblTimeSeconds"),
+                        Some(ux.tr("HintTimeSeconds")),
+                        vec![ux.toggle_item(252, CfgRef::TimeSeconds)],
+                    ));
+                }
+                // 显示名称开关（隐藏后只显示数值，如"111W"）。
+                rows.push(row_def(
+                    ux.tr("LblShowLabel"),
+                    Some(ux.tr("HintShowLabel")),
+                    vec![ux.toggle_item(260 + i as i32 * 10, CfgRef::MetricShowLabel(i))],
+                ));
+                // 数据格式：内存单位 / 网络显示（用户反馈：从「布局」页并入
+                // 对应卡片，就近配置；与字号/配色一样只影响这一项）。
+                if i == 1 {
+                    rows.push(row_def(
+                        ux.tr("LblMemUnit"),
+                        Some(ux.tr("HintMemUnit")),
+                        vec![ux.ctrl_item(155, Box::new(ux.seg(&["SegPercent", "SegGb"], CfgRef::MemUnit)))],
+                    ));
+                } else if i == 3 {
+                    rows.push(row_def(
+                        ux.tr("LblNetMode"),
+                        Some(ux.tr("HintNetDisplay")),
+                        vec![ux.ctrl_item(167, Box::new(ux.seg(&["SegBoth", "SegDown", "SegUp"], CfgRef::NetMode)))],
+                    ));
+                }
+                let _overridden = cfg.metric_font_sizes.get(i).copied().flatten().is_some();
+                // 字号滑杆：理想布局中独占整行，数值纯文本、绿填充、白圈滑块。
+                rows.push(RowDef {
+                    label: ux.tr("LblFontSize"),
+                    hint_text: None,
+                    hint2: None,
+                    divider: false,
+                    hint_only: false,
+                    header: false,
+                    items: vec![ux.font_slider_item(
+                        201 + i as i32 * 10,
+                        CfgRef::MetricFont(i),
+                        ux.ctrl_l,
+                        ux.widget_r,
+                        true,
+                    )],
+                });
+                // 字号状态条：未覆盖时「跟随全局…」；已覆盖时「已自定义」标签 + 说明 + 右侧恢复链接。
+                rows.push(RowDef {
+                    label: "",
+                    hint_text: None,
+                    hint2: None,
+                    divider: false,
+                    hint_only: false,
+                    header: false,
+                    items: vec![ux.item(
+                        206 + i as i32 * 10,
+                        Box::new(MetricFontStatusWidget { index: i, lang: ux.lang }),
+                        ux.ctrl_l,
+                        ux.widget_r,
+                        false,
+                    )],
+                });
+                // 名称色 / 数值色（色板含「跟随默认」格承担重置语义）。
+                rows.push(row_def(
+                    ux.tr("LblNameColor"),
+                    Some(ux.tr("HintNameColor")),
+                    vec![ux.ctrl_item(203 + i as i32 * 10, Box::new(MetricSwatchesWidget { cfg: CfgRef::MetricLabel(i), auto_cfg: None }))],
+                ));
+                rows.push(row_def(
+                    ux.tr("LblValueColor"),
+                    Some(ux.tr("HintValueColor")),
+                    vec![ux.ctrl_item(205 + i as i32 * 10, Box::new(MetricSwatchesWidget { cfg: CfgRef::MetricValue(i), auto_cfg: Some(CfgRef::MetricValueAuto(i)) }))],
+                ));
+                // 文字微调：名称 / 数值各自可左右、上下偏移（像素，可为负）。
+                // 4 个步进器 + 1 个「恢复默认」按钮（把四项一并归零）。
+                rows.push(row_def(
+                    ux.tr("LblOffNameX"),
+                    Some(ux.tr("HintOffName")),
+                    vec![ux.off_stepper_item(400 + i as i32 * 10, CfgRef::MetricOffset(i, 0))],
+                ));
+                rows.push(row_def(
+                    ux.tr("LblOffNameY"),
+                    None,
+                    vec![ux.off_stepper_item(401 + i as i32 * 10, CfgRef::MetricOffset(i, 1))],
+                ));
+                rows.push(row_def(
+                    ux.tr("LblOffValueX"),
+                    None,
+                    vec![ux.off_stepper_item(402 + i as i32 * 10, CfgRef::MetricOffset(i, 2))],
+                ));
+                rows.push(row_def(
+                    ux.tr("LblOffValueY"),
+                    None,
+                    vec![ux.off_stepper_item(403 + i as i32 * 10, CfgRef::MetricOffset(i, 3))],
+                ));
+                rows.push(RowDef {
+                    label: "",
+                    hint_text: None,
+                    hint2: None,
+                    divider: false,
+                    hint_only: false,
+                    header: false,
+                    items: vec![ux.item(
+                        405 + i as i32 * 10,
+                        Box::new(ButtonWidget {
+                            label: ux.tr("LblResetOffset").to_string(),
+                            action: ButtonAction::ResetMetricOffset(i),
+                            kind: ButtonKind::Secondary,
+                        }),
+                        ux.widget_r - 120.0,
+                        ux.widget_r,
+                        false,
+                    )],
+                });
+                // 展开态同样要分隔线（用户反馈：展开页也要分割线与呼吸感）。
+                // 位置 = 本行顶（画在 ROW_GAP 正中，见 paint_page）。
+                // 例外：字号状态条是字号滑杆的注解，二者之间不画线，
+                // 否则注解被从它解释的那一行上切下来。
+                for (k, rd) in rows.iter_mut().enumerate() {
+                    let is_annotation = rd
+                        .items
+                        .iter()
+                        .any(|it| it.kind.as_any().is::<MetricFontStatusWidget>());
+                    rd.divider = k > 0 && !rd.hint_only && !is_annotation;
+                }
+            }
+            // 每个指标 = 一张独立卡，卡间小间距（拖动排序的视觉分区）。
+            groups.push(("", rows, None, METRIC_CARD_GAP));
+        }
+        // 页脚卡：**设置在前、动作按钮置底**。
+        // 原先「全部重置」独占首行，行内只有右侧 96px 按钮、左侧约 500px
+        // 全空（实测 497×59 的空白矩形，占整卡 24.8%）—— 观感上就是
+        // 「一大块空着的地方」。改为「内容 → 提示 → 动作」的常规顺序，
+        // 空白行落到卡底，读作操作区而不是莫名留白。
+        groups.push((
+            "",
+            vec![
+                // 简化名称：CPU→C、Mem→M、GPU→G、Net→N、Power→P、Time→T。
+                row_def(
+                    ux.tr("LblShortNames"),
+                    Some(ux.tr("HintShortNames")),
+                    vec![ux.toggle_item(261, CfgRef::ShortNames)],
+                ),
+                hint_row_def(ux.tr("HintDragReorder")),
+                hint_row_def(ux.tr("MetricsFoot")),
+                // 全部重置（动作放最后一行，右对齐）
+                RowDef {
+                    label: "",
+                    hint_text: None,
+                    hint2: None,
+                    divider: false,
+                    hint_only: false,
+                    header: false,
+                    items: vec![ux.item(
+                        209,
+                        Box::new(ButtonWidget {
+                            label: ux.tr("LblResetAll").to_string(),
+                            action: ButtonAction::ResetAllColors,
+                            kind: ButtonKind::Secondary,
+                        }),
+                        ux.widget_r - 96.0,
+                        ux.widget_r,
+                        false,
+                    )],
+                },
+            ],
+            None,
+            CARD_GAP,
+        ));
+}
+
+fn page_window(
+    ux: &Ux,
+    _cfg: &Config,
+    _expand: &[f32; 6],
+    _order: &[u8; 6],
+    groups: &mut Vec<Group>,
+) {
+        // ── 窗口：层级与交互 / 位置与外观（报告 §11 w4） ──
+        groups.push((
+            ux.tr("GrpInteraction"),
+            vec![
+                // 主句 + 弱化补充句（报告：说明拆为两行 hint）。
+                RowDef {
+                    label: ux.tr("LblTopmost"),
+                    hint_text: Some(ux.tr("HintAlwaysTop")),
+                    hint2: Some(ux.tr("HintAlwaysTop2")),
+                    divider: false,
+                    hint_only: false,
+                    header: false,
+                    items: vec![ux.toggle_item(244, CfgRef::Topmost)],
+                },
+                row_def(
+                    ux.tr("LblClickThrough"),
+                    Some(ux.tr("HintClickThrough")),
+                    vec![ux.toggle_item(245, CfgRef::ClickThrough)],
+                ),
+            ],
+            None,
+            CARD_GAP,
+        ));
+        // 「显示位置（贴角）」已删除（用户反馈：意义不大，窗口可以直接手拖）。
+        // 配置字段 snap_corner 保留（首次启动的落位仍用它），只是不再暴露到 UI。
+        groups.push((
+            ux.tr("GrpPosLook"),
+            vec![row_def(
+                ux.tr("LblOpacity"),
+                Some(ux.tr("HintOpacity")),
+                vec![ItemDef {
+                    id: 247,
+                    kind: Box::new(SliderWidget {
+                        min: aaxsyspulse_core::config::OPACITY_PCT_MIN as f32,
+                        max: aaxsyspulse_core::config::OPACITY_PCT_MAX as f32,
+                        step: 1.0,
+                        dp: 0,
+                        unit: "%",
+                        cfg: CfgRef::Opacity,
+                        metric_style: false,
+                    }),
+                    l: ux.ctrl_l,
+                    r: ux.widget_r,
+                    tall: true,
+                }],
+            )],
+            None,
+            CARD_GAP,
+        ));
+}
+
+fn page_perf(
+    ux: &Ux,
+    _cfg: &Config,
+    _expand: &[f32; 6],
+    _order: &[u8; 6],
+    groups: &mut Vec<Group>,
+) {
+        // ── 性能：统计范围 / 刷新频率 / 画面（报告 §11 w5） ──
+        groups.push((
+            ux.tr("GrpScope"),
+            vec![
+                row_def(
+                    ux.tr("LblGpuPrimary"),
+                    Some(ux.tr("HintGpuPrimary")),
+                    vec![ux.toggle_item(263, CfgRef::GpuPrimaryOnly)],
+                ),
+                row_def(
+                    ux.tr("LblGpu3D"),
+                    Some(ux.tr("HintGpu3D")),
+                    vec![ux.toggle_item(264, CfgRef::Gpu3dOnly)],
+                ),
+                // 功耗查询：关闭跳过 MSR 内核查询（省 CPU），功耗行显示 --。
+                row_def(
+                    ux.tr("LblPowerQuery"),
+                    Some(ux.tr("HintPowerQuery")),
+                    vec![ux.toggle_item(267, CfgRef::PowerQuery)],
+                ),
+            ],
+            None,
+            CARD_GAP,
+        ));
+        groups.push((
+            ux.tr("GrpRefresh"),
+            vec![row_def(
+                ux.tr("LblNetLowFreq"),
+                Some(ux.tr("HintNetLowFreq")),
+                vec![ux.toggle_item(265, CfgRef::NetLowFreq)],
+            )],
+            None,
+            CARD_GAP,
+        ));
+        groups.push((
+            ux.tr("GrpPicture"),
+            vec![row_def(
+                ux.tr("LblEngine"),
+                Some(ux.tr("HintRenderMode")),
+                vec![ux.ctrl_item(266, Box::new(ux.seg(&["SegSmooth", "SegFine"], CfgRef::RenderEngine)))],
+            )],
+            None,
+            CARD_GAP,
+        ));
+}
+
+fn page_about(
+    ux: &Ux,
+    _cfg: &Config,
+    _expand: &[f32; 6],
+    _order: &[u8; 6],
+    groups: &mut Vec<Group>,
+) {
+        // ── 关于：头部（图标 / 名称 / 版本）/ 开发者，版权脚注 ──
+        groups.push((
+            "",
+            vec![
+                RowDef {
+                    label: "",
+                    hint_text: None,
+                    hint2: None,
+                    divider: false,
+                    hint_only: false,
+                    header: false,
+                    items: vec![ux.item(270, Box::new(AboutHeaderWidget { lang: ux.lang }), ux.rows_l, ux.widget_r, false)],
+                },
+                // 开发者信息：左侧标签 + 说明（名字），右侧「哔哩哔哩主页」外链按钮。
+                row_def(
+                    ux.tr("AboutDeveloper"),
+                    Some(ux.tr("AboutDeveloperName")),
+                    vec![ux.ctrl_item(
+                        271,
+                        Box::new(ButtonWidget {
+                            label: ux.tr("ActBilibili").to_string(),
+                            action: ButtonAction::OpenUrl(
+                                "https://space.bilibili.com/401121508",
+                            ),
+                            kind: ButtonKind::Secondary,
+                        }),
+                    )],
+                ),
+            ],
+            page_footnote(5, ux.lang),
+            CARD_GAP,
+        ));
+}
+
 /// 依据 (cfg, lang, dpi, client_w, expand, order) 重建全部 6 页布局。
 ///
 /// `order`：监控项显示顺序（第 k 位 = 指标下标），监控项页按它排列卡片；
@@ -344,35 +944,8 @@ pub fn build_pages(
     let widget_l = rows_l + LABEL_W as f32;
     let ctrl_l = widget_l.max(widget_r - CTRL_W as f32);
 
-    // 控件构造辅助（闭包仅捕获几何常量，无可变状态）。
-    let seg = |labels: &[&'static str], cfg: CfgRef| SegmentedWidget {
-        labels: labels.iter().map(|k| tr(k).to_string()).collect::<Vec<_>>().into(),
-        cfg,
-    };
-    let item = |id: i32, kind: Box<dyn super::state::IWidget>, l: f32, r: f32, tall: bool| ItemDef { id, kind, l, r, tall };
-    let ctrl_item = |id: i32, kind: Box<dyn super::state::IWidget>| {
-        let tall = kind.as_any().is::<SliderWidget>();
-        item(id, kind, ctrl_l, widget_r, tall)
-    };
-    let toggle_item = |id: i32, cfg: CfgRef| {
-        item(id, Box::new(ToggleWidget { cfg }), widget_r - TOGGLE_W as f32, widget_r, false)
-    };
-    let stepper_item = |id: i32, cfg: CfgRef| {
-        item(
-            id,
-            Box::new(StepperWidget { min: GAP_MIN as f64, max: GAP_MAX as f64, step: 1.0, cfg }),
-            widget_r - STEPPER_W as f32,
-            widget_r,
-            false,
-        )
-    };
-    let font_slider_item = |id: i32, cfg: CfgRef, l: f32, r: f32, metric: bool| ItemDef {
-        id,
-        kind: Box::new(SliderWidget { min: FONT_MIN, max: FONT_MAX, step: 1.0, dp: 0, unit: "px", cfg, metric_style: metric }),
-        l,
-        r,
-        tall: true,
-    };
+    // 行构建辅助（几何 + 语言 + 控件构造）。
+    let ux = Ux { lang, rows_l, widget_r, ctrl_l };
 
     for (p, page) in pages.iter_mut().enumerate() {
         page.cards.clear();
@@ -388,468 +961,15 @@ pub fn build_pages(
         };
 
         // 每页 = [(分组标题, 行列表, 脚注, 卡后间距)]；空标题分组跳过标题带。
-        let mut groups: Vec<(&'static str, Vec<RowDef>, Option<&'static str>, i32)> = Vec::new();
+        let mut groups: Vec<Group> = Vec::new();
 
         match p {
-            0 => {
-                // ── 偏好：显示 / 启动 / 诊断（报告 §11 w1） ──
-                groups.push((
-                    tr("GrpDisplay"),
-                    vec![
-                        row_def(
-                            tr("LblLang"),
-                            Some(tr("HintLanguage")),
-                            vec![ctrl_item(230, Box::new(seg(&["SegEn", "SegZh"], CfgRef::Lang)))],
-                        ),
-                        row_def(
-                            tr("LblAppearance"),
-                            Some(tr("HintAppearance")),
-                            vec![ctrl_item(
-                                234,
-                                Box::new(seg(
-                                    &["SegAppearanceSystem", "SegAppearanceLight", "SegAppearanceDark"],
-                                    CfgRef::Appearance,
-                                )),
-                            )],
-                        ),
-                    ],
-                    None,
-                    CARD_GAP,
-                ));
-                groups.push((
-                    tr("GrpStartup"),
-                    vec![row_def(
-                        tr("LblAutostart"),
-                        Some(tr("HintAutostart")),
-                        vec![toggle_item(231, CfgRef::AutoStart)],
-                    )],
-                    None,
-                    CARD_GAP,
-                ));
-                groups.push((
-                    tr("GrpDiagnostics"),
-                    vec![
-                        row_def(
-                            tr("LblDebug"),
-                            Some(tr("HintDebugLog")),
-                            vec![toggle_item(233, CfgRef::DebugLog)],
-                        ),
-                        // 日志文件：路径降级为按钮动作（报告 C-01/C-03）。
-                        row_def(
-                            tr("LblLogFolder"),
-                            None,
-                            vec![ctrl_item(
-                                235,
-                                Box::new(ButtonWidget {
-                                    label: tr("ActOpenLogFolder").to_string(),
-                                    action: ButtonAction::OpenLogFolder,
-                                    kind: ButtonKind::Secondary,
-                                }),
-                            )],
-                        ),
-                    ],
-                    None,
-                    CARD_GAP,
-                ));
-            }
-            1 => {
-                // ── 布局：排列 / 文字效果（报告 §11 w2） ──
-                // 「数据格式」（内存单位 / 网络显示）已下放到「监控项」页对应卡片，
-                // 就近配置（用户反馈：与内存/网络无关的页放这些选项很跳）。
-                groups.push((
-                    tr("GrpArrange"),
-                    vec![
-                        row_def(
-                            tr("LblStyle"),
-                            Some(tr("HintStyle")),
-                            vec![ctrl_item(150, Box::new(seg(&["SegHorizontal", "SegVertical"], CfgRef::Style)))],
-                        ),
-                        row_def(
-                            tr("LblFontSize"),
-                            Some(tr("HintFontSizeGlobal")),
-                            vec![ctrl_item(152, {
-                                let mut it = Box::new(SliderWidget {
-                                    min: FONT_MIN, max: FONT_MAX, step: 1.0, dp: 0, unit: "px",
-                                    cfg: CfgRef::FontSize,
-                                    metric_style: false,
-                                }) as Box<dyn super::state::IWidget>;
-                                let _ = &mut it;
-                                it
-                            })],
-                        ),
-                        row_def(
-                            tr("LblGapMetric"),
-                            Some(tr("HintItemGap")),
-                            vec![stepper_item(153, CfgRef::MetricGap)],
-                        ),
-                        row_def(
-                            tr("LblGapLabel"),
-                            Some(tr("HintNvGap")),
-                            vec![stepper_item(154, CfgRef::LabelValueGap)],
-                        ),
-                    ],
-                    None,
-                    CARD_GAP,
-                ));
-                groups.push((
-                    tr("GrpTextEffects"),
-                    vec![
-                        row_def(
-                            tr("LblFontWeight"),
-                            None,
-                            vec![ctrl_item(168, Box::new(seg(&["SegThin", "SegMedium", "SegBold"], CfgRef::FontWeight)))],
-                        ),
-                        row_def(
-                            tr("LblShadow"),
-                            Some(tr("HintTextShadow")),
-                            vec![toggle_item(158, CfgRef::TextShadow)],
-                        ),
-                        row_def(
-                            tr("LblOutline"),
-                            Some(tr("HintTextStroke")),
-                            vec![toggle_item(159, CfgRef::TextOutline)],
-                        ),
-                    ],
-                    None,
-                    CARD_GAP,
-                ));
-            }
-            2 => {
-                // ── 监控项：每项一张**独立卡**（按 metric_order 排列，可拖动排序） ──
-                let metric_cfg: [CfgRef; 6] = [
-                    CfgRef::ShowCpu,
-                    CfgRef::ShowMem,
-                    CfgRef::ShowGpu,
-                    CfgRef::ShowNet,
-                    CfgRef::PowerEnabled,
-                    CfgRef::ShowTime,
-                ];
-                // 折叠头只保留 抓手 + 名称 + 贴右缘的圆形展开按钮；
-                // 总开关移入展开菜单首行（「显示」）。
-                // 位置 k ← order[k] = 指标下标。控件 id 跟随**指标下标**（不随
-                // 位置变化），过渡弹簧按 (页, id) 键控 → 重排不串动画。
-                for &mi in order.iter() {
-                    let i = mi as usize;
-                    if i >= metric_cfg.len() {
-                        continue;
-                    }
-                    let e = expand.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                    let expanded = e > 0.5;
-                    // 该指标是否显示：折叠头据此画「已关闭」标记（开关本身在展开区）。
-                    let on = matches!(metric_cfg[i].get(cfg), Value::Bool(true));
-                    let mut rows: Vec<RowDef> = Vec::new();
-                    // 折叠头：抓手点阵 + 标题（画在 MetricHeaderWidget 内）
-                    // + 圆形展开按钮（贴右缘）。
-                    // 两项都置 tall：矩形纵跨整行 → 头部拖动热区 = 100% 行高，
-                    // 展开按钮 28×48 → 圆形按短边取半径、垂直居中于行。
-                    rows.push(RowDef {
-                        label: "",
-                        hint_text: None,
-                        hint2: None,
-                        divider: false,
-                        hint_only: false,
-                        header: true,
-                        items: vec![
-                            item(
-                                208 + i as i32 * 10,
-                                Box::new(MetricHeaderWidget { index: i, on, lang }),
-                                rows_l,
-                                widget_r - ICON_BTN as f32,
-                                true,
-                            ),
-                            item(
-                                207 + i as i32 * 10,
-                                Box::new(DisclosureWidget {
-                                    expanded,
-                                    action: ButtonAction::ToggleMetricExpand(i),
-                                }),
-                                widget_r - ICON_BTN as f32,
-                                widget_r,
-                                true,
-                            ),
-                        ],
-                    });
-
-                    if e > 0.001 {
-                        // 首行 = 总开关（用户反馈：开关从折叠头移入展开菜单，命名「显示」）。
-                        rows.push(row_def(
-                            tr("LblShow"),
-                            None,
-                            vec![toggle_item(200 + i as i32 * 10, metric_cfg[i])],
-                        ));
-                        // Time 卡：显示秒开关紧随总开关（该卡最常用的选项）。
-                        if i == 5 {
-                            rows.push(row_def(
-                                tr("LblTimeSeconds"),
-                                Some(tr("HintTimeSeconds")),
-                                vec![toggle_item(252, CfgRef::TimeSeconds)],
-                            ));
-                        }
-                        // 显示名称开关（隐藏后只显示数值，如"111W"）。
-                        rows.push(row_def(
-                            tr("LblShowLabel"),
-                            Some(tr("HintShowLabel")),
-                            vec![toggle_item(260 + i as i32 * 10, CfgRef::MetricShowLabel(i))],
-                        ));
-                        // 数据格式：内存单位 / 网络显示（用户反馈：从「布局」页并入
-                        // 对应卡片，就近配置；与字号/配色一样只影响这一项）。
-                        if i == 1 {
-                            rows.push(row_def(
-                                tr("LblMemUnit"),
-                                Some(tr("HintMemUnit")),
-                                vec![ctrl_item(155, Box::new(seg(&["SegPercent", "SegGb"], CfgRef::MemUnit)))],
-                            ));
-                        } else if i == 3 {
-                            rows.push(row_def(
-                                tr("LblNetMode"),
-                                Some(tr("HintNetDisplay")),
-                                vec![ctrl_item(167, Box::new(seg(&["SegBoth", "SegDown", "SegUp"], CfgRef::NetMode)))],
-                            ));
-                        }
-                        let _overridden = cfg.metric_font_sizes.get(i).copied().flatten().is_some();
-                        // 字号滑杆：理想布局中独占整行，数值纯文本、绿填充、白圈滑块。
-                        rows.push(RowDef {
-                            label: tr("LblFontSize"),
-                            hint_text: None,
-                            hint2: None,
-                            divider: false,
-                            hint_only: false,
-                            header: false,
-                            items: vec![font_slider_item(
-                                201 + i as i32 * 10,
-                                CfgRef::MetricFont(i),
-                                ctrl_l,
-                                widget_r,
-                                true,
-                            )],
-                        });
-                        // 字号状态条：未覆盖时「跟随全局…」；已覆盖时「已自定义」标签 + 说明 + 右侧恢复链接。
-                        rows.push(RowDef {
-                            label: "",
-                            hint_text: None,
-                            hint2: None,
-                            divider: false,
-                            hint_only: false,
-                            header: false,
-                            items: vec![item(
-                                206 + i as i32 * 10,
-                                Box::new(MetricFontStatusWidget { index: i, lang }),
-                                ctrl_l,
-                                widget_r,
-                                false,
-                            )],
-                        });
-                        // 名称色 / 数值色（色板含「跟随默认」格承担重置语义）。
-                        rows.push(row_def(
-                            tr("LblNameColor"),
-                            Some(tr("HintNameColor")),
-                            vec![ctrl_item(203 + i as i32 * 10, Box::new(MetricSwatchesWidget { cfg: CfgRef::MetricLabel(i), auto_cfg: None }))],
-                        ));
-                        rows.push(row_def(
-                            tr("LblValueColor"),
-                            Some(tr("HintValueColor")),
-                            vec![ctrl_item(205 + i as i32 * 10, Box::new(MetricSwatchesWidget { cfg: CfgRef::MetricValue(i), auto_cfg: Some(CfgRef::MetricValueAuto(i)) }))],
-                        ));
-                        // 展开态同样要分隔线（用户反馈：展开页也要分割线与呼吸感）。
-                        // 位置 = 本行顶（画在 ROW_GAP 正中，见 paint_page）。
-                        // 例外：字号状态条是字号滑杆的注解，二者之间不画线，
-                        // 否则注解被从它解释的那一行上切下来。
-                        for (k, rd) in rows.iter_mut().enumerate() {
-                            let is_annotation = rd
-                                .items
-                                .iter()
-                                .any(|it| it.kind.as_any().is::<MetricFontStatusWidget>());
-                            rd.divider = k > 0 && !rd.hint_only && !is_annotation;
-                        }
-                    }
-                    // 每个指标 = 一张独立卡，卡间小间距（拖动排序的视觉分区）。
-                    groups.push(("", rows, None, METRIC_CARD_GAP));
-                }
-                // 页脚卡：全部重置 + 拖动排序提示 + 即时生效提示。
-                groups.push((
-                    "",
-                    vec![
-                        RowDef {
-                            label: "",
-                            hint_text: None,
-                            hint2: None,
-                            divider: false,
-                            hint_only: false,
-                            header: false,
-                            items: vec![item(
-                                209,
-                                Box::new(ButtonWidget {
-                                    label: tr("LblResetAll").to_string(),
-                                    action: ButtonAction::ResetAllColors,
-                                    kind: ButtonKind::Secondary,
-                                }),
-                                widget_r - 96.0,
-                                widget_r,
-                                false,
-                            )],
-                        },
-                        hint_row_def(tr("HintDragReorder")),
-                        hint_row_def(tr("MetricsFoot")),
-                        // 简化名称：CPU→C、Mem→M、GPU→G、Net→N、Power→P、Time→T。
-                        row_def(
-                            tr("LblShortNames"),
-                            Some(tr("HintShortNames")),
-                            vec![toggle_item(261, CfgRef::ShortNames)],
-                        ),
-                    ],
-                    None,
-                    CARD_GAP,
-                ));
-            }
-            3 => {
-                // ── 窗口：层级与交互 / 位置与外观（报告 §11 w4） ──
-                groups.push((
-                    tr("GrpInteraction"),
-                    vec![
-                        // 主句 + 弱化补充句（报告：说明拆为两行 hint）。
-                        RowDef {
-                            label: tr("LblTopmost"),
-                            hint_text: Some(tr("HintAlwaysTop")),
-                            hint2: Some(tr("HintAlwaysTop2")),
-                            divider: false,
-                            hint_only: false,
-                            header: false,
-                            items: vec![toggle_item(244, CfgRef::Topmost)],
-                        },
-                        row_def(
-                            tr("LblClickThrough"),
-                            Some(tr("HintClickThrough")),
-                            vec![toggle_item(245, CfgRef::ClickThrough)],
-                        ),
-                    ],
-                    None,
-                    CARD_GAP,
-                ));
-                // 「显示位置（贴角）」已删除（用户反馈：意义不大，窗口可以直接手拖）。
-                // 配置字段 snap_corner 保留（首次启动的落位仍用它），只是不再暴露到 UI。
-                groups.push((
-                    tr("GrpPosLook"),
-                    vec![row_def(
-                        tr("LblOpacity"),
-                        Some(tr("HintOpacity")),
-                        vec![ItemDef {
-                            id: 247,
-                            kind: Box::new(SliderWidget {
-                                min: sysoverlay_core::config::OPACITY_PCT_MIN as f32,
-                                max: sysoverlay_core::config::OPACITY_PCT_MAX as f32,
-                                step: 1.0,
-                                dp: 0,
-                                unit: "%",
-                                cfg: CfgRef::Opacity,
-                                metric_style: false,
-                            }),
-                            l: ctrl_l,
-                            r: widget_r,
-                            tall: true,
-                        }],
-                    )],
-                    None,
-                    CARD_GAP,
-                ));
-            }
-            4 => {
-                // ── 性能：统计范围 / 刷新频率 / 画面（报告 §11 w5） ──
-                groups.push((
-                    tr("GrpScope"),
-                    vec![
-                        row_def(
-                            tr("LblGpuPrimary"),
-                            Some(tr("HintGpuPrimary")),
-                            vec![toggle_item(263, CfgRef::GpuPrimaryOnly)],
-                        ),
-                        row_def(
-                            tr("LblGpu3D"),
-                            Some(tr("HintGpu3D")),
-                            vec![toggle_item(264, CfgRef::Gpu3dOnly)],
-                        ),
-                        // 功耗查询：关闭跳过 MSR 内核查询（省 CPU），功耗行显示 --。
-                        row_def(
-                            tr("LblPowerQuery"),
-                            Some(tr("HintPowerQuery")),
-                            vec![toggle_item(267, CfgRef::PowerQuery)],
-                        ),
-                    ],
-                    None,
-                    CARD_GAP,
-                ));
-                groups.push((
-                    tr("GrpRefresh"),
-                    vec![row_def(
-                        tr("LblNetLowFreq"),
-                        Some(tr("HintNetLowFreq")),
-                        vec![toggle_item(265, CfgRef::NetLowFreq)],
-                    )],
-                    None,
-                    CARD_GAP,
-                ));
-                groups.push((
-                    tr("GrpPicture"),
-                    vec![row_def(
-                        tr("LblEngine"),
-                        Some(tr("HintRenderMode")),
-                        vec![ctrl_item(266, Box::new(seg(&["SegSmooth", "SegFine"], CfgRef::RenderEngine)))],
-                    )],
-                    None,
-                    CARD_GAP,
-                ));
-            }
-            _ => {
-                // ── 关于（报告 §11 w6）：头部 / 动作 / 链接，版权脚注 ──
-                groups.push((
-                    "",
-                    vec![
-                        RowDef {
-                            label: "",
-                            hint_text: None,
-                            hint2: None,
-                            divider: false,
-                            hint_only: false,
-                            header: false,
-                            items: vec![item(270, Box::new(AboutHeaderWidget { lang }), rows_l, widget_r, false)],
-                        },
-                        RowDef {
-                            label: "",
-                            hint_text: None,
-                            hint2: None,
-                            divider: false,
-                            hint_only: false,
-                            header: false,
-                            items: vec![
-                                item(
-                                    271,
-                                    Box::new(ButtonWidget {
-                                        label: tr("ActCheckUpdate").to_string(),
-                                        action: ButtonAction::CheckUpdate,
-                                        kind: ButtonKind::Secondary,
-                                    }),
-                                    rows_l,
-                                    rows_l + 110.0,
-                                    false,
-                                ),
-                                item(
-                                    272,
-                                    Box::new(ButtonWidget {
-                                        label: tr("ActCopyVersion").to_string(),
-                                        action: ButtonAction::CopyVersion,
-                                        kind: ButtonKind::Secondary,
-                                    }),
-                                    rows_l + 118.0,
-                                    rows_l + 228.0,
-                                    false,
-                                ),
-                            ],
-                        },
-                        hint_row_def(tr("AboutLinks")),
-                    ],
-                    page_footnote(5, lang),
-                    CARD_GAP,
-                ));
-            }
+            0 => page_prefs(&ux, cfg, expand, order, &mut groups),
+            1 => page_layout(&ux, cfg, expand, order, &mut groups),
+            2 => page_metrics(&ux, cfg, expand, order, &mut groups),
+            3 => page_window(&ux, cfg, expand, order, &mut groups),
+            4 => page_perf(&ux, cfg, expand, order, &mut groups),
+            _ => page_about(&ux, cfg, expand, order, &mut groups),
         }
 
         // ── 组装：页标题块 + 分组卡（浮点逻辑 y 游标） ──

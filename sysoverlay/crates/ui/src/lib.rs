@@ -1,4 +1,4 @@
-//! SysOverlay UI crate —— 离屏软件光栅化与指标条绘制。
+//! AAXSysPulse UI crate —— 离屏软件光栅化与指标条绘制。
 //!
 //! # 硬约束
 //!

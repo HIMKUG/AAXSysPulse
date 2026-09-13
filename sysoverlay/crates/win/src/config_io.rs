@@ -1,6 +1,6 @@
 //! Configuration persistence using atomic file writes.
 //!
-//! File location: `%APPDATA%\SysOverlayC\config.txt`
+//! File location: `%APPDATA%\AAXSysPulseC\config.txt`
 //!
 //! Atomic write strategy: write to a temp file in the same directory,
 //! then `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` to atomically
@@ -10,11 +10,11 @@
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::sync::mpsc;
-use sysoverlay_core::config::Config;
+use aaxsyspulse_core::config::Config;
 
-/// Returns the config directory path: `%APPDATA%\SysOverlayC\`
+/// Returns the config directory path: `%APPDATA%\AAXSysPulseC\`
 fn appdata_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("APPDATA").map(|s| std::path::PathBuf::from(s).join("SysOverlayC"))
+    std::env::var_os("APPDATA").map(|s| std::path::PathBuf::from(s).join("AAXSysPulseC"))
 }
 
 fn to_wide(s: &OsStr) -> Vec<u16> {
@@ -80,9 +80,16 @@ fn write_config_text(serialized: &str) -> bool {
     let target = dir.join("config.txt");
     let temp = dir.join("config.txt.tmp");
 
-    // Write to temp file
-    if let Err(e) = std::fs::write(&temp, serialized.as_bytes()) {
+    // Write to temp file，并在 rename 前 fsync：断电时 MoveFileExW 可能已
+    // 替换成功而数据未落盘 → 空配置。宽容解析器可自愈，但丢全部设置仍不友好。
+    let write_ok = std::fs::File::create(&temp).and_then(|mut f| {
+        use std::io::Write;
+        f.write_all(serialized.as_bytes())?;
+        f.sync_all()
+    });
+    if let Err(e) = write_ok {
         eprintln!("[config_io] failed to write temp file: {}", e);
+        let _ = std::fs::remove_file(&temp);
         return false;
     }
 

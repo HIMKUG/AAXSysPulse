@@ -1,5 +1,5 @@
 //! 性能（位图）引擎的三档字重：用 DWrite 把 DIN 三版栅格化成 8×16 位图表，
-//! 注入 `ui::font`（[`sysoverlay_ui::font::set_weight_glyph`]）。
+//! 注入 `ui::font`（[`aaxsyspulse_ui::font::set_weight_glyph`]）。
 //!
 //! # 为什么本模块存在
 //!
@@ -180,7 +180,7 @@ pub fn ensure_loaded() {
             };
             for cp in 0x20u32..=0x7E {
                 if let Some(t) = rasterize_char(&face, cp) {
-                    sysoverlay_ui::font::set_weight_glyph(weight, (cp - 0x20) as usize, t);
+                    aaxsyspulse_ui::font::set_weight_glyph(weight, (cp - 0x20) as usize, t);
                 }
             }
             crate::probe::log(&format!(

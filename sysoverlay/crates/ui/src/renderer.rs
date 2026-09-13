@@ -28,12 +28,12 @@ use crate::font::{measure_scaled_f, render_str_scaled_f};
 use crate::offscreen::SoftwareSurface;
 use crate::palette::Style;
 use crate::Rgba;
-use sysoverlay_core::color::Rgb;
-use sysoverlay_core::config::Config;
-use sysoverlay_core::snapshot::{Metric as SnapMetric, Snapshot};
-use sysoverlay_core::types::Metric as MetricEnum;
-use sysoverlay_core::types::NetMode;
-use sysoverlay_core::units::{fmt_gb, fmt_pct, fmt_power, fmt_rate, StrBuf};
+use aaxsyspulse_core::color::Rgb;
+use aaxsyspulse_core::config::Config;
+use aaxsyspulse_core::snapshot::{Metric as SnapMetric, Snapshot};
+use aaxsyspulse_core::types::Metric as MetricEnum;
+use aaxsyspulse_core::types::NetMode;
+use aaxsyspulse_core::units::{fmt_gb, fmt_pct, fmt_power, fmt_rate, StrBuf};
 
 /// 渲染器接口：画一帧离屏内容（零 Win32、零 unsafe）。
 pub trait Renderer {
@@ -170,6 +170,12 @@ pub struct MetricRow {
     pub value_w: i32,
     /// 槽位实测像素宽 = 单字符宽 × slot（C3）。
     pub slot_w: i32,
+    /// 名称文字偏移（px）：+X 向右、+Y 向下。
+    pub label_dx: i32,
+    pub label_dy: i32,
+    /// 数值文字偏移（px）。
+    pub value_dx: i32,
+    pub value_dy: i32,
 }
 
 impl MetricRow {
@@ -187,6 +193,10 @@ impl MetricRow {
             label_w: 0,
             value_w: 0,
             slot_w: 0,
+            label_dx: 0,
+            label_dy: 0,
+            value_dx: 0,
+            value_dy: 0,
         }
     }
 }
@@ -404,7 +414,7 @@ fn weight_faded(c: Rgba, factor: f32) -> Rgba {
 /// 上伸/下伸部超出位图单元，按完整 16 行 em 预留，否则竖版行间会互相
 /// 压字、脏区也盖不住墨迹边缘。
 fn visible_rows(cfg: &Config) -> f32 {
-    if cfg.render_engine == sysoverlay_core::types::RenderEngine::D2d {
+    if cfg.render_engine == aaxsyspulse_core::types::RenderEngine::D2d {
         16.0
     } else {
         crate::font::GLYPH_VISIBLE_ROWS_F
@@ -680,6 +690,8 @@ fn new_row(
     let wf = font_weight_factor(cfg.font_weight);
     // 名称隐藏时：标签宽度归零、间距归零（数值紧贴左侧起始位置）。
     let label_value_gap = if label.is_empty() { 0 } else { cfg.label_value_gap as i32 };
+    // 逐指标文字偏移（名称X/名称Y/数值X/数值Y）。
+    let off = cfg.metric_offsets[metric_index(metric)];
     MetricRow {
         metric,
         label: label_buf(label),
@@ -693,6 +705,10 @@ fn new_row(
         label_w,
         value_w,
         slot_w,
+        label_dx: off[0],
+        label_dy: off[1],
+        value_dx: off[2],
+        value_dy: off[3],
     }
 }
 
@@ -761,6 +777,10 @@ fn hash_cells(cells: &[CellSig], cfg: &Config, w: i32, h: i32, alpha: u8) -> u64
     fnv_u32(&mut acc, h as u32);
     fnv_u32(&mut acc, cfg.metric_gap);
     fnv_u32(&mut acc, cfg.label_value_gap);
+    // 逐指标文字偏移：位置类输入，改一个像素也必须触发重绘。
+    for off in cfg.metric_offsets.iter().flatten() {
+        fnv_u32(&mut acc, *off as u32);
+    }
     for c in cells {
         for b in c.text.as_str().as_bytes() {
             fnv_mix(&mut acc, &[*b]);
@@ -787,9 +807,35 @@ fn hash_cells(cells: &[CellSig], cfg: &Config, w: i32, h: i32, alpha: u8) -> u64
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StripRenderer;
 
+/// 一排指标的文字偏移在水平方向的**外扩量** `(左, 右)`。
+///
+/// 左 = 负偏移的最大绝对值（内容向左溢出量），右 = 正偏移的最大值。
+/// 自然宽度须把二者计入，否则负偏移被窗口左缘裁掉、正偏移在右缘截断。
+fn off_h_span(rows: &[MetricRow]) -> (i32, i32) {
+    let mut left = 0;
+    let mut right = 0;
+    for r in rows {
+        left = left.max(-r.label_dx).max(-r.value_dx);
+        right = right.max(r.label_dx).max(r.value_dx);
+    }
+    (left, right)
+}
+
+/// 垂直方向的外扩量 `(上, 下)`（`off_h_span` 的纵轴对应）。
+fn off_v_span(rows: &[MetricRow]) -> (i32, i32) {
+    let mut top = 0;
+    let mut bottom = 0;
+    for r in rows {
+        top = top.max(-r.label_dy).max(-r.value_dy);
+        bottom = bottom.max(r.label_dy).max(r.value_dy);
+    }
+    (top, bottom)
+}
+
 /// 横版自然宽度：PAD + Σ(label + gap + slot)（项间加 metric_gap）+ PAD。
 fn strip_natural_w_rows(rows: &[MetricRow], cfg: &Config) -> i32 {
-    let mut natural = PAD_X;
+    let (left, right) = off_h_span(rows);
+    let mut natural = PAD_X + left;
     for (i, row) in rows.iter().enumerate() {
         if i > 0 {
             natural += cfg.metric_gap as i32;
@@ -799,13 +845,14 @@ fn strip_natural_w_rows(rows: &[MetricRow], cfg: &Config) -> i32 {
         // 裁掉——拖「名称↔数值间距」时网速整段被裁，看起来就是"间距不生效"。
         natural += row.label_w + row.label_value_gap + row.value_w.max(row.slot_w);
     }
-    natural + PAD_X
+    natural + PAD_X + right
 }
 
-/// 整条内容高度（像素）：最大字号 + 上下内边距。
+/// 整条内容高度（像素）：最大字号 + 上下内边距（含偏移外扩）。
 fn strip_h_rows(rows: &[MetricRow]) -> i32 {
     let max_scale = rows.iter().map(|r| r.scale).fold(0.0, f32::max);
-    PAD_Y * 2 + (16.0 * max_scale).ceil() as i32
+    let (top, bottom) = off_v_span(rows);
+    PAD_Y * 2 + (16.0 * max_scale).ceil() as i32 + top + bottom
 }
 
 impl Renderer for StripRenderer {
@@ -826,10 +873,13 @@ impl Renderer for StripRenderer {
         let max_scale = rows.iter().map(|r| r.scale).fold(0.0, f32::max);
         let glyph_h = (16.0 * max_scale).ceil() as i32;
         let ink_rows = visible_rows(cfg);
-        let y = ((h - glyph_h) / 2).max(PAD_Y);
+        // 偏移外扩：内容左缘 / 上缘各让出外扩量，保证负偏移不被窗口边缘裁掉。
+        let (off_l, _off_r) = off_h_span(rows);
+        let (off_t, off_b) = off_v_span(rows);
+        let y = ((h - glyph_h - off_t - off_b) / 2).max(PAD_Y) + off_t;
 
         let mut cells: Vec<CellSig> = Vec::with_capacity(rows.len() * 2);
-        let mut x = PAD_X;
+        let mut x = PAD_X + off_l;
         for (i, row) in rows.iter().enumerate() {
             if i > 0 {
                 x += cfg.metric_gap as i32;
@@ -839,14 +889,14 @@ impl Renderer for StripRenderer {
             let ly = y + dy;
             // 名称隐藏时跳过标签 cell（value 直接顶左对齐位置）。
             if !row.label.is_empty() {
-                cells.push(cell_sig(&row.label, x, ly, ink_rows, row.scale, row.label_color, shade, cfg.text_shadow, cfg.text_outline, 0));
+                cells.push(cell_sig(&row.label, x + row.label_dx, ly + row.label_dy, ink_rows, row.scale, row.label_color, shade, cfg.text_shadow, cfg.text_outline, 0));
             }
             let vx = if row.label.is_empty() {
                 x
             } else {
                 x + row.label_w + row.label_value_gap + if row.value_w < row.slot_w { row.slot_w - row.value_w } else { 0 }
             };
-            cells.push(cell_sig(&row.value, vx, ly, ink_rows, row.scale, row.value_color, shade, cfg.text_shadow, cfg.text_outline, row.slot_w));
+            cells.push(cell_sig(&row.value, vx + row.value_dx, ly + row.value_dy, ink_rows, row.scale, row.value_color, shade, cfg.text_shadow, cfg.text_outline, row.slot_w));
             // 超宽值（Net 双向速率）按实测宽度推进，避免与下一项重叠
             x += row.label_w + row.label_value_gap + row.value_w.max(row.slot_w);
         }
@@ -872,13 +922,24 @@ impl Renderer for StripRenderer {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct VerticalRenderer;
 
+/// 竖版内容基准宽（不含内边距与偏移）：最宽一行的 `label + gap + max(value, slot)`。
+fn vertical_base_w(rows: &[MetricRow]) -> i32 {
+    let mut w = 0;
+    for row in rows {
+        w = w.max(row.label_w + row.label_value_gap + row.value_w.max(row.slot_w));
+    }
+    w
+}
+
 /// 竖版自然尺寸：宽 = 最宽行，高 = Σ(行高) + Σ(行距) + 内边距。
 fn vertical_natural_rows(rows: &[MetricRow], cfg: &Config) -> (i32, i32) {
     // 行高按引擎墨迹行数预留（位图字体 8 行 / DWrite 字体 16 行 em），
     // 间距为 0 时性能模式各行墨迹紧贴。
     let line_h = visible_rows(cfg);
+    let (off_l, off_r) = off_h_span(rows);
+    let (off_t, off_b) = off_v_span(rows);
     let mut max_w = PAD_X * 2;
-    let mut total_h = PAD_Y * 2;
+    let mut total_h = PAD_Y * 2 + off_t + off_b;
     for (i, row) in rows.iter().enumerate() {
         // 同 strip：实测宽度可能超过槽位（Net 双向），取 max 防右缘裁切
         max_w = max_w.max(PAD_X + row.label_w + row.label_value_gap + row.value_w.max(row.slot_w) + PAD_X);
@@ -887,7 +948,7 @@ fn vertical_natural_rows(rows: &[MetricRow], cfg: &Config) -> (i32, i32) {
             total_h += cfg.metric_gap as i32;
         }
     }
-    (max_w, total_h)
+    (max_w + off_l + off_r, total_h)
 }
 
 impl Renderer for VerticalRenderer {
@@ -909,22 +970,26 @@ impl Renderer for VerticalRenderer {
         // 若用 `w`，D2D 自愈扩窗会把窗口越扩越大 → 数值右缘又跟着右移 →
         // "扩宽→右移→再扩宽"指数级死循环（实测 text_right 301→14225 无限增大）。
         let (nat_w, nat_h) = vertical_natural_rows(rows, cfg);
-        let value_right = (nat_w - PAD_X).max(PAD_X);
+        let (off_l, _off_r) = off_h_span(rows);
+        let (off_t, _off_b) = off_v_span(rows);
+        // 内容左缘（偏移外扩后）；数值右对齐到「内容基准宽」右缘，再各自加 value_dx。
+        let origin_l = PAD_X + off_l;
+        let value_right = origin_l + vertical_base_w(rows);
         let line_h = visible_rows(cfg);
 
         let mut cells: Vec<CellSig> = Vec::with_capacity(rows.len() * 2);
-        let mut y = PAD_Y;
+        let mut y = PAD_Y + off_t;
         for row in rows {
             // 行高用引擎墨迹行数（位图字体 8 行 / DWrite 16 行），
             // 间距为 0 时性能模式各行墨迹紧贴。
             let row_h = (line_h * row.scale).ceil() as i32;
             // 名称隐藏时跳过标签 cell（数值顶左对齐）。
             if !row.label.is_empty() {
-                cells.push(cell_sig(&row.label, PAD_X, y, line_h, row.scale, row.label_color, shade, cfg.text_shadow, cfg.text_outline, 0));
+                cells.push(cell_sig(&row.label, origin_l + row.label_dx, y + row.label_dy, line_h, row.scale, row.label_color, shade, cfg.text_shadow, cfg.text_outline, 0));
             }
-            let min_x = if row.label.is_empty() { PAD_X } else { PAD_X + row.label_w + row.label_value_gap };
+            let min_x = if row.label.is_empty() { origin_l } else { origin_l + row.label_w + row.label_value_gap };
             let dx = (value_right - row.value_w).max(min_x);
-            cells.push(cell_sig(&row.value, dx, y, line_h, row.scale, row.value_color, shade, cfg.text_shadow, cfg.text_outline, row.slot_w));
+            cells.push(cell_sig(&row.value, dx + row.value_dx, y + row.value_dy, line_h, row.scale, row.value_color, shade, cfg.text_shadow, cfg.text_outline, row.slot_w));
             y += row_h + cfg.metric_gap as i32;
         }
 
@@ -988,7 +1053,7 @@ mod tests {
         assert_ne!(h1, h2, "alpha 变化必须改变指纹");
 
         let mut cfg2 = cfg;
-        cfg2.net_unit = sysoverlay_core::types::NetUnit::GB;
+        cfg2.net_unit = aaxsyspulse_core::types::NetUnit::GB;
         let h3 = StripRenderer.frame_hash(&snap, &cfg2, 300, 36, 90);
         assert_ne!(h1, h3, "单位切换必须改变指纹");
 
@@ -1002,6 +1067,51 @@ mod tests {
             Some(Rgb::new(255, 0, 0));
         let h5 = StripRenderer.frame_hash(&snap, &cfg4, 300, 36, 90);
         assert_ne!(h1, h5, "逐项配色变化必须改变指纹");
+    }
+
+    #[test]
+    fn metric_offsets_shift_cells_and_grow_natural_size() {
+        let snap = demo_snap();
+        let cfg = demo_cfg();
+        // h=0 → 垂直居中被 PAD_Y 下限吞掉，基线对两版一致，便于逐值断言。
+        let (nw, nh, cells) = StripRenderer.layout(&snap, &cfg, 0, 0);
+
+        // CPU 的数值右移 5、下移 3；名称不动。
+        let mut cfg2 = cfg;
+        cfg2.metric_offsets[metric_index(MetricEnum::Cpu)] = [0, 0, 5, 3];
+        let (nw2, nh2, cells2) = StripRenderer.layout(&snap, &cfg2, 0, 0);
+
+        assert_eq!(cells2.len(), cells.len(), "cell 数量不随偏移变化");
+        assert_eq!(
+            (cells2[0].x, cells2[0].y),
+            (cells[0].x, cells[0].y),
+            "名称 cell 不受数值偏移影响"
+        );
+        assert_eq!(cells2[1].x, cells[1].x + 5, "数值 X 偏移 +5");
+        assert_eq!(cells2[1].y, cells[1].y + 3, "数值 Y 偏移 +3");
+        assert!(nw2 > nw, "正值 X 偏移必须扩宽自然宽度 {nw} → {nw2}");
+        assert!(nh2 > nh, "正值 Y 偏移必须增高自然高度 {nh} → {nh2}");
+
+        // 指纹随之改变（否则改偏移不触发重绘）。
+        assert_ne!(
+            StripRenderer.frame_hash(&snap, &cfg, 0, 0, 90),
+            StripRenderer.frame_hash(&snap, &cfg2, 0, 0, 90),
+            "偏移变化必须改变门面指纹"
+        );
+
+        // 竖版同样生效：数值右移 5。
+        let (_, _, vcells) = VerticalRenderer.layout(&snap, &cfg, 0, 0);
+        let (_, _, vcells2) = VerticalRenderer.layout(&snap, &cfg2, 0, 0);
+        assert_eq!(vcells2[0].x, vcells[0].x, "竖版名称不动");
+        assert_eq!(vcells2[1].x, vcells[1].x + 5, "竖版数值 X 偏移 +5");
+        assert_eq!(vcells2[1].y, vcells[1].y + 3, "竖版数值 Y 偏移 +3");
+
+        // 负偏移（向左上）也必须扩宽/增高，避免被窗口边缘裁掉。
+        let mut cfg3 = cfg;
+        cfg3.metric_offsets[metric_index(MetricEnum::Cpu)] = [-6, -4, 0, 0];
+        let (nw3, nh3, _) = StripRenderer.layout(&snap, &cfg3, 0, 0);
+        assert!(nw3 > nw, "负 X 偏移也要扩宽 {nw} → {nw3}");
+        assert!(nh3 > nh, "负 Y 偏移也要增高 {nh} → {nh3}");
     }
 
     #[test]
@@ -1111,7 +1221,7 @@ mod tests {
         // 一个值，且与 NetU 相同」。必须用独立缓冲分别格式化 rx/tx 再拼接。
         let mut cfg = demo_cfg();
         cfg.net_mode = NetMode::Both;
-        cfg.net_unit = sysoverlay_core::types::NetUnit::MB;
+        cfg.net_unit = aaxsyspulse_core::types::NetUnit::MB;
         let mut snap = Snapshot::placeholder(0);
         snap.net.rx_bps = 11_850_000; // 11.85M（下载）
         snap.net.tx_bps = 240_000; // 0.24M（上传）
@@ -1142,7 +1252,7 @@ mod tests {
         snap.net.tx_bps = 240_000;
 
         let mut cfg = demo_cfg();
-        cfg.net_unit = sysoverlay_core::types::NetUnit::MB;
+        cfg.net_unit = aaxsyspulse_core::types::NetUnit::MB;
         cfg.net_mode = NetMode::Down;
         let rows = build_rows(&snap, &cfg);
         let d = rows.as_slice().iter().find(|r| matches!(r.metric, MetricEnum::Net)).unwrap();

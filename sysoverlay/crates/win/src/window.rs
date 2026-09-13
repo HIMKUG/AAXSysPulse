@@ -2,6 +2,15 @@
 //!
 //! State is stored in GWLP_USERDATA as a raw pointer to a Box<ThreadState>,
 //! eliminating the module-level WINDOW_STATE global mutex.
+//!
+//! # Safety（本文件 unsafe 汇总）
+//!
+//! - `GWLP_USERDATA` 指针生命周期：`Box<ThreadState>` 在窗口创建时 `into_raw`
+//!   存入，`WM_DESTROY` 中 `Box::from_raw` 取回——裸指针仅在窗口存续期有效，
+//!   `GetWindowLongPtrW` 的消费方全部位于本文件的 wndproc 分支内；
+//! - `GetWindowLongPtrW/SetWindowLongPtrW` 为手工声明的 32/64 位自适应 FFI
+//!   （windows 0.58 未提供按窗口位宽分派的通用绑定）；
+//! - 其余 unsafe 为常规 Win32 调用：句柄均来自 API 返回值，不跨线程共享。
 
 use crate::Config;
 use crate::Snapshot;
@@ -11,7 +20,7 @@ use std::sync::{Arc, OnceLock};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, GetDC, GetDeviceCaps, InvalidateRect,
-    ReleaseDC, ScreenToClient, ValidateRect, HORZRES, PAINTSTRUCT, VERTRES,
+    ReleaseDC, ValidateRect, HORZRES, PAINTSTRUCT, VERTRES,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -28,15 +37,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
-
-/// 命中测试结果：光标落在窗口的「透明区」——事件应穿透到下方窗口。
-const HTTRANSPARENT: isize = -1;
-/// 命中测试结果：光标落在「不透明内容」上——窗口正常接收鼠标（拖拽/悬停）。
-const HTCLIENT: isize = 1;
-
-/// 透明判定阈值：DIB alpha 低于此值视为透明（背景 alpha≈1，文字 alpha≈255）。
-/// 取 8 既能吞掉背景/阴影的低 alpha，又保留真实内容的可命中性。
-const HIT_ALPHA_THRESHOLD: u8 = 8;
 
 /// Per-window mutable state, stored in GWLP_USERDATA.
 struct ThreadState {
@@ -233,7 +233,6 @@ extern "system" {
     fn GetWindowRect(hwnd: HWND, lpRect: *mut RECT) -> BOOL;
 }
 
-const WM_NCHITTEST: u32 = 0x0084;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONUP: u32 = 0x0202;
@@ -310,41 +309,21 @@ unsafe extern "system" fn wndproc(
         // 明确拒绝激活：不抢前台应用焦点。
         WM_MOUSEACTIVATE => LRESULT(3), // MA_NOACTIVATE = 3
 
-        // 命中测试：逐像素判断是否透明。
-        // 透明区域（背景/阴影，DIB alpha < 阈值）→ 返回 HTTRANSPARENT 让事件
-        // 穿透到下方窗口；不透明区域（文字/边框）→ 返回 HTCLIENT 保持可交互
-        // （拖拽 WM_LBUTTONDOWN+SetCapture、hover WM_MOUSEMOVE 都能正常收到）。
+        // 命中测试：交给 DefWindowProc（客户区 → HTCLIENT）。
         //
-        // 仅「非全局穿透」模式生效：click_through=true 时窗口带 WS_EX_TRANSPARENT，
-        // 由系统整体穿透，此处直接走默认处理，不采样 DIB。
+        // 透明区域的穿透**不在这里做**：分层窗口（`WS_EX_LAYERED` +
+        // `UpdateLayeredWindow`）的命中测试由系统按像素 alpha 完成，alpha == 0
+        // 的像素根本不会命中本窗口，鼠标事件天然落到下方窗口。
+        // 所以渲染端必须把背景清成 alpha 恰为 0（见 SoftwareSurface::clear /
+        // D2DSurface::clear），不能是 1/255 之类的「近零」值。
         //
-        // 注意：不要改成 HTCAPTION —— 那会把客户区当标题栏，鼠标消息全部变成
-        // WM_NCMOUSEMOVE / WM_NCLBUTTONDOWN，导致自身的 hover / 拖拽逻辑收不到消息。
-        WM_NCHITTEST => {
-            let click_through = unsafe { get_state_ptr(hwnd).as_ref() }
-                .map(|s| s.cfg.click_through)
-                .unwrap_or(false);
-            if click_through {
-                LRESULT(unsafe { DefWindowProcW(hwnd, msg, _wparam, lparam) }.0)
-            } else {
-                // lparam 为光标屏幕坐标（POINTS：低 16 位 x，高 16 位 y）。
-                let sx = (lparam.0 & 0xFFFF) as i16 as i32;
-                let sy = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-                let mut pt = POINT { x: sx, y: sy };
-                // 屏幕坐标 → 客户区设备像素（popup 分层窗无边框，等价于窗口原点偏移）。
-                let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
-                let transparent = match crate::gdi::sample_alpha(pt.x, pt.y) {
-                    Some(a) => a < HIT_ALPHA_THRESHOLD,
-                    // DIB 未就绪/越界/加锁失败：退化为「可命中」，不丢输入。
-                    None => false,
-                };
-                if transparent {
-                    LRESULT(HTTRANSPARENT)
-                } else {
-                    LRESULT(HTCLIENT)
-                }
-            }
-        }
+        // ⚠️ 不要再回到「WM_NCHITTEST 返回 HTTRANSPARENT」的做法：HTTRANSPARENT
+        // 只在**同一线程**的窗口之间有效（MSDN 明确说明；跨进程时窗口管理器找不到
+        // 下一个接收者，点击会被直接吃掉 —— 正是「透明区遮挡点击」的现象），
+        // 且会让本窗口无法再接收任何鼠标消息。
+        //
+        // 也**不要**改成 HTCAPTION：那会把客户区当标题栏，鼠标消息变成
+        // WM_NCMOUSEMOVE / WM_NCLBUTTONDOWN，自身的 hover / 拖拽逻辑收不到。
 
         WM_LBUTTONDOWN => {
             if let Some(state) = get_state_ptr(hwnd).as_mut() {
@@ -417,7 +396,7 @@ unsafe extern "system" fn wndproc(
                         // 用户自由拖动 → 解除贴角：让保存的位置成为唯一定位来源，
                         // 否则残留的 snap_corner<=3 会在下次启动把窗口强行拉回旧角，
                         // 表现为"不记忆窗口位置"。与 WM_EXITSIZEMOVE 的清理逻辑一致。
-                        state.cfg.snap_corner = sysoverlay_core::config::SNAP_CORNER_FREE;
+                        state.cfg.snap_corner = aaxsyspulse_core::config::SNAP_CORNER_FREE;
                     }
                     state.pos_dirty = false;
                 }
@@ -454,7 +433,7 @@ unsafe extern "system" fn wndproc(
                 // 用户自由拖动 → 解除贴角（显示位置回到「自由定位」，
                 // 避免下次启动强行拉回旧角，尊重用户刚拖到的位置）。
                 if state.dragging {
-                    state.cfg.snap_corner = sysoverlay_core::config::SNAP_CORNER_FREE;
+                    state.cfg.snap_corner = aaxsyspulse_core::config::SNAP_CORNER_FREE;
                 }
                 state.pos_dirty = false;
                 state.size_dirty = false;
@@ -487,11 +466,16 @@ unsafe extern "system" fn wndproc(
         }
 
         WM_TIMER => {
-            // CLOCK 定时器到点：先重对齐到下一个秒边界（秒对齐唤醒，1 次/秒），
-            // 再走统一渲染入口。例行唤醒不自增渲染纪元——无新请求且秒未变时
-            // render 顶部的快速路径会直接返回。
+            // CLOCK 定时器到点：先重对齐下一次到期（显示秒 → 下一个秒边界 1Hz；
+            // 隐藏秒 → 下一个分边界 1/分），再走统一渲染入口。例行唤醒不自增
+            // 渲染纪元——无新请求时 render 顶部的快速路径会直接返回。
             if _wparam.0 == crate::gdi::CLOCK_TIMER_ID {
-                crate::gdi::rearm_clock_timer(hwnd);
+                // 节奏跟随当前配置：显示秒 = 1Hz，隐藏秒 = 1/分。
+                let secs = get_state_ptr(hwnd)
+                    .as_ref()
+                    .map(|s| s.cfg.time_show_seconds)
+                    .unwrap_or(true);
+                crate::gdi::rearm_clock_timer(hwnd, secs);
             }
             // 拖动期间不渲染：随时可能已被 SetWindowPos 刷新过几何，渲染只会
             // 提交过期/悬停帧；等 WM_LBUTTONUP/WM_EXITSIZEMOVE 统一补一帧。
@@ -871,12 +855,12 @@ impl OverlayWindow {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: hinst,
-            hIcon: windows::Win32::UI::WindowsAndMessaging::HICON::default(),
+            hIcon: crate::app_icon::large_icon(),
             hCursor: cursor,
             hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH::default(),
             lpszMenuName: windows::core::PCWSTR::null(),
-            lpszClassName: windows::core::w!("SysOverlay_WndClass"),
-            hIconSm: windows::Win32::UI::WindowsAndMessaging::HICON::default(),
+            lpszClassName: windows::core::w!("AAXSysPulse_WndClass"),
+            hIconSm: crate::app_icon::small_icon(),
         };
 
         unsafe {
@@ -915,8 +899,8 @@ impl OverlayWindow {
         let hwnd = unsafe {
             CreateWindowExW(
                 ex_style,
-                windows::core::w!("SysOverlay_WndClass"),
-                windows::core::w!("SysOverlay"),
+                windows::core::w!("AAXSysPulse_WndClass"),
+                windows::core::w!("AAX SysPulse"),
                 WS_POPUP | WS_VISIBLE,
                 pos_x,
                 pos_y,
@@ -955,8 +939,8 @@ impl OverlayWindow {
         //   2) 否则若仍显式选了贴角（snap_corner<=3 且 window_pos 为空）→ 贴到该角。
         //   3) 都没有 → 保留 CreateWindowExW 给出的默认位（screen_w/4, 24）。
         if state.cfg.window_pos.is_some() {
-            if state.cfg.snap_corner != sysoverlay_core::config::SNAP_CORNER_FREE {
-                state.cfg.snap_corner = sysoverlay_core::config::SNAP_CORNER_FREE;
+            if state.cfg.snap_corner != aaxsyspulse_core::config::SNAP_CORNER_FREE {
+                state.cfg.snap_corner = aaxsyspulse_core::config::SNAP_CORNER_FREE;
             }
         } else if state.cfg.snap_corner <= 3 {
             snap_overlay_to_corner(hwnd, state.cfg.snap_corner);
@@ -964,6 +948,18 @@ impl OverlayWindow {
         if state.cfg.click_through {
             apply_click_through(hwnd, true);
         }
+
+        // 立刻渲染首帧（启动即用，不等第一次采样）。
+        //
+        // 原因：本窗口是 WS_EX_LAYERED，**在首次 UpdateLayeredWindow 之前完全
+        // 不显示**。而 CreateWindowExW 期间同步到达的那个 WM_PAINT，此时
+        // GWLP_USERDATA 还没写入（见上），get_state_ptr 为 null → 渲染请求被
+        // 丢弃；之后再没有 WM_PAINT 触发，于是窗口要等到采样线程的第一帧
+        // （约 2s）才现身。这里补一次请求，用占位快照先把窗口画出来。
+        crate::render_thread::request(hwnd, &state.cfg);
+        // 兜底：万一渲染线程尚未就绪（通道未建立），再投递一个 WM_PAINT，
+        // 由 WM_PAINT 分支在 state 就绪后重试。
+        let _ = unsafe { InvalidateRect(hwnd, None, false) };
 
         Ok(Self { hwnd, state })
     }

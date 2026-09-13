@@ -2,8 +2,14 @@
 //!
 //! 覆盖三处界面文本：悬浮窗主界面标签（CPU/内存/…）、托盘菜单、设置面板。
 //! 配置键 `lang` 切换；文本源都在这里，便于统一维护。
+//!
+//! 数据布局：每行是一个 `(key, en, zh)` 三元组，按 key 字典序升序排列，
+//! 供 `lookup` 做 const fn 二分查找。新增一种语言只需：
+//!   1) 给每个三元组再加一列 `&str`；2) 在 `t()` 里按需选择该列。
+//! 编译期 `CHECK_TABLE` 会断言「无重复 key、且按 key 有序」，从根上消除
+//! 原先 en/zh 分 arm 编写时两语言漏配对的隐患。
 
-use sysoverlay_core::types::Lang;
+use aaxsyspulse_core::types::Lang;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 /// 全局当前语言（标题栏「解锁」等窗口外文案用；设置页切换语言时同步写入）。
@@ -21,450 +27,278 @@ pub fn global_lang() -> Lang {
     }
 }
 
+/// 翻译表：(key, en, zh)。按 key 字典序升序，供二分查找。
+/// 新增语言：给每个条目加一列 `&str`，并在 `t()` 中选取。
+const TABLE: &[(&str, &str, &str)] = &[
+    ("© 2026 AAX SysPulse", "© 2026 AAX SysPulse", "AboutCopyright"),
+    ("Shows live CPU, memory, GPU, network and power usage on your desktop.", "在桌面实时显示 CPU、内存、显卡、网络与整机功耗。", "AboutDesc"),
+    ("Developer", "开发者", "AboutDeveloper"),
+    ("HIMKUG", "HIMKUG", "AboutDeveloperName"),
+    ("AAX SysPulse", "AAX SysPulse", "AboutName"),
+    (concat!("Version ", env!("CARGO_PKG_VERSION")), concat!("版本 ", env!("CARGO_PKG_VERSION")), "AboutVer"),
+    ("Bilibili →", "哔哩哔哩主页 →", "ActBilibili"),
+    ("Open log folder →", "打开日志文件位置 →", "ActOpenLogFolder"),
+    ("Follow global", "恢复跟随全局", "ActRestoreGlobal"),
+    ("Could not update the startup entry (blocked by policy or permission). The switch was reverted.", "无法写入开机启动项（被组策略或权限阻止），开关已自动还原。", "AutoStartFailed"),
+    ("Autostart enabled via the registry Run key. Because the app is not running as administrator, it will not be elevated at login (the Power row will show --). Enable it again while running as administrator to use a scheduled task with highest privileges.", "已开启自启（注册表 Run 方式）。当前未以管理员身份运行，登录时不会提权，功耗行将显示 --。以管理员身份运行后再开关一次，可改用「计划任务 + 最高权限」方式。", "AutoStartRunFallback"),
+    ("Collapse", "收起", "BtnCollapse"),
+    ("Done", "完成", "BtnDone"),
+    ("Expand", "展开", "BtnExpand"),
+    ("Reset", "重置", "BtnReset"),
+    ("Resize", "调整", "BtnResize"),
+    ("ADVANCED", "高级", "CardAdvanced"),
+    ("APPEARANCE", "外观", "CardAppearance"),
+    ("LANGUAGE", "语言", "CardLanguage"),
+    ("MONITORING", "监控项", "CardMonitoring"),
+    ("REFRESH RATE", "刷新率", "CardRefresh"),
+    ("WINDOW", "窗口", "CardWindow"),
+    ("AAX SysPulse", "AAX SysPulse", "ElevateCaption"),
+    ("Power monitoring needs administrator rights (to read the CPU power sensor).\n\n\
+             Restart AAX SysPulse as administrator?\n\
+             (Choosing \"No\" turns the Power row off — every other metric is unaffected.)", "整机功耗显示需要管理员权限（读取 CPU 功耗传感器）。\n\n\
+             是否以管理员身份重新启动 AAX SysPulse？\n\
+             （选择「否」将关闭功耗行，不影响其他显示）", "ElevateText"),
+    ("Writes runtime state for troubleshooting. It keeps writing to disk — enable only when diagnosing.", "记录运行状态用于排查问题，会持续写入磁盘，建议仅在需要时开启。", "FootnoteDebug"),
+    ("Auto adapts the refresh rate to how fast system counters actually update, and eases off automatically when sampling gets expensive.", "自动根据系统计数器的实际更新速度调整刷新率，并在采样开销增大时自动降频。", "FootnoteRefresh"),
+    ("Keeps the overlay above every other window. It does not steal mouse input.", "让悬浮窗始终显示在其他窗口之上；默认不抢占鼠标点击。", "FootnoteTopmost"),
+    ("Arrangement", "排列", "GrpArrange"),
+    ("Data Format", "数据格式", "GrpDataFormat"),
+    ("Diagnostics", "诊断", "GrpDiagnostics"),
+    ("Display", "显示", "GrpDisplay"),
+    ("Layer & Input", "层级与交互", "GrpInteraction"),
+    ("Rendering", "画面", "GrpPicture"),
+    ("Appearance", "外观", "GrpPosLook"),
+    ("Refresh Rate", "刷新频率", "GrpRefresh"),
+    ("Sampling Scope", "统计范围", "GrpScope"),
+    ("Startup", "启动", "GrpStartup"),
+    ("Text Effects", "文字效果", "GrpTextEffects"),
+    ("Keeps the overlay above every other window.", "让悬浮条始终显示在其他窗口之上。", "HintAlwaysTop"),
+    ("It never steals mouse clicks; windows below stay interactive.", "默认不抢占鼠标点击，可正常操作下方的窗口。", "HintAlwaysTop2"),
+    ("Follows the system theme automatically.", "跟随系统时将随系统主题自动切换", "HintAppearance"),
+    ("Launch the overlay at login.", "登录系统后自动运行悬浮条", "HintAutostart"),
+    ("On: the whole overlay ignores the mouse, even the text. Off (default): transparent areas always let clicks through — only the text/shadow pixels are hit, so drag the bar by its text.", "开启：整窗（含文字）都不接收鼠标；关闭（默认）：透明区域始终穿透点击，只有文字/描边处可命中，拖动窗口请按在文字上", "HintClickThrough"),
+    ("Which screen corner to snap to.", "贴靠屏幕的哪个角", "HintCorner"),
+    ("Writes runtime state for troubleshooting. It keeps writing to disk — enable only when diagnosing.", "记录运行状态用于排查问题，会持续写入磁盘，建议仅在需要时开启。", "HintDebugLog"),
+    ("Drag the icon/name area of a card to reorder the items.", "按住卡片左侧的图标与名称区域上下拖动，即可调整监控项顺序。", "HintDragReorder"),
+    ("Affects the overlay text size, range 8–256 px.", "影响悬浮窗中的文字大小，范围 8–256 px。", "HintFontSize"),
+    ("Global default; each metric can override it on the Monitors page.", "全局默认值，单个监控项可在「监控项」页单独覆盖", "HintFontSizeGlobal"),
+    ("Affects the text size of this metric in the overlay.", "影响该监控项在悬浮窗中的文字大小。", "HintFontSizeMetric"),
+    ("Usage reflects 3D/game loads only; lower numbers are expected.", "占用率只反映游戏与 3D 应用的负载，开启后数值会偏低，属正常现象。", "HintGpu3D"),
+    ("Reads only the primary GPU and skips other adapters to save overhead.", "只读取主要显卡的数据，忽略其他显示适配器，可减少开销。", "HintGpuPrimary"),
+    ("Space between metric items.", "各监控项之间的空隙", "HintItemGap"),
+    ("Interface language. Takes effect after restart.", "界面显示语言，重启后生效", "HintLanguage"),
+    ("Percent shows usage; GB shows the actual amount.", "百分比显示占用率，GB 显示实际用量", "HintMemUnit"),
+    ("Color of the metric's name.", "监控项名称的显示颜色。", "HintNameColor"),
+    ("Show upload and download rates together.", "双向同时显示上下行速率", "HintNetDisplay"),
+    ("Saves resources; the network rate updates with a short delay.", "减少资源占用，网速显示会有短暂延迟。", "HintNetLowFreq"),
+    ("Distance between a label and its value.", "每项内部标签与数值之间的距离", "HintNvGap"),
+    ("Fine-tune where the name/value sit in the overlay (pixels; negative moves left/up).", "微调名称与数值在悬浮窗中的位置（像素；负值向左/上偏移）。", "HintOffName"),
+    ("Lower it to keep the overlay translucent for long-term display.", "降低后悬浮条会半透明，适合长期放置", "HintOpacity"),
+    ("Turn off to skip kernel-level power sampling (saves CPU); the Power row then shows --.", "关闭后跳过内核级功耗采样以节省性能，功耗行将显示 --。", "HintPowerQuery"),
+    ("Smooth favors lower cost; Fine favors animation quality.", "流畅优先降低绘制开销，精细优先保证动画细腻", "HintRenderMode"),
+    ("Shorten labels: CPU→C, Mem→M, GPU→G, Net→N, Power→P, Time→T.", "简化标签：CPU→C、Mem→M、GPU→G、Net→N、Power→P、Time→T。", "HintShortNames"),
+    ("Show or hide the metric name label (e.g. CPU, Mem).", "显示或隐藏监控项的名称标签（如 CPU、Mem）。", "HintShowLabel"),
+    ("Horizontal strip, or stacked vertical lines.", "横版一行排布，竖版逐行堆叠", "HintStyle"),
+    ("Clearer on light wallpapers; keep it off on dark backgrounds.", "在浅色壁纸上更清晰，深色背景下建议关闭", "HintTextShadow"),
+    ("Adds an outline; easier to read on busy backgrounds.", "为文字添加轮廓，复杂背景下更易读", "HintTextStroke"),
+    ("Show the clock as HH:MM:SS. Turn off to display HH:MM only.", "时间以 时:分:秒 显示；关闭后仅显示 时:分。", "HintTimeSeconds"),
+    ("Color of the metric's value.", "监控项数值的显示颜色。", "HintValueColor"),
+    ("Transition", "过渡时长", "LblAnimMs"),
+    ("Appearance", "外观", "LblAppearance"),
+    ("Launch at Login", "开机自启", "LblAutostart"),
+    ("Background", "背景色", "LblBg"),
+    ("Click-through", "鼠标可穿透", "LblClickThrough"),
+    ("Position", "显示位置", "LblCorner"),
+    ("CPU", "CPU", "LblCpu"),
+    ("Debug Log", "调试日志", "LblDebug"),
+    ("Render Mode", "渲染模式", "LblEngine"),
+    ("Foreground", "前景色", "LblFg"),
+    ("Default", "默认", "LblFollow"),
+    ("Text Size", "字号", "LblFont"),
+    ("Font Size", "字号", "LblFontSize"),
+    ("Font Weight", "字体粗细", "LblFontWeight"),
+    ("Label–Value Gap", "名称与数值的间距", "LblGapLabel"),
+    ("Item Gap", "条目间距", "LblGapMetric"),
+    ("GPU", "GPU", "LblGpu"),
+    ("3D Load Only", "仅统计 3D 负载", "LblGpu3D"),
+    ("Primary GPU Only", "仅统计主显卡", "LblGpuPrimary"),
+    ("Height", "高度", "LblHeight"),
+    ("Language", "语言", "LblLang"),
+    ("Layout", "布局", "LblLayout"),
+    ("Log File", "日志文件", "LblLogFolder"),
+    ("Memory", "内存", "LblMem"),
+    ("Memory Unit", "内存单位", "LblMemUnit"),
+    ("Name Color", "名称色", "LblNameColor"),
+    ("Network", "网络", "LblNet"),
+    ("Lower Net Refresh Rate", "降低网络刷新频率", "LblNetLowFreq"),
+    ("Network Display", "网络显示", "LblNetMode"),
+    ("Name ↔", "名称左右", "LblOffNameX"),
+    ("Name ↕", "名称上下", "LblOffNameY"),
+    ("Value ↔", "数值左右", "LblOffValueX"),
+    ("Value ↕", "数值上下", "LblOffValueY"),
+    ("Opacity", "不透明度", "LblOpacity"),
+    ("Text Outline", "文字描边", "LblOutline"),
+    ("Overlay Size", "悬浮窗尺寸", "LblOverlaySize"),
+    ("Pin Window", "固定窗口", "LblPin"),
+    ("Power", "功耗", "LblPower"),
+    ("Power Query", "功耗查询", "LblPowerQuery"),
+    ("Refresh Rate", "刷新率", "LblRate"),
+    ("Reset All", "全部重置", "LblResetAll"),
+    ("Reset to Default", "恢复默认", "LblResetOffset"),
+    ("Text Shadow", "文字阴影", "LblShadow"),
+    ("Short Names", "简化名称", "LblShortNames"),
+    ("Show", "显示", "LblShow"),
+    ("Show Name", "显示名称", "LblShowLabel"),
+    ("Style", "样式", "LblStyle"),
+    ("Time", "时间", "LblTime"),
+    ("Show Seconds", "显示秒", "LblTimeSeconds"),
+    ("Always on Top", "窗口置顶", "LblTopmost"),
+    ("Value Color", "数值色", "LblValueColor"),
+    ("Width", "宽度", "LblWidth"),
+    ("Quit", "退出", "MenuQuit"),
+    ("Quick Restart", "快速重启", "MenuRestart"),
+    ("Settings", "设置", "MenuSettings"),
+    ("Changes apply instantly — see the desktop overlay.", "修改即时生效，可在桌面悬浮窗中查看。", "MetricsFoot"),
+    ("Custom", "已自定义", "MtrCustomized"),
+    ("Follows global", "跟随全局", "MtrFollow"),
+    ("Off", "已关闭", "MtrOff"),
+    ("On", "已启用", "MtrOn"),
+    ("About", "关于", "PgAbout"),
+    ("Preferences", "偏好", "PgGeneral"),
+    ("Layout", "布局", "PgLayout"),
+    ("Arrangement and sizing — applies to every metric. Data formats live on the Monitors page.", "悬浮条的排列方式与尺寸，对所有监控项生效；数据格式见「监控项」页", "PgLayoutSub"),
+    ("Monitors", "监控项", "PgMetrics"),
+    ("Configure each metric's display, format and colors; font size follows the global default.", "逐个配置悬浮条中每项数据的显示、格式与配色，字号默认跟随全局", "PgMetricsSub"),
+    ("Motion", "动效", "PgMotion"),
+    ("Trade-offs between resource usage and accuracy — all off is most accurate.", "在资源占用与数据精度之间取舍，全部关闭时数据最准", "PgPerfSub"),
+    ("Performance", "性能", "PgPerformance"),
+    ("Language, appearance and startup behavior.", "界面语言、外观主题与启动行为", "PgPrefsSub"),
+    ("Window", "窗口", "PgWindow"),
+    ("Overlay z-order, position and mouse behavior.", "悬浮条的层级、位置与鼠标行为", "PgWindowSub"),
+    ("CPU", "CPU", "RowCpu"),
+    ("GPU", "GPU", "RowGpu"),
+    ("Memory", "内存", "RowMem"),
+    ("Net", "网络", "RowNet"),
+    ("Power", "功耗", "RowPower"),
+    ("Settings", "设置", "SbTitle"),
+    ("Dark", "深色", "SegAppearanceDark"),
+    ("Light", "浅色", "SegAppearanceLight"),
+    ("System", "跟随系统", "SegAppearanceSystem"),
+    ("Auto", "自动", "SegAuto"),
+    ("Bold", "粗", "SegBold"),
+    ("Both", "双向", "SegBoth"),
+    ("Cards", "卡片", "SegCards"),
+    ("Col", "列", "SegCol"),
+    ("Bottom L", "左下", "SegCornerLB"),
+    ("Top L", "左上", "SegCornerLT"),
+    ("Bottom R", "右下", "SegCornerRB"),
+    ("Top R", "右上", "SegCornerRT"),
+    ("Download", "下载", "SegDown"),
+    ("EN", "英文", "SegEn"),
+    ("Fine", "精细", "SegFine"),
+    ("GB", "GB", "SegGb"),
+    ("Horizontal", "横版", "SegHorizontal"),
+    ("Medium", "中", "SegMedium"),
+    ("None", "无", "SegNone"),
+    ("Percent", "百分比", "SegPercent"),
+    ("Performance", "性能", "SegPerf"),
+    ("High Quality", "高画质", "SegQuality"),
+    ("Round", "圆角", "SegRound"),
+    ("Row", "行", "SegRow"),
+    ("Smooth", "流畅", "SegSmooth"),
+    ("Split", "分栏", "SegSplit"),
+    ("Square", "方形", "SegSquare"),
+    ("Strip", "条形", "SegStrip"),
+    ("Thin", "细", "SegThin"),
+    ("Upload", "上传", "SegUp"),
+    ("Vertical", "竖版", "SegVertical"),
+    ("ZH", "中文", "SegZh"),
+    ("Log folder opened.", "已打开日志文件位置。", "StatusFolderOpened"),
+    ("Link opened in browser.", "已在浏览器中打开链接。", "StatusLinkOpened"),
+    ("Failed to open the link.", "打开链接失败。", "StatusOpenUrlFailed"),
+    ("Processor usage", "中央处理器占用率", "SubCpu"),
+    ("Graphics usage", "图形处理器占用率", "SubGpu"),
+    ("Memory usage", "内存占用率", "SubMem"),
+    ("Network throughput", "网络吞吐量", "SubNet"),
+    ("System power draw", "整机功耗", "SubPower"),
+    ("Unlock", "解锁", "TbUnlock"),
+    ("GPU row stopped: vendor driver libraries (NVML/ADL) have been unloaded.\n\
+             Utilization falls back to D3DKMT; vendor power readings require restarting AAX SysPulse.", "GPU 行已停止：厂商驱动库（NVML/ADL）已卸载。\n\
+             利用率将回落到 D3DKMT 读取；厂商功耗读数需重启应用恢复。", "TeardownGpu"),
+    ("Power row stopped: the MSR kernel driver has been unloaded.\n\
+             Re-enabling it requires restarting AAX SysPulse to restore the display.", "功耗行已停止：MSR 内核驱动已卸载。\n\
+             重新开启需要重启应用才能恢复显示。", "TeardownPower"),
+    ("AAX SysPulse Settings", "AAX SysPulse 设置", "WinTitle"),
+];
+
+/// 按字节序比较两个字符串（const 上下文可用的安全比较，避免依赖 str 的 Ord 是否 const 稳定）。
+const fn bytes_lt(a: &[u8], b: &[u8]) -> bool {
+    let n = if a.len() < b.len() { a.len() } else { b.len() };
+    let mut i = 0;
+    while i < n {
+        if a[i] != b[i] {
+            return a[i] < b[i];
+        }
+        i += 1;
+    }
+    a.len() < b.len()
+}
+
+/// const fn 二分查找：返回 key 在 TABLE 中的下标。
+const fn lookup(key: &str) -> Option<usize> {
+    let kb = key.as_bytes();
+    let mut lo = 0usize;
+    let mut hi = TABLE.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let mk = TABLE[mid].2.as_bytes();
+        if bytes_lt(mk, kb) {
+            lo = mid + 1;
+        } else if bytes_lt(kb, mk) {
+            hi = mid;
+        } else {
+            return Some(mid);
+        }
+    }
+    None
+}
+
+/// 编译期自检：TABLE 必须按 key 严格升序且无重复 key。
+/// 若有人漏加/错排条目，编译直接失败。
+/// 用 `const _` 匿名常量块，保证无论是否被引用都会在编译期求值。
+const _: () = {
+    let mut i = 1;
+    while i < TABLE.len() {
+        if !bytes_lt(TABLE[i-1].2.as_bytes(), TABLE[i].2.as_bytes()) {
+            panic!("i18n TABLE not strictly sorted/unique at index");
+        }
+        i += 1;
+    }
+};
+
 /// 翻译：按当前语言取文案。英文为默认（与 C 版一致）。
+/// 未知 key 原样透传（保持旧行为）。
 pub fn t(lang: Lang, key: &str) -> &str {
-    let zh = lang == Lang::Zh;
-    match (key, zh) {
-        // ── 悬浮窗主界面标签 ────────────────────────────
-        ("RowCpu", false) => "CPU",
-        ("RowCpu", true) => "CPU",
-        ("RowMem", false) => "Memory",
-        ("RowMem", true) => "内存",
-        ("RowGpu", false) => "GPU",
-        ("RowGpu", true) => "GPU",
-        ("RowNet", false) => "Net",
-        ("RowNet", true) => "网络",
-        ("RowPower", false) => "Power",
-        ("RowPower", true) => "功耗",
+    match lookup(key) {
+        Some(i) => if lang == Lang::Zh { TABLE[i].1 } else { TABLE[i].0 },
+        None => key,
+    }
+}
 
-        // ── 托盘菜单 ────────────────────────────────────
-        ("MenuSettings", false) => "Settings",
-        ("MenuSettings", true) => "设置",
-        ("MenuRestart", false) => "Quick Restart",
-        ("MenuRestart", true) => "快速重启",
-        ("MenuQuit", false) => "Quit",
-        ("MenuQuit", true) => "退出",
-
-        // ── 设置面板：卡片标题 ──────────────────────────
-        ("CardMonitoring", false) => "MONITORING",
-        ("CardMonitoring", true) => "监控项",
-        ("CardAppearance", false) => "APPEARANCE",
-        ("CardAppearance", true) => "外观",
-        ("CardRefresh", false) => "REFRESH RATE",
-        ("CardRefresh", true) => "刷新率",
-        ("CardWindow", false) => "WINDOW",
-        ("CardWindow", true) => "窗口",
-        ("CardAdvanced", false) => "ADVANCED",
-        ("CardAdvanced", true) => "高级",
-        ("CardLanguage", false) => "LANGUAGE",
-        ("CardLanguage", true) => "语言",
-
-        // ── 设置面板：行标签 ────────────────────────────
-        ("LblCpu", false) => "CPU",
-        ("LblCpu", true) => "CPU",
-        ("LblMem", false) => "Memory",
-        ("LblMem", true) => "内存",
-        ("LblGpu", false) => "GPU",
-        ("LblGpu", true) => "GPU",
-        ("LblNet", false) => "Network",
-        ("LblNet", true) => "网络",
-        ("LblPower", false) => "Power",
-        ("LblPower", true) => "功耗",
-        ("LblTime", false) => "Time",
-        ("LblTime", true) => "时间",
-        ("LblTimeSeconds", false) => "Show Seconds",
-        ("LblTimeSeconds", true) => "显示秒",
-        // 监控项总开关（展开菜单首行；原先放在折叠头，用户反馈移入展开区）。
-        ("LblShow", false) => "Show",
-        ("LblShow", true) => "显示",
-        ("HintTimeSeconds", false) => "Show the clock as HH:MM:SS. Turn off to display HH:MM only.",
-        ("HintTimeSeconds", true) => "时间以 时:分:秒 显示；关闭后仅显示 时:分。",
-        ("HintDragReorder", false) => "Drag the icon/name area of a card to reorder the items.",
-        ("HintDragReorder", true) => "按住卡片左侧的图标与名称区域上下拖动，即可调整监控项顺序。",
-        ("LblMemUnit", false) => "Memory Unit",
-        ("LblMemUnit", true) => "内存单位",
-        ("LblShadow", false) => "Text Shadow",
-        ("LblShadow", true) => "文字阴影",
-        ("LblOutline", false) => "Text Outline",
-        ("LblOutline", true) => "文字描边",
-        ("LblNetMode", false) => "Network Display",
-        ("LblNetMode", true) => "网络显示",
-        ("LblFontWeight", false) => "Font Weight",
-        ("LblFontWeight", true) => "字体粗细",
-        ("SegThin", false) => "Thin",
-        ("SegThin", true) => "细",
-        ("SegMedium", false) => "Medium",
-        ("SegMedium", true) => "中",
-        ("SegBold", false) => "Bold",
-        ("SegBold", true) => "粗",
-        ("SegDown", false) => "Download",
-        ("SegDown", true) => "下载",
-        ("SegUp", false) => "Upload",
-        ("SegUp", true) => "上传",
-        ("SegBoth", false) => "Both",
-        ("SegBoth", true) => "双向",
-        ("LblTopmost", false) => "Always on Top",
-        ("LblTopmost", true) => "窗口置顶",
-        ("LblFont", false) => "Text Size",
-        ("LblFont", true) => "字号",
-        ("LblStyle", false) => "Style",
-        ("LblStyle", true) => "样式",
-        ("LblOpacity", false) => "Opacity",
-        ("LblOpacity", true) => "不透明度",
-        ("LblLang", false) => "Language",
-        ("LblLang", true) => "语言",
-        ("LblLayout", false) => "Layout",
-        ("LblLayout", true) => "布局",
-        ("LblBg", false) => "Background",
-        ("LblBg", true) => "背景色",
-        ("LblFg", false) => "Foreground",
-        ("LblFg", true) => "前景色",
-        ("LblOverlaySize", false) => "Overlay Size",
-        ("LblOverlaySize", true) => "悬浮窗尺寸",
-        ("LblAutostart", false) => "Launch at Login",
-        ("LblAutostart", true) => "开机自启",
-        ("LblDebug", false) => "Debug Log",
-        ("LblDebug", true) => "调试日志",
-
-        // ── 设置面板：分段控件 / 按钮文案 ────────────────
-        ("SegPercent", false) => "Percent",
-        ("SegPercent", true) => "百分比",
-        ("SegGb", false) => "GB",
-        ("SegGb", true) => "GB",
-        ("SegCards", false) => "Cards",
-        ("SegCards", true) => "卡片",
-        ("SegStrip", false) => "Strip",
-        ("SegStrip", true) => "条形",
-        ("SegRound", false) => "Round",
-        ("SegRound", true) => "圆角",
-        ("SegSquare", false) => "Square",
-        ("SegSquare", true) => "方形",
-        ("SegNone", false) => "None",
-        ("SegNone", true) => "无",
-        ("SegRow", false) => "Row",
-        ("SegRow", true) => "行",
-        ("SegCol", false) => "Col",
-        ("SegCol", true) => "列",
-        ("SegSplit", false) => "Split",
-        ("SegSplit", true) => "分栏",
-        ("SegEn", false) => "EN",
-        ("SegEn", true) => "EN",
-        ("SegZh", false) => "中文",
-        ("SegZh", true) => "中文",
-        ("SegPerf", false) => "Performance",
-        ("SegPerf", true) => "性能",
-        ("SegQuality", false) => "Quality",
-        ("SegQuality", true) => "高画质",
-        ("SegAuto", false) => "Auto",
-        ("SegAuto", true) => "自动",
-        ("BtnDone", false) => "Done",
-        ("BtnDone", true) => "完成",
-        ("BtnResize", false) => "Resize",
-        ("BtnResize", true) => "调整",
-
-        // ── 设置面板：脚注 ──────────────────────────────
-        (
-            "FootnoteRefresh",
-            false,
-        ) => "Auto adapts the refresh rate to how fast system counters actually update, and eases off automatically when sampling gets expensive.",
-        (
-            "FootnoteRefresh",
-            true,
-        ) => "自动根据系统计数器的实际更新速度调整刷新率，并在采样开销增大时自动降频。",
-        (
-            "FootnoteDebug",
-            false,
-        ) => "Writes runtime state for troubleshooting. It keeps writing to disk — enable only when diagnosing.",
-        (
-            "FootnoteDebug",
-            true,
-        ) => "记录运行状态用于排查问题，会持续写入磁盘，建议仅在需要时开启。",
-        (
-            "FootnoteTopmost",
-            false,
-        ) => "Keeps the overlay above every other window. It does not steal mouse input.",
-        (
-            "FootnoteTopmost",
-            true,
-        ) => "让悬浮窗始终显示在其他窗口之上；默认不抢占鼠标点击。",
-
-        // ── 设置面板：窗口标题 ──────────────────────────
-        ("WinTitle", false) => "SysOverlay Settings",
-        ("WinTitle", true) => "SysOverlay 设置",
-        // 侧边栏左上角标题（精简为「设置」二字）。
-        ("SbTitle", false) => "Settings",
-        ("SbTitle", true) => "设置",
-
-        // ── 标题栏按钮 ─────────────────────────────────
-        ("TbUnlock", false) => "Unlock",
-        ("TbUnlock", true) => "解锁",
-
-        // ── 设置页分页导航（6 类；报告 §6 copy-map：常规→偏好、个性化→监控项） ──
-        ("PgGeneral", false) => "Preferences",
-        ("PgGeneral", true) => "偏好",
-        ("PgLayout", false) => "Layout",
-        ("PgLayout", true) => "布局",
-        ("PgMotion", false) => "Motion",
-        ("PgMotion", true) => "动效",
-        // 该页实际包含 开关/字号/名称色/数值色，不止颜色 → 命名"监控项"
-        ("PgMetrics", false) => "Monitors",
-        ("PgMetrics", true) => "监控项",
-        ("PgMetricsSub", false) => "Configure each metric's display, format and colors; font size follows the global default.",
-        ("PgMetricsSub", true) => "逐个配置悬浮条中每项数据的显示、格式与配色，字号默认跟随全局",
-        ("SubCpu", false) => "Processor usage",
-        ("SubCpu", true) => "中央处理器占用率",
-        ("SubMem", false) => "Memory usage",
-        ("SubMem", true) => "内存占用率",
-        ("SubGpu", false) => "Graphics usage",
-        ("SubGpu", true) => "图形处理器占用率",
-        ("SubNet", false) => "Network throughput",
-        ("SubNet", true) => "网络吞吐量",
-        ("SubPower", false) => "System power draw",
-        ("SubPower", true) => "整机功耗",
-        ("MtrOn", false) => "On",
-        ("MtrOn", true) => "已启用",
-        ("MtrOff", false) => "Off",
-        ("MtrOff", true) => "已关闭",
-        ("HintFontSize", false) => "Affects the overlay text size, range 8–256 px.",
-        ("HintFontSize", true) => "影响悬浮窗中的文字大小，范围 8–256 px。",
-        ("MetricsFoot", false) => "Changes apply instantly — see the desktop overlay.",
-        ("MetricsFoot", true) => "修改即时生效，可在桌面悬浮窗中查看。",
-        ("PgWindow", false) => "Window",
-        ("PgWindow", true) => "窗口",
-        ("PgAbout", false) => "About",
-        ("PgAbout", true) => "关于",
-        ("PgPerformance", false) => "Performance",
-        ("PgPerformance", true) => "性能",
-
-        // ── 新控件标签 ─────────────────────────────────
-        ("LblFontSize", false) => "Font Size",
-        ("LblFontSize", true) => "字号",
-        ("LblGapMetric", false) => "Item Gap",
-        ("LblGapMetric", true) => "条目间距",
-        ("LblGapLabel", false) => "Label–Value Gap",
-        ("LblGapLabel", true) => "名称与数值的间距",
-        ("LblWidth", false) => "Width",
-        ("LblWidth", true) => "宽度",
-        ("LblHeight", false) => "Height",
-        ("LblHeight", true) => "高度",
-        ("LblAnimMs", false) => "Transition S",
-        ("LblAnimMs", true) => "过渡时长",
-        ("LblNameColor", false) => "Name Color",
-        ("LblNameColor", true) => "名称色",
-        ("LblShowLabel", false) => "Show Name",
-        ("LblShowLabel", true) => "显示名称",
-        ("HintShowLabel", false) => "Show or hide the metric name label (e.g. CPU, Mem).",
-        ("HintShowLabel", true) => "显示或隐藏监控项的名称标签（如 CPU、Mem）。",
-        ("LblShortNames", false) => "Short Names",
-        ("LblShortNames", true) => "简化名称",
-        ("HintShortNames", false) => "Shorten labels: CPU→C, Mem→M, GPU→G, Net→N, Power→P, Time→T.",
-        ("HintShortNames", true) => "简化标签：CPU→C、Mem→M、GPU→G、Net→N、Power→P、Time→T。",
-        ("LblValueColor", false) => "Value Color",
-        ("LblValueColor", true) => "数值色",
-        ("BtnReset", false) => "Reset",
-        ("BtnReset", true) => "重置",
-        ("LblResetAll", false) => "Reset All",
-        ("LblResetAll", true) => "全部重置",
-        ("LblFollow", false) => "Default",
-        ("LblFollow", true) => "默认",
-        ("SegHorizontal", false) => "Horizontal",
-        ("SegHorizontal", true) => "横版",
-        ("SegVertical", false) => "Vertical",
-        ("SegVertical", true) => "竖版",
-        ("LblPin", false) => "Pin Window",
-        ("LblPin", true) => "固定窗口",
-
-        // ── 外观模式（偏好页三态切换） ─────────────────────
-        ("LblAppearance", false) => "Appearance",
-        ("LblAppearance", true) => "外观",
-        ("SegAppearanceSystem", false) => "System",
-        ("SegAppearanceSystem", true) => "跟随系统",
-        ("SegAppearanceLight", false) => "Light",
-        ("SegAppearanceLight", true) => "浅色",
-        ("SegAppearanceDark", false) => "Dark",
-        ("SegAppearanceDark", true) => "深色",
-        ("BtnExpand", false) => "Expand",
-        ("BtnExpand", true) => "展开",
-        ("BtnCollapse", false) => "Collapse",
-        ("BtnCollapse", true) => "收起",
-        ("LblRate", false) => "Refresh Rate",
-        ("LblRate", true) => "刷新率",
-        ("LblGpuPrimary", false) => "Primary GPU Only",
-        ("LblGpuPrimary", true) => "仅统计主显卡",
-        ("LblGpu3D", false) => "3D Load Only",
-        ("LblGpu3D", true) => "仅统计 3D 负载",
-        ("LblPowerQuery", false) => "Power Query",
-        ("LblPowerQuery", true) => "功耗查询",
-        ("HintPowerQuery", false) => "Turn off to skip kernel-level power sampling (saves CPU); the Power row then shows --.",
-        ("HintPowerQuery", true) => "关闭后跳过内核级功耗采样以节省性能，功耗行将显示 --。",
-        ("LblNetLowFreq", false) => "Lower Net Refresh Rate",
-        ("LblNetLowFreq", true) => "降低网络刷新频率",
-        ("LblEngine", false) => "Render Mode",
-        ("LblEngine", true) => "渲染模式",
-        // 渲染模式两档（报告 §6：性能→流畅、高画质→精细）
-        ("SegSmooth", false) => "Smooth",
-        ("SegSmooth", true) => "流畅",
-        ("SegFine", false) => "Fine",
-        ("SegFine", true) => "精细",
-
-        // ── 关于页（报告 §6：修正病句） ──────────────────
-        ("AboutName", false) => "SysOverlay",
-        ("AboutName", true) => "SysOverlay",
-        ("AboutDesc", false) => "Hardware monitoring overlay: free-form layout, per-metric colors, and smooth animated transitions.",
-        ("AboutDesc", true) => "硬件监控悬浮条：自由排布布局、逐项自定义配色，动画过渡顺滑自然。",
-        ("AboutCopyright", false) => "© 2026 SysOverlay",
-        ("AboutCopyright", true) => "© 2026 SysOverlay",
-        ("AboutLinks", false) => "Terms · Privacy · Website · Feedback · Licenses",
-        ("AboutLinks", true) => "使用条款 · 隐私政策 · 官网 · 提交反馈 · 开源许可",
-        ("AboutLogo", false) => "SO",
-        ("AboutLogo", true) => "SO",
-        ("AboutVer", false) => {
-            const S: &str = concat!("Version ", env!("CARGO_PKG_VERSION"));
-            S
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aaxsyspulse_core::types::Lang;
+    #[test]
+    fn unknown_key_passthrough() {
+        assert_eq!(t(Lang::En, "__nope__"), "__nope__");
+        assert_eq!(t(Lang::Zh, "__nope__"), "__nope__");
+    }
+    #[test]
+    fn lookup_hits_every_entry() {
+        for (en, zh, key) in TABLE {
+            assert_eq!(t(Lang::En, key), *en);
+            assert_eq!(t(Lang::Zh, key), *zh);
         }
-        ("AboutVer", true) => {
-            const S: &str = concat!("版本 ", env!("CARGO_PKG_VERSION"));
-            S
-        }
-
-        // ── v5 设置页规范（报告 §5/§6/§11）新增 ──────────
-        // 页副标题
-        ("PgPrefsSub", false) => "Language, appearance and startup behavior.",
-        ("PgPrefsSub", true) => "界面语言、外观主题与启动行为",
-        ("PgLayoutSub", false) => "Arrangement and sizing — applies to every metric. Data formats live on the Monitors page.",
-        ("PgLayoutSub", true) => "悬浮条的排列方式与尺寸，对所有监控项生效；数据格式见「监控项」页",
-        ("PgWindowSub", false) => "Overlay z-order, position and mouse behavior.",
-        ("PgWindowSub", true) => "悬浮条的层级、位置与鼠标行为",
-        ("PgPerfSub", false) => "Trade-offs between resource usage and accuracy — all off is most accurate.",
-        ("PgPerfSub", true) => "在资源占用与数据精度之间取舍，全部关闭时数据最准",
-        // 分组标题
-        ("GrpDisplay", false) => "Display",
-        ("GrpDisplay", true) => "显示",
-        ("GrpStartup", false) => "Startup",
-        ("GrpStartup", true) => "启动",
-        ("GrpDiagnostics", false) => "Diagnostics",
-        ("GrpDiagnostics", true) => "诊断",
-        ("GrpArrange", false) => "Arrangement",
-        ("GrpArrange", true) => "排列",
-        ("GrpDataFormat", false) => "Data Format",
-        ("GrpDataFormat", true) => "数据格式",
-        ("GrpTextEffects", false) => "Text Effects",
-        ("GrpTextEffects", true) => "文字效果",
-        ("GrpInteraction", false) => "Layer & Input",
-        ("GrpInteraction", true) => "层级与交互",
-        ("GrpPosLook", false) => "Appearance",
-        ("GrpPosLook", true) => "外观",
-        ("GrpScope", false) => "Sampling Scope",
-        ("GrpScope", true) => "统计范围",
-        ("GrpRefresh", false) => "Refresh Rate",
-        ("GrpRefresh", true) => "刷新频率",
-        ("GrpPicture", false) => "Rendering",
-        ("GrpPicture", true) => "画面",
-        // 偏好页：日志文件行
-        ("LblLogFolder", false) => "Log File",
-        ("LblLogFolder", true) => "日志文件",
-        ("ActOpenLogFolder", false) => "Open log folder →",
-        ("ActOpenLogFolder", true) => "打开日志文件位置 →",
-        // 窗口页新增
-        ("LblClickThrough", false) => "Click-through",
-        ("LblClickThrough", true) => "鼠标可穿透",
-        ("LblCorner", false) => "Position",
-        ("LblCorner", true) => "显示位置",
-        ("SegCornerRT", false) => "Top R",
-        ("SegCornerRT", true) => "右上",
-        ("SegCornerRB", false) => "Bottom R",
-        ("SegCornerRB", true) => "右下",
-        ("SegCornerLT", false) => "Top L",
-        ("SegCornerLT", true) => "左上",
-        ("SegCornerLB", false) => "Bottom L",
-        ("SegCornerLB", true) => "左下",
-        // 关于页动作
-        ("ActCheckUpdate", false) => "Check for Updates",
-        ("ActCheckUpdate", true) => "检查更新",
-        ("ActCopyVersion", false) => "Copy Version Info",
-        ("ActCopyVersion", true) => "复制版本信息",
-        ("StatusCopied", false) => "Copied to clipboard.",
-        ("StatusCopied", true) => "已复制到剪贴板。",
-        ("StatusUpToDate", false) => "You're up to date.",
-        ("StatusUpToDate", true) => "当前已是最新版本。",
-        ("StatusFolderOpened", false) => "Log folder opened.",
-        ("StatusFolderOpened", true) => "已打开日志文件位置。",
-        // 监控项页：两级字号语义
-        ("MtrFollow", false) => "Follows global",
-        ("MtrFollow", true) => "跟随全局",
-        ("MtrCustomized", false) => "Custom",
-        ("MtrCustomized", true) => "已自定义",
-        ("ActRestoreGlobal", false) => "Follow global",
-        ("ActRestoreGlobal", true) => "恢复跟随全局",
-        // 监控项页：逐控件 hint（报告 V03）
-        ("HintFontSizeMetric", false) => "Affects the text size of this metric in the overlay.",
-        ("HintFontSizeMetric", true) => "影响该监控项在悬浮窗中的文字大小。",
-        ("HintNameColor", false) => "Color of the metric's name.",
-        ("HintNameColor", true) => "监控项名称的显示颜色。",
-        ("HintValueColor", false) => "Color of the metric's value.",
-        ("HintValueColor", true) => "监控项数值的显示颜色。",
-        // 行内 hint（报告 §6 hint 表）
-        ("HintLanguage", false) => "Interface language. Takes effect after restart.",
-        ("HintLanguage", true) => "界面显示语言，重启后生效",
-        ("HintAppearance", false) => "Follows the system theme automatically.",
-        ("HintAppearance", true) => "跟随系统时将随系统主题自动切换",
-        ("HintAutostart", false) => "Launch the overlay at login.",
-        ("HintAutostart", true) => "登录系统后自动运行悬浮条",
-        ("HintDebugLog", false) => "Writes runtime state for troubleshooting. It keeps writing to disk — enable only when diagnosing.",
-        ("HintDebugLog", true) => "记录运行状态用于排查问题，会持续写入磁盘，建议仅在需要时开启。",
-        ("HintStyle", false) => "Horizontal strip, or stacked vertical lines.",
-        ("HintStyle", true) => "横版一行排布，竖版逐行堆叠",
-        ("HintFontSizeGlobal", false) => "Global default; each metric can override it on the Monitors page.",
-        ("HintFontSizeGlobal", true) => "全局默认值，单个监控项可在「监控项」页单独覆盖",
-        ("HintItemGap", false) => "Space between metric items.",
-        ("HintItemGap", true) => "各监控项之间的空隙",
-        ("HintNvGap", false) => "Distance between a label and its value.",
-        ("HintNvGap", true) => "每项内部标签与数值之间的距离",
-        ("HintMemUnit", false) => "Percent shows usage; GB shows the actual amount.",
-        ("HintMemUnit", true) => "百分比显示占用率，GB 显示实际用量",
-        ("HintNetDisplay", false) => "Show upload and download rates together.",
-        ("HintNetDisplay", true) => "双向同时显示上下行速率",
-        ("HintTextShadow", false) => "Clearer on light wallpapers; keep it off on dark backgrounds.",
-        ("HintTextShadow", true) => "在浅色壁纸上更清晰，深色背景下建议关闭",
-        ("HintTextStroke", false) => "Adds an outline; easier to read on busy backgrounds.",
-        ("HintTextStroke", true) => "为文字添加轮廓，复杂背景下更易读",
-        ("HintAlwaysTop", false) => "Keeps the overlay above every other window.",
-        ("HintAlwaysTop", true) => "让悬浮条始终显示在其他窗口之上。",
-        ("HintAlwaysTop2", false) => "It never steals mouse clicks; windows below stay interactive.",
-        ("HintAlwaysTop2", true) => "默认不抢占鼠标点击，可正常操作下方的窗口。",
-        ("HintClickThrough", false) => "The overlay ignores the mouse; clicks pass through to what's behind.",
-        ("HintClickThrough", true) => "悬浮条不接收鼠标事件，光标可直接穿过去点击背后内容",
-        ("HintCorner", false) => "Which screen corner to snap to.",
-        ("HintCorner", true) => "贴靠屏幕的哪个角",
-        ("HintOpacity", false) => "Lower it to keep the overlay translucent for long-term display.",
-        ("HintOpacity", true) => "降低后悬浮条会半透明，适合长期放置",
-        ("HintGpuPrimary", false) => "Reads only the primary GPU and skips other adapters to save overhead.",
-        ("HintGpuPrimary", true) => "只读取主要显卡的数据，忽略其他显示适配器，可减少开销。",
-        ("HintGpu3D", false) => "Usage reflects 3D/game loads only; lower numbers are expected.",
-        ("HintGpu3D", true) => "占用率只反映游戏与 3D 应用的负载，开启后数值会偏低，属正常现象。",
-        ("HintNetLowFreq", false) => "Saves resources; the network rate updates with a short delay.",
-        ("HintNetLowFreq", true) => "减少资源占用，网速显示会有短暂延迟。",
-        ("HintRenderMode", false) => "Smooth favors lower cost; Fine favors animation quality.",
-        ("HintRenderMode", true) => "流畅优先降低绘制开销，精细优先保证动画细腻",
-
-        // v3「行关即完全停止」：驱动/厂商库卸载后的重启恢复提示
-        ("TeardownPower", false) => {
-            "Power row stopped: the MSR kernel driver has been unloaded.\n\
-             Re-enabling it requires restarting SysOverlay to restore the display."
-        }
-        ("TeardownPower", true) => {
-            "功耗行已停止：MSR 内核驱动已卸载。\n\
-             重新开启需要重启应用才能恢复显示。"
-        }
-        ("TeardownGpu", false) => {
-            "GPU row stopped: vendor driver libraries (NVML/ADL) have been unloaded.\n\
-             Utilization falls back to D3DKMT; vendor power readings require restarting SysOverlay."
-        }
-        ("TeardownGpu", true) => {
-            "GPU 行已停止：厂商驱动库（NVML/ADL）已卸载。\n\
-             利用率将回落到 D3DKMT 读取；厂商功耗读数需重启应用恢复。"
-        }
-
-        _ => key,
     }
 }

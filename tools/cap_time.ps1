@@ -13,7 +13,7 @@ public class Win3 {
     public struct RECT { public int L, T, R, B; }
 }
 "@
-$pidTarget = (Get-Process sysoverlay-app -ErrorAction Stop).Id
+$pidTarget = (Get-Process AAXSysPulse -ErrorAction Stop).Id
 $best = [IntPtr]::Zero; $bestArea = 0; $bestRect = New-Object Win3+RECT
 $cb = [Win3+EnumProc]{
     param($h, $l)

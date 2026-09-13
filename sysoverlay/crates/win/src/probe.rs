@@ -1,7 +1,7 @@
 //! 诊断探针（P-DIAG）：`SYSOVERLAY_PROBE=1`（或设置面板「调试日志」开启）时
 //! 把各采样器的**原始 API 数据**逐行写入统一日志文件的 `probe` 流。
 //!
-//! 落盘出口统一收敛到 [`crate::logging`]（单文件 `sysoverlay_YYYYMMDD_HHMM.log`、
+//! 落盘出口统一收敛到 [`crate::logging`]（单文件 `aaxsyspulse_YYYYMMDD_HHMM.log`、
 //! 常驻句柄、`[hh:mm:ss.mmm] [probe] 消息` 行格式），本模块只负责：
 //!
 //! - 开关门控（设置面板开关 **或** 环境变量，二者取或）；

@@ -7,7 +7,7 @@
 //! 文件 I/O 收敛到一处，调用方（probe/perf）只负责各自的开关门控与行内容：
 //!
 //! - **单文件双流**：两个流都写进
-//!   `%LOCALAPPDATA%\SysOverlayC\sysoverlay_YYYYMMDD_HHMM.log`
+//!   `%LOCALAPPDATA%\AAXSysPulseC\aaxsyspulse_YYYYMMDD_HHMM.log`
 //!   （会话内**首次写入时**确定文件名，每会话一个文件；旧的 probe_*.log /
 //!   perf.log 历史文件原样保留不动）。
 //! - **统一行格式**：`[hh:mm:ss.mmm] [流名] 消息`，流名 = `probe` / `perf`，
@@ -61,7 +61,7 @@ pub fn write(stream: Stream, text: &str) {
         let Some(dir) = std::env::var_os("LOCALAPPDATA") else {
             return;
         };
-        let dir = std::path::PathBuf::from(dir).join("SysOverlayC");
+        let dir = std::path::PathBuf::from(dir).join("AAXSysPulseC");
         let _ = std::fs::create_dir_all(&dir);
         let name = session_name();
         match std::fs::OpenOptions::new()
@@ -82,13 +82,13 @@ pub fn write(stream: Stream, text: &str) {
     }
 }
 
-/// 会话日志文件名：`sysoverlay_YYYYMMDD_HHMM.log`（本地时间，首次写入时刻）。
+/// 会话日志文件名：`aaxsyspulse_YYYYMMDD_HHMM.log`（本地时间，首次写入时刻）。
 fn session_name() -> String {
     SESSION_NAME
         .get_or_init(|| {
             let st = local_systemtime();
             format!(
-                "sysoverlay_{:04}{:02}{:02}_{:02}{:02}.log",
+                "aaxsyspulse_{:04}{:02}{:02}_{:02}{:02}.log",
                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute
             )
         })

@@ -19,6 +19,16 @@
 //!
 //! Render target DPI 固定 96/96（恒等变换）：**全部布局按物理像素进行**，
 //! 与现有 `s(dpi, v)` 缩放体系无缝对接，文字直接按像素高度给 DWrite。
+//!
+//! # Safety（本文件 unsafe 汇总）
+//!
+//! - 手写 `unsafe` 仅限 SINGLE_THREADED 工厂创建与接口指针传递，其余 COM 调用
+//!   均走 `windows` crate 的安全封装；
+//! - **线程亲和性**：`D2D1_FACTORY_TYPE_SINGLE_THREADED` 要求工厂及其全部子对象
+//!   单线程使用——设置页 `Gfx` 只在设置 UI 线程触碰（模态期间由 `MODAL_DIALOG`
+//!   闸门防重入），悬浮窗侧工厂独立、在渲染线程（见 render_thread.rs 模块头）；
+//! - COM 生命周期由 `Gfx` 的 Drop 唯一管理（资源规则第 1 条），不存在裸指针
+//!   逃逸到 Drop 之后的路径。
 
 use std::collections::HashMap;
 
@@ -131,7 +141,10 @@ impl RectF {
     }
 
     pub fn rounded(self, radius: f32) -> D2D1_ROUNDED_RECT {
-        D2D1_ROUNDED_RECT { rect: self.d2d(), radiusX: radius, radiusY: radius }
+        // 半径超过半边长会产生自交几何（D2D 渲染出残角/溢出）：
+        // 卡片圆角 30px 可能高于矮卡半高（折叠头仅 52px），必须钳位。
+        let r = radius.max(0.0).min(self.w() * 0.5).min(self.h() * 0.5);
+        D2D1_ROUNDED_RECT { rect: self.d2d(), radiusX: r, radiusY: r }
     }
 
     pub fn point(self) -> D2D_POINT_2F {
@@ -221,6 +234,9 @@ pub struct Gfx {
     /// 图标路径几何缓存：键 = (图标号, 目标宽, 目标高)。
     /// 几何由工厂创建、与 RT 无关，故 RT 重建后仍可复用（无需清理）。
     paths: HashMap<(usize, i32, i32), ID2D1PathGeometry>,
+    /// 全局圆角半径（物理 px）。设置页所有圆角按「不小于它」统一，
+    /// 再由控件几何钳位 —— 见 [`Gfx::set_global_radius`] 与 [`Gfx::round_radius`]。
+    global_radius: f32,
 }
 
 /// C2：探测系统可用 UI 字体族，按 Apple 观感优先级降级。
@@ -329,6 +345,7 @@ impl Gfx {
                 layer: None,
                 ui_family: None,
                 paths: HashMap::new(),
+                global_radius: 0.0,
             })
         }
     }
@@ -541,7 +558,24 @@ impl Gfx {
 
     // ── 绘制基元（画刷经缓存；调用方持 rt 克隆，与 &mut self 无别名） ──
 
+    /// 设定**全局圆角**（物理 px）。设置页绘制前逐帧按 DPI 写入
+    /// （`settings::paint_d2d` → `layout::RADIUS`）。
+    ///
+    /// 语义：所有圆角取 `max(调用方给的半径, 全局半径)`，再钳到控件短边一半。
+    /// 于是「全局 30px」自动覆盖卡片/按钮/步进器/分段控件/色板等一切小圆角，
+    /// 而本来就是胶囊/圆形的控件（半径已是短边一半）**保持不变**。
+    pub fn set_global_radius(&mut self, r: f32) {
+        self.global_radius = r.max(0.0);
+    }
+
+    /// 实际生效的圆角：不小于全局值，且不超过短边一半（否则 D2D 自交）。
+    fn round_radius(&self, r: RectF, radius: f32) -> f32 {
+        let cap = (r.w().min(r.h())) * 0.5;
+        radius.max(self.global_radius).min(cap).max(0.0)
+    }
+
     pub fn fill_round(&mut self, rt: &ID2D1HwndRenderTarget, r: RectF, radius: f32, c: ColorF) {
+        let radius = self.round_radius(r, radius);
         if let Some(b) = self.brush(rt, c) {
             unsafe { rt.FillRoundedRectangle(&r.rounded(radius), &b) };
         }
@@ -555,6 +589,7 @@ impl Gfx {
         c: ColorF,
         width: f32,
     ) {
+        let radius = self.round_radius(r, radius);
         if let Some(b) = self.brush(rt, c) {
             unsafe { rt.DrawRoundedRectangle(&r.rounded(radius), &b, width, None) };
         }

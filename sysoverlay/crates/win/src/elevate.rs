@@ -5,6 +5,7 @@
 //! - 拒绝 UAC / 选否 → **Power 行强制关闭**（禁止显示 + 停止计算）。
 
 use crate::probe;
+use aaxsyspulse_core::types::Lang;
 use windows::Win32::UI::Shell::IsUserAnAdmin;
 use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, IDYES, MB_ICONQUESTION, MB_YESNO};
 
@@ -13,11 +14,26 @@ pub fn is_admin() -> bool {
 }
 
 /// 弹窗询问 + runas 自重启。返回 `true` = 已发起重启（调用方应立即退出）。
-pub fn prompt_and_relaunch() -> bool {
+///
+/// `lang` 由调用方从**已加载的配置**传入 —— 本弹窗出现在启动阶段，此时
+/// 设置页还没跑过、`global_lang` 仍是默认值，不能依赖它。
+/// 文案此前是硬编码中文：英文界面下会整段显示中文。
+pub fn prompt_and_relaunch(lang: Lang) -> bool {
     unsafe {
-        let text = windows::core::w!("整机功耗显示需要管理员权限（读取 CPU 功耗传感器）。\n\n是否以管理员身份重新启动 SysOverlay？\n（选择「否」将关闭功耗行，不影响其他显示）");
-        let caption = windows::core::w!("SysOverlay");
-        let choice = MessageBoxW(None, text, caption, MB_YESNO | MB_ICONQUESTION);
+        let text_w: Vec<u16> = crate::i18n::t(lang, "ElevateText")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let caption_w: Vec<u16> = crate::i18n::t(lang, "ElevateCaption")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let choice = MessageBoxW(
+            None,
+            windows::core::PCWSTR(text_w.as_ptr()),
+            windows::core::PCWSTR(caption_w.as_ptr()),
+            MB_YESNO | MB_ICONQUESTION,
+        );
         if choice != IDYES {
             probe::log("elevate user declined -> power row disabled");
             return false;

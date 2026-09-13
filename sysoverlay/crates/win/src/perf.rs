@@ -4,10 +4,10 @@
 //!
 //! 悬浮窗是 GUI 子系统进程（`windows_subsystem = "windows"`），**没有控制台**，
 //! `eprintln!` 看不到。所以这里写文件（落盘出口统一在 [`crate::logging`]，
-//! 与 probe 流共用 `sysoverlay_YYYYMMDD_HHMM.log`，行前缀 `[perf]`）：
+//! 与 probe 流共用 `aaxsyspulse_YYYYMMDD_HHMM.log`，行前缀 `[perf]`）：
 //!
 //! ```text
-//! %LOCALAPPDATA%\SysOverlayC\sysoverlay_YYYYMMDD_HHMM.log
+//! %LOCALAPPDATA%\AAXSysPulseC\aaxsyspulse_YYYYMMDD_HHMM.log
 //! ```
 //!
 //! 每 5 秒追加一行：`frames`（实际渲染帧数）、`skipped`（脏检查跳过的帧）、

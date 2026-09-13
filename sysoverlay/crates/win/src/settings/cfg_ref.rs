@@ -17,9 +17,9 @@
 //! 本文件测试即规格：每个变体都有 roundtrip 断言（set 后 get 回同一值），
 //! 外加类型错配必须返回 false 的防回归断言。
 
-use sysoverlay_core::color::Rgb;
-use sysoverlay_core::config::Config;
-use sysoverlay_core::types::{Appearance, Lang, NetMode, RenderEngine, RenderStyle};
+use aaxsyspulse_core::color::Rgb;
+use aaxsyspulse_core::config::{Config, OFFSET_MAX, OFFSET_MIN, SNAP_CORNER_FREE};
+use aaxsyspulse_core::types::{Appearance, Lang, NetMode, RenderEngine, RenderStyle};
 
 /// 控件写入/读出的泛化值。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -35,269 +35,128 @@ pub enum Value {
     /// 指标颜色（None = 跟随默认）。
     Color(Option<Rgb>),
 }
-
-/// Config 单一真值引用。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CfgRef {
-    // ── bool 开关 ──
-    ShowCpu,
-    ShowMem,
-    ShowGpu,
-    ShowNet,
-    PowerEnabled,
-    /// 时钟行显示开关（监控项页 Time 卡）。
-    ShowTime,
-    /// 时钟是否显示秒（HH:MM:SS / HH:MM）。
-    TimeSeconds,
-    /// 逐指标名称显示开关（默认开；关闭后只显示数值）。
-    MetricShowLabel(usize),
-    /// 简化名称：CPU→C、Mem→M、GPU→G、Net→N、Power→P、Time→T。
-    ShortNames,
-    /// 功耗查询开关（性能页）：false 跳过 MSR 内核查询，功耗行显示 --。
-    PowerQuery,
-    TextShadow,
-    TextOutline,
-    Topmost,
-    #[allow(dead_code)] AutoStart,
-    #[allow(dead_code)] DebugLog,
-    GpuPrimaryOnly,
-    Gpu3dOnly,
-    NetLowFreq,
-    /// 网络栏显示模式：0=双向 1=仅下载 2=仅上传。
-    NetMode,
-    /// 鼠标可穿透（窗口页，报告 §5）。
-    ClickThrough,
-    /// 贴靠屏幕的哪个角：0=右上 1=右下 2=左上 3=左下；None = 自由定位。
-    SnapCorner,
-    /// 悬浮窗不透明度（%），映射 `normal_opacity`（报告范围 40..=100）。
-    Opacity,
-
-    // ── 数值滑杆 ──
-    FontSize,
-    MetricGap,
-    LabelValueGap,
-    /// 逐指标字号（下标 0..5）。
-    MetricFont(usize),
-
-    // ── 分段选择 ──
-    Style,
-    /// 内存单位：0 = 百分比，1 = GB。
-    MemUnit,
-    /// 界面语言：0 = En，1 = Zh。
-    Lang,
-    /// 悬浮窗渲染引擎：0 = 性能（像素块），1 = 高画质（D2D + DirectWrite）。
-    RenderEngine,
-    /// 字重档位：0 = 细，1 = 中，2 = 粗（默认）。
-    FontWeight,
-    /// 外观模式：0 = 跟随系统，1 = 浅色，2 = 深色。
-    /// 顺序必须与 layout.rs 的 labels 顺序一致（红线 R1）。
-    Appearance,
-
-    // ── 指标颜色 ──
-    /// 指标名称色（下标 0..5）。
-    MetricLabel(usize),
-    /// 指标数值色（下标 0..5）。
-    MetricValue(usize),
-    /// 数值槽「自动色」：按占用率分档变色（<60% 绿 / 60~85% 橙 / ≥85% 红）。
-    MetricValueAuto(usize),
-}
-
+// 注意：刻意不用 `#[macro_export]`。本宏只在当前模块内使用；
+// 若导出，其表内 token（`cfg` 参数、`MetricFont(i)` 等模式）会带上 crate-root 卫生上下文，
+// 与模块内 `enum CfgRef` 变体、生成的 `get/set` 的 `cfg` 形参对不上，导致
+// "expected value, found macro cfg" / "cannot find tuple variant" 这类卫生错误。
+// `CfgRef` 是「控件 ↔ Config」的唯一映射表。枚举变体 + 下方 `get`/`set` 的
+// match 臂一一对应；新增设置项时同步追加：① 枚举变体 ② get 臂 ③ set 臂。
+// （历史上曾用 `for_each_cfg_field!` 宏同时生成 getter/setter，但 macro_rules!
+// 的卫生机制会让表内 `cfg`/`i` 与生成的 `get`/`set` 形参处于不同卫生上下文，
+// 导致 "expected value, found macro cfg"；故改为单一 hygiene 上下文的手写 impl，
+// 行为完全等价于原宏生成结果。）
 impl CfgRef {
-    /// 从 Config 读当前值。
     pub fn get(self, cfg: &Config) -> Value {
         match self {
-            // bool
             CfgRef::ShowCpu => Value::Bool(cfg.show_cpu),
             CfgRef::ShowMem => Value::Bool(cfg.show_mem),
             CfgRef::ShowGpu => Value::Bool(cfg.show_gpu),
             CfgRef::ShowNet => Value::Bool(cfg.show_net),
-            CfgRef::PowerEnabled => Value::Bool(cfg.power_enabled),
             CfgRef::ShowTime => Value::Bool(cfg.show_time),
             CfgRef::TimeSeconds => Value::Bool(cfg.time_show_seconds),
-            CfgRef::MetricShowLabel(i) => {
-                Value::Bool(*cfg.metric_show_labels.get(i).unwrap_or(&true))
-            }
             CfgRef::ShortNames => Value::Bool(cfg.short_names),
-            CfgRef::PowerQuery => Value::Bool(cfg.power_query),
+            CfgRef::MemUnit => Value::Select(if cfg.mem_show_gb { 1 } else { 0 }),
+            CfgRef::FontSize => Value::Num(cfg.font_size as f64),
+            CfgRef::FontWeight => Value::Select(cfg.font_weight as usize),
+            CfgRef::MetricGap => Value::Num(cfg.metric_gap as f64),
+            CfgRef::LabelValueGap => Value::Num(cfg.label_value_gap as f64),
             CfgRef::TextShadow => Value::Bool(cfg.text_shadow),
             CfgRef::TextOutline => Value::Bool(cfg.text_outline),
-            CfgRef::Topmost => Value::Bool(cfg.topmost),
             CfgRef::AutoStart => Value::Bool(cfg.autostart),
             CfgRef::DebugLog => Value::Bool(cfg.debug_log),
+            CfgRef::Topmost => Value::Bool(cfg.topmost),
+            CfgRef::Opacity => Value::Num(cfg.normal_opacity as f64),
+            CfgRef::NetMode => Value::Select(match cfg.net_mode { NetMode::Both => 0, NetMode::Down => 1, NetMode::Up => 2 }),
+            CfgRef::Style => Value::Select(match cfg.render_style { RenderStyle::Vertical => 1, _ => 0 }),
+            CfgRef::RenderEngine => Value::Select(if cfg.render_engine == RenderEngine::D2d { 1 } else { 0 }),
+            CfgRef::Lang => Value::Select(cfg.lang as usize),
+            CfgRef::PowerEnabled => Value::Bool(cfg.power_enabled),
+            CfgRef::PowerQuery => Value::Bool(cfg.power_query),
             CfgRef::GpuPrimaryOnly => Value::Bool(cfg.gpu_primary_only),
             CfgRef::Gpu3dOnly => Value::Bool(cfg.gpu_3d_only),
             CfgRef::NetLowFreq => Value::Bool(cfg.net_low_freq),
-            CfgRef::NetMode => {
-                Value::Select(match cfg.net_mode {
-                    NetMode::Both => 0,
-                    NetMode::Down => 1,
-                    NetMode::Up => 2,
-                })
-            }
-            CfgRef::ClickThrough => Value::Bool(cfg.click_through),
-            CfgRef::SnapCorner => Value::SelectOpt(if cfg.snap_corner <= 3 {
-                Some(cfg.snap_corner as usize)
-            } else {
-                None
-            }),
-            CfgRef::Opacity => Value::Num(cfg.normal_opacity as f64),
-            // num
-            CfgRef::FontSize => Value::Num(cfg.font_size as f64),
-            CfgRef::MetricGap => Value::Num(cfg.metric_gap as f64),
-            CfgRef::LabelValueGap => Value::Num(cfg.label_value_gap as f64),
-            CfgRef::MetricFont(i) => {
-                Value::Num(cfg.metric_font_sizes[i].unwrap_or(cfg.font_size) as f64)
-            }
-            // select
-            CfgRef::Style => Value::Select(match cfg.render_style {
-                RenderStyle::Vertical => 1,
-                _ => 0,
-            }),
-            CfgRef::MemUnit => Value::Select(if cfg.mem_show_gb { 1 } else { 0 }),
-            CfgRef::Lang => Value::Select(cfg.lang as usize),
-            CfgRef::RenderEngine => Value::Select(if cfg.render_engine == RenderEngine::D2d { 1 } else { 0 }),
-            CfgRef::FontWeight => Value::Select(cfg.font_weight as usize),
             CfgRef::Appearance => Value::Select(cfg.appearance.to_config() as usize),
-            // color
-    CfgRef::MetricLabel(i) => Value::Color(cfg.metric_colors[i].label),
-    CfgRef::MetricValue(i) => Value::Color(cfg.metric_colors[i].value),
-    CfgRef::MetricValueAuto(i) => Value::Bool(cfg.metric_colors[i].value_auto),
-    }
+            CfgRef::ClickThrough => Value::Bool(cfg.click_through),
+            CfgRef::SnapCorner => Value::SelectOpt(if cfg.snap_corner <= 3 { Some(cfg.snap_corner as usize) } else { None }),
+            CfgRef::MetricShowLabel(i) => Value::Bool(*cfg.metric_show_labels.get(i).unwrap_or(&true)),
+            CfgRef::MetricFont(i) => Value::Num(cfg.metric_font_sizes[i].unwrap_or(cfg.font_size) as f64),
+            CfgRef::MetricOffset(i, c) => Value::Num(cfg.metric_offsets.get(i).and_then(|o| o.get(c as usize)).copied().unwrap_or(0) as f64),
+            CfgRef::MetricLabel(i) => Value::Color(cfg.metric_colors[i].label),
+            CfgRef::MetricValue(i) => Value::Color(cfg.metric_colors[i].value),
+            CfgRef::MetricValueAuto(i) => Value::Bool(cfg.metric_colors[i].value_auto),
+        }
     }
 
-    /// 写回 Config。类型错配返回 false（debug 构建 panic）。
     pub fn set(self, cfg: &mut Config, v: Value) -> bool {
         match (self, v) {
-            // bool
-            (CfgRef::ShowCpu, Value::Bool(x)) => cfg.show_cpu = x,
-            (CfgRef::ShowMem, Value::Bool(x)) => cfg.show_mem = x,
-            (CfgRef::ShowGpu, Value::Bool(x)) => cfg.show_gpu = x,
-            (CfgRef::ShowNet, Value::Bool(x)) => cfg.show_net = x,
-            (CfgRef::PowerEnabled, Value::Bool(x)) => cfg.power_enabled = x,
-            (CfgRef::ShowTime, Value::Bool(x)) => cfg.show_time = x,
-            (CfgRef::TimeSeconds, Value::Bool(x)) => cfg.time_show_seconds = x,
-            (CfgRef::MetricShowLabel(i), Value::Bool(x)) => {
-                if let Some(v) = cfg.metric_show_labels.get_mut(i) {
-                    *v = x;
-                } else {
-                    return false;
-                }
-            }
-            (CfgRef::ShortNames, Value::Bool(x)) => cfg.short_names = x,
-            (CfgRef::PowerQuery, Value::Bool(x)) => cfg.power_query = x,
-            (CfgRef::TextShadow, Value::Bool(x)) => cfg.text_shadow = x,
-            (CfgRef::TextOutline, Value::Bool(x)) => cfg.text_outline = x,
-            (CfgRef::Topmost, Value::Bool(x)) => cfg.topmost = x,
-            (CfgRef::AutoStart, Value::Bool(x)) => cfg.autostart = x,
-            (CfgRef::DebugLog, Value::Bool(x)) => cfg.debug_log = x,
-            (CfgRef::GpuPrimaryOnly, Value::Bool(x)) => cfg.gpu_primary_only = x,
-            (CfgRef::Gpu3dOnly, Value::Bool(x)) => cfg.gpu_3d_only = x,
-            (CfgRef::NetLowFreq, Value::Bool(x)) => cfg.net_low_freq = x,
-            (CfgRef::NetMode, Value::Select(i)) => match i {
-                0 => cfg.net_mode = NetMode::Both,
-                1 => cfg.net_mode = NetMode::Down,
-                2 => cfg.net_mode = NetMode::Up,
-                _ => return false,
-            },
-            (CfgRef::ClickThrough, Value::Bool(x)) => cfg.click_through = x,
-            (CfgRef::SnapCorner, Value::SelectOpt(o)) => match o {
-                Some(i) if i <= 3 => cfg.snap_corner = i as u8,
-                None => cfg.snap_corner = sysoverlay_core::config::SNAP_CORNER_FREE,
-                _ => return false,
-            },
-            (CfgRef::SnapCorner, Value::Select(i)) => {
-                // 容错：普通分段值也接受
-                if i <= 3 {
-                    cfg.snap_corner = i as u8;
-                } else {
-                    return false;
-                }
-            }
-            (CfgRef::Opacity, Value::Num(x)) => cfg.normal_opacity = (x as u32).clamp(0, 100) as u8,
-            // num
-            (CfgRef::FontSize, Value::Num(x)) => cfg.font_size = x as f32,
-            (CfgRef::MetricGap, Value::Num(x)) => cfg.metric_gap = x as u32,
-            (CfgRef::LabelValueGap, Value::Num(x)) => cfg.label_value_gap = x as u32,
-            (CfgRef::MetricFont(i), Value::Num(x)) => {
-                if i < cfg.metric_font_sizes.len() {
-                    let v = x as f32;
-                    // 设为与全局字号相同的值 = 重置为「跟随全局」（None）。
-                    // 逐项滑杆此前只能写 Some(x)，一旦误触该指标就永久钉死、
-                    // 全局字号对它失效且 UI 上无任何恢复途径（用户实测
-                    // "字号调整对内存项目不生效"的根因）。
-                    if (v - cfg.font_size).abs() < 0.05 {
-                        cfg.metric_font_sizes[i] = None;
-                    } else {
-                        cfg.metric_font_sizes[i] = Some(v);
-                    }
-                } else {
-                    return false;
-                }
-            }
-            // select
-            // 2 档：0 = 横版（Strip，Classic 已在 parse 迁移）、1 = 竖版。
-            (CfgRef::Style, Value::Select(i)) => match i {
-                0 => cfg.render_style = RenderStyle::Strip,
-                1 => cfg.render_style = RenderStyle::Vertical,
-                _ => return false,
-            },
-            (CfgRef::MemUnit, Value::Select(i)) => cfg.mem_show_gb = i == 1,
-            // 字重：0=细 1=中 2=粗（越界拒绝，parse 阶段另有钳位兜底）
-            (CfgRef::FontWeight, Value::Select(i)) => {
-                if i <= 2 {
-                    cfg.font_weight = i as u8;
-                } else {
-                    return false;
-                }
-            }
-            (CfgRef::Appearance, Value::Select(i)) => match i {
-                0 => cfg.appearance = Appearance::System,
-                1 => cfg.appearance = Appearance::Light,
-                2 => cfg.appearance = Appearance::Dark,
-                _ => return false,
-            },
-            (CfgRef::Lang, Value::Select(i)) => match i {
-                0 => cfg.lang = Lang::En,
-                1 => cfg.lang = Lang::Zh,
-                _ => return false,
-            },
-            (CfgRef::RenderEngine, Value::Select(i)) => {
-                cfg.render_engine = if i == 1 { RenderEngine::D2d } else { RenderEngine::Gdi }
-            }
-            // color
-            (CfgRef::MetricLabel(i), Value::Color(c)) => {
-                if i < cfg.metric_colors.len() {
-                    cfg.metric_colors[i].label = c;
-                } else {
-                    return false;
-                }
-            }
-            (CfgRef::MetricValue(i), Value::Color(c)) => {
-                if i < cfg.metric_colors.len() {
-                    cfg.metric_colors[i].value = c;
-                } else {
-                    return false;
-                }
-            }
-            (CfgRef::MetricValueAuto(i), Value::Bool(x)) => {
-                if i < cfg.metric_colors.len() {
-                    cfg.metric_colors[i].value_auto = x;
-                } else {
-                    return false;
-                }
-            }
-            // 类型错配：debug 炸，release 拒绝
-            (r, v) => {
-                debug_assert!(
-                    false,
-                    "CfgRef 类型错配: {r:?} <- {v:?}"
-                );
-                return false;
-            }
+            (CfgRef::ShowCpu, v) => {  match v { Value::Bool(x) => { cfg.show_cpu = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: ShowCpu <- {v:?}"); false }  } },
+            (CfgRef::ShowMem, v) => {  match v { Value::Bool(x) => { cfg.show_mem = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: ShowMem <- {v:?}"); false }  } },
+            (CfgRef::ShowGpu, v) => {  match v { Value::Bool(x) => { cfg.show_gpu = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: ShowGpu <- {v:?}"); false }  } },
+            (CfgRef::ShowNet, v) => {  match v { Value::Bool(x) => { cfg.show_net = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: ShowNet <- {v:?}"); false }  } },
+            (CfgRef::ShowTime, v) => {  match v { Value::Bool(x) => { cfg.show_time = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: ShowTime <- {v:?}"); false }  } },
+            (CfgRef::TimeSeconds, v) => {  match v { Value::Bool(x) => { cfg.time_show_seconds = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: TimeSeconds <- {v:?}"); false }  } },
+            (CfgRef::ShortNames, v) => {  match v { Value::Bool(x) => { cfg.short_names = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: ShortNames <- {v:?}"); false }  } },
+            (CfgRef::MemUnit, v) => {  match v { Value::Select(i) => { cfg.mem_show_gb = i == 1; true } _ => { debug_assert!(false, "CfgRef 类型错配: MemUnit <- {v:?}"); false }  } },
+            (CfgRef::FontSize, v) => {  match v { Value::Num(x) => { cfg.font_size = x as f32; true } _ => { debug_assert!(false, "CfgRef 类型错配: FontSize <- {v:?}"); false }  } },
+            (CfgRef::FontWeight, v) => {  match v { Value::Select(i) => { if i <= 2 { cfg.font_weight = i as u8; true } else { false } } _ => { debug_assert!(false, "CfgRef 类型错配: FontWeight <- {v:?}"); false }  } },
+            (CfgRef::MetricGap, v) => {  match v { Value::Num(x) => { cfg.metric_gap = x as u32; true } _ => { debug_assert!(false, "CfgRef 类型错配: MetricGap <- {v:?}"); false }  } },
+            (CfgRef::LabelValueGap, v) => {  match v { Value::Num(x) => { cfg.label_value_gap = x as u32; true } _ => { debug_assert!(false, "CfgRef 类型错配: LabelValueGap <- {v:?}"); false }  } },
+            (CfgRef::TextShadow, v) => {  match v { Value::Bool(x) => { cfg.text_shadow = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: TextShadow <- {v:?}"); false }  } },
+            (CfgRef::TextOutline, v) => {  match v { Value::Bool(x) => { cfg.text_outline = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: TextOutline <- {v:?}"); false }  } },
+            (CfgRef::AutoStart, v) => {  match v { Value::Bool(x) => { cfg.autostart = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: AutoStart <- {v:?}"); false }  } },
+            (CfgRef::DebugLog, v) => {  match v { Value::Bool(x) => { cfg.debug_log = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: DebugLog <- {v:?}"); false }  } },
+            (CfgRef::Topmost, v) => {  match v { Value::Bool(x) => { cfg.topmost = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: Topmost <- {v:?}"); false }  } },
+            (CfgRef::Opacity, v) => {  match v { Value::Num(x) => { cfg.normal_opacity = (x as u32).clamp(0, 100) as u8; true } _ => { debug_assert!(false, "CfgRef 类型错配: Opacity <- {v:?}"); false }  } },
+            (CfgRef::NetMode, v) => {  match v { Value::Select(i) => { match i { 0 => { cfg.net_mode = NetMode::Both; true } 1 => { cfg.net_mode = NetMode::Down; true } 2 => { cfg.net_mode = NetMode::Up; true } _ => false } } _ => { debug_assert!(false, "CfgRef 类型错配: NetMode <- {v:?}"); false }  } },
+            (CfgRef::Style, v) => {  match v { Value::Select(i) => { match i { 0 => { cfg.render_style = RenderStyle::Strip; true } 1 => { cfg.render_style = RenderStyle::Vertical; true } _ => false } } _ => { debug_assert!(false, "CfgRef 类型错配: Style <- {v:?}"); false }  } },
+            (CfgRef::RenderEngine, v) => {  match v { Value::Select(i) => { cfg.render_engine = if i == 1 { RenderEngine::D2d } else { RenderEngine::Gdi }; true } _ => { debug_assert!(false, "CfgRef 类型错配: RenderEngine <- {v:?}"); false }  } },
+            (CfgRef::Lang, v) => {  match v { Value::Select(i) => { match i { 0 => { cfg.lang = Lang::En; true } 1 => { cfg.lang = Lang::Zh; true } _ => false } } _ => { debug_assert!(false, "CfgRef 类型错配: Lang <- {v:?}"); false }  } },
+            (CfgRef::PowerEnabled, v) => {  match v { Value::Bool(x) => { cfg.power_enabled = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: PowerEnabled <- {v:?}"); false }  } },
+            (CfgRef::PowerQuery, v) => {  match v { Value::Bool(x) => { cfg.power_query = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: PowerQuery <- {v:?}"); false }  } },
+            (CfgRef::GpuPrimaryOnly, v) => {  match v { Value::Bool(x) => { cfg.gpu_primary_only = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: GpuPrimaryOnly <- {v:?}"); false }  } },
+            (CfgRef::Gpu3dOnly, v) => {  match v { Value::Bool(x) => { cfg.gpu_3d_only = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: Gpu3dOnly <- {v:?}"); false }  } },
+            (CfgRef::NetLowFreq, v) => {  match v { Value::Bool(x) => { cfg.net_low_freq = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: NetLowFreq <- {v:?}"); false }  } },
+            (CfgRef::Appearance, v) => {  match v { Value::Select(i) => { match i { 0 => { cfg.appearance = Appearance::System; true } 1 => { cfg.appearance = Appearance::Light; true } 2 => { cfg.appearance = Appearance::Dark; true } _ => false } } _ => { debug_assert!(false, "CfgRef 类型错配: Appearance <- {v:?}"); false }  } },
+            (CfgRef::ClickThrough, v) => {  match v { Value::Bool(x) => { cfg.click_through = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: ClickThrough <- {v:?}"); false }  } },
+            (CfgRef::SnapCorner, v) => {  match v {
+                  Value::SelectOpt(o) => match o { Some(i) if i <= 3 => { cfg.snap_corner = i as u8; true } None => { cfg.snap_corner = SNAP_CORNER_FREE; true } _ => false },
+                  Value::Select(i) => { if i <= 3 { cfg.snap_corner = i as u8; true } else { false } }
+                  _ => { debug_assert!(false, "CfgRef 类型错配: SnapCorner <- {v:?}"); false }  } },
+            (CfgRef::MetricShowLabel(i), v) => {  match v { Value::Bool(x) => { if let Some(slot) = cfg.metric_show_labels.get_mut(i) { *slot = x; true } else { false } } _ => { debug_assert!(false, "CfgRef 类型错配: MetricShowLabel <- {v:?}"); false }  } },
+            (CfgRef::MetricFont(i), v) => {  match v { Value::Num(x) => {
+                  if i < cfg.metric_font_sizes.len() {
+                      let v2 = x as f32;
+                      if (v2 - cfg.font_size).abs() < 0.05 { cfg.metric_font_sizes[i] = None; } else { cfg.metric_font_sizes[i] = Some(v2); }
+                      true
+                  } else { false }
+              } _ => { debug_assert!(false, "CfgRef 类型错配: MetricFont <- {v:?}"); false }  } },
+            (CfgRef::MetricOffset(i, c), v) => {  match v { Value::Num(x) => {
+                  match cfg.metric_offsets.get_mut(i).and_then(|o| o.get_mut(c as usize)) {
+                      Some(slot) => { *slot = (x.round() as i32).clamp(OFFSET_MIN, OFFSET_MAX); true }
+                      None => false,
+                  }
+              } _ => { debug_assert!(false, "CfgRef 类型错配: MetricOffset <- {v:?}"); false }  } },
+            (CfgRef::MetricLabel(i), v) => {  match v { Value::Color(c) => { if i < cfg.metric_colors.len() { cfg.metric_colors[i].label = c; true } else { false } } _ => { debug_assert!(false, "CfgRef 类型错配: MetricLabel <- {v:?}"); false }  } },
+            (CfgRef::MetricValue(i), v) => {  match v { Value::Color(c) => { if i < cfg.metric_colors.len() { cfg.metric_colors[i].value = c; true } else { false } } _ => { debug_assert!(false, "CfgRef 类型错配: MetricValue <- {v:?}"); false }  } },
+            (CfgRef::MetricValueAuto(i), v) => {  match v { Value::Bool(x) => { if i < cfg.metric_colors.len() { cfg.metric_colors[i].value_auto = x; true } else { false } } _ => { debug_assert!(false, "CfgRef 类型错配: MetricValueAuto <- {v:?}"); false }  } }
         }
-        true
     }
 }
+
+/// `CfgRef` 枚举变体列表与 `get`/`set` 的 match 臂一一对应；
+/// `get`/`set` 是控件读写 Config 的唯一入口（单一事实来源）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CfgRef {
+    ShowCpu, ShowMem, ShowGpu, ShowNet, ShowTime, TimeSeconds, ShortNames,
+    MemUnit, FontSize, FontWeight, MetricGap, LabelValueGap,
+    TextShadow, TextOutline, AutoStart, DebugLog, Topmost,
+    Opacity, NetMode, Style, RenderEngine, Lang,
+    PowerEnabled, PowerQuery, GpuPrimaryOnly, Gpu3dOnly, NetLowFreq,
+    Appearance, ClickThrough, SnapCorner,
+    MetricShowLabel(usize), MetricFont(usize), MetricOffset(usize, u8),
+    MetricLabel(usize), MetricValue(usize), MetricValueAuto(usize),
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -433,7 +292,7 @@ mod tests {
         assert!(CfgRef::SnapCorner.set(&mut c, Value::SelectOpt(Some(1))));
         assert_eq!(c.snap_corner, 1);
         assert!(CfgRef::SnapCorner.set(&mut c, Value::SelectOpt(None)));
-        assert_eq!(c.snap_corner, sysoverlay_core::config::SNAP_CORNER_FREE);
+        assert_eq!(c.snap_corner, aaxsyspulse_core::config::SNAP_CORNER_FREE);
     }
 
     #[test]

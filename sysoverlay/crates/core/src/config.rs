@@ -1,4 +1,4 @@
-//! Configuration module for SysOverlay.
+//! Configuration module for AAXSysPulse.
 //!
 //! Handles parsing, serializing, and validation of user configuration.
 //!
@@ -47,6 +47,14 @@ pub const FONT_PX_MAX: f32 = 128.0;
 /// 不透明度可调区间（%）。设置页滑杆与落盘钳位共用。
 pub const OPACITY_PCT_MIN: u32 = 15;
 pub const OPACITY_PCT_MAX: u32 = 100;
+
+/// 逐指标文字偏移可调区间（px，可为负）。
+///
+/// 设置页步进器（`win::settings::layout::OFF_MIN/OFF_MAX`）与本文件落盘钳位
+/// 共用同一份区间（±64）—— 否则步进器能拨到 ±64 但重启被 clamp 回旧上限，
+/// 表现为「改了偏移重启就变回去」。
+pub const OFFSET_MIN: i32 = -64;
+pub const OFFSET_MAX: i32 = 64;
 
 /// 用户配置。
 ///
@@ -134,7 +142,7 @@ pub struct Config {
     /// 是否排除虚拟网卡（WSL2 vEthernet / DockerNAT / Hyper-V switch）。
     pub exclude_virtual_nic: bool,
     /// 调试日志开关。开启后各采样器把原始 API 数据写入统一日志文件
-    /// `%LOCALAPPDATA%\SysOverlayC\sysoverlay_<YYYYMMDD>_<HHMM>.log`（每会话一个文件，probe 流，设置面板可实时切换）。
+    /// `%LOCALAPPDATA%\AAXSysPulseC\aaxsyspulse_<YYYYMMDD>_<HHMM>.log`（每会话一个文件，probe 流，设置面板可实时切换）。
     pub debug_log: bool,
 
     // ── v3 新增 ──────────────────────────────────────────────
@@ -189,6 +197,8 @@ pub struct Config {
     pub time_show_seconds: bool,
     /// 逐指标名称显示开关（默认全开）。索引与 [`Metric`] 顺序一致：CPU/MEM/GPU/Net/Power/Time。
     pub metric_show_labels: [bool; 6],
+    /// 逐指标文字偏移：`[指标][分量]`。分量 0=名称X 1=名称Y 2=数值X 3=数值Y（px，可负；默认全 0）。
+    pub metric_offsets: [[i32; 4]; 6],
     /// 简化名称：CPU→C、Mem→M、GPU→G、Net→N、Power→P、Time→T（默认关）。
     pub short_names: bool,
     /// 监控项显示顺序：第 k 位元素 = 显示在第 k 位的指标下标（0..=5 排列）。
@@ -258,6 +268,7 @@ impl Default for Config {
             show_time: true,
             time_show_seconds: true,
             metric_show_labels: [true; 6],
+            metric_offsets: [[0; 4]; 6],
             short_names: false,
             metric_order: [0, 1, 2, 3, 4, 5],
         }
@@ -405,6 +416,12 @@ impl Config {
                 _ if key.starts_with("mfs_") => {
                     if let Some(idx) = parse_metric_font_size(&key, value) {
                         cfg.metric_font_sizes[idx.0] = idx.1;
+                    }
+                }
+                // 逐指标文字偏移：moff_<metric> lx ly vx vy（px，可为负；缺省槽补 0）
+                _ if key.starts_with("moff_") => {
+                    if let Some((idx, off)) = parse_metric_offset(&key, value) {
+                        cfg.metric_offsets[idx] = off;
                     }
                 }
                 "shadow" => cfg.text_shadow = Self::parse_bool(value, cfg.text_shadow),
@@ -694,6 +711,16 @@ impl Config {
                 s.push_str(&format!("mfs_{} {:.1}\n", metric.key_name(), size));
             }
         }
+        // 逐指标文字偏移：只有非全零的槽才落盘
+        for (i, metric) in Metric::ALL.iter().enumerate() {
+            let o = self.metric_offsets[i];
+            if o != [0; 4] {
+                s.push_str(&format!(
+                    "moff_{} {} {} {} {}\n",
+                    metric.key_name(), o[0], o[1], o[2], o[3]
+                ));
+            }
+        }
         s
     }
 
@@ -839,6 +866,32 @@ fn parse_metric_font_size(key: &str, value: &str) -> Option<(usize, Option<f32>)
         }
     };
     Some((idx, size))
+}
+
+/// 解析逐指标文字偏移的键与值。
+///
+/// 键形如 `moff_<metric>`（metric ∈ cpu/mem/gpu/net/power/time）。
+/// 值为 4 个整数 `lx ly vx vy`（名称X / 名称Y / 数值X / 数值Y，px，可为负），
+/// 缺省槽补 0；任一分量越界钳到 [`OFFSET_MIN`]..=[`OFFSET_MAX`]。
+/// 未知指标名或无法解析返回 `None`（静默忽略）。
+fn parse_metric_offset(key: &str, value: &str) -> Option<(usize, [i32; 4])> {
+    let rest = key.strip_prefix("moff_")?;
+    let idx = match rest {
+        "cpu" => 0,
+        "mem" => 1,
+        "gpu" => 2,
+        "net" => 3,
+        "power" => 4,
+        "time" => 5,
+        _ => return None,
+    };
+    let mut out = [0i32; 4];
+    for (i, tok) in value.split_whitespace().take(4).enumerate() {
+        if let Ok(v) = tok.parse::<i32>() {
+            out[i] = v.clamp(OFFSET_MIN, OFFSET_MAX);
+        }
+    }
+    Some((idx, out))
 }
 
 /// 解析监控项显示顺序（`morder a b c d e f`）。

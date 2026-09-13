@@ -1,7 +1,7 @@
 //! Memory sampler using GlobalMemoryStatusEx API.
 
-use sysoverlay_core::sampler::{SampleOutcome, Sampler, SamplerId};
-use sysoverlay_core::snapshot::{MemoryStat, Snapshot};
+use aaxsyspulse_core::sampler::{SampleOutcome, Sampler, SamplerId};
+use aaxsyspulse_core::snapshot::{MemoryStat, Snapshot};
 
 /// Memory sampler using GlobalMemoryStatusEx.
 pub struct MemSampler;

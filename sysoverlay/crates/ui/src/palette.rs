@@ -4,7 +4,7 @@
 //! 这里只做表示层转换，不再复制一份阈值判断。
 
 use crate::render::Rgba;
-use sysoverlay_core::color::{Palette as CorePalette, Rgb};
+use aaxsyspulse_core::color::{Palette as CorePalette, Rgb};
 
 /// 渲染期使用的调色板（预乘 alpha）。
 #[derive(Clone, Copy, Debug, PartialEq)]

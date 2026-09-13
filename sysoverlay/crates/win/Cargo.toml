@@ -1,12 +1,12 @@
 [package]
-name = "sysoverlay-win"
+name = "aaxsyspulse-win"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-sysoverlay-core = { path = "../core" }
-sysoverlay-ui = { path = "../ui" }
+aaxsyspulse-core = { path = "../core" }
+aaxsyspulse-ui = { path = "../ui" }
 arc-swap = "1.7"
 windows = { version = "0.58", features = [
   "Win32_Foundation",

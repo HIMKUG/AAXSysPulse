@@ -49,11 +49,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     UPDATELAYEREDWINDOWINFO, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
 };
 
-use sysoverlay_ui::offscreen::SoftwareSurface;
-use sysoverlay_ui::renderer::CellSig;
-use sysoverlay_ui::{RenderTarget as _, Renderer, StripRenderer, VerticalRenderer};
+use aaxsyspulse_ui::offscreen::SoftwareSurface;
+use aaxsyspulse_ui::renderer::CellSig;
+use aaxsyspulse_ui::{RenderTarget as _, Renderer, StripRenderer, VerticalRenderer};
 
-use sysoverlay_core::config::RenderEngine;
+use aaxsyspulse_core::config::RenderEngine;
 
 use crate::Config;
 use crate::perf;
@@ -68,10 +68,13 @@ pub const ANIM_TIMER_ID: usize = 7;
 /// 但 wParam==CLOCK_TIMER_ID 时会调用 [`rearm_clock_timer`] 重对齐下一次到期。
 pub const CLOCK_TIMER_ID: usize = 8;
 
-/// CLOCK 定时器启停守卫：`SetTimer` 同 ID 会**重置到期时间**，
+/// CLOCK 定时器启停守卫（值 = 目标节奏）：`SetTimer` 同 ID 会**重置到期时间**，
 /// 采样推送（最快 100ms 一帧）若每帧都 SetTimer，秒对齐时钟表永远到不了期
-/// （饿死）。因此只在 `show_time` 状态切换的那一刻 SetTimer/KillTimer 一次。
-static CLOCK_TIMER_ON: AtomicBool = AtomicBool::new(false);
+/// （饿死）。因此只在节奏/启停状态切换的那一刻 SetTimer/KillTimer 一次。
+///
+/// 0 = 关（不显示时间行）；1 = 每秒（显示秒）；2 = 每分（隐藏秒）。
+/// 隐藏秒时按分钟对齐：秒不再进画面，每秒唤醒纯属浪费（用户实测反馈）。
+static CLOCK_TIMER_MODE: AtomicU8 = AtomicU8::new(0);
 
 /// 最近一次成功整窗上传时的时钟秒值。局部脏区上传（UpdateLayeredWindowIndirect
 /// + prcDirty）在部分合成器（本机实测）上不会触发该子区重混 → 时间单元格每秒
@@ -92,34 +95,70 @@ fn ms_to_next_second() -> u32 {
     (1000 - u32::from(ms)).max(1) + 8
 }
 
-/// 按 `show_time` 同步 CLOCK 定时器启停（render 每帧调用；swap 保证只切一次）。
-fn sync_clock_timer(hwnd: HWND, want: bool) {
-    if want != CLOCK_TIMER_ON.swap(want, AtomicOrdering::Relaxed) {
+/// 距下一个**墙钟**分边界（秒=00）的毫秒数（+8ms 余量）。
+///
+/// 隐藏秒后时间文本每分钟才变一次（HH:MM），按秒唤醒纯属空转：
+/// 快速跳过路径比较的是**真实秒**（`clock::get().2`）而非格式化文本，
+/// 秒一变就不相等 → 每秒仍要跑完 layout + FNV 全帧指纹才发现"画面没变"。
+/// 改为按分钟对齐，隐藏秒时唤醒频率从 1Hz 降到 1/60Hz。
+fn ms_to_next_minute() -> u32 {
+    let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    let ms = u32::from(t.wMilliseconds);
+    let sec = u32::from(t.wSecond);
+    ((59 - sec) * 1000 + (1000 - ms)).max(1) + 8
+}
+
+/// 目标节奏对应的对齐间隔（毫秒）。
+fn clock_interval(show_seconds: bool) -> u32 {
+    if show_seconds {
+        ms_to_next_second()
+    } else {
+        ms_to_next_minute()
+    }
+}
+
+/// 目标节奏：0 = 关，1 = 每秒，2 = 每分。
+fn clock_mode(want: bool, show_seconds: bool) -> u8 {
+    if !want {
+        0
+    } else if show_seconds {
+        1
+    } else {
+        2
+    }
+}
+
+/// 按 `show_time` / `time_show_seconds` 同步 CLOCK 定时器（render 每帧调用；
+/// swap 保证只在节奏变化的瞬间重设一次）。
+fn sync_clock_timer(hwnd: HWND, want: bool, show_seconds: bool) {
+    let mode = clock_mode(want, show_seconds);
+    if mode != CLOCK_TIMER_MODE.swap(mode, AtomicOrdering::Relaxed) {
         unsafe {
-            if want {
-                let _ = SetTimer(hwnd, CLOCK_TIMER_ID, ms_to_next_second(), None);
-            } else {
+            if mode == 0 {
                 let _ = KillTimer(hwnd, CLOCK_TIMER_ID);
+            } else {
+                let _ = SetTimer(hwnd, CLOCK_TIMER_ID, clock_interval(show_seconds), None);
             }
         }
     }
 }
 
 /// CLOCK 定时器到点后的重对齐（UI 线程 WM_TIMER wParam==CLOCK_TIMER_ID 时调用）。
+/// 按当前节奏（显示秒 = 1Hz，隐藏秒 = 1/分）重设下一次到期。
 /// 此处重设不会饿死：此刻正是它自己的到期处理中，采样推送不参与 SetTimer。
-pub fn rearm_clock_timer(hwnd: HWND) {
+pub fn rearm_clock_timer(hwnd: HWND, show_seconds: bool) {
     unsafe {
-        let _ = SetTimer(hwnd, CLOCK_TIMER_ID, ms_to_next_second(), None);
+        let _ = SetTimer(hwnd, CLOCK_TIMER_ID, clock_interval(show_seconds), None);
     }
 }
 
 /// 按配置选择渲染器实例（'static，零分配）。旧卡片式（Classic）折入横版条。
-fn renderer_for(style: sysoverlay_core::types::RenderStyle) -> &'static dyn Renderer {
+fn renderer_for(style: aaxsyspulse_core::types::RenderStyle) -> &'static dyn Renderer {
     match style {
-        sysoverlay_core::types::RenderStyle::Classic | sysoverlay_core::types::RenderStyle::Strip => {
+        aaxsyspulse_core::types::RenderStyle::Classic | aaxsyspulse_core::types::RenderStyle::Strip => {
             &StripRenderer
         }
-        sysoverlay_core::types::RenderStyle::Vertical => &VerticalRenderer,
+        aaxsyspulse_core::types::RenderStyle::Vertical => &VerticalRenderer,
     }
 }
 
@@ -478,9 +517,10 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
         // 时间文本进 cell 指纹，秒变化经脏检查只重绘时间 cell（脏渲染）。
         // windows 0.58：GetLocalTime() 无参、返回 SYSTEMTIME（Foundation 模块）。
         let st = GetLocalTime();
-        sysoverlay_ui::clock::set_local(st.wHour as u32, st.wMinute as u32, st.wSecond as u32);
-        // 时钟定时器仅在 show_time 切换时启停（SetTimer 重置问题见 CLOCK_TIMER_ON）。
-        sync_clock_timer(hwnd, cfg.show_time);
+        aaxsyspulse_ui::clock::set_local(st.wHour as u32, st.wMinute as u32, st.wSecond as u32);
+        // 时钟定时器按 show_time / time_show_seconds 同步启停与节奏
+        //（SetTimer 重置问题见 CLOCK_TIMER_MODE）。
+        sync_clock_timer(hwnd, cfg.show_time, cfg.time_show_seconds);
 
         // ── P0 快速跳过：例行唤醒无事可做时 ~0.1µs 返回，连布局/指纹都不建。
         // 旧 250ms 时钟每秒 4 次唤醒，其中 3 次做完整 layout + FNV 全帧指纹
@@ -495,7 +535,7 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
         if !animating
             && HANDLED_EPOCH.load(AtomicOrdering::Relaxed)
                 == RENDER_EPOCH.load(AtomicOrdering::Relaxed)
-            && sysoverlay_ui::clock::get().2 == LAST_PRESENTED_SEC.load(AtomicOrdering::Relaxed)
+            && aaxsyspulse_ui::clock::get().2 == LAST_PRESENTED_SEC.load(AtomicOrdering::Relaxed)
             && !FORCE_FULL_REFRESH.load(AtomicOrdering::Relaxed)
             && engine_id == LAST_ENGINE.load(AtomicOrdering::Relaxed)
             && alpha_pct_x100 == RENDERED_PCT_X100.load(AtomicOrdering::Relaxed)
@@ -589,7 +629,7 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
         // ensure_loaded 幂等（内部 OnceLock），首帧前把三档 DIN 栅格化并原子发布，
         // 此后渲染期零锁纯数组读 → 不引入逐帧开销。
         crate::din_bitmap::ensure_loaded();
-        sysoverlay_ui::font::set_active_weight(cfg.font_weight);
+        aaxsyspulse_ui::font::set_active_weight(cfg.font_weight);
         // 诊断探针：悬浮窗渲染侧实际读到的指标颜色（对照设置页写入前后）。
         crate::probe::log_lazy(|| {
             format!(
@@ -645,7 +685,7 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
         // ✅ 根因已修（2026-09-12）：那不是驱动/DWM 问题，是 upload_dib 里
         // pptSrc 坐标语义错误（2× 偏移），对照实验见 docs/悬浮窗性能恢复计划.md。
         // Rect 局部上传恢复信任，时钟秒走正常脏区路径。
-        let present_sec = sysoverlay_ui::clock::get().2;
+        let present_sec = aaxsyspulse_ui::clock::get().2;
 
         // 绘制（A3：仅首帧/alpha/布局变化才整画布清零，否则只清脏区 cell）
         renderer.paint(
@@ -820,32 +860,18 @@ pub fn invalidate_dib_cache() {
     }
 }
 
-/// 命中测试用：返回窗口设备像素坐标 `(x, y)` 处**当前 DIB 帧**的 alpha（0..=255）。
-///
-/// 透明区域（背景，alpha≈1/255）与不透明内容（文字/边框，alpha≈255）在此区分，
-/// 供 `WM_NCHITTEST` 决定返回 `HTTRANSPARENT`（穿透到下方窗口）还是 `HTCLIENT`
-/// （可交互：拖拽/悬停）。
-///
-/// - 越界、DIB 尚未创建、或加锁失败（渲染线程正持有）→ 返回 `None`，
-///   调用方应退化为「可命中」（保持原行为，不丢输入）。
-/// - DIB 为 top-down 32 位 BGRA（`biHeight = -h`），alpha 在每个像素的第 4 字节。
-/// - `try_lock` 而非 `lock`：命中测试在 UI 线程高频触发，绝不阻塞等待渲染线程。
-pub fn sample_alpha(x: i32, y: i32) -> Option<u8> {
-    let dib = DIB.get()?;
-    let guard = dib.try_lock().ok()?;
-    if guard.bits == 0 || guard.w <= 0 || guard.h <= 0 {
-        return None;
-    }
-    if x < 0 || y < 0 || x >= guard.w || y >= guard.h {
-        return None;
-    }
-    let stride = guard.w as usize * 4;
-    let off = (y as usize) * stride + (x as usize) * 4 + 3;
-    let bits = guard.bits as *const u8;
-    // SAFETY: 0 <= off < w*h*4，落在 CreateDIBSection 分配的缓冲区内。
-    let alpha = unsafe { *bits.add(off) };
-    Some(alpha)
-}
+// ── 命中测试 ────────────────────────────────────────────────────────────
+//
+// 曾经这里有 `sample_alpha()` 供 `WM_NCHITTEST` 逐像素返回 HTTRANSPARENT。
+// 该做法已废弃并删除：
+//   * `HTTRANSPARENT` 只对**同一线程**的窗口有效（MSDN 原文），悬浮窗下方的
+//     窗口属于别的进程 → 窗口管理器找不到下一个接收者，点击被直接吃掉，
+//     表现为「透明区仍然遮挡点击」。
+//   * 正确机制是分层窗口自带的按像素 alpha 命中测试：DIB 里 alpha **恰好为 0**
+//     的像素不参与命中，鼠标事件自动落到下方窗口。因此渲染端必须把背景清成
+//     全 0（SoftwareSurface::clear / D2DSurface::clear），且 WM_NCHITTEST 一律
+//     交给 DefWindowProc（客户区 → HTCLIENT）。
+// 结论：这里不再需要任何采样代码，改动背景 alpha 时请一并看这两处 clear。
 
 impl DibCache {
     unsafe fn free(&mut self) {
@@ -1140,7 +1166,11 @@ fn render_d2d(
         }
 
         let t_hash = perf::begin();
-        let base = renderer.frame_hash(snap, cfg, width, height, src_alpha);
+        // 指纹直接复用上方 layout 产出的 cells（与 GDI 分支 hash_from_cells 同一姿势）。
+        // ⚠️ 勿改回 `renderer.frame_hash(...)`：trait 默认实现内部会再跑一遍完整
+        // layout —— 双倍 build_rows，且把第二次 layout 藏进 seg_hash 时段，
+        // P0 四段分解（seg_layout / seg_hash）的读数会失真。
+        let base = renderer.hash_from_cells(&cells, cfg, width, height, src_alpha);
         // 本帧已受理当前纪元（见 GDI 分支同名注释）。
         HANDLED_EPOCH.store(RENDER_EPOCH.load(AtomicOrdering::Relaxed), AtomicOrdering::Relaxed);
         let sig = base ^ ENGINE_HASH_XOR;
@@ -1165,7 +1195,7 @@ fn render_d2d(
         }
         // 时钟秒变化 → 曾强制整窗（根因同 GDI 分支注释：pptSrc 坐标语义错误
         // 已修复，Rect 局部上传恢复信任，见 docs/悬浮窗性能恢复计划.md）。
-        let present_sec = sysoverlay_ui::clock::get().2;
+        let present_sec = aaxsyspulse_ui::clock::get().2;
         perf::note_section("seg_hash", t_hash);
         crate::probe::log_lazy(|| {
             let kind = match &dirty {

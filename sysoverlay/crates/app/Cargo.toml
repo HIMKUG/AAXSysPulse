@@ -1,5 +1,5 @@
 [package]
-name = "sysoverlay-app"
+name = "aaxsyspulse-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,9 +8,16 @@ license.workspace = true
 default = []
 minidump = []
 
+# 输出的可执行文件名（= 任务管理器里的进程名）。
+# 包名改为 aaxsyspulse-app（`cargo build -p aaxsyspulse-app`），
+# 只把产物改名，避免牵动 crate 依赖名。
+[[bin]]
+name = "AAXSysPulse"
+path = "src/main.rs"
+
 [dependencies]
-sysoverlay-core = { path = "../core" }
-sysoverlay-win = { path = "../win" }
+aaxsyspulse-core = { path = "../core" }
+aaxsyspulse-win = { path = "../win" }
 arc-swap = "1.7"
 windows = { version = "0.58", features = [
   "Win32_System_Threading",
@@ -18,6 +25,11 @@ windows = { version = "0.58", features = [
   "Win32_Foundation",
   "Win32_Security",
   "Win32_System_Diagnostics_Debug",
+  # minidump 特性所需：MiniDumpWriteDump 要求 Storage_FileSystem + Kernel + Memory
+  # 三特性组合（MINIDUMP_* 类型另需 Kernel）；CreateFileW 在 Storage_FileSystem。
+  "Win32_Storage_FileSystem",
+  "Win32_System_Kernel",
+  "Win32_System_Memory",
   "Win32_UI_WindowsAndMessaging",
   "Win32_System_Services",
   "Win32_UI_Shell",

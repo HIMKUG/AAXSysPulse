@@ -82,17 +82,24 @@ impl SoftwareSurface {
 
     /// Clears the surface to "transparent".
     ///
-    /// ⚠️ 底色 alpha = 1 而非 0：分层窗口对 alpha=0 的像素**点击穿透**，
-    /// 全透明底会让悬浮窗只能"按在文字上"才能拖动。alpha=1（1/255，配合
-    /// 全局不透明度后不可见）让整个窗口矩形都可命中/拖拽/悬停。
+    /// ⚠️ 底色 alpha 必须**恰好为 0**，不能是 1/255 之类的「近零」值：
+    /// 分层窗口（`WS_EX_LAYERED` + `UpdateLayeredWindow`）的命中测试由系统
+    /// 按像素 alpha 判定 —— 只有 **alpha == 0** 的像素才会让鼠标事件穿透到
+    /// 下方窗口（MSDN Layered Windows: "areas … whose alpha value is zero
+    /// will let the mouse messages through"）。alpha=1 的像素仍会被本窗口吞掉
+    /// 点击，且 `WM_NCHITTEST` 返回 `HTTRANSPARENT` **无法**跨线程/跨进程
+    /// 补救（只对同线程窗口有效，跨进程会把点击直接吃掉）。
+    ///
+    /// 副作用（有意为之）：窗口只能按在文字/描边等实际有像素的地方拖动。
     pub fn clear(&mut self) {
-        self.pixels.fill(1);
+        self.pixels.fill(0);
     }
 
     /// 只清空一个子矩形（按行填充，A3：省掉整画布 memset）。
     ///
     /// 负坐标/越界自动裁剪到画布范围，不 panic。
-    /// 填充值 = [0,0,0,1]（BGRA，预乘 alpha=1）：与 [`Self::clear`] 同底色。
+    /// 填充值 = [0,0,0,0]（BGRA 全透明）：与 [`Self::clear`] 同底色，
+    /// 保证被清空的区域同样点击穿透（见 [`Self::clear`] 的说明）。
     pub fn clear_rect(&mut self, x: i32, y: i32, w: i32, h: i32) {
         let x = x.max(0);
         let y = y.max(0);
@@ -108,7 +115,7 @@ impl SoftwareSurface {
                     px[0] = 0;
                     px[1] = 0;
                     px[2] = 0;
-                    px[3] = 1;
+                    px[3] = 0;
                 }
             }
         }
@@ -116,7 +123,9 @@ impl SoftwareSurface {
 
     /// Converts the surface to a PNG-encoded byte vector.
     ///
-    /// Uses the `png` crate.
+    /// Uses the `png` crate. 仅测试用（PNG 对拍基线导出）：`png` 是
+    /// dev-dependency，生产构建不编译它；勿在非测试路径调用本函数。
+    #[cfg(test)]
     pub fn to_png(&self) -> Vec<u8> {
         use png::{Encoder, ColorType};
 

@@ -34,8 +34,8 @@ use windows::Win32::NetworkManagement::IpHelper::{
     MIB_NOTIFICATION_TYPE, NotifyIpInterfaceChange,
 };
 use windows::Win32::NetworkManagement::Ndis::{IfOperStatusUp, IF_OPER_STATUS};
-use sysoverlay_core::sampler::{SampleOutcome, Sampler, SamplerId};
-use sysoverlay_core::snapshot::{NetStat, Snapshot};
+use aaxsyspulse_core::sampler::{SampleOutcome, Sampler, SamplerId};
+use aaxsyspulse_core::snapshot::{NetStat, Snapshot};
 
 const IF_TYPE_ETHERNET_CSMACD: u32 = 6;
 const IF_TYPE_IEEE80211: u32 = 71;

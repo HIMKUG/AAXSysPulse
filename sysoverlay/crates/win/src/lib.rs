@@ -1,4 +1,4 @@
-//! SysOverlay Win32 Platform Layer
+//! AAXSysPulse Win32 Platform Layer
 //!
 //! This crate provides the Win32 platform-specific implementation for
 //! the system overlay application. It handles:
@@ -45,10 +45,11 @@ pub mod gfx_d2d;
 pub mod render_d2d;
 pub mod din_bitmap;
 pub mod restart;
+pub mod app_icon;
 
 // Re-export core types for convenience
-pub use sysoverlay_core::config::Config;
-pub use sysoverlay_core::snapshot::Snapshot;
+pub use aaxsyspulse_core::config::Config;
+pub use aaxsyspulse_core::snapshot::Snapshot;
 
 // Re-export main window type
 pub use window::OverlayWindow;
