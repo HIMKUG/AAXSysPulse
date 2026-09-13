@@ -1,4 +1,4 @@
-# SysOverlay-C 重构 · 架构审查报告
+# AAXSysPulse 重构 · 架构审查报告
 
 **审查对象**：`D:\code\sys-overlay-c-master\sysoverlay`（Rust workspace，3565 行）
 **对照文档**：`..\REPORT.md`（声称"重构完成 / 52 单测全绿 / 8 项技术债已修复"）
@@ -48,7 +48,7 @@ panic minidump、蒙版缓存、原子写配置、睡眠唤醒自愈——**代�
 ### 🟢 2.1 值得保留的好设计
 
 - **分层铁律清晰**：`core`(纯逻辑零依赖) / `ui`(渲染无 Win32) / `win`(唯一 unsafe) / `app`(编排)。
-  `core` 不引用 `windows` crate，可离线编译+测试（已验证：`cargo test -p sysoverlay-core` 离线通过）。
+  `core` 不引用 `windows` crate，可离线编译+测试（已验证：`cargo test -p aaxsyspulse-core` 离线通过）。
 - **`Metric<T>` 陈旧语义**：`Value`/`Stale{value,stale_for}`/`Unavailable` 比裸 `Option<f32>` 表达力强，
   天然支持"数值还在显示但已过期"的 UI 提示（建议真正接到 UI 上，见 §3）。
 - **`SampleOutcome` 三态**：`Ok`/`Transient`/`Fatal`，区分"沿用旧值"与"需重建"，设计正确。
@@ -144,7 +144,7 @@ serialized: ...\nbg 3C2B1A\nfg F2F1F0
 5. **在 `app` 起采样线程 + `ArcSwap<Snapshot>`**：`app` 持 `ArcSwap`，线程定时 `MockSampler/真实Sampler.collect()`
    后 `store`，窗口在 `WM_PAINT`/`WM_TIMER` 里 `load()` 拿最新快照重绘。报告 4.2 的设计本身是对的，只是没写。
 6. **实现 `config_io` 原子写**：按报告 5.3 用 `WriteFile`→`MoveFileExW(MOVEFILE_REPLACE_EXISTING)`，
-   真正落盘到 `%APPDATA%\SysOverlayC\config.txt`，让"关窗记住位置/配色"可用。
+   真正落盘到 `%APPDATA%\AAXSysPulse\config.txt`，让"关窗记住位置/配色"可用。
 
 ### P2 — 健壮性 / 可维护性
 7. **删全局 `WINDOW_STATE`，状态装箱进 `GWLP_USERDATA`**（§2.5），消除单例锁与泄漏。

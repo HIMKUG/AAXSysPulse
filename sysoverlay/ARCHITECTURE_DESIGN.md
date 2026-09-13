@@ -1,6 +1,6 @@
-# SysOverlay-C · 模块架构设计文档
+# AAXSysPulse · 模块架构设计文档
 
-> **定位**：本文件是 SysOverlay-C Rust 重构的**架构单一事实源**（architecture source of truth）。
+> **定位**：本文件是 AAXSysPulse Rust 重构的**架构单一事实源**（architecture source of truth）。
 > 它描述"应当如何分层、模块各自负责什么、对外暴露哪些接口、依赖方向如何"。
 > 与 `REPORT.md` 不同，本文件在「§7 实现状态矩阵」中**如实标注每个模块是「已实现 / 占位 / 待修」**，
 > 不允许把目标当现状。
@@ -121,7 +121,7 @@ core 不依赖任何上层
 | `sampler` | 组合采样器 | `MockSampler::collect()->Snapshot`（**待改：当前写死 cpu=50/gpu=Unavailable，应真正组合**） | 🟠 占位残留 |
 | `menu` | 右键菜单 | `show_menu(hwnd)->Option<u16>`；`handle_command(u16)`（目标 `TrackPopupMenu`） | ⬜ 占位 |
 | `dpi` | DPI 感知 | `apply_dpi_awareness()`（目标 `SetThreadDpiAwarenessContext(PER_MONITOR_AWARE_V2)`） | ⬜ 占位 |
-| `config_io` | 配置持久化 | `load_config()/save_config()`（目标原子写 `MoveFileExW` 到 `%APPDATA%\SysOverlayC\config.txt`） | ⬜ 占位 |
+| `config_io` | 配置持久化 | `load_config()/save_config()`（目标原子写 `MoveFileExW` 到 `%APPDATA%\AAXSysPulse\config.txt`） | ⬜ 占位 |
 
 **`win` 设计要点**
 - `gdi::render` 是 `ui` 与屏幕之间的**唯一接缝**：
@@ -144,8 +144,8 @@ core 不依赖任何上层
 **`app` 设计要点（目标，当前未实现）**
 ```rust
 fn main() {
-    // 1. 单实例互斥 CreateMutexW("SysOverlayC-SingleInstance")，已存在则静默退出
-    // 2. panic hook → MiniDumpWriteDump 到 %TEMP%\SysOverlayC_crash.dmp
+    // 1. 单实例互斥 CreateMutexW("AAXSysPulse-SingleInstance")，已存在则静默退出
+    // 2. panic hook → MiniDumpWriteDump 到 %TEMP%\AAXSysPulse_crash.dmp
     // 3. let snap = ArcSwap::from_poisonable(Arc::new(placeholder_snapshot()));
     // 4. thread::spawn: 循环 { sampler.collect(prev, now) → snap.store(Arc::new(s)); sleep(interval) }
     // 5. window.run_message_loop(|hwnd| { let s = snap.load(); gdi::render(hwnd, &s, &cfg); })
@@ -191,7 +191,7 @@ fn main() {
 ## 6. 依赖与编译边界
 
 - workspace：`members = [core, ui, win, app]`，`resolver = "2"`。
-- `core` 无 `[dependencies]` → 可纯离线编译与单测（已验证 `cargo test -p sysoverlay-core --offline` 通过）。
+- `core` 无 `[dependencies]` → 可纯离线编译与单测（已验证 `cargo test -p aaxsyspulse-core --offline` 通过）。
 - `win`/`app` 依赖 `windows` crate（目标：升级到含 `GlobalMemoryStatusEx`/`GetIfTable2` 绑定的版本，解决 proc_mem/proc_net 占位）。
 - Release profile：`opt-level="z"` + `lto` + `codegen-units=1` + `panic="abort"` + `strip` + 关 `overflow-checks`（体积优先）。
 - **建议**（可选）：为 `core` 的纯逻辑单测加 `cfg(test)` 之外不引入 dev-dep 干扰；`ui` 的 `png` 仅作 dev/test 依赖（已在 `ui/Cargo.toml` 的 `[dev-dependencies]`）。
@@ -228,7 +228,7 @@ fn main() {
 - **P1（端到端跑通，最小可用闭环）**
   4. `win/gdi::render` 接 `ui::draw_card`（SoftwareSurface → DIB → UpdateLayeredWindow）。
   5. `app` 起采样线程 + `ArcSwap<Snapshot>`，UI 线程 `load()` 重绘。
-  6. `config_io` 原子写落盘 `%APPDATA%\SysOverlayC\config.txt`。
+  6. `config_io` 原子写落盘 `%APPDATA%\AAXSysPulse\config.txt`。
 - **P2（健壮 / 可维护）**
   7. 去全局 `WINDOW_STATE`：状态装箱进 `GWLP_USERDATA`。
   8. 合并 `config.rs`/`layout.rs` 的 `Zoom/Shape/VertLayout` 为唯一真源。
@@ -272,14 +272,14 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config); // 内部: ui::draw_ca
 
 ## 10. v2 决策记录（2026-09-04 定案）
 
-v2 方案（`SysOverlay-C_优化设计方案_v2.md`）经 16 问核对后定案，关键决策摘录于此，
+v2 方案（`AAXSysPulse_优化设计方案_v2.md`）经 16 问核对后定案，关键决策摘录于此，
 使本文件保持架构单一事实源。
 
 | 议题 | 决策 |
 |---|---|
 | **配置格式** | 宽容读 + 保守写（见 §3.1）。C 版是空格分隔，不得改 `key=value`。 |
 | **排期** | 修正后 **19.5 天**（原 14.5 天低估）。P0+P1 按 **一周** 排（含补 `color.rs`/`units.rs` 空文件与 `proc_mem`/`proc_net` 占位）。 |
-| **驱动边界** | 主程序**永不依赖** PawnIO。功耗做成可选附加组件：`sysoverlay-power-setup.exe` **只装驱动、不含业务逻辑**，主程序直接调驱动。驱动不可用 → 回退**估算模型**（非隐藏、非"不可用"），UI 用 `~` 前缀标注。 |
+| **驱动边界** | 主程序**永不依赖** PawnIO。功耗做成可选附加组件：`aaxsyspulse-power-setup.exe` **只装驱动、不含业务逻辑**，主程序直接调驱动。驱动不可用 → 回退**估算模型**（非隐藏、非"不可用"），UI 用 `~` 前缀标注。 |
 | **`SampleOutcome`** | 本次重构就改：`Ok/Transient/Skipped/Fatal`（去 `&str` payload）+ 独立 `SamplerDiag`。 |
 | **诊断落点** | 内存固定环形缓冲（64 项 ≈ 1.5 KB，无堆分配、无磁盘 I/O）；三出口：默认仅内存 / 崩溃随 MiniDump / `--diag` 打印到 stdout。 |
 | **双渲染模式** | **删掉 `CardCompositor`**（过度抽象）。`draw_card` 保持唯一骨架，差异经**两个注入点**注入：`&dyn TextRasterizer`（字体）+ `&dyn Decoration`（装饰：`EcoDecoration`/`QualityDecoration`）。 |
@@ -295,7 +295,7 @@ v2 方案（`SysOverlay-C_优化设计方案_v2.md`）经 16 问核对后定案�
 
 ### 10.1 实测基准（2026-09-04）
 
-`cargo build --release` + `cargo bloat --release --crates -p sysoverlay-app`：
+`cargo build --release` + `cargo bloat --release --crates -p aaxsyspulse-app`：
 
 | 项 | 实测值 |
 |---|---|

@@ -7,14 +7,14 @@
 
 ## ⚡ 2026-09-12 A/B 实测勘误（本文档估算值已被校准，先读这节）
 
-> 本文其余章节的 µs 数字是**静态估算**。下表为同机 90 秒 A/B 实测（`SYSOVERLAY_PERF=1`
-> 逐帧落盘 + 进程 TotalProcessorTime），对照组用 `SYSOVERLAY_NODIRTY=1` 切换整窗上传。
+> 本文其余章节的 µs 数字是**静态估算**。下表为同机 90 秒 A/B 实测（`AAXSYSPULSE_PERF=1`
+> 逐帧落盘 + 进程 TotalProcessorTime），对照组用 `AAXSYSPULSE_NODIRTY=1` 切换整窗上传。
 > **复现步骤**：
 > ```bash
-> cd sysoverlay && cargo build --release -p sysoverlay-app
-> : > "$LOCALAPPDATA/SysOverlayC/perf.log"
-> SYSOVERLAY_PERF=1 ./target/release/sysoverlay-app.exe & sleep 90   # A 模式
-> # 对照组加 SYSOVERLAY_NODIRTY=1，重跑 90s
+> cd sysoverlay && cargo build --release -p aaxsyspulse-app
+> : > "$LOCALAPPDATA/AAXSysPulse/perf.log"
+> AAXSYSPULSE_PERF=1 ./target/release/aaxsyspulse-app.exe & sleep 90   # A 模式
+> # 对照组加 AAXSYSPULSE_NODIRTY=1，重跑 90s
 > # 解析：grep render_d2d_ok perf.log 提取 us= 取分位数（D2D 生产引擎每帧完整耗时）
 > ```
 > 机器：实际桌面机 Win11；测量窗口 90s；采样节奏 ≈2s/次（46 快照/窗）；另有每秒时钟唤醒。
@@ -184,7 +184,7 @@ Windows 只在「更新区域非空且队列空闲」时投递 `WM_PAINT`，但*
 
 ### P5 · 加 `--perf` 测量开关（建议做）
 
-`SYSOVERLAY_PERF=1` 时，用 `QueryPerformanceCounter` 统计并每 5 秒打到 stderr：
+`AAXSYSPULSE_PERF=1` 时，用 `QueryPerformanceCounter` 统计并每 5 秒打到 stderr：
 **帧数/秒、单帧平均/最大耗时、被脏检查跳过次数**。
 这样你我都能用数据校准上面的估算，而不是靠猜。
 
