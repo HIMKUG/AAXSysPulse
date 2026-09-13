@@ -26,6 +26,7 @@ pub mod sampler;
 pub mod cadence;
 pub mod scheduler;
 pub mod metrics;
+pub mod composite;
 pub mod layout;
 pub mod config;
 pub mod color;

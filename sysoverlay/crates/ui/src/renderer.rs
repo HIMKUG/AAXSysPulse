@@ -201,8 +201,8 @@ impl MetricRow {
     }
 }
 
-/// 固定容量（最多 6 项：CPU/Mem/GPU/Net/Power/Time）的栈上指标列表（C2：零堆分配）。
-const MAX_METRICS: usize = 6;
+/// 固定容量（最多 7 项：CPU/Mem/GPU/Net/Power/Time/Util）的栈上指标列表（C2：零堆分配）。
+const MAX_METRICS: usize = 7;
 pub struct RowList {
     items: [MetricRow; MAX_METRICS],
     count: usize,
@@ -212,6 +212,7 @@ impl RowList {
     fn new() -> Self {
         Self {
             items: [
+                MetricRow::empty(),
                 MetricRow::empty(),
                 MetricRow::empty(),
                 MetricRow::empty(),
@@ -358,6 +359,7 @@ fn metric_index(m: MetricEnum) -> usize {
         MetricEnum::Net => 3,
         MetricEnum::Power => 4,
         MetricEnum::Time => 5,
+        MetricEnum::Util => 6,
     }
 }
 
@@ -652,6 +654,40 @@ fn build_row(m: MetricEnum, snap: &Snapshot, cfg: &Config, style: Style) -> Opti
                 cfg,
                 style.ui.name,
                 style.ui.value,
+            ))
+        }
+        MetricEnum::Util => {
+            if !cfg.show_util {
+                return None;
+            }
+            // 综合占用：CPU/内存/GPU 的排队论闭式解（见 core::composite），
+            // 由采样线程算好填进 snap.util。三种数值态：
+            // - 正常：占用率强调色（与其他指标一致的三档变色）
+            // - 降级（≥1 源缺失，重归一化续算）：陈旧色提示"数值可信度下降"
+            // - 不可用（全源缺失）：红色 "--" 引导注意
+            let (v, stale, ok) = metric_parts(&snap.util);
+            let mut b = StrBuf::new();
+            if ok {
+                fmt_pct(&mut b, v);
+            } else {
+                b.push_str("--");
+            }
+            let color = if !ok {
+                style.accent(100.0)
+            } else if stale || snap.util_partial {
+                style.stale_accent(v)
+            } else {
+                style.accent(v)
+            };
+            let label = metric_label(cfg, 6, "Util", "U");
+            Some(new_row(
+                MetricEnum::Util,
+                label,
+                b,
+                SLOT_PCT,
+                cfg,
+                style.ui.name,
+                color,
             ))
         }
     }
@@ -1015,7 +1051,14 @@ mod tests {
     use super::*;
 
     fn demo_cfg() -> Config {
-        Config::default()
+        // 新默认值里 CPU/内存/GPU 显示是关的（用户拍板）；
+        // 渲染测试关心的是"行的内容与几何"，与默认开关策略无关，
+        // 这里显式打开以保持既有断言语义。
+        let mut c = Config::default();
+        c.show_cpu = true;
+        c.show_mem = true;
+        c.show_gpu = true;
+        c
     }
 
     fn demo_snap() -> Snapshot {
@@ -1365,7 +1408,7 @@ mod tests {
         // 顺序必须真实生效：把 Time 排到最前，行序随之改变。
         crate::clock::set_local(1, 2, 3);
         let mut cfg = demo_cfg();
-        cfg.metric_order = [5, 0, 1, 2, 3, 4];
+        cfg.metric_order = [5, 0, 1, 2, 3, 4, 6];
         let rows = build_rows(&Snapshot::placeholder(0), &cfg);
         let seq: Vec<MetricEnum> = rows.as_slice().iter().map(|r| r.metric).collect();
         assert_eq!(
@@ -1375,9 +1418,10 @@ mod tests {
                 MetricEnum::Cpu,
                 MetricEnum::Mem,
                 MetricEnum::Gpu,
-                MetricEnum::Net
+                MetricEnum::Net,
+                MetricEnum::Util
             ],
-            "metric_order 必须决定显示顺序"
+            "metric_order 必须决定显示顺序（Power 默认关，Util 不可用仍显示 --）"
         );
 
         // 时间文本变化 → 帧指纹必须变化（脏渲染依赖此性质）
@@ -1388,6 +1432,64 @@ mod tests {
         // 同一秒内 → 指纹稳定（跳帧省渲染的前提）
         let h3 = StripRenderer.frame_hash(&Snapshot::placeholder(0), &cfg, 400, 36, 90);
         assert_eq!(h2, h3, "同一秒内指纹必须稳定");
+    }
+
+    #[test]
+    fn util_row_states_and_colors() {
+        // Util 行三态：正常值 / 降级（部分源缺失）/ 不可用（全源缺失）。
+        let cfg = demo_cfg();
+        assert!(cfg.show_util, "Util 默认显示");
+
+        // 不可用（启动首帧）：显示红色 "--"，行仍占位。
+        let rows = build_rows(&Snapshot::placeholder(0), &cfg);
+        let u = rows
+            .as_slice()
+            .iter()
+            .find(|r| matches!(r.metric, MetricEnum::Util))
+            .expect("show_util=true 时必须有 Util 行");
+        assert_eq!(u.label.as_str(), "Util");
+        assert_eq!(u.value.as_str(), "--");
+        assert_eq!(u.value_color, Style::default().accent(100.0), "不可用必须红色");
+
+        // 正常值：占用率强调色（47% → 绿档）。
+        let mut snap = Snapshot::placeholder(0);
+        snap.util = SnapMetric::Value(47.0);
+        snap.util_partial = false;
+        let rows = build_rows(&snap, &cfg);
+        let u = rows.as_slice().iter().find(|r| matches!(r.metric, MetricEnum::Util)).unwrap();
+        assert_eq!(u.value.as_str(), "47%");
+        assert_eq!(u.value_color, Style::default().accent(47.0));
+
+        // 降级（GPU 缺失重归一化）：陈旧色。
+        let mut snap = Snapshot::placeholder(0);
+        snap.util = SnapMetric::Value(61.0);
+        snap.util_partial = true;
+        let rows = build_rows(&snap, &cfg);
+        let u = rows.as_slice().iter().find(|r| matches!(r.metric, MetricEnum::Util)).unwrap();
+        assert_eq!(u.value_color, Style::default().stale_accent(61.0), "降级值必须用陈旧色");
+
+        // 关闭 → 行消失。
+        let mut cfg2 = cfg;
+        cfg2.show_util = false;
+        let rows = build_rows(&Snapshot::placeholder(0), &cfg2);
+        assert!(
+            !rows.as_slice().iter().any(|r| matches!(r.metric, MetricEnum::Util)),
+            "show_util=false 时不得出现 Util 行"
+        );
+    }
+
+    #[test]
+    fn util_short_label_and_slot() {
+        // 简称 U；数值槽与百分比一致（"100%" 4 字符）。
+        let mut cfg = demo_cfg();
+        cfg.short_names = true;
+        let mut snap = Snapshot::placeholder(0);
+        snap.util = SnapMetric::Value(100.0);
+        let rows = build_rows(&snap, &cfg);
+        let u = rows.as_slice().iter().find(|r| matches!(r.metric, MetricEnum::Util)).unwrap();
+        assert_eq!(u.label.as_str(), "U");
+        assert_eq!(u.value.as_str(), "100%");
+        assert_eq!(u.slot, SLOT_PCT);
     }
 
     /// `layout` 预算门禁（恢复计划 P4.3，照 build_pages 门禁模式）：

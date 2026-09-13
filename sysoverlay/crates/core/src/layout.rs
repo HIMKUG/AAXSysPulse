@@ -538,6 +538,8 @@ mod tests {
             gpu: Metric::Unavailable,
             net: NetStat::default(),
             power: Metric::Unavailable,
+            util: Metric::Unavailable,
+            util_partial: false,
         };
         let rows = RowsShown::from_snapshot(&snap, true);
         assert!(rows.cpu);

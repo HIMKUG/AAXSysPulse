@@ -16,7 +16,7 @@ use std::time::Duration;
 use aaxsyspulse_core::cadence::{DELTA_ENTER, DELTA_EXIT, EXIT_TICKS, IDLE_MAX_MS, REFRESH_FLOOR_MS, ACTIVE_CPU_PCT, ACTIVE_NET_BPS};
 use aaxsyspulse_core::scheduler::Scheduler;
 use aaxsyspulse_core::scheduler::Source;
-use aaxsyspulse_win::window::{get_shared_seq, publish_schedule_cfg, schedule_cfg, setup_resume_channel, snap_store, wait_cfg_change};
+use aaxsyspulse_win::window::{get_shared_seq, publish_schedule_cfg, schedule_cfg, schedule_util, setup_resume_channel, snap_store, wait_cfg_change};
 use aaxsyspulse_win::OverlayWindow;
 use aaxsyspulse_win::SystemSampler;
 use aaxsyspulse_win::dpi;
@@ -203,8 +203,9 @@ fn main() {
             .map(|a| std::path::PathBuf::from(a).join("AAXSysPulseC\\config.txt").exists())
             .unwrap_or(false);
         aaxsyspulse_win::probe::log(&format!(
-            "cfg show_cpu={} show_mem={} show_gpu={} show_net={} power={} interval={} auto={} exclude_virtual={} power_interval={} appdata_set={} cfg_file_exists={}",
+            "cfg show_cpu={} show_mem={} show_gpu={} show_net={} show_util={} power={} interval={} auto={} exclude_virtual={} power_interval={} appdata_set={} cfg_file_exists={}",
             cfg.show_cpu as u8, cfg.show_mem as u8, cfg.show_gpu as u8, cfg.show_net as u8,
+            cfg.show_util as u8,
             cfg.power_enabled as u8, cfg.interval_ms, cfg.refresh_auto,
             cfg.exclude_virtual_nic as u8, cfg.power_interval_ms,
             appdata.is_some() as u8, cfg_exists as u8,
@@ -426,10 +427,11 @@ fn main() {
 
             let plan = sched.plan(now_ms, &enabled);
             let power_on = enabled[4];
+            let util_on = schedule_util();
             // 空计划零开销：无源到期且无需 flush → 不克隆快照、不进采样器。
             let snap = if plan.any() || need_flush {
                 need_flush = false;
-                sampler.sample(&plan, Some(&pending), now_ms, power_on)
+                sampler.sample(&plan, Some(&pending), now_ms, power_on, util_on)
             } else {
                 pending.clone()
             };

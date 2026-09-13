@@ -176,7 +176,7 @@ struct SettingsCtx {
     /// 正在编辑的输入框（buf/caret）。
     edit: Option<EditState>,
     /// 各指标配置卡的展开态（UI 状态，不落盘）。
-    metric_expanded: [bool; 6],
+    metric_expanded: [bool; 7],
     /// 滚轮惯性的滚动速度（px/s），橡胶边界用。
     scroll_vel: f32,
     /// 当前客户区尺寸（WM_SIZE 更新，rebuild_pages 与命中测试用）。
@@ -196,7 +196,7 @@ struct SettingsCtx {
     /// 侧边栏选中胶囊的滑动脉簧（值 = 页面下标）。
     nav_sel: motion::Spring,
     /// 各指标折叠卡的动画展开度（0..1）。
-    metric_expand_t: [motion::Spring; 6],
+    metric_expand_t: [motion::Spring; 7],
     /// 上一帧是否仍在推进布局类弹簧（收敛后再补一次重排）。
     layout_anim_active: bool,
     /// 翻页弹簧：水平位移（px，从 24 滑入到 0）。
@@ -228,12 +228,12 @@ struct SettingsCtx {
     /// 换位滑动弹簧（逐指标，值 = 相对基准槽位的额外 y 位移，目标恒为 0）。
     /// 换位时把「对面那张卡」弹到它的旧视觉位置，再由弹簧滑回新槽位 ——
     /// 这就是「一张张卡片挪动」的非线性动画。
-    card_slide: [motion::Spring; 6],
+    card_slide: [motion::Spring; 7],
     /// 拖拽释放时的落位弹簧动画状态（None = 无进行中释放动画）。
     drag_release: Option<ReleaseInfo>,
     /// 松手后被拖卡自己的落位弹簧（逐指标）：从拖动偏移量 spring 到 0，
     /// 弹簧收敛后才触发真正的 rebuild_pages（确保卡槽无空隙）。
-    metric_release: [motion::Spring; 6],
+    metric_release: [motion::Spring; 7],
     /// 滚动条拖拽状态：`Some(grab)` = 正在拖，`grab` = 按下点相对拇指顶缘的偏移
     /// （client px）。None = 未在拖。
     ///
@@ -258,7 +258,7 @@ struct CardDrag {
     /// 被拖指标下标（0..=5；id 键控，不随显示位置变化）。
     metric: usize,
     /// 拖动预览中的显示顺序（换位即时更新，抬手才落盘）。
-    order: [u8; 6],
+    order: [u8; 7],
     /// 抓取点相对被拖卡顶缘的偏移（按下时确定，恒定 → 贴手）。
     grab_dy: i32,
     /// 被拖卡当前 y 偏移（rect 相对 base 布局位置）。
@@ -538,7 +538,7 @@ fn create_dialog(overlay: HWND) {
             page_anim: None,
             interaction: Interaction::Idle,
             edit: None,
-            metric_expanded: [false; 6],
+            metric_expanded: [false; 7],
             scroll_vel: 0.0,
             client_size: (w, h),
             nav_hover: None,
@@ -548,7 +548,7 @@ fn create_dialog(overlay: HWND) {
             spatial_grids: Vec::new(),
             transitions: std::collections::HashMap::new(),
             nav_sel: motion::Spring::new(0.0),
-            metric_expand_t: [motion::Spring::new(0.0); 6],
+            metric_expand_t: [motion::Spring::new(0.0); 7],
             layout_anim_active: false,
             page_slide: motion::Spring::new(0.0),
             page_fade: motion::Spring::new(1.0),
@@ -563,9 +563,9 @@ fn create_dialog(overlay: HWND) {
             status: None,
             stepper_hold: None,
             card_drag: None,
-            card_slide: [motion::Spring::new(0.0); 6],
+            card_slide: [motion::Spring::new(0.0); 7],
             drag_release: None,
-            metric_release: [motion::Spring::new(0.0); 6],
+            metric_release: [motion::Spring::new(0.0); 7],
             sb_drag: None,
             sb_hover: false,
         };
@@ -824,14 +824,14 @@ fn step_drag_release(ctx: &mut SettingsCtx, dt: f32) -> bool {
     if settled {
         ctx.drag_release = None;
         ctx.card_drag = None;
-        ctx.metric_release = [motion::Spring::new(0.0); 6];
+        ctx.metric_release = [motion::Spring::new(0.0); 7];
     }
     settled
 }
 
 // ── 单向数据流：Action 分派（唯一写入口） ────────────────
 
-/// v3：Time 与 CPU/Mem/GPU/Net/Power 平权，同属监控项（共 6 项）。
+/// v3：Time 与 CPU/Mem/GPU/Net/Power/Util 平权，同属监控项（共 7 项）。
 fn is_metric_toggle(r: CfgRef) -> bool {
     matches!(
         r,
@@ -839,12 +839,13 @@ fn is_metric_toggle(r: CfgRef) -> bool {
             | CfgRef::ShowMem
             | CfgRef::ShowGpu
             | CfgRef::ShowNet
+            | CfgRef::ShowUtil
             | CfgRef::ShowTime
             | CfgRef::PowerEnabled
     )
 }
 
-/// 拒绝「关闭全部监控项」：任意时刻可见项数 ≥ 1（含 Time）。
+/// 拒绝「关闭全部监控项」：任意时刻可见项数 ≥ 1（含 Time 与 Util）。
 fn metrics_all_off_after(cfg: &aaxsyspulse_core::config::Config, turning_off: CfgRef) -> bool {
     let v = |r: CfgRef| matches!(r.get(cfg), Value::Bool(true));
     let would_off = |r: CfgRef| r == turning_off;
@@ -852,6 +853,7 @@ fn metrics_all_off_after(cfg: &aaxsyspulse_core::config::Config, turning_off: Cf
         && (!v(CfgRef::ShowMem) || would_off(CfgRef::ShowMem))
         && (!v(CfgRef::ShowGpu) || would_off(CfgRef::ShowGpu))
         && (!v(CfgRef::ShowNet) || would_off(CfgRef::ShowNet))
+        && (!v(CfgRef::ShowUtil) || would_off(CfgRef::ShowUtil))
         && (!v(CfgRef::ShowTime) || would_off(CfgRef::ShowTime))
         && (!v(CfgRef::PowerEnabled) || would_off(CfgRef::PowerEnabled))
 }
@@ -935,10 +937,13 @@ fn dispatch(ctx: &mut SettingsCtx, action: Action) {
                             show_teardown_notice(overlay, "TeardownPower");
                         }
                         CfgRef::ShowGpu
-                            if !cfg.show_gpu && !(cfg.power_enabled && cfg.power_query) =>
+                            if !cfg.show_gpu
+                                && !(cfg.power_enabled && cfg.power_query)
+                                && !cfg.show_util =>
                         {
-                            // 厂商驱动库（NVML/ADL）只在「GPU 行与功耗行**都**关」时才卸载。
-                            // 功耗行仍开着时，厂商库会继续保留（它要供整机功耗的 GPU 瓦数），
+                            // 厂商驱动库（NVML/ADL）只在「GPU 行、功耗行、Util 行
+                            // **都**关」时才卸载。功耗/Util 任一仍开着时，厂商库
+                            // 会继续保留（整机功耗要 GPU 瓦数、Util 要 GPU 占用率），
                             // 此时不能弹"需重启恢复"——那句话不成立。
                             show_teardown_notice(overlay, "TeardownGpu");
                         }
@@ -2038,14 +2043,14 @@ unsafe fn on_wm_lbuttondown(hwnd: HWND, _msg: u32, _wparam: WPARAM, lparam: LPAR
             {
             // 开始新的拖拽前，清理可能残留的释放落位动画（避免新旧状态打架）。
             ctx.drag_release = None;
-            ctx.metric_release = [motion::Spring::new(0.0); 6];
+            ctx.metric_release = [motion::Spring::new(0.0); 7];
             let mi = mh.index;
             let order = ctx
             .card_drag
             .as_ref()
             .map(|d| d.order)
             .unwrap_or_else(|| {
-            ctx.cfg().map(|c| c.metric_order).unwrap_or([0, 1, 2, 3, 4, 5])
+            ctx.cfg().map(|c| c.metric_order).unwrap_or([0, 1, 2, 6, 3, 4, 5])
             });
             let pos = order.iter().position(|&m| m as usize == mi).unwrap_or(0);
             let card_top = ctx.pages[ctx.page]
@@ -2054,7 +2059,7 @@ unsafe fn on_wm_lbuttondown(hwnd: HWND, _msg: u32, _wparam: WPARAM, lparam: LPAR
             .map(|c| c.rect.top)
             .unwrap_or(cpt.0.y);
             // 清空上一次拖拽残留的换位弹簧（避免旧偏移串到本次）。
-            ctx.card_slide = [motion::Spring::new(0.0); 6];
+            ctx.card_slide = [motion::Spring::new(0.0); 7];
             ctx.card_drag = Some(CardDrag {
             metric: mi,
             order,
@@ -2944,12 +2949,12 @@ fn paint_page(
     oy: f32,
     body: f32,
     caption: f32,
-    _metric_expanded: &[bool; 6],
+    _metric_expanded: &[bool; 7],
     drag_pos: Option<usize>,
     transitions: &mut std::collections::HashMap<(usize, i32), Transition>,
-    card_slide: &[motion::Spring; 6],
+    card_slide: &[motion::Spring; 7],
     drag_release: Option<&ReleaseInfo>,
-    metric_release: &[motion::Spring; 6],
+    metric_release: &[motion::Spring; 7],
     dt: f32,
     focus: Option<usize>,
     keyboard_mode: bool,

@@ -246,6 +246,8 @@ impl Appearance {
 /// 可逐项调色的指标。顺序即配置数组的下标序（**不是**悬浮窗的显示序 ——
 /// 显示序由 [`Config` 的 `metric_order`](crate::config::Config) 决定）。
 /// `Time` 是时钟行（非采样指标），配色/字号槽位复用同一套逐项数组。
+/// `Util`（综合占用）追加在末尾（下标 6）：保持既有下标 0..=5 稳定，
+/// 旧配置的 `mc_*`/`mfs_*`/`morder` 语义不变。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Metric {
     Cpu,
@@ -254,17 +256,19 @@ pub enum Metric {
     Net,
     Power,
     Time,
+    Util,
 }
 
 impl Metric {
     /// 所有合法值（下标序）。
-    pub const ALL: [Metric; 6] = [
+    pub const ALL: [Metric; 7] = [
         Metric::Cpu,
         Metric::Mem,
         Metric::Gpu,
         Metric::Net,
         Metric::Power,
         Metric::Time,
+        Metric::Util,
     ];
 
     /// 配置键里的短名：`mc_cpu_lbl` / `mc_mem_val` 等。
@@ -276,6 +280,7 @@ impl Metric {
             Metric::Net => "net",
             Metric::Power => "power",
             Metric::Time => "time",
+            Metric::Util => "util",
         }
     }
 }

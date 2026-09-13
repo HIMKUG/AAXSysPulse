@@ -13,6 +13,7 @@ use crate::proc_mem::MemSampler;
 use crate::proc_net::NetSampler;
 use crate::gpu_vendor;
 use crate::power_system::SystemPower;
+use aaxsyspulse_core::composite::{Meter, MeterConfig};
 use aaxsyspulse_core::sampler::{Backoff, SampleOutcome, Sampler, SamplerDiag, SamplerId};
 use aaxsyspulse_core::scheduler::SamplePlan;
 use aaxsyspulse_core::snapshot::{Metric, Snapshot};
@@ -25,6 +26,12 @@ pub struct SystemSampler {
     net: NetSampler,
     /// 整机功耗（用户拍板公式：CPU实测+GPU实测+内存+主板+硬盘）。
     syspower: SystemPower,
+
+    /// 综合占用（Util）的时间维度计：非对称 EMA + 卡顿指数。
+    /// 状态归采样线程所有（单线程所有权，无锁）。
+    util_meter: Meter,
+    /// 上次 Util 更新的时间戳（毫秒）；None = 尚未更新过（首帧 dt 视为非法 → 全信读数）。
+    last_util_ms: Option<u64>,
 
     /// Diagnostic ring buffer (64 entries, no heap, survives crashes).
     pub diag: SamplerDiag,
@@ -54,6 +61,8 @@ impl SystemSampler {
             gpu: GpuSampler::new(),
             net: NetSampler::new(exclude_virtual),
             syspower: SystemPower::new(),
+            util_meter: Meter::new(MeterConfig::default()),
+            last_util_ms: None,
             diag: SamplerDiag::new(),
             backoff: [Backoff::default(); 5],
             seq: 0,
@@ -115,7 +124,17 @@ impl SystemSampler {
     /// 这是调度器「GPU/Net 独立降频」的执行端：计划外的源零开销。
     ///
     /// `prev` 是上一份完整快照（通常来自线程本地缓存），未到期源从中复制。
-    pub fn sample(&mut self, plan: &SamplePlan, prev: Option<&Snapshot>, now_ms: u64, power_enabled: bool) -> Snapshot {
+    ///
+    /// `util_enabled` = 综合占用行开关（`show_util`）。开启时每周期用快照里的
+    /// CPU/内存/GPU 占用率算排队论闭式解（缺源重归一化）并经非对称 EMA 平滑。
+    pub fn sample(
+        &mut self,
+        plan: &SamplePlan,
+        prev: Option<&Snapshot>,
+        now_ms: u64,
+        power_enabled: bool,
+        util_enabled: bool,
+    ) -> Snapshot {
         // 从上一份快照出发：未到期源直接保留旧值，失败源也不再丢数据。
         let mut snap = prev.cloned().unwrap_or_else(|| Snapshot::placeholder(now_ms));
         snap.seq = self.seq;
@@ -217,6 +236,38 @@ impl SystemSampler {
             // 查询被禁用（行开关关 / 性能页 power_query 关 / teardown 后重开）：
             // 显式置 Unavailable，覆盖 prev 带来的旧值 → 功耗行显示 `--` 而非冻结的旧瓦数。
             snap.power = Metric::Unavailable;
+        }
+
+        // Util：综合占用（用户拍板：闭式解 + 非对称 EMA，等权，缺源重归一化）。
+        //
+        // 数据源保障在 publish 侧完成（show_util OR 进 cpu/mem/gpu 采样位），
+        // 这里只管算：显示行关 ≠ 数据源停 —— Util 行开着时 CPU/内存/GPU
+        // 始终有新数据进快照，即使它们各自的行是隐藏的。
+        if util_enabled {
+            let dt_ms = self.last_util_ms.map(|t| now_ms.saturating_sub(t));
+            self.last_util_ms = Some(now_ms);
+            let cpu = snap.cpu.value().map(|v| f64::from(v) / 100.0);
+            // 内存没有 Metric 包装（load_pct 恒有定义），视为始终可用；
+            // 首帧未采样时为 prev 携带的 0，随后即被真实读数覆盖。
+            let mem = Some(f64::from(snap.memory.load_pct) / 100.0);
+            let gpu = snap.gpu.value().map(|v| f64::from(v) / 100.0);
+            match aaxsyspulse_core::composite::aggregate3([cpu, mem, gpu]) {
+                Some((score, degraded)) => {
+                    let dt_secs = dt_ms.map(|d| d as f64 / 1000.0).unwrap_or(0.0);
+                    let m = self.util_meter.update(score, dt_secs);
+                    snap.util = Metric::Value(m.smooth_milli as f32 / 10.0);
+                    snap.util_partial = degraded;
+                }
+                None => {
+                    // 三源全缺（理论上仅硬件级故障）：行显示红色 --。
+                    snap.util = Metric::Unavailable;
+                    snap.util_partial = false;
+                }
+            }
+        } else {
+            // 行关：显式置 Unavailable，覆盖 prev 带来的旧值（与功耗行同策略）。
+            snap.util = Metric::Unavailable;
+            snap.util_partial = false;
         }
 
         self.seq += 1;

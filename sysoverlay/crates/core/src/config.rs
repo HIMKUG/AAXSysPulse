@@ -94,17 +94,25 @@ pub struct Config {
 
     // ── v3 横向条 ────────────────────────────────────────────
     /// 监控项开关（设置里可独立控制，至少保留一项由 UI 层保证）。
+    ///
+    /// 默认值（用户拍板）：CPU/内存/GPU **关**、Util/网络/时间开 ——
+    /// 全新安装的悬浮窗只显示综合占用 + 网速 + 时钟。
+    /// 注意：`show_util` 开启时采样层会强制保持 CPU/内存/GPU 的采样
+    /// （`show_util` 参与采样门 OR，见 `win::window::publish_schedule_cfg`），
+    /// 「行显示关」≠「数据源停采」。
     pub show_cpu: bool,
     pub show_mem: bool,
     pub show_gpu: bool,
     pub show_net: bool,
+    /// 综合占用（Util）行开关。默认开。
+    pub show_util: bool,
     /// 内存显示模式：false = 百分比，true = 实际占用量（GB，不显示总量）。
     pub mem_show_gb: bool,
     /// 正文字号（像素，8.0..=40.0，0.5 步进）。旧键 `font_scale` 迁移为 ×16。
     pub font_size: f32,
     /// 逐指标字号覆盖（None = 跟随全局 `font_size`）。
-    /// 索引与 [`Metric`] 顺序一致：CPU/MEM/GPU/Net/Power/Time。
-    pub metric_font_sizes: [Option<f32>; 6],
+    /// 索引与 [`Metric`] 顺序一致：CPU/MEM/GPU/Net/Power/Time/Util。
+    pub metric_font_sizes: [Option<f32>; 7],
     /// 字重档位（0=细 / 1=中 / 2=粗，默认 2=粗）。
     ///
     /// 位图字体只有一套字形，三档以**笔画覆盖率**区分（alpha 调制：
@@ -120,7 +128,7 @@ pub struct Config {
     /// 窗口翻页的过渡动画时长（ms，100..=2000，默认 300）。
     pub anim_ms: u32,
     /// 逐项配色：每个指标的名称/数值色槽，None = 跟随 `fg`。
-    pub metric_colors: [MetricColors; 6],
+    pub metric_colors: [MetricColors; 7],
     /// 文字阴影（颜色自动取字体反色：白字黑影 / 黑字白影）。
     pub text_shadow: bool,
     /// 文字描边（1px 四向，颜色同阴影规则）。
@@ -195,15 +203,16 @@ pub struct Config {
     pub show_time: bool,
     /// 时间显示秒（HH:MM:SS）；关闭 = 仅 HH:MM。默认开。
     pub time_show_seconds: bool,
-    /// 逐指标名称显示开关（默认全开）。索引与 [`Metric`] 顺序一致：CPU/MEM/GPU/Net/Power/Time。
-    pub metric_show_labels: [bool; 6],
+    /// 逐指标名称显示开关（默认全开）。索引与 [`Metric`] 顺序一致：CPU/MEM/GPU/Net/Power/Time/Util。
+    pub metric_show_labels: [bool; 7],
     /// 逐指标文字偏移：`[指标][分量]`。分量 0=名称X 1=名称Y 2=数值X 3=数值Y（px，可负；默认全 0）。
-    pub metric_offsets: [[i32; 4]; 6],
-    /// 简化名称：CPU→C、Mem→M、GPU→G、Net→N、Power→P、Time→T（默认关）。
+    pub metric_offsets: [[i32; 4]; 7],
+    /// 简化名称：CPU→C、Mem→M、GPU→G、Net→N、Power→P、Time→T、Util→U（默认关）。
     pub short_names: bool,
-    /// 监控项显示顺序：第 k 位元素 = 显示在第 k 位的指标下标（0..=5 排列）。
-    /// 下标序与 [`Metric`] 枚举序一致：CPU/MEM/GPU/Net/Power/Time。
-    pub metric_order: [u8; 6],
+    /// 监控项显示顺序：第 k 位元素 = 显示在第 k 位的指标下标（0..=6 排列）。
+    /// 下标序与 [`Metric`] 枚举序一致：CPU/MEM/GPU/Net/Power/Time/Util。
+    /// 默认 Util 排在 GPU 之后：[0,1,2,6,3,4,5]。
+    pub metric_order: [u8; 7],
 }
 
 /// 未贴角标记值（自由定位）。
@@ -227,20 +236,22 @@ impl Default for Config {
             window_pos: None,
             window_size: None,
             size_locked: false,
-            show_cpu: true,
-            show_mem: true,
-            show_gpu: true,
+            // 用户拍板：CPU/内存/GPU 显示默认关，Util/网络/时间默认开。
+            show_cpu: false,
+            show_mem: false,
+            show_gpu: false,
             show_net: true,
+            show_util: true,
             mem_show_gb: false,
             // 32px ≈ 旧默认 font_scale 2（16px 基准 ×2）
             font_size: 32.0,
-            metric_font_sizes: [None; 6],
+            metric_font_sizes: [None; 7],
             font_weight: 2,
             metric_gap: 8,
             label_value_gap: 6,
             normal_opacity: 35,
             anim_ms: 300,
-            metric_colors: [MetricColors::default(); 6],
+            metric_colors: [MetricColors::default(); 7],
             text_shadow: true,
             text_outline: false,
             autostart: false,
@@ -267,10 +278,11 @@ impl Default for Config {
             driver_check_last_date: 0,
             show_time: true,
             time_show_seconds: true,
-            metric_show_labels: [true; 6],
-            metric_offsets: [[0; 4]; 6],
+            metric_show_labels: [true; 7],
+            metric_offsets: [[0; 4]; 7],
             short_names: false,
-            metric_order: [0, 1, 2, 3, 4, 5],
+            // Util（下标 6）默认排在 GPU 之后。
+            metric_order: [0, 1, 2, 6, 3, 4, 5],
         }
     }
 }
@@ -338,6 +350,7 @@ impl Config {
                 "show_mem" => cfg.show_mem = Self::parse_bool(value, cfg.show_mem),
                 "show_gpu" => cfg.show_gpu = Self::parse_bool(value, cfg.show_gpu),
                 "show_net" => cfg.show_net = Self::parse_bool(value, cfg.show_net),
+                "show_util" => cfg.show_util = Self::parse_bool(value, cfg.show_util),
                 "mem_gb" => cfg.mem_show_gb = Self::parse_bool(value, cfg.mem_show_gb),
                 // 新字号（px，0.5 步进）。区间见 [`FONT_PX_MIN`]/[`FONT_PX_MAX`]
                 // （4..128；下限兼顾极小字号，上限给大屏留足空间）。
@@ -403,6 +416,7 @@ impl Config {
                             Metric::Net => 3,
                             Metric::Power => 4,
                             Metric::Time => 5,
+                            Metric::Util => 6,
                         };
                         let mc = &mut cfg.metric_colors[idx];
                         if slot.1 {
@@ -623,6 +637,7 @@ impl Config {
         s.push_str(&format!("show_mem {}\n", self.show_mem as u32));
         s.push_str(&format!("show_gpu {}\n", self.show_gpu as u32));
         s.push_str(&format!("show_net {}\n", self.show_net as u32));
+        s.push_str(&format!("show_util {}\n", self.show_util as u32));
         s.push_str(&format!("show_time {}\n", self.show_time as u32));
         s.push_str(&format!("time_seconds {}\n", self.time_show_seconds as u32));
         for (i, &v) in self.metric_show_labels.iter().enumerate() {
@@ -633,13 +648,14 @@ impl Config {
         }
         s.push_str(&format!("short_names {}\n", self.short_names as u32));
         s.push_str(&format!(
-            "morder {} {} {} {} {} {}\n",
+            "morder {} {} {} {} {} {} {}\n",
             self.metric_order[0],
             self.metric_order[1],
             self.metric_order[2],
             self.metric_order[3],
             self.metric_order[4],
-            self.metric_order[5]
+            self.metric_order[5],
+            self.metric_order[6]
         ));
         s.push_str(&format!("mem_gb {}\n", self.mem_show_gb as u32));
         s.push_str(&format!("font_size {:.1}\n", self.font_size));
@@ -805,6 +821,7 @@ fn parse_metric_color(key: &str, value: &str) -> Option<((Metric, bool), Option<
         "net" => Metric::Net,
         "power" => Metric::Power,
         "time" => Metric::Time,
+        "util" => Metric::Util,
         _ => return None,
     };
     let slot = match slot_part {
@@ -836,6 +853,7 @@ fn parse_metric_show_label(key: &str) -> Option<usize> {
         "net" => Some(3),
         "power" => Some(4),
         "time" => Some(5),
+        "util" => Some(6),
         _ => None,
     }
 }
@@ -855,6 +873,7 @@ fn parse_metric_font_size(key: &str, value: &str) -> Option<(usize, Option<f32>)
         "net" => 3,
         "power" => 4,
         "time" => 5,
+        "util" => 6,
         _ => return None,
     };
     let v = value.trim();
@@ -883,6 +902,7 @@ fn parse_metric_offset(key: &str, value: &str) -> Option<(usize, [i32; 4])> {
         "net" => 3,
         "power" => 4,
         "time" => 5,
+        "util" => 6,
         _ => return None,
     };
     let mut out = [0i32; 4];
@@ -894,13 +914,18 @@ fn parse_metric_offset(key: &str, value: &str) -> Option<(usize, [i32; 4])> {
     Some((idx, out))
 }
 
-/// 解析监控项显示顺序（`morder a b c d e f`）。
+/// 解析监控项显示顺序（`morder a b c d e f [g]`）。
 ///
-/// 须恰好 6 个、彼此不重复且都在 0..=5 内的值（空格/逗号/Tab 分隔），
-/// 任何违规整体返回 None（调用方回落默认恒等排列，永不部分应用）。
-fn parse_metric_order(value: &str) -> Option<[u8; 6]> {
-    let mut seen = [false; 6];
-    let mut out = [0u8; 6];
+/// 接受两种长度：
+/// - **7 个值**（新版）：0..=6 的排列，直接采用；
+/// - **6 个值**（旧版迁移）：0..=5 的排列，把 Util（6）插到 GPU（2）之后，
+///   与新默认序 [0,1,2,6,3,4,5] 的相对位置一致。
+///
+/// 值须彼此不重复（空格/逗号/Tab 分隔），任何违规整体返回 None
+/// （调用方回落默认排列，永不部分应用）。
+fn parse_metric_order(value: &str) -> Option<[u8; 7]> {
+    let mut seen = [false; 7];
+    let mut out = [0u8; 7];
     let mut n = 0usize;
     for tok in value.split(|c: char| c.is_ascii_whitespace() || c == ',') {
         let tok = tok.trim();
@@ -908,17 +933,37 @@ fn parse_metric_order(value: &str) -> Option<[u8; 6]> {
             continue;
         }
         let v: u8 = tok.parse().ok()?;
-        if v > 5 || seen[v as usize] {
+        if v > 6 || seen[v as usize] {
             return None;
         }
         seen[v as usize] = true;
-        out[n] = v;
+        if n < 7 {
+            out[n] = v;
+        }
         n += 1;
     }
-    if n != 6 {
-        return None;
+    match n {
+        7 => Some(out),
+        // 旧版 6 值排列：恰为 0..=5 的排列（含 6 的 6 值序列属非法截断，拒绝），
+        // 迁移为「GPU 之后插入 Util」。
+        6 => {
+            if !seen[2] || seen[6] {
+                return None;
+            }
+            let mut migrated = [0u8; 7];
+            let mut k = 0usize;
+            for &v in out.iter().take(6) {
+                migrated[k] = v;
+                k += 1;
+                if v == 2 {
+                    migrated[k] = 6;
+                    k += 1;
+                }
+            }
+            Some(migrated)
+        }
+        _ => None,
     }
-    Some(out)
 }
 
 #[cfg(test)]
@@ -1006,7 +1051,8 @@ fg F4F1EE
         cfg.size_locked = true;
         cfg.show_time = true;
         cfg.time_show_seconds = false;
-        cfg.metric_order = [3, 4, 5, 0, 1, 2];
+        cfg.show_util = false;
+        cfg.metric_order = [3, 4, 5, 6, 0, 1, 2];
         cfg.metric_colors[0] = MetricColors {
             label: Some(Rgb::new(0x12, 0x34, 0x56)),
             value: None,
@@ -1375,7 +1421,7 @@ fg F4F1EE
     #[test]
     fn test_metric_font_size_default_follows_global() {
         let cfg = Config::default();
-        assert_eq!(cfg.metric_font_sizes, [None; 6], "默认全部跟随全局字号");
+        assert_eq!(cfg.metric_font_sizes, [None; 7], "默认全部跟随全局字号");
     }
 
     #[test]
@@ -1410,7 +1456,11 @@ fg F4F1EE
         let cfg = Config::parse(C_REAL_CONFIG);
         assert!(cfg.show_time, "时间项默认显示");
         assert!(cfg.time_show_seconds, "默认显示秒");
-        assert_eq!(cfg.metric_order, [0, 1, 2, 3, 4, 5], "默认恒等排列");
+        assert_eq!(
+            cfg.metric_order,
+            [0, 1, 2, 6, 3, 4, 5],
+            "默认 Util 排在 GPU 之后"
+        );
     }
 
     #[test]
@@ -1418,37 +1468,81 @@ fg F4F1EE
         let mut cfg = Config::default();
         cfg.show_time = true;
         cfg.time_show_seconds = false;
-        cfg.metric_order = [3, 4, 5, 0, 1, 2];
+        cfg.metric_order = [3, 4, 5, 6, 0, 1, 2];
         let text = cfg.serialize();
         let parsed = Config::parse(&text);
         assert_eq!(parsed, cfg, "时间/顺序往返失败，实际输出:\n{}", text);
         assert!(text.contains("show_time 1\n"));
         assert!(text.contains("time_seconds 0\n"));
-        assert!(text.contains("morder 3 4 5 0 1 2\n"));
+        assert!(text.contains("morder 3 4 5 6 0 1 2\n"));
     }
 
     #[test]
     fn test_metric_order_validation() {
-        // 非法输入一律整体回落默认恒等排列（永不部分应用）。
+        // 非法输入一律整体回落默认排列（永不部分应用）。
         for bad in [
-            "0 1 2 3 4",       // 缺一个
-            "0 1 2 3 4 5 6",   // 越界值
-            "0 1 2 3 4 5 5",   // 重复
-            "0 1 2 3 4 x",     // 非数字
-            "",                // 空
-            "9 9 9 9 9 9",     // 全越界
+            "0 1 2 3 4",         // 缺两个
+            "0 1 2 3 4 5 5 6",   // 重复
+            "0 1 2 3 4 x 6",     // 非数字
+            "",                  // 空
+            "9 9 9 9 9 9 9",     // 全越界
+            "0 1 2 3 4 6",       // 6 值但含 6：非法截断，拒绝
         ] {
             let cfg = Config::parse(&format!("morder {bad}"));
             assert_eq!(
                 cfg.metric_order,
-                [0, 1, 2, 3, 4, 5],
+                [0, 1, 2, 6, 3, 4, 5],
                 "非法 morder {:?} 应回落默认",
                 bad
             );
         }
-        // 合法：逗号分隔也接受
-        let cfg = Config::parse("morder 5,4,3,2,1,0");
-        assert_eq!(cfg.metric_order, [5, 4, 3, 2, 1, 0]);
+        // 合法：新版 7 值 + 逗号分隔
+        let cfg = Config::parse("morder 6,5,4,3,2,1,0");
+        assert_eq!(cfg.metric_order, [6, 5, 4, 3, 2, 1, 0]);
+        // 合法：旧版 6 值排列 → 迁移为 GPU 之后插入 Util
+        let cfg = Config::parse("morder 5 4 3 2 1 0");
+        assert_eq!(
+            cfg.metric_order, [5, 4, 3, 2, 6, 1, 0],
+            "旧 6 值排列必须在 GPU(2) 后插入 Util(6)"
+        );
+    }
+
+    #[test]
+    fn test_show_util_defaults_and_roundtrip() {
+        // 用户拍板：Util 默认开，CPU/内存/GPU 默认关。
+        let d = Config::default();
+        assert!(d.show_util, "Util 默认开启");
+        assert!(!d.show_cpu && !d.show_mem && !d.show_gpu, "CPU/内存/GPU 默认关闭");
+        assert!(d.show_net && d.show_time, "网络与时间保持默认开");
+        // 旧配置无 show_util 键 → 落到默认 true（升级用户无损获得 Util）
+        assert!(Config::parse(C_REAL_CONFIG).show_util);
+        // 往返
+        let mut cfg = Config::default();
+        cfg.show_util = false;
+        assert_eq!(Config::parse(&cfg.serialize()), cfg);
+    }
+
+    #[test]
+    fn test_util_per_metric_slots() {
+        // Util 占逐项数组 6 号槽：配色/字号/名称开关/偏移键都要能往返。
+        let mut cfg = Config::default();
+        cfg.metric_colors[6] = MetricColors {
+            label: Some(Rgb::new(0x11, 0x22, 0x33)),
+            value: None,
+            value_auto: true,
+        };
+        cfg.metric_font_sizes[6] = Some(20.0);
+        cfg.metric_show_labels[6] = false;
+        cfg.metric_offsets[6] = [1, -2, 3, -4];
+        let text = cfg.serialize();
+        let parsed = Config::parse(&text);
+        assert_eq!(parsed, cfg, "Util 逐项槽往返失败:\n{}", text);
+        // COLORREF = BBGGRR
+        assert!(text.contains("mc_util_lbl 332211\n"));
+        assert!(text.contains("mc_util_valauto 1\n"));
+        assert!(text.contains("mfs_util 20.0\n"));
+        assert!(text.contains("msl_util 0\n"));
+        assert!(text.contains("moff_util 1 -2 3 -4\n"));
     }
 
     #[test]
@@ -1507,7 +1601,7 @@ fg F4F1EE
     #[test]
     fn test_metric_font_size_unknown_ignored() {
         let cfg = Config::parse("mfs_xxx 20.0\nmfs");
-        assert_eq!(cfg.metric_font_sizes, [None; 6]);
+        assert_eq!(cfg.metric_font_sizes, [None; 7]);
     }
 
     #[test]

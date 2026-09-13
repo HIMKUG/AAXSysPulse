@@ -115,11 +115,15 @@ pub fn get_shared_seq() -> &'static AtomicU64 {
 static SCHED_AUTO: AtomicBool = AtomicBool::new(true);
 static SCHED_INTERVAL_MS: AtomicU32 = AtomicU32::new(1000);
 /// 位 0..4 = cpu/mem/gpu/net/power 启用（位 4 = 功耗采样门 = power_enabled ∧ power_query）。
+/// cpu/mem/gpu 位含 `show_util` 的 OR 语义：Util 行开着时，即使 CPU/内存/GPU
+/// 行显示关闭，采样也必须继续 —— 否则综合占用无从计算（用户拍板）。
 static SCHED_ENABLED: AtomicU32 = AtomicU32::new(0b1_1111);
 /// Power 独立采样间隔（毫秒，与刷新率解耦）。
 static SCHED_POWER_INTERVAL_MS: AtomicU32 = AtomicU32::new(3000);
 /// Net 低频采样开关（独立分频 2s，速率按真实 Δt 计算不失真）。
 static SCHED_NET_LOW: AtomicBool = AtomicBool::new(true);
+/// Util 计算开关（综合占用行）。true 时采样线程每周期用最新快照算闭式解。
+static SCHED_UTIL: AtomicBool = AtomicBool::new(true);
 
 // 配置代际：设置改动 → 代际 +1 并唤醒采样线程（全关停车后靠它唤醒）。
 static CFG_GEN: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
@@ -162,14 +166,18 @@ pub fn publish_schedule_cfg(cfg: &Config) {
     // 功耗采样门 = 行开关 ∧ 查询开关（性能页）：query 关 → 跳过 MSR 内核查询，
     // 采样器把 Snapshot.power 显式置 Unavailable（功耗行显示 --）。
     let power_gate = cfg.power_enabled && cfg.power_query;
-    let mask = (cfg.show_cpu as u32)
-        | ((cfg.show_mem as u32) << 1)
-        | ((cfg.show_gpu as u32) << 2)
+    // Util 数据源保障（用户拍板）：show_util 开启 ⇒ cpu/mem/gpu 采样位强制 ON，
+    // 与各自显示行开关取 OR。「行显示关」只关显示，不关 Util 的数据源。
+    let util_gate = cfg.show_util;
+    let mask = ((cfg.show_cpu || util_gate) as u32)
+        | (((cfg.show_mem || util_gate) as u32) << 1)
+        | (((cfg.show_gpu || util_gate) as u32) << 2)
         | ((cfg.show_net as u32) << 3)
         | ((power_gate as u32) << 4);
     SCHED_ENABLED.store(mask, Ordering::Relaxed);
     SCHED_POWER_INTERVAL_MS.store(cfg.power_interval_ms, Ordering::Relaxed);
     SCHED_NET_LOW.store(cfg.net_low_freq, Ordering::Relaxed);
+    SCHED_UTIL.store(cfg.show_util, Ordering::Relaxed);
     // GPU 查询范围（主适配器/3D 引擎 only）随配置即时生效
     crate::proc_gpu::set_gpu_scope(cfg.gpu_primary_only, cfg.gpu_3d_only);
     // 唤醒采样线程（含全关停车状态）
@@ -177,6 +185,11 @@ pub fn publish_schedule_cfg(cfg: &Config) {
     *gen += 1;
     CFG_CV.notify_all();
     drop(gen);
+}
+
+/// 采样线程读取 Util 计算开关（设置页改动即时生效）。
+pub fn schedule_util() -> bool {
+    SCHED_UTIL.load(Ordering::Relaxed)
 }
 
 /// 采样线程读取当前调度参数：(interval_ms, auto, [cpu, mem, gpu, net, power], power_interval_ms)。

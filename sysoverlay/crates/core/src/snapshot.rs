@@ -27,6 +27,12 @@ pub struct Snapshot {
     /// 默认 `Unavailable`：功耗是可选附加组件（v2 决策「驱动边界」），
     /// 驱动没装时主程序**不会**因此降级，这一行直接隐藏。
     pub power: Metric<f32>,
+    /// 综合占用（Util，%）。由 CPU/内存/GPU 占用率经排队论闭式解聚合而成，
+    /// 详见 [`crate::composite`]。
+    pub util: Metric<f32>,
+    /// Util 是否为**降级值**：≥1 个数据源缺失时按剩余源重归一化计算。
+    /// 仅 `util` 有值时有意义；渲染层据此把数值染成降级色。
+    pub util_partial: bool,
 }
 
 impl Snapshot {
@@ -44,6 +50,8 @@ impl Snapshot {
             gpu: Metric::Unavailable,
             net: NetStat::default(),
             power: Metric::Unavailable,
+            util: Metric::Unavailable,
+            util_partial: false,
         }
     }
 }

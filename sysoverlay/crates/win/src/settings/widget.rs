@@ -1042,8 +1042,8 @@ fn paint_metric_header(
     // cfg 不可得（overlay 句柄失效）时按「开」处理：
     // 宁可少画一枚标签，也不在状态未知时错报「已关闭」。
     let on = cfg.map_or(true, |c| matches!(on_cfg.get(c), Value::Bool(true)));
-    const KEYS: [&str; 6] = ["LblCpu", "LblMem", "LblGpu", "LblNet", "LblPower", "LblTime"];
-    let name = crate::i18n::t(lang, KEYS[index.min(5)]);
+    const KEYS: [&str; 7] = ["LblCpu", "LblMem", "LblGpu", "LblNet", "LblPower", "LblTime", "LblUtil"];
+    let name = crate::i18n::t(lang, KEYS[index.min(6)]);
     // 折叠头标题比正文大一档（用户反馈：字号偏小）。
     let title_px = body_px * 1.2;
 

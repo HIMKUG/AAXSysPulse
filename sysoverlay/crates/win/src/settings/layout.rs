@@ -385,8 +385,8 @@ type Group = (&'static str, Vec<RowDef>, Option<&'static str>, i32);
 fn page_prefs(
     ux: &Ux,
     _cfg: &Config,
-    _expand: &[f32; 6],
-    _order: &[u8; 6],
+    _expand: &[f32; 7],
+    _order: &[u8; 7],
     groups: &mut Vec<Group>,
 ) {
         // ── 偏好：显示 / 启动 / 诊断（报告 §11 w1） ──
@@ -453,8 +453,8 @@ fn page_prefs(
 fn page_layout(
     ux: &Ux,
     _cfg: &Config,
-    _expand: &[f32; 6],
-    _order: &[u8; 6],
+    _expand: &[f32; 7],
+    _order: &[u8; 7],
     groups: &mut Vec<Group>,
 ) {
         // ── 布局：排列 / 文字效果（报告 §11 w2） ──
@@ -519,21 +519,38 @@ fn page_layout(
         ));
 }
 
+/// 监控项控件 id：`base + 10i` 沿用历史分配（i ≤ 5）；
+/// Util（i = 6）整体平移到空闲的 **500 段** —— 直接套公式会得到 260..268，
+/// 与既有静态控件撞号（同页 261 = 简化名称开关；跨页 263/265/266/267 = 性能页）。
+/// 过渡弹簧按 (页, id) 键控、命中测试按 id 查控件，撞号会串动画/串交互。
+fn mid(base: i32, i: usize) -> i32 {
+    if i < 6 {
+        return base + i as i32 * 10;
+    }
+    match base {
+        200..=208 => 500 + (base - 200),
+        260 => 519,
+        400..=405 => 510 + (base - 400),
+        _ => base + i as i32 * 10,
+    }
+}
+
 fn page_metrics(
     ux: &Ux,
     cfg: &Config,
-    expand: &[f32; 6],
-    order: &[u8; 6],
+    expand: &[f32; 7],
+    order: &[u8; 7],
     groups: &mut Vec<Group>,
 ) {
         // ── 监控项：每项一张**独立卡**（按 metric_order 排列，可拖动排序） ──
-        let metric_cfg: [CfgRef; 6] = [
+        let metric_cfg: [CfgRef; 7] = [
             CfgRef::ShowCpu,
             CfgRef::ShowMem,
             CfgRef::ShowGpu,
             CfgRef::ShowNet,
             CfgRef::PowerEnabled,
             CfgRef::ShowTime,
+            CfgRef::ShowUtil,
         ];
         // 折叠头只保留 抓手 + 名称 + 贴右缘的圆形展开按钮；
         // 总开关移入展开菜单首行（「显示」）。
@@ -560,14 +577,14 @@ fn page_metrics(
                 header: true,
                 items: vec![
                     ux.item(
-                        208 + i as i32 * 10,
+                        mid(208, i),
                         Box::new(MetricHeaderWidget { index: i, on_cfg: metric_cfg[i], lang: ux.lang }),
                         ux.rows_l,
                         ux.widget_r - ICON_BTN as f32,
                         true,
                     ),
                     ux.item(
-                        207 + i as i32 * 10,
+                        mid(207, i),
                         Box::new(DisclosureWidget {
                             expanded,
                             action: ButtonAction::ToggleMetricExpand(i),
@@ -584,7 +601,7 @@ fn page_metrics(
                 rows.push(row_def(
                     ux.tr("LblShow"),
                     None,
-                    vec![ux.toggle_item(200 + i as i32 * 10, metric_cfg[i])],
+                    vec![ux.toggle_item(mid(200, i), metric_cfg[i])],
                 ));
                 // Time 卡：显示秒开关紧随总开关（该卡最常用的选项）。
                 if i == 5 {
@@ -598,7 +615,7 @@ fn page_metrics(
                 rows.push(row_def(
                     ux.tr("LblShowLabel"),
                     Some(ux.tr("HintShowLabel")),
-                    vec![ux.toggle_item(260 + i as i32 * 10, CfgRef::MetricShowLabel(i))],
+                    vec![ux.toggle_item(mid(260, i), CfgRef::MetricShowLabel(i))],
                 ));
                 // 数据格式：内存单位 / 网络显示（用户反馈：从「布局」页并入
                 // 对应卡片，就近配置；与字号/配色一样只影响这一项）。
@@ -625,7 +642,7 @@ fn page_metrics(
                     hint_only: false,
                     header: false,
                     items: vec![ux.font_slider_item(
-                        201 + i as i32 * 10,
+                        mid(201, i),
                         CfgRef::MetricFont(i),
                         ux.ctrl_l,
                         ux.widget_r,
@@ -641,7 +658,7 @@ fn page_metrics(
                     hint_only: false,
                     header: false,
                     items: vec![ux.item(
-                        206 + i as i32 * 10,
+                        mid(206, i),
                         Box::new(MetricFontStatusWidget { index: i, lang: ux.lang }),
                         ux.ctrl_l,
                         ux.widget_r,
@@ -652,34 +669,34 @@ fn page_metrics(
                 rows.push(row_def(
                     ux.tr("LblNameColor"),
                     Some(ux.tr("HintNameColor")),
-                    vec![ux.ctrl_item(203 + i as i32 * 10, Box::new(MetricSwatchesWidget { cfg: CfgRef::MetricLabel(i), auto_cfg: None }))],
+                    vec![ux.ctrl_item(mid(203, i), Box::new(MetricSwatchesWidget { cfg: CfgRef::MetricLabel(i), auto_cfg: None }))],
                 ));
                 rows.push(row_def(
                     ux.tr("LblValueColor"),
                     Some(ux.tr("HintValueColor")),
-                    vec![ux.ctrl_item(205 + i as i32 * 10, Box::new(MetricSwatchesWidget { cfg: CfgRef::MetricValue(i), auto_cfg: Some(CfgRef::MetricValueAuto(i)) }))],
+                    vec![ux.ctrl_item(mid(205, i), Box::new(MetricSwatchesWidget { cfg: CfgRef::MetricValue(i), auto_cfg: Some(CfgRef::MetricValueAuto(i)) }))],
                 ));
                 // 文字微调：名称 / 数值各自可左右、上下偏移（像素，可为负）。
                 // 4 个步进器 + 1 个「恢复默认」按钮（把四项一并归零）。
                 rows.push(row_def(
                     ux.tr("LblOffNameX"),
                     Some(ux.tr("HintOffName")),
-                    vec![ux.off_stepper_item(400 + i as i32 * 10, CfgRef::MetricOffset(i, 0))],
+                    vec![ux.off_stepper_item(mid(400, i), CfgRef::MetricOffset(i, 0))],
                 ));
                 rows.push(row_def(
                     ux.tr("LblOffNameY"),
                     None,
-                    vec![ux.off_stepper_item(401 + i as i32 * 10, CfgRef::MetricOffset(i, 1))],
+                    vec![ux.off_stepper_item(mid(401, i), CfgRef::MetricOffset(i, 1))],
                 ));
                 rows.push(row_def(
                     ux.tr("LblOffValueX"),
                     None,
-                    vec![ux.off_stepper_item(402 + i as i32 * 10, CfgRef::MetricOffset(i, 2))],
+                    vec![ux.off_stepper_item(mid(402, i), CfgRef::MetricOffset(i, 2))],
                 ));
                 rows.push(row_def(
                     ux.tr("LblOffValueY"),
                     None,
-                    vec![ux.off_stepper_item(403 + i as i32 * 10, CfgRef::MetricOffset(i, 3))],
+                    vec![ux.off_stepper_item(mid(403, i), CfgRef::MetricOffset(i, 3))],
                 ));
                 rows.push(RowDef {
                     label: "",
@@ -689,7 +706,7 @@ fn page_metrics(
                     hint_only: false,
                     header: false,
                     items: vec![ux.item(
-                        405 + i as i32 * 10,
+                        mid(405, i),
                         Box::new(ButtonWidget {
                             label: ux.tr("LblResetOffset").to_string(),
                             action: ButtonAction::ResetMetricOffset(i),
@@ -760,8 +777,8 @@ fn page_metrics(
 fn page_window(
     ux: &Ux,
     _cfg: &Config,
-    _expand: &[f32; 6],
-    _order: &[u8; 6],
+    _expand: &[f32; 7],
+    _order: &[u8; 7],
     groups: &mut Vec<Group>,
 ) {
         // ── 窗口：层级与交互 / 位置与外观（报告 §11 w4） ──
@@ -818,8 +835,8 @@ fn page_window(
 fn page_perf(
     ux: &Ux,
     _cfg: &Config,
-    _expand: &[f32; 6],
-    _order: &[u8; 6],
+    _expand: &[f32; 7],
+    _order: &[u8; 7],
     groups: &mut Vec<Group>,
 ) {
         // ── 性能：统计范围 / 刷新频率 / 画面（报告 §11 w5） ──
@@ -871,8 +888,8 @@ fn page_perf(
 fn page_about(
     ux: &Ux,
     _cfg: &Config,
-    _expand: &[f32; 6],
-    _order: &[u8; 6],
+    _expand: &[f32; 7],
+    _order: &[u8; 7],
     groups: &mut Vec<Group>,
 ) {
         // ── 关于：头部（图标 / 名称 / 版本）/ 开发者，版权脚注 ──
@@ -919,8 +936,8 @@ pub fn build_pages(
     lang: Lang,
     dpi: u32,
     client_w: i32,
-    expand: &[f32; 6],
-    order: &[u8; 6],
+    expand: &[f32; 7],
+    order: &[u8; 7],
 ) {
     let tr = |k: &'static str| crate::i18n::t(lang, k);
 
@@ -1072,7 +1089,7 @@ mod spacing_tests {
     fn build_all(expand: f32) -> [Page; 6] {
         let cfg = Config::default();
         let mut pages: [Page; 6] = Default::default();
-        build_pages(&mut pages, &cfg, Lang::Zh, D, 900, &[expand; 6], &[0, 1, 2, 3, 4, 5]);
+        build_pages(&mut pages, &cfg, Lang::Zh, D, 900, &[expand; 7], &[0, 1, 2, 6, 3, 4, 5]);
         pages
     }
 
@@ -1202,7 +1219,7 @@ mod spacing_tests {
                 }
             }
         }
-        assert_eq!(checked, 12, "两种展开态 × 6 张监控项卡");
+        assert_eq!(checked, 14, "两种展开态 × 7 张监控项卡");
     }
 
     /// 折叠（未展开）时监控项卡只有一行（就是折叠头）。
