@@ -107,13 +107,13 @@ fn ring0() -> Option<&'static Ring0> {
     }
     RING0.get_or_init(|| unsafe {
         use windows::Win32::Foundation::{
-            CloseHandle, GetLastError, GENERIC_READ, GENERIC_WRITE, ERROR_SERVICE_ALREADY_RUNNING, HANDLE,
+            GetLastError, GENERIC_READ, GENERIC_WRITE, ERROR_SERVICE_ALREADY_RUNNING,
         };
         use windows::Win32::Storage::FileSystem::CreateFileW;
         use windows::Win32::System::Services::{
             // QueryServiceConfigW/QUERY_SERVICE_CONFIGW 在模块级导入（helper 用），
             // 此处不再重复引入以免遮蔽触发 unused 警告。
-            ChangeServiceConfigW, CreateServiceW, OpenSCManagerW, OpenServiceW,
+            ChangeServiceConfigW, CloseServiceHandle, CreateServiceW, OpenSCManagerW, OpenServiceW,
             StartServiceW, ENUM_SERVICE_TYPE, SC_HANDLE,
             SC_MANAGER_ALL_ACCESS, SERVICE_ALL_ACCESS, SERVICE_DEMAND_START, SERVICE_ERROR,
             SERVICE_ERROR_NORMAL, SERVICE_KERNEL_DRIVER, SERVICE_NO_CHANGE, SERVICE_START_TYPE,
@@ -133,9 +133,22 @@ fn ring0() -> Option<&'static Ring0> {
             probe::log("msr: no driver file in any candidate location (will fail unless service path is still valid)");
         }
 
+        // RAII：失败路径统一 CloseServiceHandle。旧版手动管理漏关了 svc 句柄，
+        // 泄漏的句柄令服务删除永远停在「标记删除」（ERROR_SERVICE_MARKED_FOR_DELETE），
+        // 同名服务无法重建——排查「换装路径后服务死局」时实测踩中。
+        struct SvcHandleGuard(SC_HANDLE);
+        impl Drop for SvcHandleGuard {
+            fn drop(&mut self) {
+                // Drop 中无 fail-safe 路径可走；关闭失败（句柄已失效）忽略即可。
+                unsafe {
+                    let _ = CloseServiceHandle(self.0);
+                }
+            }
+        }
+
         // 2. SCM：创建（幂等，含失效 BinaryPath 自愈）+ 启动服务
         let scm = match OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS) {
-            Ok(h) => h,
+            Ok(h) => SvcHandleGuard(h),
             Err(e) => {
                 probe::log(&format!(
                     "msr OpenSCManager failed hr=0x{:x}（需要管理员权限）",
@@ -146,11 +159,12 @@ fn ring0() -> Option<&'static Ring0> {
         };
         let svc_name = windows::core::w!("AAXSysPulseWinRing0");
         let svc_display = windows::core::w!("AAXSysPulse WinRing0 MSR Driver");
-        let svc: SC_HANDLE = match OpenServiceW(scm, svc_name, SERVICE_ALL_ACCESS) {
+        let svc: SvcHandleGuard = match OpenServiceW(scm.0, svc_name, SERVICE_ALL_ACCESS) {
             Ok(h) => {
+                let h = SvcHandleGuard(h);
                 // 服务已存在：BinaryPath 仍有效则原样复用；失效（文件被删/移动）
                 // 则重定向到候选位置——修复旧版"服务指向已删除文件"的死局。
-                match query_service_binary_path(h) {
+                match query_service_binary_path(h.0) {
                     Some(bp) if driver_file_exists(&bp) => {
                         probe::log(&format!("msr: reusing service, binary={bp}"));
                     }
@@ -167,7 +181,7 @@ fn ring0() -> Option<&'static Ring0> {
                                     .chain(Some(0))
                                     .collect();
                                 if let Err(e) = ChangeServiceConfigW(
-                                    h,
+                                    h.0,
                                     ENUM_SERVICE_TYPE(SERVICE_NO_CHANGE),
                                     SERVICE_START_TYPE(SERVICE_NO_CHANGE),
                                     SERVICE_ERROR(SERVICE_NO_CHANGE),
@@ -183,7 +197,7 @@ fn ring0() -> Option<&'static Ring0> {
                                         "msr ChangeServiceConfig failed hr=0x{:x}",
                                         e.code().0 as u32
                                     ));
-                                    return None;
+                                    return None; // guard 自动关闭 svc + scm
                                 }
                                 probe::log(&format!("msr: service repointed to {}", p.display()));
                             }
@@ -203,7 +217,7 @@ fn ring0() -> Option<&'static Ring0> {
                         let wide: Vec<u16> =
                             p.to_string_lossy().encode_utf16().chain(Some(0)).collect();
                         match CreateServiceW(
-                            scm,
+                            scm.0,
                             svc_name,
                             svc_display,
                             SERVICE_ALL_ACCESS,
@@ -219,7 +233,7 @@ fn ring0() -> Option<&'static Ring0> {
                         ) {
                             Ok(h) => {
                                 probe::log(&format!("msr: service created at {}", p.display()));
-                                h
+                                SvcHandleGuard(h)
                             }
                             Err(e) => {
                                 probe::log(&format!(
@@ -240,13 +254,16 @@ fn ring0() -> Option<&'static Ring0> {
                 }
             }
         };
-        if let Err(e) = StartServiceW(svc, None) {
+        // StartService 失败不再直接放弃：183（ERROR_ALREADY_EXISTS）通常表示设备名
+        // 已被另一个 WinRing0 实例占用（其他监控程序 / 遗留安装的旧服务仍在运行）——
+        // 此时设备本身可用。落到下方设备打开探测：能打开就照常读 MSR，
+        // 与 driver-installer 的 RES_OK_DEVICE 语义对齐。
+        if let Err(e) = StartServiceW(svc.0, None) {
             if GetLastError() != ERROR_SERVICE_ALREADY_RUNNING {
                 probe::log(&format!(
-                    "msr StartService failed err={}（拒绝/驱动签名被拦）",
+                    "msr StartService failed err={}（继续探测设备是否已由其他实例提供）",
                     e.code().0
                 ));
-                return None;
             }
         }
 
@@ -265,14 +282,18 @@ fn ring0() -> Option<&'static Ring0> {
             Ok(_h) if !_h.is_invalid() => _h,
             Ok(_h) => {
                 probe::log("msr open device returned invalid handle");
-                return None;
+                return None; // guard 自动关闭 svc + scm
             }
             Err(e) => {
-                probe::log(&format!("msr open device failed hr=0x{:x}", e.code().0 as u32));
-                return None;
+                // 走到这里 = 服务没能由本会话启动、且设备也没有任何实例提供：
+                // 真正的失败（权限不足 / 签名被 DSE 拦截 / 驱动文件损坏）。
+                probe::log(&format!(
+                    "msr open device failed hr=0x{:x}（服务未运行且设备不可用）",
+                    e.code().0 as u32
+                ));
+                return None; // guard 自动关闭 svc + scm
             }
         };
-        let _ = CloseHandle(HANDLE(scm.0));
         let c = cpuid_info();
         probe::log(&format!(
             "msr ring0 ready vendor={} family=0x{:x} model=0x{:x}",
