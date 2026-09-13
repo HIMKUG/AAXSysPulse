@@ -1,4 +1,4 @@
-//! 性能测量开关（P5）：`SYSOVERLAY_PERF=1` 时统计渲染开销并落盘。
+//! 性能测量开关（P5）：`AAXSYSPULSE_PERF=1` 时统计渲染开销并落盘。
 //!
 //! # 为什么需要它
 //!
@@ -31,7 +31,7 @@ use std::sync::{Mutex, OnceLock};
 fn enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {
-        std::env::var("SYSOVERLAY_PERF")
+        std::env::var("AAXSYSPULSE_PERF")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })
@@ -168,7 +168,7 @@ fn maybe_report() {
 
 // ── 消息级耗时探针（UI 线程谁在卡？） ─────────────────────
 //
-// SYSOVERLAY_PERF=1 时，消息循环每条消息从 GetMessageW 返回到
+// AAXSYSPULSE_PERF=1 时，消息循环每条消息从 GetMessageW 返回到
 // DispatchMessageW 返回之间的耗时（wall-time）若超过 MSG_SLOW_US
 // 阈值，立即追加一行到统一日志的 perf 流：`msg slow hwnd=.. msg=0x.. us=..`。
 // 用于定位「UI 线程被谁占住」（进程扫描 / 渲染 / 设置窗口重绘）。

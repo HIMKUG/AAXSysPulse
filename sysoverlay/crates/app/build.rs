@@ -32,10 +32,17 @@ fn main() {
         // For now, we just check the file exists. The actual embedding
         // happens via the include_bytes! macro in the Rust code.
     } else {
+        // Derive the build.bat location from the manifest dir so the hint
+        // stays correct even if the workspace folder is renamed or moved.
+        let build_bat = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("driver-installer")
+            .join("build.bat");
         eprintln!(
             "cargo:warning=Driver installer not found at {}. \
-             Run 'D:\\code\\sys-overlay-c-master\\sysoverlay\\driver-installer\\build.bat' to build it.",
-            driver_installer_path.display()
+             Run '{}' to build it.",
+            driver_installer_path.display(),
+            build_bat.display()
         );
     }
 

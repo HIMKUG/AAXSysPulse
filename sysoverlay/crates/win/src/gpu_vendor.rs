@@ -17,7 +17,7 @@
 //!   `(None, None)` → 利用率走 D3DKMT、功耗记 Unavailable；
 //! - **多显卡共同工作**：每张独显各读一次功耗并累加（整机显存总功耗），
 //!   利用率以主卡（第一张）为准；Intel 后端为骨架暂不读功耗；
-//! - 每次失败都记探针（`SYSOVERLAY_PROBE=1`）。
+//! - 每次失败都记探针（`AAXSYSPULSE_PROBE=1`）。
 //!
 //! # Safety（本文件 unsafe 汇总）
 //!

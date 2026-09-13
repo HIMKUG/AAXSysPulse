@@ -1,4 +1,4 @@
-/* SysOverlay-C —— 纯 Win32 悬浮系统监控卡片
+/* AAXSysPulse —— 纯 Win32 悬浮系统监控卡片
  *
  * 只链 user32 / gdi32 / pdh / advapi32：不依赖 GDI+、不依赖 C++ 运行时。
  *
@@ -130,12 +130,30 @@ static void refreshLayout(void)
 static FILE *openCfg(const char *mode)
 {
     const char *ad = getenv("APPDATA");
+    WCHAR dir[MAX_PATH * 2];
     WCHAR file[MAX_PATH * 2];
     char mb[MAX_PATH * 3];
     FILE *f;
-    if (ad) MultiByteToWideChar(CP_UTF8, 0, ad, -1, file, MAX_PATH);
-    else    StringCchCopyW(file, ARRAYSIZE(file), L".");
-    StringCchCatW(file, ARRAYSIZE(file), L"\\SysOverlayC");
+
+    if (ad) MultiByteToWideChar(CP_UTF8, 0, ad, -1, dir, MAX_PATH);
+    else    StringCchCopyW(dir, ARRAYSIZE(dir), L".");
+
+    /* One-time migration: rename the old %APPDATA%\SysOverlayC folder. */
+    if (ad) {
+        WCHAR old[MAX_PATH * 2];
+        WCHAR neo[MAX_PATH * 2];
+        StringCchCopyW(old, ARRAYSIZE(old), dir);
+        StringCchCatW(old, ARRAYSIZE(old), L"\\SysOverlayC");
+        StringCchCopyW(neo, ARRAYSIZE(neo), dir);
+        StringCchCatW(neo, ARRAYSIZE(neo), L"\\AAXSysPulse");
+        if (GetFileAttributesW(old) != INVALID_FILE_ATTRIBUTES &&
+            GetFileAttributesW(neo) == INVALID_FILE_ATTRIBUTES) {
+            MoveFileExW(old, neo, MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH);
+        }
+    }
+
+    StringCchCopyW(file, ARRAYSIZE(file), dir);
+    StringCchCatW(file, ARRAYSIZE(file), L"\\AAXSysPulse");
     CreateDirectoryW(file, NULL);
     StringCchCatW(file, ARRAYSIZE(file), L"\\config.txt");
     WideCharToMultiByte(CP_UTF8, 0, file, -1, mb, sizeof(mb), NULL, NULL);
@@ -973,12 +991,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     wc.lpfnWndProc = WndProc;
     wc.hInstance = inst;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.lpszClassName = L"SysOverlayC";
+    wc.lpszClassName = L"AAXSysPulse";
     if (!RegisterClassW(&wc)) return 1;
 
     g_hwnd = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TOOLWINDOW | (g_topmost ? WS_EX_TOPMOST : 0),
-        wc.lpszClassName, L"SysOverlay", WS_POPUP,
+        wc.lpszClassName, L"AAXSysPulse", WS_POPUP,
         g_posX, g_posY, g_cardW, g_cardH, NULL, NULL, inst, NULL);
     if (!g_hwnd) return 1;
 

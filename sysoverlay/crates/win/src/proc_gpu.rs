@@ -11,7 +11,7 @@
 //! 说明：绑定里的 `D3DKMT_NODE_PERFDATA` 缺少 `UtilizationPercentage` 字段，
 //! 因此不使用 NodePerfData 路线；RunningTime 法在 WDDM 2.0+ 通用且免驱动。
 //!
-//! 探针（`SYSOVERLAY_PROBE=1`）记录每个适配器的 LUID / 引擎数 / 每引擎
+//! 探针（`AAXSYSPULSE_PROBE=1`）记录每个适配器的 LUID / 引擎数 / 每引擎
 //! RunningTime 与算得的百分比——GPU 一直显示 `--` 时看这里。
 //!
 //! # D1：拓扑缓存

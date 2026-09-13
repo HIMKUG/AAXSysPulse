@@ -442,7 +442,7 @@ pub fn open_settings(overlay: HWND) {
     create_dialog(overlay);
 }
 
-/// 诊断用：模拟点击 CPU 开关（SYSOVERLAY_DIAG=settings,click）。
+/// 诊断用：模拟点击 CPU 开关（AAXSYSPULSE_DIAG=settings,click）。
 pub fn diag_click_cpu() {
     let hwnd = SETTINGS_HWND.load(Ordering::SeqCst);
     if hwnd == -1 {

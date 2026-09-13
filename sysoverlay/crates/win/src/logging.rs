@@ -15,7 +15,7 @@
 //!   逐行加前缀，仍合并为**一次 write_all** 落盘。
 //! - **常驻句柄**：`Mutex<Option<File>>` 打开一次复用，每行写入后 flush——
 //!   消除旧实现的每行 open/close 开销。
-//! - **开关语义不在本模块**：`SYSOVERLAY_PROBE` / `SYSOVERLAY_PERF` 的门控
+//! - **开关语义不在本模块**：`AAXSYSPULSE_PROBE` / `AAXSYSPULSE_PERF` 的门控
 //!   仍由 probe.rs / perf.rs 自行判断，本模块不做开关检查，只管落盘
 //!   （panic hook 的「无条件写」也因此天然成立）。
 //!
@@ -23,8 +23,8 @@
 
 use std::sync::{Mutex, OnceLock};
 
-/// 日志流：probe = 诊断探针（SYSOVERLAY_PROBE / 设置面板「调试日志」），
-/// perf = 性能统计（SYSOVERLAY_PERF）。
+/// 日志流：probe = 诊断探针（AAXSYSPULSE_PROBE / 设置面板「调试日志」），
+/// perf = 性能统计（AAXSYSPULSE_PERF）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Stream {
     Probe,

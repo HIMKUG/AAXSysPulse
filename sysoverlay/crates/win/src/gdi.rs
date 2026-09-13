@@ -234,9 +234,9 @@ fn compute_alpha_pct(_hwnd: HWND, cfg: &Config) -> (f32, bool) {
 static LAST_FRAME_HASH: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(u64::MAX);
 
-/// 脏矩形上屏开关：`SYSOVERLAY_NODIRTY=1` 时退回经典整窗上传（A1 回退）。
+/// 脏矩形上屏开关：`AAXSYSPULSE_NODIRTY=1` 时退回经典整窗上传（A1 回退）。
 static DIRTY_DISABLED: LazyLock<bool> =
-    LazyLock::new(|| std::env::var("SYSOVERLAY_NODIRTY").map(|v| v == "1").unwrap_or(false));
+    LazyLock::new(|| std::env::var("AAXSYSPULSE_NODIRTY").map(|v| v == "1").unwrap_or(false));
 
 /// 脏矩形追踪：上一帧各文字 cell 的几何 + 内容指纹（A1 比对源）。
 static PREV_CELLS: OnceLock<Mutex<Vec<CellSig>>> = OnceLock::new();
@@ -941,7 +941,7 @@ impl DibCache {
 ///
 /// `src_alpha` 为全局恒定 alpha（透明度 × 悬停系数，0..=255）。
 /// `dirty` 决定整窗上传还是只上传脏区子矩形（A1/A2）：
-/// - `Dirty::Full` 或 `SYSOVERLAY_NODIRTY=1` → 经典 `UpdateLayeredWindow`。
+/// - `Dirty::Full` 或 `AAXSYSPULSE_NODIRTY=1` → 经典 `UpdateLayeredWindow`。
 /// - `Dirty::Rect` → `UpdateLayeredWindowIndirect` + `prcDirty`，只上传该子区。
 #[allow(clippy::too_many_arguments)]
 fn present(

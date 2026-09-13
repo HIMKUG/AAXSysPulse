@@ -989,7 +989,7 @@ impl OverlayWindow {
                 // 0 = WM_QUIT；-1 = 错误——两者都退出
                 break;
             }
-            // 每消息耗时探针（SYSOVERLAY_PERF=1 时记录慢消息归属）
+            // 每消息耗时探针（AAXSYSPULSE_PERF=1 时记录慢消息归属）
             let diag = crate::perf::msg_begin();
             unsafe {
                 let _ = TranslateMessage(&msg);

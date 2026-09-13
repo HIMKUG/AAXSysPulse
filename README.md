@@ -1,4 +1,4 @@
-# SysOverlay-C —— Win32 系统监控悬浮卡片
+# AAXSysPulse —— Win32 系统监控悬浮卡片
 
 一个轻量级、高性能的 Windows 系统监控工具，以无边框半透明悬浮窗形式常驻屏幕右上角，实时显示 **CPU / 内存 / GPU / 网络** 四大核心指标。纯 C 语言编写，仅依赖四个 Windows 原生 DLL，无任何运行时依赖。
 
@@ -61,7 +61,7 @@
 
 - **sys-overlay-c.zip** - 完整版包含 exe 文件和配置文件示例
 
-解压后双击 `sysoverlay-c.exe` 即可运行！
+解压后双击 `AAXSysPulse.exe` 即可运行！
 
 > ⚠️ **注意**: `.exe` 文件不会在主仓库中展示，请通过 Releases 页面下载。
 
@@ -85,7 +85,7 @@ set ZIG=E:\dev\zig\zig.exe
 build.bat
 ```
 
-编译完成后，会在根目录生成 `sysoverlay-c.exe`。
+编译完成后，会在根目录生成 `AAXSysPulse.exe`。
 
 > 💡 **提示**：编译脚本默认使用 `E:\dev\zig\zig.exe`，如需更改请编辑 `build.bat`。
 
@@ -93,7 +93,7 @@ build.bat
 
 ## 🎮 使用方法
 
-启动后直接双击 `sysoverlay-c.exe`，会出现以下操作：
+启动后直接双击 `AAXSysPulse.exe`，会出现以下操作：
 
 | 操作 | 效果 |
 |------|------|
@@ -102,7 +102,7 @@ build.bat
 
 ### 配置文件
 
-配置保存在 `%APPDATA%\SysOverlayC\config.txt`，格式如下：
+配置保存在 `%APPDATA%\AAXSysPulse\config.txt`，格式如下：
 
 ```txt
 minimal          # 极简模式 (0=关闭，1=开启)
@@ -158,7 +158,7 @@ fg               # 前景色/文字色 (HEX 颜色)
 
 对比 PySide6 版本（需 Python 环境 + 641MB Qt 依赖）：
 
-| 指标 | PySide6 版 | SysOverlay-C |
+| 指标 | PySide6 版 | AAXSysPulse |
 |------|-----------|--------------|
 | 文件大小 | ~641 MB | **~75 KB** |
 | 常驻内存 | ~118 MB | **~7 MB** |

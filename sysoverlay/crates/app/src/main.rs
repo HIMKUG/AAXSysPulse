@@ -291,13 +291,13 @@ fn main() {
     ));
     publish_schedule_cfg(&cfg);
 
-    // ── 4b'. 诊断模式：SYSOVERLAY_DIAG 自动打开辅助窗口（子串匹配）──
-    // 无人值守复现与二分定位用（配合 SYSOVERLAY_PERF=1 / SYSOVERLAY_PROBE=1
+    // ── 4b'. 诊断模式：AAXSYSPULSE_DIAG 自动打开辅助窗口（子串匹配）──
+    // 无人值守复现与二分定位用（配合 AAXSYSPULSE_PERF=1 / AAXSYSPULSE_PROBE=1
     // 收集 UI 线程卡顿与 CPU 占用证据）：
     //   "1"/"all"     → 全部窗口
     //   "settings"    → 仅设置窗口    "graph" → 仅曲线    "procs" → 仅进程榜
     //   ",click"      → 附加：每 3s 自动模拟点击设置页 CPU 开关（复现 UI 不刷新）
-    let diag = std::env::var("SYSOVERLAY_DIAG").unwrap_or_default();
+    let diag = std::env::var("AAXSYSPULSE_DIAG").unwrap_or_default();
     let diag_on = |token: &str| {
         diag == "1" || diag == "all" || diag.split(',').any(|t| t == token)
     };

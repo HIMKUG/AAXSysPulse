@@ -1,4 +1,4 @@
-//! 诊断探针（P-DIAG）：`SYSOVERLAY_PROBE=1`（或设置面板「调试日志」开启）时
+//! 诊断探针（P-DIAG）：`AAXSYSPULSE_PROBE=1`（或设置面板「调试日志」开启）时
 //! 把各采样器的**原始 API 数据**逐行写入统一日志文件的 `probe` 流。
 //!
 //! 落盘出口统一收敛到 [`crate::logging`]（单文件 `aaxsyspulse_YYYYMMDD_HHMM.log`、
@@ -38,7 +38,7 @@ pub fn debug() -> bool {
     DEBUG.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// 是否启用：设置面板开关 **或** 环境变量 `SYSOVERLAY_PROBE=1`（二者取或）。
+/// 是否启用：设置面板开关 **或** 环境变量 `AAXSYSPULSE_PROBE=1`（二者取或）。
 ///
 /// 环境变量作为兜底通道，方便无法进设置面板的场景（如沙箱/脚本）开启。
 pub fn enabled() -> bool {
@@ -49,7 +49,7 @@ pub fn enabled() -> bool {
 fn env_probe_on() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {
-        std::env::var("SYSOVERLAY_PROBE")
+        std::env::var("AAXSYSPULSE_PROBE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })
@@ -126,7 +126,7 @@ pub fn install_panic_hook() {
 }
 
 fn perf_flag() -> bool {
-    std::env::var("SYSOVERLAY_PERF")
+    std::env::var("AAXSYSPULSE_PERF")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
