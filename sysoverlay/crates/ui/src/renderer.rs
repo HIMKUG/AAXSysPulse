@@ -33,7 +33,7 @@ use aaxsyspulse_core::config::Config;
 use aaxsyspulse_core::snapshot::{Metric as SnapMetric, Snapshot};
 use aaxsyspulse_core::types::Metric as MetricEnum;
 use aaxsyspulse_core::types::NetMode;
-use aaxsyspulse_core::units::{fmt_gb, fmt_pct, fmt_power, fmt_rate, StrBuf};
+use aaxsyspulse_core::units::{fmt_gb, fmt_pct, fmt_pct1, fmt_power, fmt_rate, StrBuf};
 
 /// 渲染器接口：画一帧离屏内容（零 Win32、零 unsafe）。
 pub trait Renderer {
@@ -136,6 +136,8 @@ fn fnv_f32(acc: &mut u64, v: f32) {
 /// 槽位宽度（字符数）——按各类数值的**最大**模板串宽取值：
 /// 百分比 `100%`=4；GB 占用 `999.9GB`=7；网速 `888.8M/s`=8；功耗 `8888W`=5。
 pub const SLOT_PCT: u32 = 4;
+/// 带一位小数的百分比 `99.9%`=5（综合占用 Util 专用，见 [`fmt_pct1`]）。
+pub const SLOT_PCT1: u32 = 5;
 pub const SLOT_GB: u32 = 7;
 pub const SLOT_RATE: u32 = 8;
 pub const SLOT_POWER: u32 = 5;
@@ -667,11 +669,18 @@ fn build_row(m: MetricEnum, snap: &Snapshot, cfg: &Config, style: Style) -> Opti
             // - 不可用（全源缺失）：红色 "--" 引导注意
             let (v, stale, ok) = metric_parts(&snap.util);
             let mut b = StrBuf::new();
-            if ok {
-                fmt_pct(&mut b, v);
-            } else {
+            // 一位小数（可关）：空闲时整数 % 长期不变会让单元格哈希静止、
+            // 屏幕上看不到刷新（数据其实每 1.5s 都在提交）；小数位让平滑抖动可见。
+            let pct_slot = if !ok {
                 b.push_str("--");
-            }
+                SLOT_PCT
+            } else if cfg.util_decimal {
+                fmt_pct1(&mut b, v);
+                SLOT_PCT1
+            } else {
+                fmt_pct(&mut b, v);
+                SLOT_PCT
+            };
             let color = if !ok {
                 style.accent(100.0)
             } else if stale || snap.util_partial {
@@ -684,7 +693,7 @@ fn build_row(m: MetricEnum, snap: &Snapshot, cfg: &Config, style: Style) -> Opti
                 MetricEnum::Util,
                 label,
                 b,
-                SLOT_PCT,
+                pct_slot,
                 cfg,
                 style.ui.name,
                 color,
@@ -1451,13 +1460,13 @@ mod tests {
         assert_eq!(u.value.as_str(), "--");
         assert_eq!(u.value_color, Style::default().accent(100.0), "不可用必须红色");
 
-        // 正常值：占用率强调色（47% → 绿档）。
+        // 正常值：占用率强调色（47.0% → 绿档；Util 显示一位小数，见 fmt_pct1）。
         let mut snap = Snapshot::placeholder(0);
         snap.util = SnapMetric::Value(47.0);
         snap.util_partial = false;
         let rows = build_rows(&snap, &cfg);
         let u = rows.as_slice().iter().find(|r| matches!(r.metric, MetricEnum::Util)).unwrap();
-        assert_eq!(u.value.as_str(), "47%");
+        assert_eq!(u.value.as_str(), "47.0%");
         assert_eq!(u.value_color, Style::default().accent(47.0));
 
         // 降级（GPU 缺失重归一化）：陈旧色。
@@ -1480,7 +1489,7 @@ mod tests {
 
     #[test]
     fn util_short_label_and_slot() {
-        // 简称 U；数值槽与百分比一致（"100%" 4 字符）。
+        // 简称 U；数值槽为一位小数百分比（"99.9%" 5 字符，见 fmt_pct1）。
         let mut cfg = demo_cfg();
         cfg.short_names = true;
         let mut snap = Snapshot::placeholder(0);
@@ -1488,8 +1497,8 @@ mod tests {
         let rows = build_rows(&snap, &cfg);
         let u = rows.as_slice().iter().find(|r| matches!(r.metric, MetricEnum::Util)).unwrap();
         assert_eq!(u.label.as_str(), "U");
-        assert_eq!(u.value.as_str(), "100%");
-        assert_eq!(u.slot, SLOT_PCT);
+        assert_eq!(u.value.as_str(), "100.0%");
+        assert_eq!(u.slot, SLOT_PCT1);
     }
 
     /// `layout` 预算门禁（恢复计划 P4.3，照 build_pages 门禁模式）：

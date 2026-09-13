@@ -106,6 +106,10 @@ pub struct Config {
     pub show_net: bool,
     /// 综合占用（Util）行开关。默认开。
     pub show_util: bool,
+    /// 综合占用显示一位小数（"24.7%"）。默认开：
+    /// 空闲时整数 % 长期不变会让悬浮窗看起来"不刷新"（数据其实每周期都在
+    /// 提交），小数位让平滑抖动可见；关闭回落经典整数显示（"24%"）。
+    pub util_decimal: bool,
     /// 内存显示模式：false = 百分比，true = 实际占用量（GB，不显示总量）。
     pub mem_show_gb: bool,
     /// 正文字号（像素，8.0..=40.0，0.5 步进）。旧键 `font_scale` 迁移为 ×16。
@@ -242,6 +246,7 @@ impl Default for Config {
             show_gpu: false,
             show_net: true,
             show_util: true,
+            util_decimal: true,
             mem_show_gb: false,
             // 32px ≈ 旧默认 font_scale 2（16px 基准 ×2）
             font_size: 32.0,
@@ -351,6 +356,7 @@ impl Config {
                 "show_gpu" => cfg.show_gpu = Self::parse_bool(value, cfg.show_gpu),
                 "show_net" => cfg.show_net = Self::parse_bool(value, cfg.show_net),
                 "show_util" => cfg.show_util = Self::parse_bool(value, cfg.show_util),
+                "util_decimal" => cfg.util_decimal = Self::parse_bool(value, cfg.util_decimal),
                 "mem_gb" => cfg.mem_show_gb = Self::parse_bool(value, cfg.mem_show_gb),
                 // 新字号（px，0.5 步进）。区间见 [`FONT_PX_MIN`]/[`FONT_PX_MAX`]
                 // （4..128；下限兼顾极小字号，上限给大屏留足空间）。
@@ -638,6 +644,7 @@ impl Config {
         s.push_str(&format!("show_gpu {}\n", self.show_gpu as u32));
         s.push_str(&format!("show_net {}\n", self.show_net as u32));
         s.push_str(&format!("show_util {}\n", self.show_util as u32));
+        s.push_str(&format!("util_decimal {}\n", self.util_decimal as u32));
         s.push_str(&format!("show_time {}\n", self.show_time as u32));
         s.push_str(&format!("time_seconds {}\n", self.time_show_seconds as u32));
         for (i, &v) in self.metric_show_labels.iter().enumerate() {
@@ -1516,9 +1523,14 @@ fg F4F1EE
         assert!(d.show_net && d.show_time, "网络与时间保持默认开");
         // 旧配置无 show_util 键 → 落到默认 true（升级用户无损获得 Util）
         assert!(Config::parse(C_REAL_CONFIG).show_util);
+        // util_decimal：默认开；旧配置无该键 → 落到默认 true；可关闭并往返
+        assert!(d.util_decimal, "Util 小数显示默认开启");
+        assert!(Config::parse(C_REAL_CONFIG).util_decimal);
         // 往返
         let mut cfg = Config::default();
         cfg.show_util = false;
+        assert_eq!(Config::parse(&cfg.serialize()), cfg);
+        cfg.util_decimal = false;
         assert_eq!(Config::parse(&cfg.serialize()), cfg);
     }
 

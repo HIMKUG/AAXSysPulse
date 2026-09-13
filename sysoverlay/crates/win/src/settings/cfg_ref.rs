@@ -53,6 +53,7 @@ impl CfgRef {
             CfgRef::ShowGpu => Value::Bool(cfg.show_gpu),
             CfgRef::ShowNet => Value::Bool(cfg.show_net),
             CfgRef::ShowUtil => Value::Bool(cfg.show_util),
+            CfgRef::UtilDecimal => Value::Bool(cfg.util_decimal),
             CfgRef::ShowTime => Value::Bool(cfg.show_time),
             CfgRef::TimeSeconds => Value::Bool(cfg.time_show_seconds),
             CfgRef::ShortNames => Value::Bool(cfg.short_names),
@@ -95,6 +96,7 @@ impl CfgRef {
             (CfgRef::ShowGpu, v) => {  match v { Value::Bool(x) => { cfg.show_gpu = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: ShowGpu <- {v:?}"); false }  } },
             (CfgRef::ShowNet, v) => {  match v { Value::Bool(x) => { cfg.show_net = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: ShowNet <- {v:?}"); false }  } },
             (CfgRef::ShowUtil, v) => {  match v { Value::Bool(x) => { cfg.show_util = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: ShowUtil <- {v:?}"); false }  } },
+            (CfgRef::UtilDecimal, v) => {  match v { Value::Bool(x) => { cfg.util_decimal = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: UtilDecimal <- {v:?}"); false }  } },
             (CfgRef::ShowTime, v) => {  match v { Value::Bool(x) => { cfg.show_time = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: ShowTime <- {v:?}"); false }  } },
             (CfgRef::TimeSeconds, v) => {  match v { Value::Bool(x) => { cfg.time_show_seconds = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: TimeSeconds <- {v:?}"); false }  } },
             (CfgRef::ShortNames, v) => {  match v { Value::Bool(x) => { cfg.short_names = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: ShortNames <- {v:?}"); false }  } },
@@ -149,7 +151,7 @@ impl CfgRef {
 /// `get`/`set` 是控件读写 Config 的唯一入口（单一事实来源）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CfgRef {
-    ShowCpu, ShowMem, ShowGpu, ShowNet, ShowUtil, ShowTime, TimeSeconds, ShortNames,
+    ShowCpu, ShowMem, ShowGpu, ShowNet, ShowUtil, UtilDecimal, ShowTime, TimeSeconds, ShortNames,
     MemUnit, FontSize, FontWeight, MetricGap, LabelValueGap,
     TextShadow, TextOutline, AutoStart, DebugLog, Topmost,
     Opacity, NetMode, Style, RenderEngine, Lang,
@@ -177,6 +179,8 @@ mod tests {
             (CfgRef::ShowNet, Value::Bool(false)),
             (CfgRef::ShowUtil, Value::Bool(false)),
             (CfgRef::ShowUtil, Value::Bool(true)),
+            (CfgRef::UtilDecimal, Value::Bool(false)),
+            (CfgRef::UtilDecimal, Value::Bool(true)),
             (CfgRef::ShowTime, Value::Bool(true)),
             (CfgRef::ShowTime, Value::Bool(false)),
             (CfgRef::TimeSeconds, Value::Bool(true)),

@@ -611,6 +611,15 @@ fn page_metrics(
                         vec![ux.toggle_item(252, CfgRef::TimeSeconds)],
                     ));
                 }
+                // Util 卡：一位小数开关（空闲时整数 % 长期不变，屏幕上像"不刷新"；
+                // 小数位让每周期提交的平滑抖动可见）。
+                if i == 6 {
+                    rows.push(row_def(
+                        ux.tr("LblUtilDecimal"),
+                        Some(ux.tr("HintUtilDecimal")),
+                        vec![ux.toggle_item(mid(202, 6), CfgRef::UtilDecimal)],
+                    ));
+                }
                 // 显示名称开关（隐藏后只显示数值，如"111W"）。
                 rows.push(row_def(
                     ux.tr("LblShowLabel"),
