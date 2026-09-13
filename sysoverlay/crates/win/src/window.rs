@@ -692,6 +692,12 @@ pub fn modify_config(hwnd: HWND, f: impl FnOnce(&mut Config)) {
     let p = unsafe { get_state_ptr(hwnd) };
     if !p.is_null() {
         unsafe { f(&mut (*p).cfg) };
+        // 防御性兑账网：任何走本函数的配置变更都重新同步调试日志运行时标志。
+        // 根因教训（2026-09-13）：设置开关只改了 cfg.debug_log，probe::DEBUG
+        // 无人同步，「关闭日志」要等重启才生效，期间逐帧探针以 ~1.2KB/s 刷盘。
+        // CfgRef::DebugLog 的 setter 已即时同步；此处兜底覆盖绕过 CfgRef 的
+        // 写入路径（托盘项/代码直改/未来新增路径）。一次原子写，零负担。
+        unsafe { crate::probe::set_debug((*p).cfg.debug_log) };
     }
 }
 

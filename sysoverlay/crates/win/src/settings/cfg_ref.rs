@@ -106,7 +106,7 @@ impl CfgRef {
             (CfgRef::TextShadow, v) => {  match v { Value::Bool(x) => { cfg.text_shadow = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: TextShadow <- {v:?}"); false }  } },
             (CfgRef::TextOutline, v) => {  match v { Value::Bool(x) => { cfg.text_outline = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: TextOutline <- {v:?}"); false }  } },
             (CfgRef::AutoStart, v) => {  match v { Value::Bool(x) => { cfg.autostart = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: AutoStart <- {v:?}"); false }  } },
-            (CfgRef::DebugLog, v) => {  match v { Value::Bool(x) => { cfg.debug_log = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: DebugLog <- {v:?}"); false }  } },
+            (CfgRef::DebugLog, v) => {  match v { Value::Bool(x) => { cfg.debug_log = x; crate::probe::set_debug(x); true } _ => { debug_assert!(false, "CfgRef 类型错配: DebugLog <- {v:?}"); false }  } },
             (CfgRef::Topmost, v) => {  match v { Value::Bool(x) => { cfg.topmost = x; true } _ => { debug_assert!(false, "CfgRef 类型错配: Topmost <- {v:?}"); false }  } },
             (CfgRef::Opacity, v) => {  match v { Value::Num(x) => { cfg.normal_opacity = (x as u32).clamp(0, 100) as u8; true } _ => { debug_assert!(false, "CfgRef 类型错配: Opacity <- {v:?}"); false }  } },
             (CfgRef::NetMode, v) => {  match v { Value::Select(i) => { match i { 0 => { cfg.net_mode = NetMode::Both; true } 1 => { cfg.net_mode = NetMode::Down; true } 2 => { cfg.net_mode = NetMode::Up; true } _ => false } } _ => { debug_assert!(false, "CfgRef 类型错配: NetMode <- {v:?}"); false }  } },

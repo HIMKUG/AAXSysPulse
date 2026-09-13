@@ -21,6 +21,7 @@
 //!
 //! 时间戳取本地时间（`GetLocalTime`），对齐任务栏时钟，便于人工比对现场。
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// 日志流：probe = 诊断探针（AAXSYSPULSE_PROBE / 设置面板「调试日志」），
@@ -46,12 +47,46 @@ static FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
 /// 会话文件名缓存：本会话内首次写入时确定，之后不再变。
 static SESSION_NAME: OnceLock<String> = OnceLock::new();
 
+/// 会话日志体积保险丝：单会话落盘总量封顶，超限后写入一次性标记行，
+/// 之后本会话所有写入静默丢弃（重启/新会话自动恢复）。
+/// 教训（2026-09-13）：渲染逐帧探针在开关失灵期间实测 ~1.2KB/s × 数小时；
+/// 开关门控之外再上体积硬上限，任何未来的失控写入都被硬性截断。
+const SESSION_CAP_BYTES: u64 = 8 * 1024 * 1024;
+/// 本会话累计写入字节（纯内存计数，零系统调用）。
+static SESSION_BYTES: AtomicU64 = AtomicU64::new(0);
+/// 超限标记：置位后本会话所有写入直接丢弃。
+static CAP_HIT: AtomicBool = AtomicBool::new(false);
+
 /// 追加一段日志文本（单行或多行）到指定流。
 ///
 /// 多行文本的每一行都会加 `[hh:mm:ss.mmm] [流名] ` 前缀，但整段合并为
 /// 一次 `write_all`（perf 的 5s 聚合批量落盘设计因此得以保留）。
 /// 打开文件失败时静默放弃——日志是尽力而为，绝不影响主流程。
 pub fn write(stream: Stream, text: &str) {
+    if CAP_HIT.load(Ordering::Relaxed) {
+        return;
+    }
+    // +32：行前缀/时间戳余量。并发窗口内的少量超写可接受——保险丝只需
+    // 保证「有界」，不做精确字节会计。
+    let prev = SESSION_BYTES.fetch_add(text.len() as u64 + 32, Ordering::Relaxed);
+    if prev >= SESSION_CAP_BYTES {
+        // 首个越界者写一次性标记行（直通 write_inner 绕过自身检查），随后封笔。
+        if !CAP_HIT.swap(true, Ordering::Relaxed) {
+            write_inner(
+                stream,
+                &format!(
+                    "── session log cap {}MB reached; further lines dropped until restart ──",
+                    SESSION_CAP_BYTES / (1024 * 1024)
+                ),
+            );
+        }
+        return;
+    }
+    write_inner(stream, text);
+}
+
+/// 实际落盘（常驻句柄 + write_all + flush），无体积检查。
+fn write_inner(stream: Stream, text: &str) {
     // 前缀与内容在无锁阶段拼好，持锁时间只剩 write_all + flush。
     let prefix = format!("[{}] [{}] ", local_ts(), stream.tag());
     let body = prefixed(&prefix, text);
