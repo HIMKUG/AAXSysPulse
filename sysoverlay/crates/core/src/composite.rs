@@ -263,6 +263,14 @@ fn alpha(dt: f64, tau: f64) -> f64 {
     dt / (tau + dt)
 }
 
+/// 跳变直通阈值：0..=1 量程上的 0.25（25 个百分点）。
+///
+/// 依据：CPU/内存/GPU 占用率在采样窗口内的正常抖动幅度远低于此；
+/// 单步跨过它只可能是真实负载跃迁（应用启动/退出、GPU 突发），
+/// 此时不再用 τ 拖尾（用户实测拍板：大动向必须立即反映到显示），
+/// 而是直接采信本次读数。显示节奏仍由提交侧的刷新下限约束。
+const JUMP_STEP: f64 = 0.25;
+
 /// 状态化的负载计。O(1) 内存（5 个 f64 + 2 个整数），无环形缓冲区，无分配。
 #[derive(Clone, Copy, Debug)]
 pub struct Meter {
@@ -318,7 +326,11 @@ impl Meter {
             1.0
         };
 
-        let a = if s > self.ema {
+        // 大动向直通优先于非对称 τ：单步跨过 JUMP_STEP 视为真实负载跃迁，
+        // 立即采信本次读数（a=1 ⇒ ema=s）；常规抖动仍走 τ 平滑。
+        let a = if (s - self.ema).abs() >= JUMP_STEP {
+            1.0
+        } else if s > self.ema {
             alpha(dt_secs, self.cfg.tau_up)
         } else {
             alpha(dt_secs, self.cfg.tau_down)

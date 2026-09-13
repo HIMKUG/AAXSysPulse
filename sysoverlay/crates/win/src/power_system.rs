@@ -41,8 +41,6 @@ pub struct SystemPower {
     disks: usize,
     /// 最近一轮 GPU 功耗（厂商模块读数）。
     gpu_watts: Option<f32>,
-    /// GPU 功耗 EMA 平滑值（与 CPU 实测的窗口平均语义对齐，避免瞬时跳动）。
-    gpu_watts_ema: Option<f32>,
     /// 最近一轮 CPU 实测功率（供进程分摊）。
     last_cpu_w: Option<f32>,
     /// GPU 瓦数缺失状态（**仅在翻转时**记探针，避免每帧刷屏）。
@@ -68,7 +66,6 @@ impl SystemPower {
             ram_est_w: ram_sticks as f32 * EST_RAM_W_PER_STICK,
             disks,
             gpu_watts: None,
-            gpu_watts_ema: None,
             last_cpu_w: None,
             gpu_watts_missing: false,
         };
@@ -102,16 +99,11 @@ impl SystemPower {
         } else {
             self.ram_sticks as f32 * EST_RAM_W_PER_STICK
         };
-        // GPU 功耗与 CPU 实测的"窗口平均"语义对齐：厂商模块若返回瞬时读数，
-        // 用 EMA 平滑避免整机功耗随帧跳动（无读数时回落 0，并重置平滑器）。
-        let gpu = if let Some(w) = self.gpu_watts {
-            let ema = self.gpu_watts_ema.map(|p| p * 0.6 + w * 0.4).unwrap_or(w);
-            self.gpu_watts_ema = Some(ema);
-            ema
-        } else {
-            self.gpu_watts_ema = None;
-            0.0
-        };
+        // GPU 功耗直通显示，不再做 EMA：原 0.6/0.4 平滑在 3s 采样节拍下把
+        // 负载爬坡拖长约 12s（"功耗 15s 才见 300W"的主要软件侧成因）。
+        // NVML/ADLX 读数本身已被驱动内部平均，叠加 EMA 属双重平滑；
+        // 显示节奏由提交侧 1.5~4.5s 的刷新下限约束，无需在此再平滑。
+        let gpu = self.gpu_watts.unwrap_or(0.0);
         // 可观测性（BUG-4 的教训）：GPU 瓦数缺失时整机功耗会**静默漏掉整个显卡项**
         // （曾经的成因是 GPU 行开关误当采样门）。这里在状态翻转时记一行，
         // 让"功耗是否完整"从日志即可判定，而不是靠用户拿硬件监控对账才发现。

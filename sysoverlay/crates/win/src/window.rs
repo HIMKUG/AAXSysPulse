@@ -25,7 +25,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, DestroyWindow,
-    GetClassNameW, IsWindowVisible, PostQuitMessage, RegisterClassExW,
+    IsWindowVisible, PostQuitMessage, RegisterClassExW,
     SetWindowPos, ShowWindow,
     TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW,
     LoadCursorW, MSG, SWP_NOACTIVATE, SWP_NOZORDER, SWP_NOSIZE,
@@ -37,6 +37,38 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
+
+// ── 悬浮窗显隐状态标记文件（供二次启动时判断）───────────────────────────────
+const OVERLAY_STATE_FILE: &str = "overlay_hidden.dat";
+
+fn overlay_state_dir() -> std::path::PathBuf {
+    std::env::var("LOCALAPPDATA")
+        .map(|p| std::path::PathBuf::from(p).join("AAXSysPulse"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
+
+fn overlay_state_path() -> std::path::PathBuf {
+    overlay_state_dir().join(OVERLAY_STATE_FILE)
+}
+
+/// 标记悬浮窗已隐藏（二次启动时应显示）；不存在则视为已显示。
+fn mark_overlay_hidden(hidden: bool) {
+    let path = overlay_state_path();
+    if hidden {
+        // 确保目录存在
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, b"1");
+    } else {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// 读取悬浮窗隐藏标记：存在=隐藏，不存在/读失败=显示。
+fn is_overlay_hidden() -> bool {
+    overlay_state_path().is_file()
+}
 
 /// Per-window mutable state, stored in GWLP_USERDATA.
 struct ThreadState {
@@ -541,9 +573,10 @@ unsafe extern "system" fn wndproc(
             match mouse {
                 WM_LBUTTONUP => {
                     let visible = IsWindowVisible(hwnd).as_bool();
-                    let _ = ShowWindow(hwnd, if visible { SW_HIDE } else { SW_SHOW });
-                    // 重新显示时立即画一帧（推送模式下不轮询，不画会空白）
-                    if !visible {
+                    if visible {
+                        mark_overlay_hidden(true);
+                    } else {
+                        mark_overlay_hidden(false);
                         // E1：唤醒采样线程（事件驱动，不再依赖其隐藏轮询）
                         if let Some(tx) = RESUME_NOTIFY.get() {
                             let _ = tx.send(());
@@ -552,6 +585,7 @@ unsafe extern "system" fn wndproc(
                             crate::render_thread::request(hwnd, &state.cfg);
                         }
                     }
+                    let _ = ShowWindow(hwnd, if visible { SW_HIDE } else { SW_SHOW });
                 }
                 WM_RBUTTONUP => {
                     if let Some(cmd) = crate::menu::show_tray_menu(hwnd) {
@@ -1033,27 +1067,52 @@ impl Drop for OverlayWindow {
     }
 }
 
-/// 用 FindWindowW 按窗口类名找悬浮窗句柄（第二次启动时主实例已运行，无需新建）。
-/// 返回值需要用户确认存在后再使用；句柄不归调用方所有，无需 CloseHandle。
+/// 第二次启动时的行为决策（通过标记文件判断）：
+/// - 悬浮窗隐藏 → 显示悬浮窗（用户可能想查看数据）
+/// - 悬浮窗显示 → 打开设置页（用户明确想改设置）
+///
+/// 返回值：第二实例应立即退出（老窗口已处理）。
+pub fn handle_second_instance() -> bool {
+    let hidden = is_overlay_hidden();
+    crate::probe::log(&format!(
+        "second_instance: overlay_hidden={} -> {}",
+        hidden,
+        if hidden { "show overlay" } else { "open settings" }
+    ));
+    // 用 EnumWindows 找主窗口句柄（用于显示/开设置）。
+    // 这是纯显示路径的句柄获取，不参与状态判断。
+    match find_overlay_hwnd() {
+        Some(hwnd) => {
+            if hidden {
+                mark_overlay_hidden(false);
+                unsafe { let _ = ShowWindow(hwnd, SW_SHOW); }
+            } else {
+                crate::settings::open_settings(hwnd);
+            }
+        }
+        None => {
+            crate::probe::log("second_instance: overlay hwnd not found");
+        }
+    }
+    true
+}
+
+/// 用 EnumWindows + GetClassNameW 按窗口类名找悬浮窗句柄。
+/// 返回值不归调用方所有，无需 CloseHandle。
 fn find_overlay_hwnd() -> Option<HWND> {
     unsafe {
         use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
         use windows::Win32::Foundation::BOOL;
         use std::sync::Mutex;
-
-        let result: Box<Mutex<Option<HWND>>> = Box::new(Mutex::new(None));
-        // Box 指针转 u64 再塞进 LPARAM，避免 LPARAM 包装类型的 as 转换限制。
-        let result_ptr = Box::into_raw(result) as u64;
-
         extern "system" {
-            fn EnumWindows(
-                lpEnumFunc: Option<unsafe extern "system" fn(HWND, LPARAM) -> BOOL>,
-                lParam: LPARAM,
-            ) -> BOOL;
+            fn EnumWindows(lpEnumFunc: Option<unsafe extern "system" fn(HWND, LPARAM) -> BOOL>, lParam: LPARAM) -> BOOL;
         }
 
+        let result: Box<Mutex<Option<HWND>>> = Box::new(Mutex::new(None));
+        let result_ptr = Box::into_raw(result) as u64;
+
         unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-            // LPARAM → Box：lparam.0 拿内层 i64，转 u64 再转回裸指针
+            // LPARAM(i64) → 原始指针：先 as isize 再 as u64 再 as 指针
             let raw = lparam.0 as isize as u64;
             let result = &*(raw as *const Mutex<Option<HWND>>);
             let mut buf = [0u16; 256];
@@ -1068,7 +1127,7 @@ fn find_overlay_hwnd() -> Option<HWND> {
                 if let Ok(mut r) = result.lock() {
                     *r = Some(hwnd);
                 }
-                return BOOL(0);
+                return BOOL(0); // 找到即停止枚举
             }
             BOOL(1)
         }
@@ -1078,33 +1137,4 @@ fn find_overlay_hwnd() -> Option<HWND> {
         let result = Box::from_raw(result_ptr as *mut Mutex<Option<HWND>>);
         result.lock().ok().and_then(|g| *g)
     }
-}
-
-/// 第二次启动时的行为决策：
-/// - 悬浮窗隐藏 → 显示悬浮窗（用户可能想查看数据）
-/// - 悬浮窗显示 → 打开设置页（用户明确想改设置）
-///
-/// 返回值：第二实例应立即退出（老窗口已处理）。
-pub fn handle_second_instance() -> bool {
-    match find_overlay_hwnd() {
-        Some(hwnd) => {
-            let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
-            crate::probe::log(&format!(
-                "second_instance: hwnd={:#x} visible={} -> {}",
-                hwnd.0 as usize, visible,
-                if visible { "open settings" } else { "show overlay" }
-            ));
-            if visible {
-                crate::settings::open_settings(hwnd);
-            } else {
-                unsafe { let _ = ShowWindow(hwnd, SW_SHOW); }
-            }
-        }
-        None => {
-            // 找不到窗口：主实例还在初始化（尚未 RegisterClassEx）。
-            // 第二实例退出，让主实例继续；下次双击时窗口已就绪。
-            crate::probe::log("second_instance: hwnd not found (main still starting?)");
-        }
-    }
-    true
 }
