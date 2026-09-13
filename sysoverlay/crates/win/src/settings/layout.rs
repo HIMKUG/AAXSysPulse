@@ -561,7 +561,7 @@ fn page_metrics(
                 items: vec![
                     ux.item(
                         208 + i as i32 * 10,
-                        Box::new(MetricHeaderWidget { index: i, lang: ux.lang }),
+                        Box::new(MetricHeaderWidget { index: i, on_cfg: metric_cfg[i], lang: ux.lang }),
                         ux.rows_l,
                         ux.widget_r - ICON_BTN as f32,
                         true,

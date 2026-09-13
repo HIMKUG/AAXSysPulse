@@ -107,10 +107,12 @@ pub struct DisclosureWidget {
 /// 总开关已移入展开菜单（首行「显示」），因此折叠态用一枚「已关闭」弱化标签
 /// 承担状态指示（开启时不画，保持折叠行安静）。
 /// 整行可点击（展开/收起）；箭头是行内独立控件、不与其重叠。
-/// `on` 状态在绘制时从 `Config` 实时读取（而非构建时捕获），
-/// 保证配置变更后"已关闭"标签实时更新。
+/// `on` 不做构建时快照：绘制时经 `on_cfg` 从 Config 实时读取，
+/// 配置一变「已关闭」标签即刷新，无需重建页面。
 pub struct MetricHeaderWidget {
     pub index: usize,
+    /// 该指标显示开关的 Config 引用（与 layout::page_metrics 的 metric_cfg 同源）。
+    pub on_cfg: CfgRef,
     /// 构建时语言（跟随 cfg.lang，不依赖全局态时序）。
     pub lang: Lang,
 }
@@ -438,7 +440,7 @@ pub fn paint_widget(
     } else if let Some(ab) = w.kind.as_any().downcast_ref::<AboutHeaderWidget>() {
         paint_about_header(rt, gfx, dpi, theme, r, ab.lang);
     } else if let Some(mh) = w.kind.as_any().downcast_ref::<MetricHeaderWidget>() {
-        paint_metric_header(rt, gfx, dpi, theme, r, mh.index, cfg, mh.lang, body_px, small_px);
+        paint_metric_header(rt, gfx, dpi, theme, r, mh.index, mh.on_cfg, cfg, mh.lang, body_px, small_px);
     } else if let Some(ms) = w.kind.as_any().downcast_ref::<MetricFontStatusWidget>() {
         paint_metric_font_status(
             rt, gfx, state, dpi, theme, r, cfg, ms.index, ms.lang, body_px, small_px,
@@ -1022,7 +1024,7 @@ fn paint_metric_font_status(
 ///   字母徽标已移除（用户反馈无信息量）；总开关在展开菜单首行（「显示」），
 ///   因此这里仅在关闭态补一枚弱化标签，避免折叠列表出现「看不出已关」的死角。
 ///   硬约束（B-07）：折叠头不含任何可调参数控件，仅抓手 + 名称 + 状态 + 箭头。
-///   `on` 状态在绘制时从 `Config` 实时读取，保证配置变更后"已关闭"标签实时更新。
+///   `on` 每帧经 `on_cfg` 从 Config 现读 → 配置一变即刷新，无需重建页面。
 #[allow(clippy::too_many_arguments)]
 fn paint_metric_header(
     rt: &windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget,
@@ -1031,25 +1033,15 @@ fn paint_metric_header(
     t: &Theme,
     r: RectF,
     index: usize,
+    on_cfg: CfgRef,
     cfg: Option<&Config>,
     lang: Lang,
     body_px: f32,
     caption_px: f32,
 ) {
-    // 从实时配置中读取指标开关状态（而非依赖构建时捕获的值）。
-    // metric_cfg 顺序：0=CPU, 1=Mem, 2=GPU, 3=Net, 4=Power, 5=Time
-    let on = cfg.map_or(false, |c| {
-        let cfg_ref = match index {
-            0 => super::cfg_ref::CfgRef::ShowCpu,
-            1 => super::cfg_ref::CfgRef::ShowMem,
-            2 => super::cfg_ref::CfgRef::ShowGpu,
-            3 => super::cfg_ref::CfgRef::ShowNet,
-            4 => super::cfg_ref::CfgRef::PowerEnabled,
-            5 => super::cfg_ref::CfgRef::ShowTime,
-            _ => return false,
-        };
-        matches!(cfg_ref.get(c), super::cfg_ref::Value::Bool(true))
-    });
+    // cfg 不可得（overlay 句柄失效）时按「开」处理：
+    // 宁可少画一枚标签，也不在状态未知时错报「已关闭」。
+    let on = cfg.map_or(true, |c| matches!(on_cfg.get(c), Value::Bool(true)));
     const KEYS: [&str; 6] = ["LblCpu", "LblMem", "LblGpu", "LblNet", "LblPower", "LblTime"];
     let name = crate::i18n::t(lang, KEYS[index.min(5)]);
     // 折叠头标题比正文大一档（用户反馈：字号偏小）。
