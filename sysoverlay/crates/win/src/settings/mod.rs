@@ -51,7 +51,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, GetClientRect,
+    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect,
     LoadCursorW, PostMessageW, RegisterClassExW, SetCursor, SetWindowPos, ShowWindow, HCURSOR,
     IDC_HAND, MINMAXINFO, SW_HIDE, SW_SHOW, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOSIZE, WINDOW_EX_STYLE, WNDCLASSEXW, WS_MINIMIZEBOX, WS_POPUP,
@@ -123,6 +123,11 @@ const EDIT_TIMER: usize = 12;
 const STATUS_TIMER: usize = 13;
 /// 步进器长按连发：350ms 首延迟，之后每 60ms 一步。
 const STEPPER_TIMER: usize = 14;
+/// 设置页关闭后延迟销毁计时器：隐藏窗口 → 6.5s 无操作才 DestroyWindow。
+/// 用户在 6.5s 内重新打开设置页 → 取消定时器，窗口及所有状态完整保留。
+const DESTROY_TIMER: usize = 15;
+/// DESTROY_TIMER 的延时（毫秒）。
+const DESTROY_DELAY_MS: u32 = 6500;
 const STEPPER_REPEAT_MS: u32 = 60;
 
 // ── GDI extern（window.rs 的声明是私有的，此处独立声明） ─
@@ -433,6 +438,8 @@ pub fn open_settings(overlay: HWND) {
         let hwnd = HWND(existing as *mut _);
         if unsafe { IsWindow(hwnd) }.as_bool() {
             unsafe {
+                // 取消延迟销毁定时器（用户主动重新打开 = 保留窗口）。
+                kill_timer(hwnd, DESTROY_TIMER);
                 let _ = ShowWindow(hwnd, SW_SHOW);
             }
             return;
@@ -2261,6 +2268,11 @@ unsafe fn on_wm_timer(hwnd: HWND, _msg: u32, wparam: WPARAM, _lparam: LPARAM) ->
             }
             }
             let _ = InvalidateRect(hwnd, None, false);
+            } else if wparam.0 == DESTROY_TIMER {
+            // 延迟销毁计时器到期：真正销毁窗口，释放所有 GDI 资源。
+            // 窗口销毁时 SettingsCtx 在 WM_DESTROY 中 drop，ctx_of 返回 None。
+            kill_timer(hwnd, DESTROY_TIMER);
+            let _ = DestroyWindow(hwnd);
             }
             LRESULT(0)
         }
@@ -2417,7 +2429,10 @@ unsafe fn on_wm_close(hwnd: HWND, _msg: u32, _wparam: WPARAM, _lparam: LPARAM) -
             }
             }
             let _ = ShowWindow(hwnd, SW_HIDE);
-            // 设置页隐藏：本次构建/滚动触碰的页面全部转冷，主动修剪一次。
+            // 启动延迟销毁计时器：6.5s 后无人再操作则 DestroyWindow，释放所有资源。
+            // 6.5s 内用户重新打开设置页 → open_settings 里 KillTimer 取消定时器，
+            // 窗口及所有状态（滚屏位置/card 展开态）完整保留，速度与内存兼得。
+            unsafe { start_timer(hwnd, DESTROY_TIMER, DESTROY_DELAY_MS); }
             crate::mem_tune::trim("settings closed");
             LRESULT(0)
         }
