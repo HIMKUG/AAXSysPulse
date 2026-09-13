@@ -1,4 +1,4 @@
-# SysOverlay-C Rust 重构项目报告
+# AAXSysPulse Rust 重构项目报告
 
 **日期**：2026-09-03
 **状态**：✅ 重构完成（骨架级可用）
@@ -7,7 +7,7 @@
 
 ## 一、项目背景
 
-SysOverlay-C 是一个 Windows 系统监控悬浮卡片工具，纯 C 语言实现，以无边框半透明窗口形式实时显示 CPU / 内存 / GPU / 网络四项指标。原有 C 版本约 75KB，零运行时依赖。
+AAXSysPulse 是一个 Windows 系统监控悬浮卡片工具，纯 C 语言实现，以无边框半透明窗口形式实时显示 CPU / 内存 / GPU / 网络四项指标。原有 C 版本约 75KB，零运行时依赖。
 
 本次重构目标是将单体 C 代码迁移至 Rust 分层架构，同时修复已知的 8 项技术债（每帧蒙版重算、采集与渲染同线程、配置解析无校验等）。
 
@@ -208,13 +208,13 @@ pub fn save(cfg: &Config) -> Result<(), IoError> {
 
 ```rust
 // main.rs 开头
-let mutex = unsafe { CreateMutexW(None, TRUE, w!("SysOverlayC-SingleInstance"))? };
+let mutex = unsafe { CreateMutexW(None, TRUE, w!("AAXSysPulse-SingleInstance"))? };
 if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
     return Ok(());  // 静默退出
 }
 
 std::panic::set_hook(Box::new(|info| {
-    let path = std::env::temp_dir().join("SysOverlayC_crash.dmp");
+    let path = std::env::temp_dir().join("AAXSysPulse_crash.dmp");
     write_minidump(&path);  // MiniDumpWriteDump
 }));
 ```
@@ -244,7 +244,7 @@ e089e20  fix(core): config/color/units 测试兼容
 8c75cd5  feat(core): config, color, units modules
 01562c9  feat: Phase 0 baseline documentation
 392331d  docs: rewrite README with detailed introduction
-750aae3  Initial commit: SysOverlay-C Win32 system monitoring overlay
+750aae3  Initial commit: AAXSysPulse Win32 system monitoring overlay
 ```
 
 ---
@@ -262,7 +262,7 @@ cargo build --release
 cargo test --workspace
 
 # 运行程序
-./target/release/sysoverlay-app.exe
+./target/release/aaxsyspulse-app.exe
 ```
 
 **依赖**：Windows 10/11 (x64)，无需 Zig 或任何运行时。

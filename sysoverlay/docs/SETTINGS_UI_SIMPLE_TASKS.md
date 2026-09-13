@@ -35,7 +35,7 @@
 | F1 | `crates/win/src/settings/widget.rs` | `slider_t_from_value` / `slider_value_from_x` 纯函数 + `slider_tests` 3 单测 | `slider_tests` 3 passed |
 | H1 | `crates/win/src/settings/motion.rs` | `Spring`（半隐式欧拉，收敛返回 true 可停帧）、`project`、`rubber_band`、`animations_enabled`、`high_contrast`，5 单测；模块 `mod motion;` 已接入 `settings/mod.rs` | `settings::motion::tests` 5 passed（本次新接入） |
 
-**汇总：`cargo test -p sysoverlay-win --lib` → 32 passed / 0 failed / 0 警告。**
+**汇总：`cargo test -p aaxsyspulse-win --lib` → 32 passed / 0 failed / 0 警告。**
 
 ## 三、本轮踩坑记录（已修复）
 

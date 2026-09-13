@@ -269,7 +269,7 @@ impl Appearance {
 ```
 
 - 在 `crates/core/src/lib.rs` 的 `types` 重导出处确认 `Appearance` 可经 `sysoverlay_core::types::Appearance` 访问（若 `types` 是 `pub mod`，无需改）。
-- 验证：`cargo test -p sysoverlay-core` 通过；新增测试 `appearance_accepts_numeric_and_string` 断言 `from_config("1") == from_config("light")`。
+- 验证：`cargo test -p aaxsyspulse-core` 通过；新增测试 `appearance_accepts_numeric_and_string` 断言 `from_config("1") == from_config("light")`。
 
 #### 任务 A2：`Config` 增加 `appearance` 与 `settings_size`
 - 文件：`crates/core/src/config.rs`
@@ -327,7 +327,7 @@ impl Appearance {
   1. 新增测试 `appearance_and_set_size_roundtrip`：非默认值 `Appearance::Dark` + `(900, 640)` 经 `serialize → parse` 后相等。
   2. 新增测试 `set_size_out_of_range_rejected`：`set_size 100 100` / `set_size 9999 9999` 均回落到默认 `(720, 560)`。
   3. 在既有 `test_roundtrip_non_default`（705 行）里补两行非默认赋值，确保纳入该测试的覆盖。
-  4. `cargo test -p sysoverlay-core` 全绿。
+  4. `cargo test -p aaxsyspulse-core` 全绿。
 
 #### 任务 A3：`CfgRef` 增加 `Appearance`
 - 文件：`crates/win/src/settings/cfg_ref.rs`
@@ -360,7 +360,7 @@ impl Appearance {
 
 - 同时在文件顶部 `use` 行补 `Appearance`。
 - 验证：在 `roundtrip_cases()`（233 行）补三条 `(CfgRef::Appearance, Value::Select(0|1|2))`；
-  `cargo test -p sysoverlay-win cfg_ref` 全绿。
+  `cargo test -p aaxsyspulse-win cfg_ref` 全绿。
 
 > **里程碑闸门 A**：`cargo test` 全绿 + `cargo build --release` 零警告。此时 UI 行为**完全未变**（新字段无消费者），可安全停下核对。
 
@@ -425,7 +425,7 @@ impl Appearance {
         assert_eq!(Theme::resolve(Appearance::Light).dark, false, "强制浅色必须生效");
 ```
 
-- 验证：`cargo test -p sysoverlay-win theme` 全绿。
+- 验证：`cargo test -p aaxsyspulse-win theme` 全绿。
 
 #### 任务 B2：外观切换时实时换肤
 - 文件：`crates/win/src/settings/mod.rs`
@@ -611,7 +611,7 @@ fn rect_center(r: RectF) -> (f32, f32) {
 ```
 
 - 在 `crates/win/src/settings/mod.rs` 顶部模块声明处补 `pub mod icons;`
-- 验证：`cargo build -p sysoverlay-win` 通过（此时图标尚无调用方，会出现 dead_code 警告 → 在 `icons.rs` 顶部加 `#![allow(dead_code)]` 临时压制，阶段 D 接入后删除）。
+- 验证：`cargo build -p aaxsyspulse-win` 通过（此时图标尚无调用方，会出现 dead_code 警告 → 在 `icons.rs` 顶部加 `#![allow(dead_code)]` 临时压制，阶段 D 接入后删除）。
 
 #### 任务 C2：字体族降级探测
 - 文件：`crates/win/src/gfx_d2d.rs`
@@ -783,7 +783,7 @@ pub fn build_pages(
 
 > 所有 `widget_l / widget_r` 的计算逻辑不变（仍相对 `card_l`/`card_r`）。
 
-- 验证：`cargo build -p sysoverlay-win` 会报错（调用方签名不匹配）——这是**预期红**，
+- 验证：`cargo build -p aaxsyspulse-win` 会报错（调用方签名不匹配）——这是**预期红**，
   在 D2/D3 修完。本任务只保证 `layout.rs` 自身内部自洽（`cargo check` 报错点全部集中在调用方）。
 
 #### 任务 D2：`Page` 增加滚动与折叠态
@@ -823,7 +823,7 @@ pub fn build_pages(
     pub hover_t: f32,
 ```
 
-- 验证：`cargo check -p sysoverlay-win` 仅剩 `layout.rs` 调用方签名错误。
+- 验证：`cargo check -p aaxsyspulse-win` 仅剩 `layout.rs` 调用方签名错误。
 
 #### 任务 D3：`paint_sidebar` 替换 `paint_nav`
 - 文件：`crates/win/src/settings/mod.rs`
@@ -973,7 +973,7 @@ fn paint_scrollbar(
 }
 ```
 
-- 验证：`cargo check -p sysoverlay-win` 通过；`cargo build --release` 零警告。
+- 验证：`cargo check -p aaxsyspulse-win` 通过；`cargo build --release` 零警告。
 
 #### 任务 D4：命中测试改为侧边栏
 - 文件：`crates/win/src/settings/mod.rs`
@@ -1273,7 +1273,7 @@ pub fn slider_value_from_x(x: f32, track: RectF, min: f64, max: f64, step: f64) 
 }
 ```
 
-- 验证：`cargo test -p sysoverlay-win slider` 全绿（先看红，再看绿）。
+- 验证：`cargo test -p aaxsyspulse-win slider` 全绿（先看红，再看绿）。
 
 #### 任务 F2：滑杆绘制改为绝对位置 + 轨道填充
 - 文件：`crates/win/src/settings/widget.rs` 的 `paint_slider`（368 行）
@@ -1310,7 +1310,7 @@ pub fn slider_value_from_x(x: f32, track: RectF, min: f64, max: f64, step: f64) 
 **(c)** `SliderWidget` 的 `joystick: bool` 字段（106 行）**删除**（已废弃且现在无消费者），
 同步删除 `layout.rs` 中 3 处构造参数。
 
-- 验证：`cargo build --release` 零警告；`cargo test -p sysoverlay-win` 全绿。
+- 验证：`cargo build --release` 零警告；`cargo test -p aaxsyspulse-win` 全绿。
 
 #### 任务 F3：拖动语义改为绝对定位
 - 文件：`crates/win/src/settings/mod.rs`
@@ -1754,7 +1754,7 @@ pub fn high_contrast() -> bool {
 > `HIGHCONTRASTW` 在 `windows` crate 中可能叫 `HIGHCONTRASTW`，
 > 编译报错则以实际导出名称为准。
 
-- 验证：`cargo test -p sysoverlay-win motion` 全绿（5 个测试）。
+- 验证：`cargo test -p aaxsyspulse-win motion` 全绿（5 个测试）。
 
 #### 任务 H2：按压与悬停过渡
 - 文件：`crates/win/src/settings/mod.rs`、`widget.rs`
@@ -1951,7 +1951,7 @@ fn anim_params(ctx: &mut SettingsCtx, dt: f32) -> (f32, f32) {
 | `BtnCollapse` | Collapse | 收起 |
 
 - 并确认 `LblResetAll` 既可用于行标签也可用于按钮文案（现状已如此）。
-- 验证：`cargo test -p sysoverlay-win i18n`（若有全键一致性测试）全绿；`cargo build --release` 零警告。
+- 验证：`cargo test -p aaxsyspulse-win i18n`（若有全键一致性测试）全绿；`cargo build --release` 零警告。
 
 #### 任务 I3：死代码清理
 - 文件：多处

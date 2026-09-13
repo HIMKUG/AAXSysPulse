@@ -6,7 +6,7 @@
 
 | 组 | 项 | 状态 | 落点 |
 |----|----|------|------|
-| P0+A | A1 脏矩形上屏（`UpdateLayeredWindowIndirect`+`prcDirty`，`SYSOVERLAY_NODIRTY=1` 可回退） | ✅ | `win/gdi.rs` |
+| P0+A | A1 脏矩形上屏（`UpdateLayeredWindowIndirect`+`prcDirty`，`AAXSYSPULSE_NODIRTY=1` 可回退） | ✅ | `win/gdi.rs` |
 | P0+A | A2 直写 DIB（只拷脏区子矩形，免整窗 187KB 拷贝） | ✅ | `win/gdi.rs` |
 | P0+A | A3 清脏区（`clear_rect`，仅清 cell 包围盒） | ✅ | `ui/offscreen.rs` + `renderer.rs` |
 | P0+D | D1 GPU 适配器拓扑缓存 + WM_DISPLAYCHANGE 失效 | ✅ | `win/proc_gpu.rs`、`win/window.rs` |
@@ -89,7 +89,7 @@
   修复 = DXGI（`gpu_detect` 已有 vendor/device 信息）取 dGPU LUID 精确匹配拓扑。
 - PERF 日志文件跨运行追加且无启动标记，tail 会混入上一次运行的数据（perf/probe 的
   `rm` 均被 safe-delete 拦截）——单次运行数据必须按 `startup pid=` 切分。
-- rustc 增量编译 ICE（`sysoverlay-app` lib）：`CARGO_INCREMENTAL=0` 绕过，缓存疑似损坏。
+- rustc 增量编译 ICE（`aaxsyspulse-app` lib）：`CARGO_INCREMENTAL=0` 绕过，缓存疑似损坏。
 
 ## 第三轮：Net 增量查询压缩（同日续）
 
@@ -111,7 +111,7 @@
 | 采样主循环周期成本 | 31–47ms | **稳态 `cycle cost_ms=0`**（探针验证 cycle 2–5 / 7–9 仅做增量查询） | — |
 | 测试 | 162 绿 | **162 绿，0 warning** | — |
 
-探针证据（`SYSOVERLAY_PROBE=1`，清空日志后单次运行）：
+探针证据（`AAXSYSPULSE_PROBE=1`，清空日志后单次运行）：
 - cycle 1：`net enum cached 5 nics: [20,10,18,8,17]`（一次 `GetIfTable2`）→ 5× `net query idx=`（GetIfEntry2）
 - cycle 2–5：无 `net enum`，仅 5× `net query idx=`，`cycle cost_ms=0`
 - cycle 6：10s 安全刷新触发一次 `net enum cached` → 查询，`cycle cost_ms=31`
@@ -127,7 +127,7 @@
 ### 本轮排障关键教训（测量方法论）
 
 - **perf/probe 日志跨运行追加 + 单实例锁 = 污染陷阱**：最初 `tail` 读到的 `sample_net us=~28-32ms` / `sample_gpu us=~72ms` 是**残留旧实例**（更早构建）持续写入的，并非新代码问题——清空日志前无法区分。
-- 正确测量法：① 启动前 `Get-Process sysoverlay-app | Stop-Process` 杀尽残留（否则新进程撞单实例锁瞬时退出，CPU 测成 ~0 假象）；② `Set-Content perf.log ""` / `probe.log ""` **截断**日志（safe-delete 拦截 `rm`），保证只读单次运行数据；③ PERF 关测 CPU、PERF 开读 `sample_*` 分段耗时；④ PowerShell `TotalProcessorTime` 测 CPU 需注意单位（ms ÷ (秒×1000×核数)）。
+- 正确测量法：① 启动前 `Get-Process aaxsyspulse-app | Stop-Process` 杀尽残留（否则新进程撞单实例锁瞬时退出，CPU 测成 ~0 假象）；② `Set-Content perf.log ""` / `probe.log ""` **截断**日志（safe-delete 拦截 `rm`），保证只读单次运行数据；③ PERF 关测 CPU、PERF 开读 `sample_*` 分段耗时；④ PowerShell `TotalProcessorTime` 测 CPU 需注意单位（ms ÷ (秒×1000×核数)）。
 - 本轮新代码的 GPU 同样确认已优化：仅首周期 `sample_gpu` 因一次性 `pick_dgpu` 落 ~77ms，后续 `gpu node pct=2.2` 每周期 <20ms（perf 不再记录），`gpu primary picked idx=1` 精确命中 dGPU。
 
 ## 第四轮：事件驱动 NIC 重枚举 + 进程榜分频（同日续）
@@ -158,7 +158,7 @@
 
 ### 实测（release，16 逻辑核）
 
-清洁单实例运行（`Stop-Process` 杀残留 → 截断 `probe.log`/`perf.log` → `SYSOVERLAY_PROBE=1` + `APPDATA` 注入 → 20s → 读日志）：
+清洁单实例运行（`Stop-Process` 杀残留 → 截断 `probe.log`/`perf.log` → `AAXSYSPULSE_PROBE=1` + `APPDATA` 注入 → 20s → 读日志）：
 
 | 指标 | 上轮（round-3） | 本轮 | 说明 |
 |------|----------------|------|------|
@@ -191,7 +191,7 @@
 
 | 项 | 说明 |
 |----|------|
-| 独立线程 + 独立消息泵 | `open()` 改为 spawn `sysoverlay-graph` 线程；窗口在线程上创建并跑自己的 `GetMessageW` 循环（与 `window.rs` 同款写法，`ret.0<=0` 退出）；1s 定时重绘 + GDI 绘制全部发生在曲线线程，**悬浮条 UI 线程不再被周期唤醒** |
+| 独立线程 + 独立消息泵 | `open()` 改为 spawn `aaxsyspulse-graph` 线程；窗口在线程上创建并跑自己的 `GetMessageW` 循环（与 `window.rs` 同款写法，`ret.0<=0` 退出）；1s 定时重绘 + GDI 绘制全部发生在曲线线程，**悬浮条 UI 线程不再被周期唤醒** |
 | `WM_APP_RESTORE`（WM_APP+1） | 最小化后再次 open：恢复显隐/定时器经消息交窗口所属线程，不跨线程直接 `SetTimer`/`ShowWindow` |
 | 生命周期 | `WM_DESTROY` → `PostQuitMessage(0)` 收尾线程；`GRAPH_THREAD_ALIVE` CAS 防重复 spawn，spawn 失败/线程退出均复位 |
 | 定时器脏检查 | 新增 `history::peek_seq()`（一次原子 load，无克隆）；`WM_TIMER` 时序序号未变不重绘，每 5 拍强制一次保主题/DPI 变化可见 → Auto 档（2s 周期）下重绘次数减半 |

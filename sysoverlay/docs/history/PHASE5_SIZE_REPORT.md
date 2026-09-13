@@ -13,9 +13,9 @@
 当前二进制已处于非常精简的状态，主要组成：
 
 - **windows crate**: Win32 API bindings (layered window, GDI, input handling)
-- **sysoverlay-core**: 核心数据结构 (Snapshot, Sampler trait, Config)
-- **sysoverlay-ui**: 轻量渲染 (GDI bitmap rendering, BMP字体)
-- **sysoverlay-win**: 平台层 (窗口管理, 采样器)
+- **aaxsyspulse-core**: 核心数据结构 (Snapshot, Sampler trait, Config)
+- **aaxsyspulse-ui**: 轻量渲染 (GDI bitmap rendering, BMP字体)
+- **aaxsyspulse-win**: 平台层 (窗口管理, 采样器)
 - **arc-swap**: 线程间无锁共享指针
 - **proc-macro2/quote/syn**: Rust 编译必需
 
@@ -81,7 +81,7 @@ GPU 和 Network 采样器采用延迟初始化策略：
 
 如果未来体积超标，可考虑：
 
-1. **UPX 压缩**: `upx --best --lzma target/release/sysoverlay-app.exe`
+1. **UPX 压缩**: `upx --best --lzma target/release/aaxsyspulse-app.exe`
    - 警告：可能导致 SmartScreen 误报
 
 2. **进一步裁剪 windows features**: 检查是否有未使用的 Win32 子系统

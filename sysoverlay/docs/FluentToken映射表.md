@@ -148,10 +148,10 @@ curve_decelerate_mid: [0.0, 0.0, 0.0, 1.0]     // ← 修正：首轮误写 [0.8
 
 ```bash
 # 1. 编译通过
-cargo build -p sysoverlay-win 2>&1 | head -50
+cargo build -p aaxsyspulse-win 2>&1 | head -50
 
 # 2. 测试全部通过（特别是 slider_tests）
-cargo test -p sysoverlay-win --lib 2>&1 | tail -20
+cargo test -p aaxsyspulse-win --lib 2>&1 | tail -20
 
 # 3. S0 基线截图对比（人工）
 # 对比 docs/baseline/ 与当前渲染输出，确认颜色/间距/圆角符合映射表

@@ -19,7 +19,7 @@
 | exe 启动无崩溃 | ✅ 进程正常创建窗口（PID 27256） |
 | 分层窗口创建 | ✅ WS_EX_LAYERED + RegisterClassExW + CreateWindowExW |
 | 窗口拖动 | ✅ WM_NCHITTEST 返回 HTCAPTION，WM_LBUTTONDOWN/MOUSEMOVE 实现拖拽 |
-| 单实例保护 | ✅ 命名互斥体 SysOverlayC-SingleInstance |
+| 单实例保护 | ✅ 命名互斥体 AAXSysPulse-SingleInstance |
 | panic 兜底 | ✅ panic hook 写入 temp |
 
 **实测资源（启动后 3 秒）**：

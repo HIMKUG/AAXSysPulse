@@ -1,10 +1,10 @@
-# SysOverlay-C 渲染 / CPU / 功耗优化方案（20 项）
+# AAXSysPulse 渲染 / CPU / 功耗优化方案（20 项）
 
 > 基于 2026-09-08 对当前代码的实际勘察。**所有标注 `file:line` 的事实均已核对源码**，
 > 未标行的部分属推断，实施前请先布探针实测。
 >
 > 用户 debug 哲学：**先测量后优化**。本文档只排优先级，动手前请先用
-> `perf.rs` + `probe.rs` 抓一轮真实数据（`SYSOVERLAY_PERF=1`），照着热点做。
+> `perf.rs` + `probe.rs` 抓一轮真实数据（`AAXSYSPULSE_PERF=1`），照着热点做。
 
 ---
 

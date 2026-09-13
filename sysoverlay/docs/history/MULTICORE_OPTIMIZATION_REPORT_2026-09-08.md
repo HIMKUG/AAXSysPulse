@@ -1,4 +1,4 @@
-# SysOverlay-C 多核优化报告（2026-09-08）
+# AAXSysPulse 多核优化报告（2026-09-08）
 
 > 目的：说明本程序**如何把工作分摊到多个 CPU 核心**，以及为什么稳态整机 CPU 能做到 0.03–0.09%（16 逻辑核机）。
 > 配套实测见 `PERF_RESULTS_2026-09-08.md`（第三轮 Net 压缩、第四轮 事件驱动 NIC + 进程榜降频）。
@@ -15,7 +15,7 @@
 | **采样线程** | `SystemSampler` 驱动调度器轮询 CPU/Mem/GPU/Net/Power → `snap_store` | **绑 core 0**，`BELOW_NORMAL` 优先级 | 是 | 分频后每周期 <1ms；隐藏时挂起 |
 | **进程榜线程** | 独立 2s 轮询进程表 → `PostMessage` 推给面板 | 系统调度 | 是（仅面板打开时跑） | 仅面板拉起时才有，不计入悬浮条 |
 | 历史曲线线程 | 曲线窗口按需，从 `ArcSwap` 无锁读 `Snapshot` | 系统调度 | 按需 | 窗口未开时 `push` 直接跳过 |
-| 诊断点击线程 | `SYSOVERLAY_DIAG=click` 临时模拟点击 | 系统调度 | 临时 | 仅排障用 |
+| 诊断点击线程 | `AAXSYSPULSE_DIAG=click` 临时模拟点击 | 系统调度 | 临时 | 仅排障用 |
 
 > 关键事实：**GPU vendor 探测（`pick_dgpu`）不在热路径**。它走 `OnceLock` 一次性完成，之后每周期只对主适配器做 `D3DKMT RunningTime` 增量查询（~2ms）。`Power`（RAPL MSR）同样在采样线程内、驱动 `OnceLock` 一次性就绪。
 
@@ -111,7 +111,7 @@ thread::sleep(Duration::from_millis(sleep_ms));
 
 | 方向 | 收益 | 风险/成本 |
 |------|------|----------|
-| ~~曲线窗口独立渲染线程~~ **✅ 已落地（第五轮，同日）** | 曲线高频绘制不占 UI 线程：1s 定时 + GDI 绘制移入 `sysoverlay-graph` 线程（自有消息泵），UI 线程 0 条周期消息；另加 `peek_seq` 脏检查，重绘 1s→数据变化驱动 | 实测线程 7→8、trail 无 0x0113 周期项、CPU 无回退 |
+| ~~曲线窗口独立渲染线程~~ **✅ 已落地（第五轮，同日）** | 曲线高频绘制不占 UI 线程：1s 定时 + GDI 绘制移入 `aaxsyspulse-graph` 线程（自有消息泵），UI 线程 0 条周期消息；另加 `peek_seq` 脏检查，重绘 1s→数据变化驱动 | 实测线程 7→8、trail 无 0x0113 周期项、CPU 无回退 |
 | 设置页重绘合并（已是增量，D5 已覆盖） | 边际 | 低 |
 | GPU 若未来改 PDH 多引擎 | 可复用「事件驱动 + LUID 精确匹配」思路 | 当前单适配器增量已够，无必要 |
 | 采样线程进一步压缩 | 已 `cycle cost_ms=0`，收益趋近于零 | 边际 |

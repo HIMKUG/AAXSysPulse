@@ -1,4 +1,4 @@
-# PHASE0_BEHAVIOR.md - SysOverlay-C 对外行为清单（冻结版）
+# PHASE0_BEHAVIOR.md - AAXSysPulse 对外行为清单（冻结版）
 
 > 本文档基于 `overlay.c` v1.0 代码完整提取，作为后续重构的基准。所有行为均从源代码反向得出，供重构验证使用。
 

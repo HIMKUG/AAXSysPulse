@@ -26,7 +26,7 @@ cd /d D:\code\sys-overlay-c-master
 build.bat
 ```
 
-成功后在目录生成 `sysoverlay-c.exe`。
+成功后在目录生成 `AAXSysPulse.exe`。
 
 ---
 
@@ -38,15 +38,15 @@ build.bat
    ```cmd
    set ZIG=E:\dev\zig\zig.exe
    "%ZIG%" cc -g -std=c11 -Wall -Wextra -DUNICODE -D_UNICODE ^
-       overlay.c -o sysoverlay-c.exe ^
+       overlay.c -o AAXSysPulse.exe ^
        -lpdh -lgdi32 -luser32 -ladvapi32 -lkernel32 -lcomdlg32
    ```
 
 2. **运行并捕获输出**（10 分钟，约 600 条采样，假设 1s 间隔）：
    ```cmd
-   sysoverlay-c.exe > PHASE0_baseline_raw.txt 2>&1
+   AAXSysPulse.exe > PHASE0_baseline_raw.txt 2>&1
    timeout /t 600 /nobreak >nul
-   taskkill /f /im sysoverlay-c.exe
+   taskkill /f /im AAXSysPulse.exe
    ```
 
 3. **后处理脚本**（Python 示例）：
@@ -104,7 +104,7 @@ static void sample(Metrics *m)
 然后：
 ```cmd
 build.bat
-sysoverlay-c.exe
+AAXSysPulse.exe
 # 运行 10 分钟
 # 自动输出到 PHASE0_baseline.csv
 ```

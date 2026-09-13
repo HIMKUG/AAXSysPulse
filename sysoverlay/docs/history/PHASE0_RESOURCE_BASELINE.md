@@ -122,7 +122,7 @@ PdhAddEnglishCounterW // 添加 3 个计数器（GPU/网收/网发）
 
 ### 3.4 为什么不是更多？
 
-相比典型的 Win32 程序，SysOverlay-C 的 GDI 对象数量极少，原因是：
+相比典型的 Win32 程序，AAXSysPulse 的 GDI 对象数量极少，原因是：
 
 1. **每帧动态创建/销毁**：GDI 画刷/画笔在 `roundRectFill`/`roundRectStroke` 内每帧创建后立即销毁，不累积
 2. **无缓存图片**：不使用 `LoadImage` 加载图标/光标文件
