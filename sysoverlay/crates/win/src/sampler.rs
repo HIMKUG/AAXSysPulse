@@ -257,6 +257,12 @@ impl SystemSampler {
                     let m = self.util_meter.update(score, dt_secs);
                     snap.util = Metric::Value(m.smooth_milli as f32 / 10.0);
                     snap.util_partial = degraded;
+                    if crate::probe::enabled() {
+                        crate::probe::log(&format!(
+                            "util in cpu={cpu:?} mem={mem:?} gpu={gpu:?} score={score:.3} instant={} smooth={} dt={dt_ms:?}",
+                            m.instant_milli, m.smooth_milli
+                        ));
+                    }
                 }
                 None => {
                     // 三源全缺（理论上仅硬件级故障）：行显示红色 --。
@@ -324,5 +330,31 @@ impl SystemSampler {
 impl Default for SystemSampler {
     fn default() -> Self {
         Self::new(true)
+    }
+}
+
+#[cfg(test)]
+mod util_probe {
+    use super::*;
+    use aaxsyspulse_core::scheduler::SamplePlan;
+
+    /// 临时诊断：用本机真实传感器连跑 6 个周期，打印 Util 计算管线各环节。
+    /// 运行：cargo test -p aaxsyspulse-win --lib util_live_probe -- --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn util_live_probe() {
+        let mut s = SystemSampler::new(true);
+        let plan = SamplePlan { cpu: true, mem: true, gpu: true, net: false, power: false };
+        let mut prev = Snapshot::placeholder(0);
+        let mut t: u64 = 1_000;
+        for i in 0..6 {
+            let snap = s.sample(&plan, Some(&prev), t, false, true);
+            println!(
+                "i={i} cpu={:?} mem={} gpu={:?} -> util={:?} partial={}",
+                snap.cpu, snap.memory.load_pct, snap.gpu, snap.util, snap.util_partial
+            );
+            prev = snap;
+            t += 2_000;
+        }
     }
 }

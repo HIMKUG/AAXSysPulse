@@ -243,7 +243,10 @@ impl Default for MeterConfig {
     fn default() -> Self {
         Self {
             tau_up: 2.0,
-            tau_down: 15.0,
+            // 下降 3s（用户实测拍板）：负载结束后 ~3s 内回落到位，
+            // 配合提交侧 1.5~4.5s 的刷新节奏，观感即"平均 3 秒刷新"。
+            // （原 15s 曾被误读为"卡死在峰值不动"）
+            tau_down: 3.0,
             tau_duty: 30.0,
             warn: 0.70,
             spike: 0.85,

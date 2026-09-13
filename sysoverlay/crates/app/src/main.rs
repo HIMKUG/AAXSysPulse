@@ -172,7 +172,8 @@ fn main() {
                 eprintln!("[AAX SysPulse] Failed to create single-instance mutex");
                 std::process::exit(1);
             };
-            if GetLastError() != ERROR_ALREADY_EXISTS {
+            let err = GetLastError();
+            if err != ERROR_ALREADY_EXISTS {
                 owned = Some(h);
                 break;
             }
@@ -436,6 +437,17 @@ fn main() {
             let plan = sched.plan(now_ms, &enabled);
             let power_on = enabled[4];
             let util_on = schedule_util();
+            // Util 数据源保障：show_util 开启时强制 CPU/GPU 采样（即使行关闭也不断源）。
+            // Memory 的 load_pct 始终有值（来自 prev 快照），无需强制进计划。
+            let mut plan = plan;
+            if util_on {
+                if !plan.cpu {
+                    plan.cpu = true;
+                }
+                if !plan.gpu {
+                    plan.gpu = true;
+                }
+            }
             // 空计划零开销：无源到期且无需 flush → 不克隆快照、不进采样器。
             let snap = if plan.any() || need_flush {
                 need_flush = false;
