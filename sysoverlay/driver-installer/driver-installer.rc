@@ -3,3 +3,8 @@
  * The driver file (WinRing0x64.sys) must sit next to this .rc at build time. */
 #define SYS_RES_ID 101
 SYS_RES_ID SYS "WinRing0x64.sys"
+
+/* Embed the application manifest (id 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID,
+ * type 24 = RT_MANIFEST). It requests administrator rights so the installer
+ * gets a UAC prompt on launch and always runs elevated. */
+1 24 "driver-installer.manifest"

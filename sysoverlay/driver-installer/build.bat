@@ -85,9 +85,11 @@ if errorlevel 1 (
 )
 
 REM --- Step 2: compile + link (static CRT, no console) ---
+REM /MANIFEST:NO: keep the requireAdministrator manifest embedded by rc.exe above
+REM              (otherwise link.exe would generate its own default manifest).
 cl.exe /O1 /Os /GS- /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /EHsc /MT /W3 /utf-8 ^
     /Fe:"%OUTPUT%" "%SOURCE%" "%RES%" ^
-    /link /SUBSYSTEM:WINDOWS /MACHINE:X64 kernel32.lib advapi32.lib user32.lib
+    /link /SUBSYSTEM:WINDOWS /MACHINE:X64 /MANIFEST:NO kernel32.lib advapi32.lib user32.lib shell32.lib
 
 if %ERRORLEVEL% EQU 0 (
     echo Build successful: %OUTPUT%

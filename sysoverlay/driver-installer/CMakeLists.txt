@@ -16,9 +16,10 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 # --- Embed WinRing0x64.sys as a resource ---
 # The driver binary must be present at configure time; it gets baked into the exe.
 set(SYS_BIN "${CMAKE_CURRENT_SOURCE_DIR}/WinRing0x64.sys")
+set(MANIFEST_PATH "${CMAKE_CURRENT_SOURCE_DIR}/driver-installer.manifest")
 if(EXISTS "${SYS_BIN}")
-    # Generate a .rc that points at the sys with an absolute path, so the
-    # resource compiler finds it regardless of the working directory.
+    # Generate a .rc that points at the sys + manifest with absolute paths, so the
+    # resource compiler finds them regardless of the working directory.
     configure_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/driver-installer.rc.in"
         "${CMAKE_CURRENT_BINARY_DIR}/driver-installer_gen.rc"
@@ -42,6 +43,7 @@ target_link_libraries(driver-installer
     advapi32
     kernel32
     user32
+    shell32
 )
 
 # Install rule (optional)

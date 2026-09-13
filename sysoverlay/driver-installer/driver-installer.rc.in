@@ -2,3 +2,6 @@
  * ID must match SYS_RES_ID in src/driver-installer.c. */
 #define SYS_RES_ID 101
 SYS_RES_ID SYS "@SYS_PATH@"
+
+/* Application manifest (id 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID, type 24 = RT_MANIFEST). */
+1 24 "@MANIFEST_PATH@"
