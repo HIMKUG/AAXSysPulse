@@ -1578,6 +1578,7 @@ fn on_title_btn(ctx: &mut SettingsCtx, btn: TitleBtn) {
         TitleBtn::Min => {
             unsafe { let _ = ShowWindow(find_hwnd(ctx), SW_HIDE); }
             crate::probe::log("[settings] titlebar min (hidden)");
+            crate::mem_tune::trim("settings minimized");
         }
         TitleBtn::Close => {
             unsafe { let _ = PostMessageW(find_hwnd(ctx), WM_CLOSE, WPARAM(0), LPARAM(0)); }
@@ -1667,6 +1668,8 @@ unsafe fn on_wm_exitsizemove(hwnd: HWND, _msg: u32, _wparam: WPARAM, _lparam: LP
             let _ = config_io::save_config_async(&c);
             }
             }
+            // 设置窗拖拽/缩放结束：触碰过的页面即将转冷，主动修剪一次。
+            crate::mem_tune::trim("settings drag-end");
             LRESULT(0)
         }
 
@@ -2414,6 +2417,8 @@ unsafe fn on_wm_close(hwnd: HWND, _msg: u32, _wparam: WPARAM, _lparam: LPARAM) -
             }
             }
             let _ = ShowWindow(hwnd, SW_HIDE);
+            // 设置页隐藏：本次构建/滚动触碰的页面全部转冷，主动修剪一次。
+            crate::mem_tune::trim("settings closed");
             LRESULT(0)
         }
 

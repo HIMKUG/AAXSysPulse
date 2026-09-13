@@ -46,6 +46,7 @@ pub mod render_d2d;
 pub mod din_bitmap;
 pub mod restart;
 pub mod app_icon;
+pub mod mem_tune;
 
 // Re-export core types for convenience
 pub use aaxsyspulse_core::config::Config;

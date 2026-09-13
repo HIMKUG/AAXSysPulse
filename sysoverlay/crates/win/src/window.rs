@@ -457,6 +457,9 @@ unsafe extern "system" fn wndproc(
                     crate::render_thread::request(hwnd, &state.cfg);
                 }
             }
+            // 拖拽/缩放刚结束：交互触碰的大量页面即将转冷，主动修剪一次
+            // （60s 节流；渲染热页下一帧软故障即回，无正确性影响）。
+            crate::mem_tune::trim("overlay drag-end");
             LRESULT(0)
         }
 

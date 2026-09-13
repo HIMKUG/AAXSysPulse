@@ -291,6 +291,9 @@ fn main() {
     ));
     publish_schedule_cfg(&cfg);
 
+    // ── 4b''. 内存主动适配：内存优先级 VERY_LOW + 启动稳定修剪（见 mem_tune 模块头）──
+    aaxsyspulse_win::mem_tune::init();
+
     // ── 4b'. 诊断模式：AAXSYSPULSE_DIAG 自动打开辅助窗口（子串匹配）──
     // 无人值守复现与二分定位用（配合 AAXSYSPULSE_PERF=1 / AAXSYSPULSE_PROBE=1
     // 收集 UI 线程卡顿与 CPU 占用证据）：
@@ -413,6 +416,11 @@ fn main() {
                 }
                 aaxsyspulse_win::gdi::WatchdogAction::None => {}
             }
+
+            // 内存自适应：键鼠闲置 ≥5min → 修剪一次工作集（单次闲置期只修一次，
+            // 60s 节流在函数内）。挂在采样心跳而非 WM_TIMER：CLOCK/ANIM 定时器
+            // 随显示状态启停，采样心跳（全源关闭仍有 30s 慢心跳）才是常驻周期。
+            aaxsyspulse_win::mem_tune::tick_idle_check();
 
             // 源启停转换：禁用 → 释放后端资源（驱动服务/厂商库/缓存）；
             // 启用 → 重置基线防毛刺。Power 行刚关时置 flush 标记，
