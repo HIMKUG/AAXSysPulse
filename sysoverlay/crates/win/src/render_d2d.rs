@@ -24,7 +24,7 @@
 //!   不存在跨线程 DC 共享。
 
 use std::collections::HashMap;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
 
 use windows::core::{w, Interface, PCWSTR};
@@ -41,7 +41,7 @@ use windows::Win32::Graphics::Direct2D::{
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteFactory5, IDWriteFontCollection,
     IDWriteFontCollection1, IDWriteFontFile, IDWriteFontSet, IDWriteFontSetBuilder1,
-    IDWriteStringList, IDWriteTextFormat, IDWriteTextLayout, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_PROPERTY_ID_FAMILY_NAME, DWRITE_FONT_STRETCH_NORMAL,
+    IDWriteStringList, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_PROPERTY_ID_FAMILY_NAME, DWRITE_FONT_STRETCH_NORMAL,
     DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL,
     DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_METRICS, DWRITE_WORD_WRAPPING_NO_WRAP,
 };
@@ -69,6 +69,9 @@ struct RtCache {
     w: i32,
     h: i32,
     mem_dc: HDC,
+    /// RT 世代号：每次重建（尺寸变化 / 设备丢失）自增。
+    /// 画刷缓存以它为键的一部分——画刷属于某个 RT，跨 RT 复用会画到旧 DC 上。
+    gen: u64,
 }
 
 thread_local! {
@@ -77,11 +80,155 @@ thread_local! {
         w: 0,
         h: 0,
         mem_dc: HDC(std::ptr::null_mut()),
+        gen: 0,
     }) };
 }
 
 thread_local! {
     static RT_DEVICE_LOST: RefCell<bool> = const { RefCell::new(false) };
+}
+
+// 文字格式缓存（进程级/线程级，**跨帧保留**）。
+//
+// 只依赖 DWrite 全局工厂 + `din_font` 的进程级私有字体集，与 RT 无关，
+// 因此可以跨帧、跨 RT 复用。键 =（字号量化, 字重）。
+//
+// ⚠️ 2026-09-14：此前该缓存挂在 `D2DSurface` 上，而 `D2DSurface::bind` 每帧
+// 新建实例 → 缓存每帧从空开始 → **每帧重复 `CreateTextFormat`**（字体集查找 +
+// font face 解析，非廉价）。改为 thread_local 后只创建一次。
+thread_local! {
+    static FORMAT_CACHE: RefCell<HashMap<(u32, u32), IDWriteTextFormat>> =
+        RefCell::new(HashMap::new());
+}
+
+// 画刷缓存（跨帧保留，**随 RT 世代失效**）。
+struct BrushCache {
+    gen: u64,
+    map: HashMap<(u8, u8, u8, u8), ID2D1SolidColorBrush>,
+}
+
+thread_local! {
+    static BRUSH_CACHE: RefCell<BrushCache> = RefCell::new(BrushCache {
+        gen: u64::MAX,
+        map: HashMap::new(),
+    });
+}
+
+/// 当前 RT 世代号（未创建过 RT 时为 0）。
+fn rt_gen() -> u64 {
+    RT_CACHE.with(|c| c.borrow().gen)
+}
+
+/// 取（或创建）画刷。RT 世代变了（重建）即整体丢弃重建，避免把画刷留在旧 DC 上。
+fn cached_brush(rt: &ID2D1DCRenderTarget, c: Rgba) -> Option<ID2D1SolidColorBrush> {
+    let gen = rt_gen();
+    let key = (c.r, c.g, c.b, c.a);
+    BRUSH_CACHE.with(|bc| {
+        let mut bc = bc.borrow_mut();
+        if bc.gen != gen {
+            bc.map.clear();
+            bc.gen = gen;
+        }
+        if let Some(b) = bc.map.get(&key) {
+            return Some(b.clone());
+        }
+        let b: ID2D1SolidColorBrush = unsafe { rt.CreateSolidColorBrush(&straight(c), None).ok()? };
+        bc.map.insert(key, b.clone());
+        Some(b)
+    })
+}
+
+/// 取（或创建）文字格式。只依赖全局 DWrite 工厂与进程级字体集，跨帧安全。
+fn cached_text_format(px: f32, weight: u8) -> Option<IDWriteTextFormat> {
+    let key = ((px * 4.0).round() as u32, weight as u32);
+    FORMAT_CACHE.with(|fc| {
+        let mut fc = fc.borrow_mut();
+        if let Some(f) = fc.get(&key) {
+            return Some(f.clone());
+        }
+        let dwrite = dwrite_factory()?;
+        // 高画质模式字体：DIN 三版（私有字体集，进程级加载一次，按字重取档）；
+        // 文件缺失/加载失败 → 回退系统 Segoe UI（按其真实字重档位）。
+        let f: IDWriteTextFormat = match din_font(weight) {
+            Some(cf) => unsafe {
+                let col: IDWriteFontCollection = cf.collection.cast().ok()?;
+                dwrite
+                    .CreateTextFormat(
+                        PCWSTR(cf.family.as_ptr()),
+                        Some(&col),
+                        DWRITE_FONT_WEIGHT_NORMAL,
+                        DWRITE_FONT_STYLE_NORMAL,
+                        DWRITE_FONT_STRETCH_NORMAL,
+                        px,
+                        w!(""),
+                    )
+                    .ok()?
+            },
+            None => unsafe {
+                dwrite
+                    .CreateTextFormat(
+                        w!("Segoe UI"),
+                        None,
+                        dwrite_weight(weight),
+                        DWRITE_FONT_STYLE_NORMAL,
+                        DWRITE_FONT_STRETCH_NORMAL,
+                        px,
+                        w!(""),
+                    )
+                    .ok()?
+            },
+        };
+        unsafe {
+            let _ = f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            let _ = f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        }
+        fc.insert(key, f.clone());
+        Some(f)
+    })
+}
+
+// ── 帧内细分段计时（诊断用，PERF=1 才有值） ────────────────
+//
+// seg_draw（D2D 绘制 1274µs，帧成本最大单项）此前只有总数、无内部分解，
+// 导致"引擎固有成本、无单点肥肉"的结论缺证据。这里在 cell 级循环里自累加
+// 四类候选成本，帧末一条 `note_section_us` 落盘（避免上万条样本撑爆缓冲）。
+
+const ACC_FMT: usize = 0;
+const ACC_BRUSH: usize = 1;
+const ACC_LAYOUT: usize = 2;
+const ACC_TEXT: usize = 3;
+
+thread_local! {
+    static SEG_ACC: Cell<[u64; 4]> = const { Cell::new([0; 4]) };
+}
+
+/// 累加一段耗时到 `SEG_ACC[idx]`（`start == 0` 时零成本返回）。
+fn acc_add(idx: usize, start: u64) {
+    if start == 0 {
+        return;
+    }
+    let us = crate::perf::elapsed_since(start);
+    SEG_ACC.with(|c| {
+        let mut a = c.get();
+        a[idx] += us;
+        c.set(a);
+    });
+}
+
+/// 帧末（gdi::render_d2d 读完 seg_draw 之后）调用：把累加值落进 perf 段样本并清零。
+/// 全部为 0（PERF 关闭）时不做任何事。
+pub fn flush_seg_acc() {
+    SEG_ACC.with(|c| {
+        let a = c.get();
+        if a == [0; 4] {
+            return;
+        }
+        c.set([0; 4]);
+        crate::perf::note_section_us("seg_d2d_fmt", a[ACC_FMT]);
+        crate::perf::note_section_us("seg_d2d_brush", a[ACC_BRUSH]);
+        crate::perf::note_section_us("seg_d2d_layout", a[ACC_LAYOUT]);
+        crate::perf::note_section_us("seg_d2d_text", a[ACC_TEXT]);
+    });
 }
 
 /// 将文本编码为 UTF16，返回 Vec。
@@ -100,6 +247,7 @@ fn get_or_create_rt(mem_dc: HDC, w: i32, h: i32) -> Option<ID2D1DCRenderTarget> 
             w: b.w,
             h: b.h,
             mem_dc: b.mem_dc,
+            gen: b.gen,
         }
     });
 
@@ -141,6 +289,8 @@ fn get_or_create_rt(mem_dc: HDC, w: i32, h: i32) -> Option<ID2D1DCRenderTarget> 
     cache.w = w;
     cache.h = h;
     cache.mem_dc = mem_dc;
+    // 世代自增：通知画刷缓存整体失效（见 RtCache::gen 注释）。
+    cache.gen = cache.gen.wrapping_add(1);
     RT_DEVICE_LOST.with(|flag| *flag.borrow_mut() = false);
     crate::probe::log(&format!("d2d rt cache: created/rebuilt {}x{}", w, h));
     let result = cache.rt.clone();
@@ -286,11 +436,6 @@ fn dwrite_weight(weight: u8) -> DWRITE_FONT_WEIGHT {
 /// 绑到 DIB 内存 DC 的 D2D 离屏渲染目标；实现 `ui::RenderTarget` 供悬浮窗复用。
 pub struct D2DSurface {
     rt: ID2D1DCRenderTarget,
-    dwrite: IDWriteFactory,
-    /// 文字格式缓存：(字号px 量化, 字重) → TextFormat。
-    formats: HashMap<(u32, u32), IDWriteTextFormat>,
-    /// 画刷缓存：(r,g,b,a) → 直色画刷。
-    brushes: HashMap<(u8, u8, u8, u8), ID2D1SolidColorBrush>,
     /// 本帧已绘制的**最右文本右缘**（DWrite 实测，含宽度）。布局按位图字体度量
     /// 计算 cell 几何，DIN 真字形通常更宽 → 实测右缘超出窗口即被右缘裁掉。
     /// gdi::render_d2d 在 end_draw 后读取它做自愈扩窗（一次到位，无需估算余量）。
@@ -305,71 +450,18 @@ impl D2DSurface {
     /// 这里改为使用 `get_or_create_rt` 缓存——尺寸不变时复用已创建的 RT，
     /// 仅在尺寸变化或设备丢失时重建。
     pub fn bind(mem_dc: HDC, w: i32, h: i32) -> Option<Self> {
-        let dwrite = dwrite_factory()?;
         let rt = get_or_create_rt(mem_dc, w, h)?;
         Some(Self {
             rt,
-            dwrite: dwrite.clone(),
-            formats: HashMap::new(),
-            brushes: HashMap::new(),
             max_text_right: 0.0,
         })
     }
 
-    fn brush(&mut self, c: Rgba) -> Option<&ID2D1SolidColorBrush> {
-        let key = (c.r, c.g, c.b, c.a);
-        if !self.brushes.contains_key(&key) {
-            let b = unsafe {
-                self.rt
-                    .CreateSolidColorBrush(&straight(c), None)
-                    .ok()?
-            };
-            self.brushes.insert(key, b);
-        }
-        self.brushes.get(&key)
-    }
-
-    fn text_format(&mut self, px: f32, weight: u8) -> Option<&IDWriteTextFormat> {
-        let key = ((px * 4.0).round() as u32, weight as u32);
-        if !self.formats.contains_key(&key) {
-            // 高画质模式字体：DIN 三版（私有字体集，进程级加载一次，按字重取档）；
-            // 文件缺失/加载失败 → 回退系统 Segoe UI（按其真实字重档位）。
-            let f: IDWriteTextFormat = match din_font(weight) {
-                Some(cf) => unsafe {
-                    let col: IDWriteFontCollection = cf.collection.cast().ok()?;
-                    self.dwrite
-                        .CreateTextFormat(
-                            PCWSTR(cf.family.as_ptr()),
-                            Some(&col),
-                            DWRITE_FONT_WEIGHT_NORMAL,
-                            DWRITE_FONT_STYLE_NORMAL,
-                            DWRITE_FONT_STRETCH_NORMAL,
-                            px,
-                            w!(""),
-                        )
-                        .ok()?
-                },
-                None => unsafe {
-                    self.dwrite
-                        .CreateTextFormat(
-                            w!("Segoe UI"),
-                            None,
-                            dwrite_weight(weight),
-                            DWRITE_FONT_STYLE_NORMAL,
-                            DWRITE_FONT_STRETCH_NORMAL,
-                            px,
-                            w!(""),
-                        )
-                        .ok()?
-                },
-            };
-            unsafe {
-                let _ = f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                let _ = f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-            }
-            self.formats.insert(key, f);
-        }
-        self.formats.get(&key)
+    fn brush(&mut self, c: Rgba) -> Option<ID2D1SolidColorBrush> {
+        let t = crate::perf::begin();
+        let b = cached_brush(&self.rt, c);
+        acc_add(ACC_BRUSH, t);
+        b
     }
 
     /// 在 (x,y) 处用 DWrite 画一段文字（含可选阴影/描边，镜像 draw_row_text 语义）。
@@ -396,57 +488,67 @@ impl D2DSurface {
             return;
         }
         let px = d2d_font_px(scale);
-        let fmt = match self.text_format(px, weight) {
-            Some(f) => f.clone(),
+        let t_fmt = crate::perf::begin();
+        let fmt = cached_text_format(px, weight);
+        acc_add(ACC_FMT, t_fmt);
+        let Some(fmt) = fmt else { return };
+        // 画刷先解析一次（每个 cell 最多两种颜色：主色 + 阴影/描边色），
+        // 不在描边 4 次循环里重复查缓存。
+        let brush_main = match self.brush(color) {
+            Some(b) => b,
             None => return,
         };
+        let brush_shade = if outline || shadow { self.brush(shade) } else { None };
+
+        let t_lay = crate::perf::begin();
         let text_buf = encode_text(text);
-        let layout: IDWriteTextLayout = match unsafe {
-            self.dwrite
-                .CreateTextLayout(&text_buf, &fmt, 1e6, 1e6)
-        } {
-            Ok(l) => l,
-            Err(_) => return,
-        };
-        let mut tm = DWRITE_TEXT_METRICS::default();
-        unsafe {
-            let _ = layout.GetMetrics(&mut tm);
-        }
-        let actual_w = tm.widthIncludingTrailingWhitespace;
+        let lay = dwrite_factory()
+            .and_then(|d| unsafe { d.CreateTextLayout(&text_buf, &fmt, 1e6, 1e6).ok() })
+            .map(|l| {
+                let mut tm = DWRITE_TEXT_METRICS::default();
+                unsafe {
+                    let _ = l.GetMetrics(&mut tm);
+                }
+                (l, tm.widthIncludingTrailingWhitespace)
+            });
+        acc_add(ACC_LAYOUT, t_lay);
+        let Some((layout, actual_w)) = lay else { return };
         // 右对齐修正：布局锚点 = x + 位图度量宽（与 cell_sig 用同一度量函数）。
         let base_x = if right_align {
             x as f32 + aaxsyspulse_ui::font::measure_scaled_f(text, scale) as f32 - actual_w
         } else {
             x as f32
         };
-        let draw = |surface: &mut Self, ox: i32, oy: i32, col: Rgba| {
-            let b = match surface.brush(col) {
-                Some(b) => b.clone(),
-                None => return,
-            };
+        let draw = |surface: &mut Self, ox: i32, oy: i32, b: &ID2D1SolidColorBrush| {
             // 自愈扩窗依据：DWrite 实测该行文本右缘（DIN 真字形宽度，非位图度量）。
             let right = base_x + ox as f32 + actual_w;
             if right > surface.max_text_right {
                 surface.max_text_right = right;
             }
+            let t = crate::perf::begin();
             unsafe {
                 surface.rt.DrawTextLayout(
                     D2D_POINT_2F { x: base_x + ox as f32, y: (y + oy) as f32 },
                     &layout,
-                    &b,
+                    b,
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
                 );
             }
+            acc_add(ACC_TEXT, t);
         };
         if outline {
-            draw(self, -1, 0, shade);
-            draw(self, 1, 0, shade);
-            draw(self, 0, -1, shade);
-            draw(self, 0, 1, shade);
+            if let Some(b) = &brush_shade {
+                draw(self, -1, 0, b);
+                draw(self, 1, 0, b);
+                draw(self, 0, -1, b);
+                draw(self, 0, 1, b);
+            }
         } else if shadow {
-            draw(self, 1, 1, shade);
+            if let Some(b) = &brush_shade {
+                draw(self, 1, 1, b);
+            }
         }
-        draw(self, 0, 0, color);
+        draw(self, 0, 0, &brush_main);
     }
 
     /// 开始一帧绘制（**必须**在 clear/任何绘制前调用）。
@@ -496,7 +598,7 @@ impl RenderTarget for D2DSurface {
             return;
         }
         let b = match self.brush(color) {
-            Some(b) => b.clone(),
+            Some(b) => b,
             None => return,
         };
         let rr = D2D1_ROUNDED_RECT {
@@ -517,7 +619,7 @@ impl RenderTarget for D2DSurface {
             return;
         }
         let b = match self.brush(color) {
-            Some(b) => b.clone(),
+            Some(b) => b,
             None => return,
         };
         unsafe {
@@ -541,8 +643,9 @@ impl RenderTarget for D2DSurface {
     fn measure_text(&self, s: &str, _font: aaxsyspulse_ui::FontSpec) -> (i32, i32) {
         // 一次性 format（不走缓存：&self；此方法在 cell 绘制路径不被调用，仅为 trait 完整性）。
         let fallback = (s.len() as i32 * 8, 16);
+        let Some(dwrite) = dwrite_factory() else { return fallback };
         let fmt: IDWriteTextFormat = match unsafe {
-            self.dwrite.CreateTextFormat(
+            dwrite.CreateTextFormat(
                 w!("Segoe UI"),
                 None,
                 DWRITE_FONT_WEIGHT_NORMAL,
@@ -556,9 +659,7 @@ impl RenderTarget for D2DSurface {
             Err(_) => return fallback,
         };
         let text_buf = encode_text(s);
-        let layout = match unsafe {
-            self.dwrite.CreateTextLayout(&text_buf, &fmt, 1e6, 1e6)
-        } {
+        let layout = match unsafe { dwrite.CreateTextLayout(&text_buf, &fmt, 1e6, 1e6) } {
             Ok(l) => l,
             Err(_) => return fallback,
         };

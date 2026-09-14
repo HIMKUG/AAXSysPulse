@@ -1707,24 +1707,23 @@ unsafe fn on_wm_mousewheel(hwnd: HWND, _msg: u32, wparam: WPARAM, lparam: LPARAM
             let (_, vp_h) = content_viewport(d, ctx.client_size.0, ctx.client_size.1);
             let content_h = ctx.pages[ctx.page].h;
 
-            // 一步 = 行高，并把 notch 数（raw/120）整倍数化，
-            // 高精度滚轮（触控板）的小增量也被正确保留。
+            // 一格 = 一拍：把 scroll_y 直接推进一步，**不注入惯性**。
+            //
+            // 旧实现在此写入 `scroll_vel = -delta / 0.033`，而帧循环每帧都用
+            // `motion::project(vel)` 从**当前**位置重新投射目标、且 vel 从不衰减：
+            // 目标每帧再前移 30+px，弹簧一路追到底部/顶部才被 clamp 停住 ——
+            // 表现就是「滚一格，窗口一直滑到底」。
+            // 滚轮是精确输入，与滚动条拖拽同理（见 drag 分支）：清零惯性 +
+            // 对齐弹簧，落点即终点。
             let step = scrollbar::wheel_step(d);
             let delta = raw as f32 / 120.0 * step;
             // 减号：向上滚 → scroll_y 减小（修复旧实现的符号反）。
             let max = (content_h - vp_h).max(0) as f32;
-            let nv = ctx.pages[ctx.page].scroll_y as f32 - delta;
-
-            let clamped = if nv < 0.0 {
-            -motion::rubber_band(-nv, vp_h as f32, 0.55)
-            } else if nv > max {
-            max + motion::rubber_band(nv - max, vp_h as f32, 0.55)
-            } else {
-            nv
-            };
-            ctx.pages[ctx.page].scroll_y = clamped.round() as i32;
-            // 惯性速度（px/s），方向与 delta 相反（减）。
-            ctx.scroll_vel = -delta / 0.033;
+            // 末端**硬夹**、不再橡胶回弹：惯性弹簧已不存在，越界量无人拉回，
+            // 若保留 rubber_band 会把 scroll_y 永久停在负数/超界值上。
+            let nv = (ctx.pages[ctx.page].scroll_y as f32 - delta).clamp(0.0, max);
+            ctx.pages[ctx.page].scroll_y = nv.round() as i32;
+            ctx.scroll_vel = 0.0;
             ctx.scroll_spring.set(ctx.pages[ctx.page].scroll_y as f32);
             let _ = InvalidateRect(hwnd, None, false);
             }
@@ -2568,9 +2567,14 @@ fn paint_d2d(hwnd: HWND) -> bool {
     // （实测单帧 ~2.4ms ≈ 单核 10%，是 CPU 占用回退 0.1-0.2%→0.6% 的主因）。
     let release_moving = ctx.drag_release.is_some() && !step_drag_release(ctx, dt);
 
-    // H4：滚动惯性——动量投射 → 行吸附 → 弹簧趋近（收敛即停）。
-    // 滚轮惯性：动量投射 → 行吸附 → 弹簧趋近（收敛即停）。
+    // 滚动惯性：动量投射 → 行吸附 → 弹簧趋近（收敛即停）。
     // 方向约定：scroll_vel 与 scroll_y 同号（正值 = 继续向下滚）。
+    //
+    // ⚠️ 当前**无输入源**会写入非零 scroll_vel：滚轮已改为「一格 = 一拍」的
+    // 离散步进（见 on_wm_mousewheel），拖拽路径也会主动清零。即本分支是
+    // 休眠状态，保留是为了将来接入触控板惯性手势。若要重新启用，必须先修掉
+    // 「每帧从当前位置重新投射 → 目标一路前移到底」的问题（动量落点应在
+    // 手势结束时**一次性**算定，而不是每帧重算）。
     if ctx.scroll_vel.abs() > 1.0 {
         let (_, vp_h) = content_viewport(dpi, ctx.client_size.0, ctx.client_size.1);
         let page = &mut ctx.pages[ctx.page];

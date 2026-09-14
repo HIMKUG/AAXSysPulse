@@ -19,15 +19,21 @@
 //! 「内容指纹跳过 + 脏区上传」架构只在以下前提下成立；每条都有 2026-09-12
 //! 实测背书（见 docs/悬浮窗性能恢复计划.md 与 PERF_ANALYSIS.md 顶部勘误）：
 //!
-//! 1. **空间稀疏**：脏区必须物理上小于整窗。`show_time` 开启时时钟每秒变化，
-//!    脏区 = 整窗（0.3 实验 pct=100%，n=113 无一例外）→ Rect 上传零收益。
-//!    这是物理现实不是 bug，别再去"修"它。
+//! 1. **空间稀疏**：脏区必须物理上小于整窗。0.3 实验（pct=100%，n=113 无一例外）
+//!    的成因是当时 `show_time` 下**每秒时钟变化强制 `Dirty::Full`**（历史
+//!    workaround，见 85fe335「force full ULW on second change」），不是脏区模型
+//!    算大了。该强制逻辑已随 023c91e（pptSrc 根因修复）删除，删除后单格变化的
+//!    时钟帧实测 pct=5（见 docs/悬浮窗性能恢复计划.md）。
+//!    2026-09-14 的 `Dirty::Rects`（连通分量多矩形）针对的是另一种退化：
+//!    **同帧多个互不相邻的格变化**时，单并集矩形会把两格之间的空隙一起上传。
+//!    注意它不改善单格变化帧（那种帧旧模型已经只上传该格）。
 //! 2. **时间稀疏**：内容在两次采样间稳定。跳帧率对内容节奏敏感（实测 9% 与
 //!    0% 两现）——高频变更内容下跳过率归零，收益消失。
 //! 3. **ULWIndirect 语义**：整窗 DIB 的 `pptSrc` 必须 = (0,0)（窗口左上角在源
 //!    DC 中的对齐点），写脏区左上角会与 `prcDirty` 叠加成 2× 偏移。这是本模块
-//!    全部 Rect 上传的根基——任何新增上传路径都照抄（upload_dib / present 两处
-//!    已一致），别凭直觉改。
+//!    全部脏矩形上传的根基——`ulw_indirect_rect`（2026-09-14 从 present 与
+//!    upload_dib 里抽出的）是本模块**唯一** ULWIndirect 出口，任何新增上传
+//!    路径都照抄它，别凭直觉改。
 //! 4. **收益已到顶**：整条管线空闲 1.3% 单核；P0 分解 seg_draw=1274µs 是 D2D
 //!    引擎固有成本、无单点肥肉，P2 已依红线关闭。不要为再挤 1% 动架构。
 //! 5. **引擎正确性**：D2D↔GDI 引擎切换必须强制整窗（`ENGINE_HASH_XOR` 让指纹
@@ -237,6 +243,11 @@ static LAST_FRAME_HASH: std::sync::atomic::AtomicU64 =
 /// 脏矩形上屏开关：`AAXSYSPULSE_NODIRTY=1` 时退回经典整窗上传（A1 回退）。
 static DIRTY_DISABLED: LazyLock<bool> =
     LazyLock::new(|| std::env::var("AAXSYSPULSE_NODIRTY").map(|v| v == "1").unwrap_or(false));
+
+/// 上屏失败后的整窗恢复闸门：任一 ULW/ULWIndirect 失败即置位，下一帧
+/// `compute_dirty_in` 消费之并强制整窗。与"帧指纹回滚"配合使用：
+/// 指纹回滚保证重试帧不被跳过，本闸门保证重试帧整窗覆盖（缺一会冻结）。
+static NEEDS_FULL_REUPLOAD: AtomicBool = AtomicBool::new(false);
 
 /// 脏矩形追踪：上一帧各文字 cell 的几何 + 内容指纹（A1 比对源）。
 static PREV_CELLS: OnceLock<Mutex<Vec<CellSig>>> = OnceLock::new();
@@ -487,15 +498,42 @@ fn present_size_changed(width: i32, height: i32) -> bool {
     prev != cur
 }
 
-/// 脏区：整窗或子矩形。
+/// 脏区：整窗，或若干连通分量矩形（可能边缘相碰，语义上互不重叠的"变化区域簇"）。
+///
+/// 多矩形语义：每个矩形独立走一次 `UpdateLayeredWindowIndirect(prcDirty=矩形)`，
+/// `pptSrc` 恒为 (0,0)（见文件头适用边界第 3 条）。空向量 = 本帧没有任何像素变化
+/// → 跳过上屏（DIB 与窗口显示本就一致；该分支接替了旧"无变化 → Full"承担的
+/// 失败自愈职责，改由 [`NEEDS_FULL_REUPLOAD`] 闸门承担）。
+/// 分量数超过 [`MAX_DIRTY_RECTS`] 时折叠为 `Full`，防病态布局下的系统调用风暴。
+#[derive(Debug)]
 enum Dirty {
     Full,
-    Rect(RECT),
+    Rects(Vec<RECT>),
 }
 
 impl Dirty {
     fn is_full(&self) -> bool {
         matches!(self, Dirty::Full)
+    }
+}
+
+/// 脏区分量上限。横条布局 ≤ 10 格（MetricRow 上限），8 绰绰有余；
+/// 触顶说明布局病态或调用方漏判 Full 条件，保守整窗。
+const MAX_DIRTY_RECTS: usize = 8;
+
+/// 探针用脏区摘要："Full" / "None(skip)" / "Rects(n=2, (l,t,r,b) (l,t,r,b))"。
+fn fmt_dirty(dirty: &Dirty) -> String {
+    match dirty {
+        Dirty::Full => "Full".into(),
+        Dirty::Rects(rs) if rs.is_empty() => "None(skip)".into(),
+        Dirty::Rects(rs) => format!(
+            "Rects(n={}, {})",
+            rs.len(),
+            rs.iter()
+                .map(|r| format!("({},{},{},{})", r.left, r.top, r.right, r.bottom))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
     }
 }
 
@@ -565,7 +603,7 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
 
         // 引擎切换检测：性能 ↔ 高画质 切换后强制整窗重绘。
         // 两引擎的 cell 内容指纹完全相同（文本/几何/颜色一致），只有像素外观
-        // 不同 → 脏区比对结果为「无变化」→ Rect(空) 上传等于什么都没上传，
+        // 不同 → 脏区比对结果为「无变化」→ Rects(空) 直接跳过上屏，
         // 画面停留在旧引擎像素，直到悬停改变 alpha 触发整窗重画
         // （实测症状：切引擎后必须鼠标悬停才生效）。这里在指纹层面强制失效。
         static LAST_ENGINE: AtomicU8 = AtomicU8::new(u8::MAX);
@@ -670,10 +708,11 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
         let Ok(mut surface) = surface.lock() else { return };
         surface.resize(width.max(1), height.max(1));
 
-        // 脏区（A1）：alpha / cell 数 / cell 位置变化 → 整窗；否则内容变更的 cell 并集。
+        // 脏区（A1）：alpha / cell 数 / cell 位置变化 → 整窗；否则内容变化的 cell
+        // 按包围盒**连通分量**聚成若干脏矩形（空隙不再被捎带上传）。
         // changed 位图供 paint 跳过未变化 cell（标签不重画，v3 性能档）。
         // ⚠️ 尺寸相对上次送屏有变 → 画布与 DIB 都被清零重建，必须整窗重画+整窗上传，
-        // 否则 Rect 上传会让非脏区域变全透明（实测：上半部分和左侧消失）。
+        // 否则脏矩形上传会让非脏区域变全透明（实测：上半部分和左侧消失）。
         let (mut dirty, mut changed) = compute_dirty(&cells, src_alpha);
         // 设置面板触发的重绘：强制整窗（局部 ULW 在部分合成器上不生效 → 颜色/粗细
         // 「看起来没刷新」，实测证据见 force_full_refresh 注释）。
@@ -684,7 +723,7 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
         // 时钟秒变化 → 曾强制整窗（旧注释：Rect 局部上传 ULW 成功但不重混）。
         // ✅ 根因已修（2026-09-12）：那不是驱动/DWM 问题，是 upload_dib 里
         // pptSrc 坐标语义错误（2× 偏移），对照实验见 docs/悬浮窗性能恢复计划.md。
-        // Rect 局部上传恢复信任，时钟秒走正常脏区路径。
+        // 脏矩形上传恢复信任，时钟秒走正常脏区路径（多矩形后只上传时间格本身）。
         let present_sec = aaxsyspulse_ui::clock::get().2;
 
         // 绘制（A3：仅首帧/alpha/布局变化才整画布清零，否则只清脏区 cell）
@@ -697,6 +736,8 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
             if dirty.is_full() { None } else { Some(&changed) },
         );
 
+        // 跳过上屏的帧（Rects 空，无像素变化）返回 true：该秒的画面内容
+        // 本就已在窗口上，快速跳过路径据此记账是正确的。
         if present(hwnd, &surface, width, height, src_alpha, &dirty) {
             LAST_PRESENTED_SEC.store(present_sec, AtomicOrdering::Relaxed);
         } else {
@@ -751,14 +792,21 @@ fn compute_dirty_in(
     let Ok(mut prev) = prev.lock() else {
         return (Dirty::Full, all());
     };
+    // 上屏失败恢复：上一帧 ULW 失败 → 本帧整窗覆盖（配套帧指纹回滚，见该静态注释）。
+    if NEEDS_FULL_REUPLOAD.swap(false, AtomicOrdering::Relaxed) {
+        *prev = cells.to_vec();
+        prev_alpha.store(src_alpha, AtomicOrdering::Relaxed);
+        return (Dirty::Full, all());
+    }
     if prev_alpha_v != src_alpha || prev.len() != n {
         *prev = cells.to_vec();
         prev_alpha.store(src_alpha, AtomicOrdering::Relaxed);
         return (Dirty::Full, all());
     }
-    let mut union: Option<RECT> = None;
+
+    // 第一遍：找出**内容变化**格（hash 不同）。上传矩形只由这些格构成。
+    let mut content_changed = vec![false; n];
     let mut force_full = false;
-    let mut changed = vec![false; n];
     for (i, (a, b)) in cells.iter().zip(prev.iter()).enumerate() {
         if a.x != b.x || a.y != b.y {
             // 布局漂移：旧位置像素必须随整窗上传清掉
@@ -766,24 +814,7 @@ fn compute_dirty_in(
             break;
         }
         if a.hash != b.hash {
-            changed[i] = true;
-            // 包围盒用 bbox_x（右对齐数值 cell 会向左覆盖整个预留槽位，
-            // 比绘制原点 x 更靠左）——否则数值变化时左侧残影不会被上传清除。
-            let r = RECT {
-                left: a.bbox_x,
-                top: a.y,
-                right: a.bbox_x + a.w,
-                bottom: a.y + a.h,
-            };
-            union = Some(match union {
-                Some(u) => RECT {
-                    left: u.left.min(r.left),
-                    top: u.top.min(r.top),
-                    right: u.right.max(r.right),
-                    bottom: u.bottom.max(r.bottom),
-                },
-                None => r,
-            });
+            content_changed[i] = true;
         }
     }
     *prev = cells.to_vec();
@@ -791,39 +822,100 @@ fn compute_dirty_in(
     if force_full {
         return (Dirty::Full, all());
     }
-    match union {
-        Some(u) => {
-            // 邻接传播至不动点（cell ≤ 10，代价可忽略）
-            loop {
-                let mut grew = false;
-                for i in 0..n {
-                    if !changed[i] {
-                        continue;
-                    }
-                    for j in 0..n {
-                        if changed[j] || i == j {
-                            continue;
-                        }
-                        if cells_intersect(&cells[i], &cells[j]) {
-                            changed[j] = true;
-                            grew = true;
-                        }
-                    }
+
+    // 第二遍：邻接传播（语义与旧版一致，服务 GDI paint 跳格重画）：
+    // 变化格包围盒（含阴影/描边外扩）相交的邻居也要重画——变化格 clear_rect
+    // 会擦掉邻居墨迹。传播只扩 `changed`，**不扩上传矩形**：邻居内容没变，
+    // 重画出的像素与上一帧相同，无需上传（两引擎的字体渲染都是确定性的）。
+    let mut changed = content_changed.clone();
+    loop {
+        let mut grew = false;
+        for i in 0..n {
+            if !changed[i] {
+                continue;
+            }
+            for j in 0..n {
+                if changed[j] || i == j {
+                    continue;
                 }
-                if !grew {
-                    break;
+                if cells_intersect(&cells[i], &cells[j]) {
+                    changed[j] = true;
+                    grew = true;
                 }
             }
-            (Dirty::Rect(u), changed)
         }
-        // 有 cell 内容变化 → 上传其并集；否则（理论不可达）保守整窗
-        None => (Dirty::Full, all()),
+        if !grew {
+            break;
+        }
     }
+
+    // 连通分量：把**内容变化**格按包围盒相交聚成簇，每簇一个 bbox 并集矩形。
+    // 与旧"单一并集"的本质区别：两簇之间的空隙不再被捎带上传。
+    // （不同簇的矩形可能相交——重叠上传无害：拷的是同一份 DIB 内容，无需去重。）
+    let rects = dirty_components(cells, &content_changed);
+    if rects.len() > MAX_DIRTY_RECTS {
+        return (Dirty::Full, all());
+    }
+    (Dirty::Rects(rects), changed)
 }
 
 /// cell 包围盒（已含阴影/描边外扩）相交测试。
 fn cells_intersect(a: &CellSig, b: &CellSig) -> bool {
     a.bbox_x < b.bbox_x + b.w && b.bbox_x < a.bbox_x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+}
+
+/// 把内容变化格按包围盒相交关系聚成连通分量，返回每簇的 bbox 并集矩形。
+/// 并查集实现；cell ≤ 10，O(n²) 可忽略。
+fn dirty_components(cells: &[CellSig], changed: &[bool]) -> Vec<RECT> {
+    let n = cells.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(p: &mut [usize], mut x: usize) -> usize {
+        while p[x] != x {
+            p[x] = p[p[x]];
+            x = p[x];
+        }
+        x
+    }
+    for i in 0..n {
+        if !changed[i] {
+            continue;
+        }
+        for j in (i + 1)..n {
+            if changed[j] && cells_intersect(&cells[i], &cells[j]) {
+                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                if ri != rj {
+                    parent[ri] = rj;
+                }
+            }
+        }
+    }
+    // 归组：root → bbox 并集。包围盒用 bbox_x（右对齐格墨迹左溢，见文件头第 4 条）。
+    let mut acc: Vec<(usize, RECT)> = Vec::new();
+    for i in 0..n {
+        if !changed[i] {
+            continue;
+        }
+        let r = RECT {
+            left: cells[i].bbox_x,
+            top: cells[i].y,
+            right: cells[i].bbox_x + cells[i].w,
+            bottom: cells[i].y + cells[i].h,
+        };
+        let root = find(&mut parent, i);
+        match acc.iter_mut().find(|(root0, _)| *root0 == root) {
+            Some((_, rect)) => {
+                rect.left = rect.left.min(r.left);
+                rect.top = rect.top.min(r.top);
+                rect.right = rect.right.max(r.right);
+                rect.bottom = rect.bottom.max(r.bottom);
+            }
+            None => acc.push((root, r)),
+        }
+    }
+    acc.into_iter().map(|(_, rect)| rect).collect()
 }
 
 /// 逐帧复用的离屏画布（P2）。
@@ -940,9 +1032,11 @@ impl DibCache {
 /// 把 SoftwareSurface 上屏（DIB + UpdateLayeredWindow / UpdateLayeredWindowIndirect）。
 ///
 /// `src_alpha` 为全局恒定 alpha（透明度 × 悬停系数，0..=255）。
-/// `dirty` 决定整窗上传还是只上传脏区子矩形（A1/A2）：
-/// - `Dirty::Full` 或 `AAXSYSPULSE_NODIRTY=1` → 经典 `UpdateLayeredWindow`。
-/// - `Dirty::Rect` → `UpdateLayeredWindowIndirect` + `prcDirty`，只上传该子区。
+/// `dirty` 决定上屏方式（A1/A2）：
+/// - `Dirty::Full` 或 `AAXSYSPULSE_NODIRTY=1` → 整窗拷贝 + 经典 `UpdateLayeredWindow`。
+/// - `Dirty::Rects(rects)` → 逐矩形拷进 DIB + 逐矩形 ULWIndirect；空列表 = 无像素
+///   变化，跳过上屏（DIB 与窗口内容本就一致）。
+/// 返回 false = 上屏失败（调用方回滚帧指纹；NEEDS_FULL_REUPLOAD 保证下帧整窗恢复）。
 #[allow(clippy::too_many_arguments)]
 fn present(
     hwnd: HWND,
@@ -969,13 +1063,6 @@ fn present(
             return false;
         };
 
-        // A2：只拷脏区子矩形（Full 则整窗），省掉整窗 187KB 中间拷贝
-        let rect = match dirty {
-            Dirty::Full => RECT { left: 0, top: 0, right: width, bottom: height },
-            Dirty::Rect(r) => *r,
-        };
-        copy_rect_to_dib(bits, surface, &rect, width, height);
-
         // pptDst 传 NULL：保持窗口当前位置。
         // 若传 Some((0,0))，UpdateLayeredWindow 会把窗口挪到该坐标——
         // 这正是旧版"一拖动就弹回原位"的元凶（每帧渲染都重置位置）。
@@ -988,6 +1075,9 @@ fn present(
         };
 
         let ok = if *DIRTY_DISABLED || matches!(dirty, Dirty::Full) {
+            // A2 整窗拷贝（历史：187KB 中间拷贝在 Full 帧不可避免）
+            let rect = RECT { left: 0, top: 0, right: width, bottom: height };
+            copy_rect_to_dib(bits, surface, &rect, width, height);
             let src_pt = POINT::default();
             UpdateLayeredWindow(
                 hwnd,
@@ -1001,39 +1091,30 @@ fn present(
                 windows::Win32::UI::WindowsAndMessaging::ULW_ALPHA,
             )
             .is_ok()
-        } else if let Dirty::Rect(r) = dirty {
-            // 脏矩形上传：只更新 r 对应子区，DWM 只重混这一小块。
-            // ⚠️ pptSrc 语义 = 窗口左上角在源 DC 中的对齐点：整窗 DIB 必须写 (0,0)。
-            // 写 (r.left, r.top) 会与窗口坐标的 prcDirty 叠加成 2× 偏移——ULW 返回
-            // 成功但贴错像素，即历史「时钟冻结」根因（对照实验见
-            // docs/悬浮窗性能恢复计划.md）。本 GDI 兜底路径与 upload_dib（D2D 路径）
-            // 必须保持一致——D2D 被禁用/回退 GDI 的机器更依赖这里。
-            // prcDirty 非空时 psize/pptDst 被忽略；psize 给整窗尺寸是规范姿势。
-            let psize = SIZE { cx: width, cy: height };
-            let ppsrc = POINT { x: 0, y: 0 };
-            let prc = RECT {
-                left: r.left,
-                top: r.top,
-                right: r.right,
-                bottom: r.bottom,
-            };
-            let info = UPDATELAYEREDWINDOWINFO {
-                cbSize: std::mem::size_of::<UPDATELAYEREDWINDOWINFO>() as u32,
-                hdcDst: screen_dc,
-                pptDst: std::ptr::null(),
-                psize: &psize as *const SIZE,
-                hdcSrc: mem_dc,
-                pptSrc: &ppsrc as *const POINT,
-                crKey: COLORREF(0),
-                pblend: &bf as *const BLENDFUNCTION,
-                dwFlags: windows::Win32::UI::WindowsAndMessaging::ULW_ALPHA,
-                prcDirty: &prc as *const RECT,
-            };
-            UpdateLayeredWindowIndirect(hwnd, &info).as_bool()
+        } else if let Dirty::Rects(rects) = dirty {
+            if rects.is_empty() {
+                true // 无像素变化：跳过上屏（DIB 与窗口显示一致）
+            } else {
+                // A2：先把每个脏矩形从画布拷进 DIB（DIB 其余区域保留旧帧，
+                // 与窗口显示一致），再逐矩形 ULWIndirect。拷贝全部先行，
+                // 与上传解耦：任一矩形上传失败不影响 DIB 的完整性。
+                for r in rects {
+                    copy_rect_to_dib(bits, surface, r, width, height);
+                }
+                let mut all_ok = true;
+                for r in rects {
+                    if !ulw_indirect_rect(hwnd, screen_dc, mem_dc, width, height, &bf, r) {
+                        all_ok = false;
+                        break; // 失败即止：闸门保证下一帧整窗恢复
+                    }
+                }
+                all_ok
+            }
         } else {
             false
         };
         if !ok {
+            NEEDS_FULL_REUPLOAD.store(true, AtomicOrdering::Relaxed);
             crate::probe::log("present: UpdateLayeredWindow failed");
         }
 
@@ -1043,10 +1124,60 @@ fn present(
     }
 }
 
+/// 对单个脏矩形执行 `UpdateLayeredWindowIndirect`。
+///
+/// ✅ 根因修复（2026-09-12 对照实验钉死，见 docs/悬浮窗性能恢复计划.md）：
+/// `pptSrc` 语义 = 「窗口左上角在 hdcSrc 中的对齐点」。整窗 DIB 的正确值是 (0,0)。
+/// 旧代码写 (r.left, r.top)，与窗口坐标的 prcDirty 叠加后源像素被 2× 偏移——
+/// API 返回成功但贴错像素，即历史「Rect ok=true 而画面不更新」的根因。
+/// **本函数是全项目唯一 ULWIndirect 出口**（文件头适用边界第 3 条：
+/// 任何新增上传路径必须照抄本函数，禁止另写）。
+#[allow(clippy::too_many_arguments)]
+unsafe fn ulw_indirect_rect(
+    hwnd: HWND,
+    screen_dc: HDC,
+    mem_dc: HDC,
+    width: i32,
+    height: i32,
+    bf: &BLENDFUNCTION,
+    r: &RECT,
+) -> bool {
+    let ppsrc = POINT { x: 0, y: 0 };
+    // prcDirty 非空时 psize/pptDst 被忽略；psize 给整窗尺寸是规范姿势。
+    let psize = SIZE { cx: width, cy: height };
+    // 与 copy_rect_to_dib 同一套钳制：cell 包围盒（含右对齐槽位/描边外扩）
+    // 可能略微越出窗口，越界的 prcDirty 交给 ULWIndirect 只会失败。
+    // 钳成空 → 无需上传，返回 true（本矩形没有可见像素在上屏范围内）。
+    let prc = RECT {
+        left: r.left.max(0),
+        top: r.top.max(0),
+        right: r.right.min(width),
+        bottom: r.bottom.min(height),
+    };
+    if prc.right <= prc.left || prc.bottom <= prc.top {
+        return true;
+    }
+    let info = UPDATELAYEREDWINDOWINFO {
+        cbSize: std::mem::size_of::<UPDATELAYEREDWINDOWINFO>() as u32,
+        hdcDst: screen_dc,
+        pptDst: std::ptr::null(),
+        psize: &psize as *const SIZE,
+        hdcSrc: mem_dc,
+        pptSrc: &ppsrc as *const POINT,
+        crKey: COLORREF(0),
+        pblend: bf as *const BLENDFUNCTION,
+        dwFlags: windows::Win32::UI::WindowsAndMessaging::ULW_ALPHA,
+        prcDirty: &prc as *const RECT,
+    };
+    UpdateLayeredWindowIndirect(hwnd, &info).as_bool()
+}
+
 /// 把已绘制好的 DIB（mem_dc）上传到分层窗口（高画质 D2D 路径用）。
 ///
 /// D2D 直接写进 DIB 的预乘 BGRA 比特，所以无需 `copy_rect_to_dib`——
-/// 只需把 DIB 上屏。`dirty` 决定整窗上传还是只上传脏子矩形（A1/A2 同性能模式）。
+/// 只需把 DIB 上屏。`dirty` 决定上屏方式（与 GDI 路径同一套 A1/A2 语义）：
+/// - `Dirty::Full` 或 `AAXSYSPULSE_NODIRTY=1` → 经典 `UpdateLayeredWindow`。
+/// - `Dirty::Rects(rects)` → 逐矩形 ULWIndirect；空列表 = 跳过上屏。
 /// 返回 false = 上屏失败（调用方应回滚帧指纹，否则相同内容帧会被跳过 → 冻结）。
 unsafe fn upload_dib(hwnd: HWND, width: i32, height: i32, src_alpha: u8, dirty: &Dirty) -> bool {
     let screen_dc = GetDC(hwnd);
@@ -1072,7 +1203,7 @@ unsafe fn upload_dib(hwnd: HWND, width: i32, height: i32, src_alpha: u8, dirty: 
     // 卡死探针（2026-09-12 13:40 事故）：渲染线程最后日志停在 PAINT-DONE，
     // 唯一剩余阻塞点在 upload_dib 内部（GetDC / DIB.lock / ULW）。
     // ULW 前后各打一条，下次复现即可把挂起点钉死到具体 API。
-    crate::probe::log_lazy(|| format!("upload-begin {width}x{height} dirty={}", match dirty { Dirty::Full => "Full".into(), Dirty::Rect(r) => format!("Rect({},{},{},{})", r.left, r.top, r.right, r.bottom) }));
+    crate::probe::log_lazy(|| format!("upload-begin {width}x{height} dirty={}", fmt_dirty(dirty)));
     let ok = if *DIRTY_DISABLED || matches!(dirty, Dirty::Full) {
         let sz = SIZE { cx: width, cy: height };
         let src_pt = POINT::default();
@@ -1088,35 +1219,26 @@ unsafe fn upload_dib(hwnd: HWND, width: i32, height: i32, src_alpha: u8, dirty: 
             windows::Win32::UI::WindowsAndMessaging::ULW_ALPHA,
         )
         .is_ok()
-    } else if let Dirty::Rect(r) = dirty {
-        // ✅ 根因修复（2026-09-12 对照实验钉死，见 docs/悬浮窗性能恢复计划.md）：
-        // pptSrc 语义 = 「窗口左上角在 hdcSrc 中的对齐点」。整窗 DIB 的正确值是
-        // (0,0)。旧代码写 (r.left, r.top)，与窗口坐标的 prcDirty 叠加后源像素
-        // 被 2× 偏移，读到 DIB 中错误内容/越界——API 返回成功但贴错像素，
-        // 即历史「Rect ok=true 而画面不更新」的根因。对照实验：
-        //   旧值 → 时间格像素两次截图哈希相同（冻结复现）
-        //   (0,0) → 哈希变化（时钟恢复走秒）
-        let ppsrc = POINT { x: 0, y: 0 };
-        // prcDirty 非空时 psize/pptDst 被忽略；psize 给整窗尺寸是规范姿势。
-        let psize = SIZE { cx: width, cy: height };
-        let prc = RECT { left: r.left, top: r.top, right: r.right, bottom: r.bottom };
-        let info = UPDATELAYEREDWINDOWINFO {
-            cbSize: std::mem::size_of::<UPDATELAYEREDWINDOWINFO>() as u32,
-            hdcDst: screen_dc,
-            pptDst: std::ptr::null(),
-            psize: &psize as *const SIZE,
-            hdcSrc: mem_dc,
-            pptSrc: &ppsrc as *const POINT,
-            crKey: COLORREF(0),
-            pblend: &bf as *const BLENDFUNCTION,
-            dwFlags: windows::Win32::UI::WindowsAndMessaging::ULW_ALPHA,
-            prcDirty: &prc as *const RECT,
-        };
-        UpdateLayeredWindowIndirect(hwnd, &info).as_bool()
+    } else if let Dirty::Rects(rects) = dirty {
+        if rects.is_empty() {
+            true // 无像素变化：跳过上屏（DIB 与窗口显示一致）
+        } else {
+            // 逐矩形 ULWIndirect：pptSrc=(0,0) / pptDst=NULL 语义由
+            // ulw_indirect_rect 唯一出口保证（见该函数注释）。
+            let mut all_ok = true;
+            for r in rects {
+                if !ulw_indirect_rect(hwnd, screen_dc, mem_dc, width, height, &bf, r) {
+                    all_ok = false;
+                    break; // 失败即止：闸门保证下一帧整窗恢复
+                }
+            }
+            all_ok
+        }
     } else {
         false
     };
     if !ok {
+        NEEDS_FULL_REUPLOAD.store(true, AtomicOrdering::Relaxed);
         crate::probe::log("upload_dib: UpdateLayeredWindow failed");
     }
     crate::probe::log_lazy(|| format!("upload-end ok={ok}"));
@@ -1198,11 +1320,10 @@ fn render_d2d(
         let present_sec = aaxsyspulse_ui::clock::get().2;
         perf::note_section("seg_hash", t_hash);
         crate::probe::log_lazy(|| {
-            let kind = match &dirty {
-                Dirty::Full => "Full".to_string(),
-                Dirty::Rect(r) => format!("Rect({},{},{},{})", r.left, r.top, r.right, r.bottom),
-            };
-            format!("d2d render {}x{} cells={} dirty={} alpha={}", width, height, cells.len(), kind, src_alpha)
+            format!(
+                "d2d render {}x{} cells={} dirty={} alpha={}",
+                width, height, cells.len(), fmt_dirty(&dirty), src_alpha
+            )
         });
 
         let screen_dc = GetDC(hwnd);
@@ -1249,6 +1370,9 @@ fn render_d2d(
             return false;
         }
         perf::note_section("seg_draw", t_draw);
+        // seg_draw 内部的细分段（fmt/brush/layout/text）由 render_d2d 在 cell 循环里
+        // 自累加，在此一次性落盘（避免上万条段样本撑爆缓冲）。
+        crate::render_d2d::flush_seg_acc();
         let need_w = (text_right + 12.0).ceil() as i32;
         // 收缩目标取 max(DWrite 实测, 布局自然宽)：扩（guard 用 nat_w）与缩
         // （此处用 need_w）的目标若互相错开 8~32px 会形成扩缩循环，取 max
@@ -1282,7 +1406,7 @@ fn render_d2d(
             perf::note_section("render_d2d_shrink", t0);
             return true; // 缩窗续帧（非失败）
         }
-        crate::probe::log_lazy(|| format!("d2d PAINT-DONE -> upload {}x{} dirty={:?}", width, height, match &dirty { Dirty::Full => "Full".into(), Dirty::Rect(r) => format!("Rect({},{},{},{})", r.left, r.top, r.right, r.bottom) }));
+        crate::probe::log_lazy(|| format!("d2d PAINT-DONE -> upload {}x{} dirty={}", width, height, fmt_dirty(&dirty)));
 
         // 释放 DIB 锁再上屏：upload_dib 内部会重新加锁取同一份 mem_dc。
         // std Mutex 不可重入——上一轮补 begin_draw 后 end_draw 成功、执行流抵达
@@ -1293,18 +1417,22 @@ fn render_d2d(
         // 恢复计划 0.3 实验：脏区面积占比。区分两个假设——
         // ① pct≈100：脏区物理上≈整窗，prcDirty 无罪，接受现状；
         // ② pct 很小但耗时未降：ULWIndirect 的 prcDirty 分支有问题 → 真优化机会。
-        let dirty_pct = match &dirty {
-            Dirty::Full => 100u64,
-            Dirty::Rect(r) => {
-                let dw = (r.right - r.left).max(0) as u64;
-                let dh = (r.bottom - r.top).max(0) as u64;
-                (dw * dh * 100)
+        // 恢复计划 0.3 实验：脏区面积占比。多矩形 = 各分量面积之和 / 整窗面积。
+        let (dirty_pct, rect_n) = match &dirty {
+            Dirty::Full => (100u64, 1usize),
+            Dirty::Rects(rs) => {
+                let area: u64 = rs
+                    .iter()
+                    .map(|r| ((r.right - r.left).max(0) as u64) * ((r.bottom - r.top).max(0) as u64))
+                    .sum();
+                let pct = (area * 100)
                     .checked_div((width.max(0) as u64) * (height.max(0) as u64))
                     .unwrap_or(100)
-                    .min(100)
+                    .min(100);
+                (pct, rs.len())
             }
         };
-        perf::note_section(&format!("seg_upload pct={dirty_pct}"), t_upload);
+        perf::note_section(&format!("seg_upload pct={dirty_pct} n={rect_n}"), t_upload);
         if !uploaded {
             LAST_FRAME_HASH.store(u64::MAX, AtomicOrdering::Relaxed);
         } else {
@@ -1457,4 +1585,139 @@ pub fn invalidate_frame_hash() {
     // 快速跳过路径同步失效：设置变更（指纹失效）必须立即重绘，
     // 不能被"秒未变 ∧ 纪元未变"的快速路径吞掉。
     RENDER_EPOCH.fetch_add(1, AtomicOrdering::Relaxed);
+}
+
+#[cfg(test)]
+mod dirty_tests {
+    use super::*;
+    use aaxsyspulse_core::units::StrBuf;
+    use aaxsyspulse_ui::Rgba;
+
+    /// 最小可比对 CellSig：脏判定只看 x/y/bbox_x/w/h/hash。
+    fn cell(x: i32, hash: u64) -> CellSig {
+        CellSig {
+            x,
+            y: 8,
+            w: 40,
+            h: 28,
+            bbox_x: x,
+            right_align: false,
+            hash,
+            text: StrBuf::new(),
+            color: Rgba::default(),
+            shade: Rgba::default(),
+            shadow: false,
+            outline: false,
+            scale: 1.0,
+        }
+    }
+
+    fn fresh_state() -> (OnceLock<Mutex<Vec<CellSig>>>, AtomicU8) {
+        (OnceLock::new(), AtomicU8::new(0))
+    }
+
+    fn run(
+        state: &(OnceLock<Mutex<Vec<CellSig>>>, AtomicU8),
+        cells: &[CellSig],
+    ) -> (Dirty, Vec<bool>) {
+        compute_dirty_in(&state.0, &state.1, cells, 255)
+    }
+
+    #[test]
+    fn first_frame_is_full() {
+        let st = fresh_state();
+        let (d, changed) = run(&st, &[cell(0, 1), cell(100, 2)]);
+        assert!(d.is_full());
+        assert!(changed.iter().all(|&c| c), "首帧必须全部重画");
+    }
+
+    #[test]
+    fn two_far_changed_cells_yield_two_rects() {
+        let st = fresh_state();
+        run(&st, &[cell(0, 1), cell(100, 2), cell(300, 3)]); // 建立基线
+        // 第 0、2 格变化（相距远，中间隔第 1 格）→ 2 个矩形，空隙不上传
+        let cells = [cell(0, 99), cell(100, 2), cell(300, 98)];
+        let (d, changed) = run(&st, &cells);
+        let Dirty::Rects(rs) = d else { panic!("应为 Rects，实际 {}", fmt_dirty(&d)) };
+        assert_eq!(rs.len(), 2, "相距远的变化格不得合并");
+        assert!(rs[0].right <= rs[1].left, "矩形之间必须隔开空隙");
+        assert!(changed[0] && changed[2] && !changed[1], "邻接传播不得标记不相交邻居");
+    }
+
+    #[test]
+    fn adjacent_changed_cells_merge_into_one_rect() {
+        let st = fresh_state();
+        // ⚠️ cells_intersect 用半开区间严格判定（right/bottom 边界不算相交）：
+        // 「相触」（0..40 与 40..80）**不算**相交，必须真正重叠才并成一簇。
+        run(&st, &[cell(0, 1), cell(30, 2)]); // 包围盒 0..40 与 30..70 重叠
+        let cells = [cell(0, 99), cell(30, 98)];
+        let (d, _) = run(&st, &cells);
+        let Dirty::Rects(rs) = d else { panic!("应为 Rects") };
+        assert_eq!(rs.len(), 1, "重叠的变化格必须并成一簇");
+        assert_eq!((rs[0].left, rs[0].right), (0, 70));
+    }
+
+    #[test]
+    fn unchanged_neighbor_is_not_uploaded() {
+        // 传播邻居（changed=true）不应扩大上传矩形：上传只由内容变化格构成
+        let st = fresh_state();
+        // 两格重叠：0..40 与 20..60（真重叠才会触发邻接传播）；基线后只改第 0 格
+        run(&st, &[cell(0, 1), cell(20, 2)]);
+        let cells = [cell(0, 99), cell(20, 2)];
+        let (d, changed) = run(&st, &cells);
+        let Dirty::Rects(rs) = d else { panic!("应为 Rects") };
+        assert_eq!(rs.len(), 1);
+        assert_eq!((rs[0].left, rs[0].right), (0, 40), "未变化的邻居格不得进入上传矩形");
+        assert!(changed[1], "但 paint 位图要标记邻居（clear_rect 擦除防线）");
+    }
+
+    #[test]
+    fn no_change_yields_empty_rects_not_full() {
+        let st = fresh_state();
+        let cells = [cell(0, 1), cell(100, 2)];
+        run(&st, &cells);
+        let (d, _) = run(&st, &cells); // 同内容再来一帧
+        let Dirty::Rects(rs) = d else { panic!("应为 Rects") };
+        assert!(rs.is_empty(), "无变化必须是空矩形列表（跳过上屏）");
+    }
+
+    #[test]
+    fn alpha_change_is_full() {
+        let st = fresh_state();
+        run(&st, &[cell(0, 1)]);
+        let (d, _) = compute_dirty_in(&st.0, &st.1, &[cell(0, 1)], 128); // alpha 变了
+        assert!(d.is_full());
+    }
+
+    #[test]
+    fn position_drift_is_full() {
+        let st = fresh_state();
+        run(&st, &[cell(0, 1)]);
+        let (d, _) = run(&st, &[cell(10, 1)]); // x 漂移
+        assert!(d.is_full());
+    }
+
+    #[test]
+    fn too_many_components_folds_to_full() {
+        let st = fresh_state();
+        let base: Vec<CellSig> = (0..10).map(|i| cell(i * 100, i as u64 + 1)).collect();
+        run(&st, &base);
+        let changed: Vec<CellSig> = (0..10).map(|i| cell(i * 100, i as u64 + 100)).collect();
+        let (d, _) = run(&st, &changed);
+        assert!(d.is_full(), "超过 MAX_DIRTY_RECTS(8) 必须折叠整窗");
+    }
+
+    #[test]
+    fn upload_failure_gate_forces_full_next_frame() {
+        let st = fresh_state();
+        let cells = [cell(0, 1), cell(100, 2)];
+        run(&st, &cells);
+        run(&st, &cells);
+        NEEDS_FULL_REUPLOAD.store(true, AtomicOrdering::Relaxed);
+        let (d, changed) = run(&st, &cells);
+        assert!(d.is_full(), "闸门置位后下一帧必须整窗");
+        assert!(changed.iter().all(|&c| c));
+        // 闸门一次性：消费后回到正常路径
+        assert!(!NEEDS_FULL_REUPLOAD.load(AtomicOrdering::Relaxed));
+    }
 }

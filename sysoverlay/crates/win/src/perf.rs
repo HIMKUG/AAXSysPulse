@@ -305,6 +305,31 @@ pub fn note_section(label: &str, start: u64) {
     }
 }
 
+/// 段级样本（**直接给微秒值**）：供调用方在**帧末**把自累加的细分段一次性落盘。
+///
+/// 为什么需要它：`note_section` 一次调用一个样本，而 cell 级循环（如每 cell 的
+/// D2D 画刷/排版创建）会在 5s 内产生上万条，撑爆 16k 缓冲。故调用方在循环内用
+/// [`elapsed_since`] 累加，帧末用本函数落一条。
+pub fn note_section_us(label: &str, us: u64) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(mut v) = SECTION_SAMPLES.lock() {
+        if v.len() < SECTION_SAMPLES_MAX {
+            v.push((label.to_string(), us));
+        }
+    }
+}
+
+/// 从 `start` 到现在的微秒数；未启用（`start == 0`）时返回 0。
+/// 配合 [`note_section_us`] 做帧内自累加，取代高频 `note_section`。
+pub fn elapsed_since(start: u64) -> u64 {
+    if start == 0 {
+        return 0;
+    }
+    elapsed_us(start)
+}
+
 /// 采样循环周期探针：记录一轮采样耗时与休眠时长，判别忙等/采样超支。
 /// 数值超过阈值时落盘（正常 1s 周期时几乎不写）。
 pub fn note_cycle(cost_ms: u32, sleep_ms: u64) {
