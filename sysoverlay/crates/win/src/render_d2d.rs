@@ -48,6 +48,7 @@ use windows::Win32::Graphics::DirectWrite::{
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::HDC;
 
+use aaxsyspulse_core::config::{Config, RenderEngine};
 use aaxsyspulse_ui::Rgba;
 use aaxsyspulse_ui::{Rect, RenderTarget};
 
@@ -234,6 +235,66 @@ pub fn flush_seg_acc() {
 /// 将文本编码为 UTF16，返回 Vec。
 fn encode_text(text: &str) -> Vec<u16> {
     text.encode_utf16().collect()
+}
+
+/// 启动期预热：把 DWrite **首次**字体解析的一次性成本从"首帧"挪到"渲染线程
+/// 刚起来时"，与主线程的窗口/托盘/自启初始化**并行**。
+///
+/// 背景（2026-09-14 实测，perf 段 `seg_d2d_layout`）：冷启动首帧的
+/// `CreateTextLayout` 单次占用 **317ms**（整帧 377ms），DIN 私有字体集在第一次
+/// 真正排版时才被 DWrite 解析。加上预热后，这段成本被提前到窗口还不可见时，
+/// 且与主线程启动工作重叠 —— 首帧因此变快，窗口内容更早出现。
+///
+/// ⚠️ 只预热**当前配置用到的字重与字号**：每个字重是一个独立 .otf，
+/// 逐一预热会把启动成本乘上字重数；字重/字号变更（设置操作）时各自首帧
+/// 付一次即可接受。
+///
+/// 线程亲和：本函数只在渲染线程调用（`render_thread::start` 的线程体开头），
+/// 创建的 `IDWriteTextFormat` 落进本线程的 [`FORMAT_CACHE`]，与后续渲染同线程。
+pub fn warmup(cfg: &Config) {
+    if cfg.render_engine != RenderEngine::D2d {
+        return; // 性能模式不碰 D2D/DWrite 字体集，不预热
+    }
+    let t = crate::perf::begin();
+    // 1) 私有字体集（DIN 三档之一）+ 字号 format：建立字体集与字号对象
+    let _ = din_font(cfg.font_weight);
+    let Some(dwrite) = dwrite_factory() else { return };
+    let mut sizes = vec![cfg.font_size];
+    for s in cfg.metric_font_sizes.iter().flatten() {
+        sizes.push(*s);
+    }
+    // 2) 真正触发字体解析的是第一次 CreateTextLayout——逐个字号做一次即弃。
+    //    ⚠️ 文本必须覆盖**实际会渲染的字符集**：2026-09-14 实测，只喂 ASCII
+    //    （"0123456789:%"）时预热仅 1.2ms，首帧 CreateTextLayout 仍要 140ms——
+    //    因为真实文本里有 DIN 字体不含的字符，首次触发 DWrite 的**回退字体
+    //    查找**（建立系统字体集索引，很贵）。这里把 ASCII 可打印字符 + 数字
+    //    标点 + 常用中文标签全覆盖，一次性把回退链建好。
+    let text = encode_text(
+        " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`\
+         abcdefghijklmnopqrstuvwxyz{|}~处理器内存显卡网络功耗时钟温度频率使用率\
+         综合占用显存延迟上传下载当前最高最低平均",
+    );
+    let n_sizes = sizes.len();
+    for px in sizes {
+        let Some(fmt) = cached_text_format(px, cfg.font_weight) else {
+            continue;
+        };
+        let _ = unsafe { dwrite.CreateTextLayout(&text, &fmt, 1e6, 1e6) };
+    }
+    crate::probe::log(&format!(
+        "d2d warmup done us={} weight={} sizes={}",
+        crate::perf::elapsed_since(t),
+        cfg.font_weight,
+        n_sizes
+    ));
+}
+
+/// [`warmup`] 的便捷入口：读渲染线程的配置镜像并预热；
+/// 镜像尚未发布（watchdog respawn 路径）时静默跳过。
+pub fn warmup_if_cfg() {
+    if let Some(cfg) = crate::render_thread::cfg_snapshot() {
+        warmup(&cfg);
+    }
 }
 
 /// 获取或创建 D2D DC RenderTarget。尺寸变化或设备丢失时重建。

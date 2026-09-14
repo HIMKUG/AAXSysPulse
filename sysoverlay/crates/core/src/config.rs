@@ -266,7 +266,9 @@ impl Default for Config {
             power_display: PowerDisplay::CpuPackage,
             power_interval_ms: 3000,
             exclude_virtual_nic: true,
-            debug_log: false,
+            // 2026-09-14：默认开（诊断优先）。关闭方式：设置面板「调试日志」开关，
+            // 或环境变量 AAXSYSPULSE_PROBE=0（probe）/ AAXSYSPULSE_PERF=0（perf）。
+            debug_log: true,
             render_style: RenderStyle::Strip,
             lang: Lang::En,
             gpu_primary_only: true,

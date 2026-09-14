@@ -249,6 +249,12 @@ static DIRTY_DISABLED: LazyLock<bool> =
 /// 指纹回滚保证重试帧不被跳过，本闸门保证重试帧整窗覆盖（缺一会冻结）。
 static NEEDS_FULL_REUPLOAD: AtomicBool = AtomicBool::new(false);
 
+/// 诊断开关（`AAXSYSPULSE_NODRAW=1`）：D2D 路径跳过 `paint_cells`，但保留
+/// `begin_draw` / `clear` / `end_draw`。用于判定 `seg_d2d_end` 的成本性质——
+/// 随内容变化 = 真在光栅化；基本不变 = 固定 flush/提交开销（2026-09-14 调查用）。
+static NODRAW: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("AAXSYSPULSE_NODRAW").map(|v| v == "1").unwrap_or(false));
+
 /// 脏矩形追踪：上一帧各文字 cell 的几何 + 内容指纹（A1 比对源）。
 static PREV_CELLS: OnceLock<Mutex<Vec<CellSig>>> = OnceLock::new();
 
@@ -1355,13 +1361,20 @@ fn render_d2d(
         };
         let t_draw = perf::begin();
         surface.begin_draw();
+        let t_clear = perf::begin();
         surface.clear();
-        paint_cells(&mut surface, &cells, cfg.font_weight);
+        perf::note_section("seg_d2d_clear", t_clear);
+        if !*NODRAW {
+            paint_cells(&mut surface, &cells, cfg.font_weight);
+        }
         // 自愈扩窗（D2D 右缘裁切根治）：绘制完成后用 DWrite 实测最右文本右缘。
         // 布局按位图度量推算 cell，DIN 真字形更宽 → 右缘可能超出窗口被裁。
         // 若超出，立即按实测右缘扩宽窗口并续帧重画，直到收敛（无需估算余量）。
         let text_right = surface.max_text_right;
-        if !surface.end_draw() {
+        let t_end = perf::begin();
+        let ended = surface.end_draw();
+        perf::note_section("seg_d2d_end", t_end);
+        if !ended {
             // 设备丢失/状态错误：本帧跳过上屏并回滚指纹，改走 GDI 分支兜底；
             // 下帧 bind 会重建 RT 重试 D2D。
             drop(dib);

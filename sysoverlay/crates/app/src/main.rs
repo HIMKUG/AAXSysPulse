@@ -274,6 +274,9 @@ fn main() {
 
     // ── 4. Create overlay window（先于采样线程：线程需要 hwnd 推送消息）────
     // P1：渲染线程必须先于窗口创建启动，否则首帧渲染请求无人消费。
+    // 先发布配置镜像（不投递请求）：让渲染线程一起来就按正确的字重/字号预热
+    // DWrite 字体（首次解析实测 317ms），与下面建窗/托盘/自启初始化并行。
+    aaxsyspulse_win::render_thread::publish_cfg(&cfg);
     aaxsyspulse_win::render_thread::start();
     let window = match OverlayWindow::new(cfg) {
         Ok(w) => w,

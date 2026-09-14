@@ -3,7 +3,7 @@ ab_perf.ps1 —— 悬浮窗 A/B 测量一条命令（悬浮窗性能恢复计�
 
 完成：构建 -> 双跑 -> 解析统一日志 -> 输出 A/B 分位数对比表。
   A 组 = 默认（内容指纹跳过 + 脏区 Rect 上传）
-  B 组 = SYSOVERLAY_NODIRTY=1（每帧经典整窗 UpdateLayeredWindow）
+  B 组 = AAXSYSPULSE_NODIRTY=1（每帧经典整窗 UpdateLayeredWindow）
 
 用法（在仓库根目录）：
   powershell -ExecutionPolicy Bypass -File tools\ab_perf.ps1 -DurationSec 60
@@ -70,7 +70,7 @@ function Invoke-Round {
     Remove-Item $curPath -ErrorAction SilentlyContinue
     $runStart = Get-Date
 
-    $env:SYSOVERLAY_PERF = "1"
+    $env:AAXSYSPULSE_PERF = "1"
     foreach ($k in $ExtraEnv.Keys) { Set-Item -Path "Env:$k" -Value $ExtraEnv[$k] }
     try {
         $p = Start-Process -FilePath $Exe -PassThru
@@ -81,12 +81,12 @@ function Invoke-Round {
         Start-Sleep -Milliseconds 600
     }
     finally {
-        Remove-Item Env:SYSOVERLAY_PERF -ErrorAction SilentlyContinue
+        Remove-Item Env:AAXSYSPULSE_PERF -ErrorAction SilentlyContinue
         foreach ($k in $ExtraEnv.Keys) { Remove-Item -Path "Env:$k" -ErrorAction SilentlyContinue }
     }
 
     $sessionLog = Get-SessionLog -After $runStart.AddSeconds(-2)
-    if (-not $sessionLog) { throw "$Name 组没有产生会话日志（$logDir\aaxsyspulse_*.log）——确认 SYSOVERLAY_PERF 生效" }
+    if (-not $sessionLog) { throw "$Name 组没有产生会话日志（$logDir\aaxsyspulse_*.log）——确认 AAXSYSPULSE_PERF 生效" }
     Copy-Item $sessionLog.FullName (Join-Path $PSScriptRoot "ab_perf_$Name.log") -Force
 
     # ── 解析：frame_render 逐帧样本 + section 段样本 + frames/skipped 聚合行 ──
@@ -141,8 +141,8 @@ Write-Section "[ab] 2/4 A 组（默认：指纹跳过 + 脏区 Rect 上传）"
 $a = Invoke-Round -Name "A" -ExtraEnv @{}
 
 # ── 3/4 B 组：整窗上传 ──
-Write-Section "[ab] 3/4 B 组（SYSOVERLAY_NODIRTY=1：整窗上传）"
-$b = Invoke-Round -Name "B" -ExtraEnv @{ SYSOVERLAY_NODIRTY = "1" }
+Write-Section "[ab] 3/4 B 组（AAXSYSPULSE_NODIRTY=1：整窗上传）"
+$b = Invoke-Round -Name "B" -ExtraEnv @{ AAXSYSPULSE_NODIRTY = "1" }
 
 # ── 4/4 分位数表 ──
 Write-Section "[ab] 4/4 A/B 分位数对比（us，skip_pct 为 %）"

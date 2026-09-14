@@ -1,4 +1,4 @@
-//! 性能测量开关（P5）：`AAXSYSPULSE_PERF=1` 时统计渲染开销并落盘。
+//! 性能测量开关（P5）：**默认开**，`AAXSYSPULSE_PERF=0` 关闭。统计渲染开销并落盘。
 //!
 //! # 为什么需要它
 //!
@@ -27,13 +27,14 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-/// 是否启用（进程内只读一次环境变量）。
+/// 是否启用：**默认开**（2026-09-14 起，便于随时取数）；
+/// `AAXSYSPULSE_PERF=0` / `false` 显式关闭。进程内只读一次环境变量。
 fn enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {
         std::env::var("AAXSYSPULSE_PERF")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true)
     })
 }
 
@@ -131,6 +132,9 @@ fn maybe_report() {
     let max = MAX_US.swap(0, Ordering::Relaxed);
     let avg = total.checked_div(frames).unwrap_or(0);
     // 恢复计划 0.4：聚合行带 p50/p99 与跳帧率——分布比均值诚实。
+    // ⚠️ 2026-09-14 修：此前只 sort **不清空**，样本是全程累计的 → 聚合行的
+    // p50/p99 长期带着启动首帧的尖峰（实测 p99 一直是 986ms），与"每 5s 窗口"
+    // 的语义不符，会误导判断。改为取完即清（与 FRAMES/TOTAL_US 的 swap 同语义）。
     let (p50, p99) = match RENDER_US.lock() {
         Ok(mut q) => {
             q.sort_unstable();
@@ -141,7 +145,9 @@ fn maybe_report() {
                     q[(((q.len() - 1) as f64) * f).round() as usize]
                 }
             };
-            (pick(0.50), pick(0.99))
+            let r = (pick(0.50), pick(0.99));
+            q.clear();
+            r
         }
         Err(_) => (0, 0),
     };

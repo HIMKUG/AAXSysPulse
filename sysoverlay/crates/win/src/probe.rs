@@ -25,8 +25,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-/// 全局开关（由设置面板的「调试日志」项在运行时切换）。
-static DEBUG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 全局开关（由设置面板的「调试日志」项在运行时切换）。**默认开**（2026-09-14）。
+static DEBUG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// 设置面板调用：开/关调试日志。立即生效，无需重启。
 pub fn set_debug(on: bool) {
@@ -38,20 +38,29 @@ pub fn debug() -> bool {
     DEBUG.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// 是否启用：设置面板开关 **或** 环境变量 `AAXSYSPULSE_PROBE=1`（二者取或）。
+/// 是否启用。优先级（2026-09-14 起**默认开**，便于随时取数）：
 ///
-/// 环境变量作为兜底通道，方便无法进设置面板的场景（如沙箱/脚本）开启。
+/// 1. 环境变量 `AAXSYSPULSE_PROBE`：`0`/`false` 强制关、`1`/`true` 强制开；
+/// 2. 否则看设置面板「调试日志」开关（[`DEBUG`]，默认开）。
 pub fn enabled() -> bool {
-    DEBUG.load(std::sync::atomic::Ordering::Relaxed) || env_probe_on()
+    match env_probe_force() {
+        Some(v) => v,
+        None => DEBUG.load(std::sync::atomic::Ordering::Relaxed),
+    }
 }
 
-/// 环境变量开关（进程内只读一次，避免每次 log 都读环境）。
-fn env_probe_on() -> bool {
-    static E: OnceLock<bool> = OnceLock::new();
+/// 环境变量强制开关（进程内只读一次，避免每次 log 都读环境）。未设置 → `None`。
+fn env_probe_force() -> Option<bool> {
+    static E: OnceLock<Option<bool>> = OnceLock::new();
     *E.get_or_init(|| {
-        std::env::var("AAXSYSPULSE_PROBE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+        let v = std::env::var("AAXSYSPULSE_PROBE").ok()?;
+        if v == "0" || v.eq_ignore_ascii_case("false") {
+            Some(false)
+        } else if v == "1" || v.eq_ignore_ascii_case("true") {
+            Some(true)
+        } else {
+            None
+        }
     })
 }
 

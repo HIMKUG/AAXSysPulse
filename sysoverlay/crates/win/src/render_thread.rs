@@ -55,6 +55,12 @@ pub fn start() {
     let _ = std::thread::Builder::new()
         .name("overlay-render".into())
         .spawn(move || {
+            // 启动期预热（2026-09-14）：把 DWrite 首次字体解析的一次性成本
+            // （实测首帧 seg_d2d_layout 317ms）提前到这里，与主线程随后的
+            // 窗口创建/托盘/自启初始化**并行**，使窗口内容更早出现。
+            // 配置镜像由 main 在 start() 前发布（publish_cfg）；未发布时
+            // （watchdog respawn 路径）跳过——那时字体早已解析过，无需预热。
+            crate::render_d2d::warmup_if_cfg();
             loop {
                 let Ok(hwnd_addr) = rx.recv() else {
                     crate::probe::log("rt: channel closed -> exit");
@@ -78,6 +84,27 @@ pub fn start() {
                 }
             }
         });
+}
+
+/// 只发布配置镜像、不投递渲染请求。
+///
+/// 用途：`main` 在 `start()` 之前调用，让渲染线程一起来就能按正确的
+/// 字重/字号做启动期预热（[`crate::render_d2d::warmup_if_cfg`]）——
+/// 否则预热只能等到第一帧，与"提前"的目的相悖。
+pub fn publish_cfg(cfg: &Config) {
+    let mut slot = match RENDER_CFG.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    *slot = Some(*cfg);
+}
+
+/// 读配置镜像快照（中毒时取内层值，与 [`render_once`] 同语义）。未发布 → None。
+pub(crate) fn cfg_snapshot() -> Option<Config> {
+    match RENDER_CFG.lock() {
+        Ok(g) => *g,
+        Err(p) => *p.into_inner(),
+    }
 }
 
 /// 单次渲染：读配置镜像 + 快照 → gdi::render。
@@ -112,6 +139,7 @@ pub fn respawn() {
 }
 
 /// UI 线程调用：发布最新配置 + 投递渲染请求（同帧多次请求合并为一次）。
+/// 启动期（窗口创建前）也可只发布配置不请求渲染：见 [`publish_cfg`]。
 pub fn request(hwnd: HWND, cfg: &Config) {
     // 中毒恢复与 render_once 对称：锁内只是 Copy 赋值，panic 源实际不存在，
     // 但一旦中毒若不 into_inner，配置镜像会永久冻结在旧值（快照照常更新、
