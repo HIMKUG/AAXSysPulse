@@ -95,7 +95,7 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("Fine-tune where the name/value sit in the overlay (pixels; negative moves left/up).", "微调名称与数值在悬浮窗中的位置（像素；负值向左/上偏移）。", "HintOffName"),
     ("Lower it to keep the overlay translucent for long-term display.", "降低后悬浮条会半透明，适合长期放置", "HintOpacity"),
     ("Turn off to skip kernel-level power sampling (saves CPU); the Power row then shows --.", "关闭后跳过内核级功耗采样以节省性能，功耗行将显示 --。", "HintPowerQuery"),
-    ("Smooth favors lower cost; Fine favors animation quality.", "流畅优先降低绘制开销，精细优先保证动画细腻", "HintRenderMode"),
+    ("Smooth favors lower cost; Fine boosts responsiveness by up to 8× on rapid changes.", "流畅优先降低绘制开销；精细在剧烈变动时可快八倍", "HintRenderMode"),
     ("Shorten labels: CPU→C, Mem→M, GPU→G, Net→N, Power→P, Time→T, Util→U.", "简化标签：CPU→C、Mem→M、GPU→G、Net→N、Power→P、Time→T、Util→U。", "HintShortNames"),
     ("Show or hide the metric name label (e.g. CPU, Mem).", "显示或隐藏监控项的名称标签（如 CPU、Mem）。", "HintShowLabel"),
     ("Horizontal strip, or stacked vertical lines.", "横版一行排布，竖版逐行堆叠", "HintStyle"),
