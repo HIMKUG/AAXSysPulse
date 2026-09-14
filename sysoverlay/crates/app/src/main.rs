@@ -16,7 +16,7 @@ use std::time::Duration;
 use aaxsyspulse_core::cadence::{DELTA_ENTER, DELTA_EXIT, EXIT_TICKS, IDLE_MAX_MS, REFRESH_FLOOR_MS, ACTIVE_CPU_PCT, ACTIVE_NET_BPS};
 use aaxsyspulse_core::scheduler::Scheduler;
 use aaxsyspulse_core::scheduler::Source;
-use aaxsyspulse_win::window::{get_shared_seq, publish_schedule_cfg, schedule_cfg, schedule_util, setup_resume_channel, snap_store, wait_cfg_change};
+use aaxsyspulse_win::window::{get_shared_seq, publish_schedule_cfg, schedule_cfg, schedule_disk, schedule_util, setup_resume_channel, snap_store, update_shared_diag, wait_cfg_change};
 use aaxsyspulse_win::OverlayWindow;
 use aaxsyspulse_win::SystemSampler;
 use aaxsyspulse_win::dpi;
@@ -199,16 +199,82 @@ fn main() {
     //   否则 30 次重试在 1ms 内耗尽，旧进程尚未释放互斥体 → 重启静默失败。）
 
     // ── 2. Load config ─────────────────────────────────────────────────────
-    let mut cfg = config_io::load_config();
+    let mut cfg = match config_io::load_config() {
+        Ok(cfg) => cfg,
+        Err(config_io::ConfigError::VersionSpanTooLarge { min, max }) => {
+            // 版本跨度过大：弹窗让用户选择，绝不静默按某个版本解析
+            // （否则旧格式文件字段被忽略 → 配置丢失）。
+            use std::os::windows::ffi::OsStrExt;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                MessageBoxW, IDYES, MB_ICONERROR, MB_YESNOCANCEL, MB_OK, MB_ICONINFORMATION,
+                MB_SETFOREGROUND,
+            };
+            let title = "配置版本不兼容";
+            let msg = format!(
+                "检测到配置文件版本跨度过大（最低 v{}，最高 v{}）。\n\n\
+                 若继续用现有文件，部分配置可能无法正确加载。\n\n\
+                 选择「是」：用默认配置覆盖当前【所有】配置\n\
+                 （system / appearance / monitor / layout_h / layout_v 全部重置为默认值，\n\
+                 原文件已自动备份）。\n\
+                 选择「否」或「取消」：退出程序，不动任何配置，请手动检查或重新配置。",
+                min, max
+            );
+            let title_w: Vec<u16> =
+                std::ffi::OsStr::new(title).encode_wide().chain(std::iter::once(0)).collect();
+            let msg_w: Vec<u16> =
+                std::ffi::OsStr::new(&msg).encode_wide().chain(std::iter::once(0)).collect();
+            let choice = unsafe {
+                MessageBoxW(
+                    None,
+                    windows::core::PCWSTR(msg_w.as_ptr()),
+                    windows::core::PCWSTR(title_w.as_ptr()),
+                    MB_ICONERROR | MB_YESNOCANCEL | MB_SETFOREGROUND,
+                )
+            };
+            if choice != IDYES {
+                // 否 / 取消：退出，不动配置
+                eprintln!("[AAX SysPulse] 配置版本跨度过大，用户选择退出（不动配置）。");
+                std::process::exit(1);
+            }
+            // 是：用默认配置覆盖，立即落盘消除版本不一致
+            let cfg = aaxsyspulse_core::config::Config::default();
+            let _ = config_io::save_config(&cfg);
+            let done_w: Vec<u16> = std::ffi::OsStr::new(
+                "配置已重置为默认值，原配置已备份在 config 目录。",
+            )
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+            let done_title_w: Vec<u16> =
+                std::ffi::OsStr::new("配置已重置").encode_wide().chain(std::iter::once(0)).collect();
+            unsafe {
+                MessageBoxW(
+                    None,
+                    windows::core::PCWSTR(done_w.as_ptr()),
+                    windows::core::PCWSTR(done_title_w.as_ptr()),
+                    MB_ICONINFORMATION | MB_OK | MB_SETFOREGROUND,
+                );
+            }
+            cfg
+        }
+    };
     // 调试日志开关：按配置初始化（必须在下面任何 probe::log 之前，
     // 否则本次启动的 cfg / 启动头会被自己吞掉）。设置面板可实时改。
     aaxsyspulse_win::probe::set_debug(cfg.debug_log);
+    // 全局 panic hook：任何线程 panic 都把「位置 + 消息」无条件写进统一日志。
+    // 没有它时，wndproc（extern "system"）里的 panic 会跨 FFI 边界直接 abort，
+    // 表现就是「开个设置窗、点一下按钮整个进程无声消失」，日志里毫无痕迹。
+    aaxsyspulse_win::probe::install_panic_hook();
     // 探针：记录运行时实际生效的配置（裁决「power 分支没跑」这类问题）
     {
         let appdata = std::env::var_os("APPDATA");
         let cfg_exists = appdata
             .as_ref()
-            .map(|a| std::path::PathBuf::from(a).join("AAXSysPulseC\\config.txt").exists())
+            .map(|a| {
+                std::path::PathBuf::from(a)
+                    .join("AAXSysPulseC\\config\\system.cfg")
+                    .exists()
+            })
             .unwrap_or(false);
         aaxsyspulse_win::probe::log(&format!(
             "cfg show_cpu={} show_mem={} show_gpu={} show_net={} show_util={} power={} interval={} auto={} exclude_virtual={} power_interval={} appdata_set={} cfg_file_exists={}",
@@ -361,6 +427,7 @@ fn main() {
         let overlay_hwnd = windows::Win32::Foundation::HWND(hwnd_addr as *mut _);
 
         let now_init = get_tick_count_ms();
+        let mut last_sample_ms = now_init;
 
         let mut last_refresh = now_init.saturating_sub(REFRESH_FLOOR_MS);
         let mut ema_cpu_committed = 0f32;
@@ -382,16 +449,26 @@ fn main() {
         let mut need_flush = false;
 
         loop {
+            // 采样线程暂停（系统即将睡眠 / 会话已锁定）：低频轮询等待恢复信号，
+            // 避免睡眠期间空转 CPU。注意窗口隐藏时采样线程已通过 IsWindowVisible
+            // 挂起；这里额外检测 SAMPLER_SUSPENDED 是双保险兜底。
+            while aaxsyspulse_win::sampler_suspended() {
+                // 100ms 轮询恢复信号，不使用 recv() 阻塞——让窗口隐藏时的
+                // resume_rx 信号也能唤醒本线程。
+                if resume_rx.recv_timeout(std::time::Duration::from_millis(100)).is_err() {
+                    // 无信号，超时继续等待（sampler_suspended 变 false 前每轮睡 100ms）
+                }
+                // 即使收到信号也再循环一次，让 try_recv() 消费掉后再继续
+            }
+
             // 覆盖层隐藏时完全停止采样：省 CPU（数值不更新，DWM 无合成）。
             unsafe {
                 use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
                 while !IsWindowVisible(overlay_hwnd).as_bool() {
-                    // E1：事件驱动——挂起等待 resume 信号（托盘显示 / 系统唤醒），
-                    // 不再每 1s 轮询一次可见性。显示时 window 线程会发 resume。
-                    if resume_rx.recv().is_err() {
-                        // 通道已断开（应处在退出路径）：短暂让出后重查，避免忙等
-                        thread::sleep(Duration::from_millis(200));
-                    }
+                    // E1：事件驱动——挂起等待 resume 信号（托盘显示 / 系统唤醒 / 全屏恢复）。
+                    // 1s 超时兜底：任何显示路径漏发信号时，最多 1s 后重查可见性自愈，
+                    // 不再可能永久卡死（2026-09-14 实测：全屏恢复漏发 → 采样冻结 3 小时）。
+                    let _ = resume_rx.recv_timeout(Duration::from_millis(1000));
                 }
             }
 
@@ -400,11 +477,24 @@ fn main() {
                 sampler.reset_backoff();
             }
 
+            // 兜底唤醒检测（WM_POWERBROADCAST 可能不触发，如 Modern Standby）：
+            // 若距离上次采样的时间差超过正常间隔的 3 倍，说明系统刚从睡眠恢复但通知丢了，
+            // 自动触发恢复逻辑（重置退避）。
+            let now_before_wait = get_tick_count_ms();
+            const FALLBACK_WAKE_GAP_MS: u64 = (REFRESH_FLOOR_MS as u64) * 3;
+            if now_before_wait.saturating_sub(last_sample_ms) > FALLBACK_WAKE_GAP_MS {
+                sampler.reset_backoff();
+                aaxsyspulse_win::probe::log("sampler: fallback wake detected — gap exceeded 3x normal interval");
+            }
+
             // 会话锁定（BUG-1）：锁屏安全桌面不显示悬浮窗，采样纯烧 CPU。
             // 挂起等待解锁信号（window 线程 UNLOCK 时发 resume），零轮询；
             // 解锁唤醒后 reset_backoff 并直达采样——立即补采消除数据空白窗口。
-            if aaxsyspulse_win::window::session_locked() && resume_rx.recv().is_ok() {
-                sampler.reset_backoff();
+            // 5s 超时兜底：解锁信号万一丢失，最多 5s 后重查状态，不会永久阻塞。
+            if aaxsyspulse_win::window::session_locked() {
+                if resume_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
+                    sampler.reset_backoff();
+                }
             }
 
             // 设置改动即时生效（原子镜像，无锁；改动态代际 +1 会从 wait_cfg_change 提前唤醒）
@@ -447,6 +537,7 @@ fn main() {
             let plan = sched.plan(now_ms, &enabled);
             let power_on = enabled[4];
             let util_on = schedule_util();
+            let disk_on = schedule_disk();
             // Util 数据源保障：show_util 开启时强制 CPU/GPU 采样（即使行关闭也不断源）。
             // Memory 的 load_pct 始终有值（来自 prev 快照），无需强制进计划。
             let mut plan = plan;
@@ -461,10 +552,12 @@ fn main() {
             // 空计划零开销：无源到期且无需 flush → 不克隆快照、不进采样器。
             let snap = if plan.any() || need_flush {
                 need_flush = false;
-                sampler.sample(&plan, Some(&pending), now_ms, power_on, util_on)
+                sampler.sample(&plan, Some(&pending), now_ms, power_on, util_on, disk_on)
             } else {
                 pending.clone()
             };
+            // 同步诊断数据到共享区（设置窗口可通过消息请求读取）
+            update_shared_diag(&sampler.diag);
             let after_ms = get_tick_count_ms();
 
             if plan.cpu {
@@ -569,12 +662,20 @@ fn main() {
             // wait_cfg_change 立即唤醒。全部源关闭 → 30s 慢心跳兜底
             // （可见性变化/系统唤醒走各自的通道，不依赖本循环高频轮询）。
             let now_after = get_tick_count_ms();
+            // 记录本次采样时间戳，用于兜底唤醒检测（两次采样间隔超 3 倍正常值时自动重置退避）。
+            last_sample_ms = now_after;
+
+            // 远程会话中降低采样频率：把超时翻倍（原来 1s 变成 2s，原来 2s 变成 4s），
+            // 减少资源占用（WM_POWERBROADCAST 在远程会话中不一定触发，靠通知驱动不可能，
+            // 所以在兜底检测里额外照顾）。
             let any_enabled = enabled.iter().any(|&x| x);
-            let timeout_ms = if any_enabled {
-                sched.next_wake_ms(now_after, &enabled).saturating_sub(now_after).min(30_000).max(1)
+            let base_timeout_ms: u64 = if any_enabled {
+                sched.next_wake_ms(now_after, &enabled).saturating_sub(now_after).min(30_000u64).max(1u64)
             } else {
-                30_000
+                30_000u64
             };
+            let remote_factor: u64 = if aaxsyspulse_win::in_remote_session() { 2 } else { 1 };
+            let timeout_ms: u32 = (base_timeout_ms * remote_factor) as u32;
             aaxsyspulse_win::probe::log_lazy(|| {
                 format!(
                     "sleep_ms={} auto={} plan={}{}{}{}{} mode={}",
@@ -588,7 +689,7 @@ fn main() {
                     mode_active as u8,
                 )
             });
-            cfg_gen = wait_cfg_change(cfg_gen, timeout_ms);
+            cfg_gen = wait_cfg_change(cfg_gen, timeout_ms as u64);
         }
     });
 

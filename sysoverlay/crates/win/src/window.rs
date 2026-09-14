@@ -14,10 +14,11 @@
 
 use crate::Config;
 use crate::Snapshot;
+use aaxsyspulse_core::sampler::SamplerDiag;
 use arc_swap::ArcSwap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, GetDC, GetDeviceCaps, InvalidateRect,
     ReleaseDC, ValidateRect, HORZRES, PAINTSTRUCT, VERTRES,
@@ -37,6 +38,119 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
+
+// ── 全屏检测 ──────────────────────────────────────────────
+
+/// SHQueryUserNotificationState 查询结果：应用程序在通知状态下的运行级别。
+///
+/// 取值必须与 Windows SDK `QUERY_USER_NOTIFICATION_STATE` 严格一致：
+/// `1`=NOT_PRESENT `2`=BUSY `3`=RUNNING_D3D_FULL_SCREEN `4`=PRESENTATION_MODE
+/// `5`=ACCEPTS_NOTIFICATIONS（**普通桌面**）`6`=QUIET_TIME `7`=APP。
+///
+/// ⚠️ 回归教训：曾把 3/4 误写成 5/8 —— 于是「普通桌面（=5）」被判成 D3D 全屏，
+/// 悬浮窗一在桌面上就被自动隐藏，采样线程随之 park（功耗 / 综合占用停更）。
+#[allow(dead_code)]
+const QUNS_NOT_PRESENT: u32 = 1;
+/// 有应用程序在全屏运行（D3D 独占全屏）。
+const QUNS_RUNNING_D3D_FULL_SCREEN: u32 = 3;
+/// 应用程序以演示模式运行。
+const QUNS_PRESENTATION_MODE: u32 = 4;
+
+#[link(name = "shell32")]
+extern "system" {
+    fn SHQueryUserNotificationState(pState: *mut u32) -> windows::Win32::Foundation::WIN32_ERROR;
+}
+
+/// 检测前台窗口是否全屏。
+///
+/// 首先调用 `SHQueryUserNotificationState`，若返回 `QUNS_RUNNING_D3D_FULL_SCREEN`
+/// 或 `QUNS_PRESENTATION_MODE` 则认为全屏；否则再比较前台窗口矩形与
+/// **整个显示器矩形**（rcMonitor，处理无边框全屏可能不触发 API 的情况）。
+///
+/// 返回 `true` 表示当前前台应用处于全屏状态。
+fn is_foreground_fullscreen() -> bool {
+    unsafe {
+        // 方法一：SHQueryUserNotificationState
+        let mut state: u32 = 0;
+        if SHQueryUserNotificationState(&mut state).is_ok() {
+            if state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_PRESENTATION_MODE {
+                crate::probe::log("is_foreground_fullscreen: API says fullscreen");
+                return true;
+            }
+        }
+
+        // 方法二：前台窗口矩形 vs 整个显示器矩形（备选：无边框全屏）
+        use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect, GWL_STYLE, WS_CAPTION};
+        use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST, GetMonitorInfoW};
+
+        let fg_hwnd = GetForegroundWindow();
+        if fg_hwnd.is_invalid() {
+            return false;
+        }
+
+        // 跳过悬浮窗自身
+        let my_hwnd = find_overlay_hwnd().unwrap_or(HWND::default());
+        if fg_hwnd == my_hwnd {
+            return false;
+        }
+
+        let mut fg_rect = RECT::default();
+        if GetWindowRect(fg_hwnd, &mut fg_rect).is_err() {
+            return false;
+        }
+
+        // 跳过最小化窗口
+        if fg_rect.left == fg_rect.right || fg_rect.top == fg_rect.bottom {
+            return false;
+        }
+
+        // 获取前台窗口所在显示器
+        let hmon = MonitorFromWindow(fg_hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut mi = windows::Win32::Graphics::Gdi::MONITORINFOEXW::default();
+        mi.monitorInfo.cbSize = std::mem::size_of::<windows::Win32::Graphics::Gdi::MONITORINFOEXW>() as u32;
+        if !GetMonitorInfoW(hmon, &mut mi as *mut _ as *mut _).as_bool() {
+            return false;
+        }
+
+        // 必须与整个显示器矩形（rcMonitor）而非工作区（rcWork）比对：
+        // 最大化窗口恰好覆盖工作区（ratio=1.00）但盖不住任务栏——用工作区
+        // 比对会把「最大化浏览器」误判成全屏（2026-09-14 日志实测大量
+        // ratio=1.00 误触发，悬浮窗随之莫名隐藏/恢复）；真全屏覆盖整个显示器。
+        let mon = mi.monitorInfo.rcMonitor;
+        let mon_w = mon.right - mon.left;
+        let mon_h = mon.bottom - mon.top;
+        let fg_w = fg_rect.right - fg_rect.left;
+        let fg_h = fg_rect.bottom - fg_rect.top;
+
+        let overlap = (
+            (fg_rect.left.max(mon.left) .. fg_rect.right.min(mon.right)).len().max(0) as i32,
+            (fg_rect.top.max(mon.top) .. fg_rect.bottom.min(mon.bottom)).len().max(0) as i32,
+        );
+
+        let overlap_ratio = if fg_w > 0 && fg_h > 0 && mon_w > 0 && mon_h > 0 {
+            (overlap.0 as f64 / mon_w as f64).min(overlap.1 as f64 / mon_h as f64)
+        } else {
+            0.0
+        };
+
+        let mut is_full = overlap_ratio > 0.99 && fg_w >= mon_w && fg_h >= mon_h;
+        // 任务栏自动隐藏时 rcWork == rcMonitor，仅凭矩形区分不了最大化与
+        // 无边框全屏：最大化窗口保有 WS_CAPTION（无边框全屏没有），再挡一道。
+        if is_full {
+            let style = GetWindowLongPtrW(fg_hwnd, GWL_STYLE.0) as u32;
+            if style & WS_CAPTION.0 != 0 {
+                is_full = false;
+            }
+        }
+        if is_full {
+            crate::probe::log(&format!(
+                "is_foreground_fullscreen: rect check fullscreen (ratio={:.2})",
+                overlap_ratio
+            ));
+        }
+        is_full
+    }
+}
 
 // ── 悬浮窗显隐状态标记文件（供二次启动时判断）───────────────────────────────
 const OVERLAY_STATE_FILE: &str = "overlay_hidden.dat";
@@ -134,6 +248,24 @@ pub fn snap_store(snap: Snapshot) {
         .store(Arc::new(snap));
 }
 
+// ─── 共享诊断数据（采样线程 → 设置窗口） ───────────────────
+
+/// 共享诊断环形缓冲。采样线程每轮 sample() 后更新，
+/// 设置窗口通过 WM_GET_SAMPLER_DIAG / WM_SAMPLER_DIAG 消息对拿取。
+/// 使用 ArcSwap 实现无锁读写——与 SharedSnapshot 相同模式。
+static SHARED_DIAG: OnceLock<ArcSwap<SamplerDiag>> = OnceLock::new();
+
+/// 返回共享诊断缓冲（Arc 所有权转移给调用方）。
+/// 与 snap_get() 相同模式：ArcSwap 保证读端无需锁。
+pub fn shared_diag() -> Arc<SamplerDiag> {
+    SHARED_DIAG.get_or_init(|| ArcSwap::from_pointee(SamplerDiag::new())).load_full()
+}
+
+/// 上层（app/main.rs）每轮 sample 后调用此函数更新共享诊断。
+pub fn update_shared_diag(diag: &SamplerDiag) {
+    SHARED_DIAG.get_or_init(|| ArcSwap::from_pointee(SamplerDiag::new())).store(Arc::new(diag.clone()));
+}
+
 /// Returns a mutable handle to the shared sequence number (for app use).
 pub fn get_shared_seq() -> &'static AtomicU64 {
     &SHARED_SEQ
@@ -210,6 +342,10 @@ pub fn publish_schedule_cfg(cfg: &Config) {
     SCHED_POWER_INTERVAL_MS.store(cfg.power_interval_ms, Ordering::Relaxed);
     SCHED_NET_LOW.store(cfg.net_low_freq, Ordering::Relaxed);
     SCHED_UTIL.store(cfg.show_util, Ordering::Relaxed);
+    // 磁盘监控由 metric_order 是否包含 DiskRead/DiskWrite 决定（无需独立 show_disk 布尔）。
+    // 若 order 含磁盘指标则开启采样；采样器会按需创建/销毁 PDH 查询。
+    let disk_in_order = cfg.metric_order.contains(&7) || cfg.metric_order.contains(&8);
+    SCHED_DISK.store(disk_in_order, Ordering::Relaxed);
     // GPU 查询范围（主适配器/3D 引擎 only）随配置即时生效
     crate::proc_gpu::set_gpu_scope(cfg.gpu_primary_only, cfg.gpu_3d_only);
     // 唤醒采样线程（含全关停车状态）
@@ -219,9 +355,17 @@ pub fn publish_schedule_cfg(cfg: &Config) {
     drop(gen);
 }
 
+/// 磁盘采样开关：默认 false，用户在 monitor 配置文件里手动开启后变为 true。
+static SCHED_DISK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// 采样线程读取 Util 计算开关（设置页改动即时生效）。
 pub fn schedule_util() -> bool {
     SCHED_UTIL.load(Ordering::Relaxed)
+}
+
+/// 采样线程读取磁盘采样开关（monitor 配置 show_disk）。
+pub fn schedule_disk() -> bool {
+    SCHED_DISK.load(Ordering::Relaxed)
 }
 
 /// 采样线程读取当前调度参数：(interval_ms, auto, [cpu, mem, gpu, net, power], power_interval_ms)。
@@ -302,6 +446,12 @@ pub const WM_RECONFIG: u32 = 0x8000 + 2;
 /// 阻塞在 GetMessageW 上（空闲 0% CPU），有新数据才画。
 pub const WM_NEW_SNAPSHOT: u32 = 0x8000 + 3;
 
+/// 设置窗口请求诊断数据：Settings → Overlay。
+pub const WM_GET_SAMPLER_DIAG: u32 = 0x8000 + 4;
+
+/// Overlay 回复诊断数据：Overlay → Settings。LPARAM = `*const SamplerDiag`。
+pub const WM_SAMPLER_DIAG: u32 = 0x8000 + 5;
+
 /// Retrieves ThreadState pointer from GWLP_USERDATA.
 ///
 /// 返回 null 表示窗口尚未完成创建（WM_CREATE/WM_SIZE 等消息在
@@ -336,12 +486,35 @@ pub fn is_window_hovered(hwnd: HWND) -> bool {
 /// Notifies the app's sampling thread of a system resume event via a oneshot.
 static RESUME_NOTIFY: OnceLock<std::sync::mpsc::Sender<()>> = OnceLock::new();
 
+/// 即将挂起标志：wndproc 在 PBT_APMSUSPEND 时置位，采样线程检测到后暂停采样。
+/// 避免睡眠期间空转 CPU（窗口隐藏时采样线程已挂起，这里是双保险）。
+static SAMPLER_SUSPENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 采样线程查询：是否处于系统挂起状态（睡眠期间采样线程busy-wait低频重试）。
+pub fn sampler_suspended() -> bool {
+    SAMPLER_SUSPENDED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 会话锁定状态（BUG-1）：锁定时采样线程挂起，解锁立即补采。
 static SESSION_LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 全屏检测定时器 ID。
+const FULLSCREEN_TIMER_ID: usize = 16;
+
+/// 上一帧是否处于全屏状态（用于边沿检测）。
+static WAS_FULLSCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 采样线程查询：会话是否处于锁定状态（锁屏安全桌面不显示悬浮窗，采样纯烧 CPU）。
 pub fn session_locked() -> bool {
     SESSION_LOCKED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 是否处于远程桌面会话中（由全屏检测定时器更新，采样线程只读）。
+static IN_REMOTE_SESSION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 采样线程查询：是否在远程会话中。远程会话中降低采样频率。
+pub fn in_remote_session() -> bool {
+    IN_REMOTE_SESSION.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 unsafe extern "system" fn wndproc(
@@ -525,6 +698,65 @@ unsafe extern "system" fn wndproc(
                     .unwrap_or(true);
                 crate::gdi::rearm_clock_timer(hwnd, secs);
             }
+
+            // 全屏检测定时器（1s 间隔）：检测前台窗口是否全屏，触发隐藏/恢复。
+            if _wparam.0 == FULLSCREEN_TIMER_ID {
+                let cfg = get_state_ptr(hwnd)
+                    .as_ref()
+                    .map(|s| s.cfg);
+                let enabled = cfg
+                    .map(|c| c.fullscreen_auto_hide)
+                    .unwrap_or(false);
+
+                if enabled {
+                    let is_full = is_foreground_fullscreen();
+                    let was_full = WAS_FULLSCREEN.load(Ordering::Relaxed);
+
+                    if is_full != was_full {
+                        WAS_FULLSCREEN.store(is_full, Ordering::Relaxed);
+                        if is_full {
+                            // 进入全屏 → 隐藏悬浮窗
+                            mark_overlay_hidden(true);
+                            let _ = ShowWindow(hwnd, SW_HIDE);
+                            crate::probe::log("fullscreen: hiding overlay");
+                        } else {
+                            // 退出全屏 → 恢复悬浮窗
+                            mark_overlay_hidden(false);
+                            let _ = ShowWindow(hwnd, SW_SHOW);
+                            // 唤醒采样线程：隐藏期间到期的 sleep 醒来后，它会阻塞在
+                            // 「不可见 → 等待 resume」上；本路径漏发信号曾导致采样
+                            // 永久冻结（2026-09-14 实测：20:44 起数值停更 3 小时）。
+                            if let Some(tx) = RESUME_NOTIFY.get() {
+                                let _ = tx.send(());
+                            }
+                            // 恢复时立即渲染一帧
+                            if let Some(state) = get_state_ptr(hwnd).as_ref() {
+                                crate::render_thread::request(hwnd, &state.cfg);
+                            }
+                            crate::probe::log("fullscreen: restoring overlay");
+                        }
+                    }
+                }
+
+                // 远程桌面会话检测：GetSystemMetrics(SM_REMOTESESSION) 在远程会话中返回 TRUE。
+                // 采样线程据此降低采样频率（延长 sleep 间隔），减少资源占用。
+                // windows crate 的 GetSystemMetrics 需要 SYSTEM_METRICS_INDEX 包装常量值。
+                {
+                    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SYSTEM_METRICS_INDEX};
+                    const SM_REMOTESESSION: SYSTEM_METRICS_INDEX =
+                        SYSTEM_METRICS_INDEX(0x1000i32);
+                    let remote = unsafe { GetSystemMetrics(SM_REMOTESESSION) != 0 };
+                    if remote != IN_REMOTE_SESSION.load(Ordering::Relaxed) {
+                        IN_REMOTE_SESSION.store(remote, Ordering::Relaxed);
+                        crate::probe::log(if remote {
+                            "session: entered remote desktop — reducing sampling frequency"
+                        } else {
+                            "session: left remote desktop — restoring normal sampling"
+                        });
+                    }
+                }
+            }
+
             // 拖动期间不渲染：随时可能已被 SetWindowPos 刷新过几何，渲染只会
             // 提交过期/悬停帧；等 WM_LBUTTONUP/WM_EXITSIZEMOVE 统一补一帧。
             let dragging = get_state_ptr(hwnd)
@@ -638,6 +870,21 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
 
+        // ── 设置窗口请求诊断数据：返回共享诊断缓冲指针 ──
+        WM_GET_SAMPLER_DIAG => {
+            let diag = shared_diag();
+            let ptr = &*diag as *const SamplerDiag;
+            // 发送给 settings 窗口（由 lparam 传入目标 HWND）
+            let target = HWND(lparam.0 as *mut _);
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                target,
+                WM_SAMPLER_DIAG,
+                WPARAM(0),
+                LPARAM(ptr as isize),
+            );
+            LRESULT(0)
+        }
+
         // 自愈：显示变化 → 重建 DIB 缓存（屏幕 DC 可能改变）+ 直接重画一帧
         WM_DISPLAYCHANGE => {
             crate::proc_gpu::invalidate_topology();
@@ -657,15 +904,39 @@ unsafe extern "system" fn wndproc(
 
         // Self-heal: system resume → notify sampling thread to reset backoff
         WM_POWERBROADCAST => {
-            // BUG-2：0x0007 = PBT_APMRESUMESUSPEND（用户输入唤醒，前面还有一发
-            // 0x0012）；0x0012 = PBT_APMRESUMEAUTOMATIC（定时/计划任务唤醒**只发
-            // 此码**）。只听 0x0007 会让定时唤醒的机器漏掉采样退避重置。
-            const PBT_APMRESUMESUSPEND: u32 = 0x0007;
+            const PBT_APMSUSPEND: u32 = 0x0004;
             const PBT_APMRESUMEAUTOMATIC: u32 = 0x0012;
-            if matches!(lparam.0 as u32, PBT_APMRESUMESUSPEND | PBT_APMRESUMEAUTOMATIC) {
-                if let Some(tx) = RESUME_NOTIFY.get() {
-                    let _ = tx.send(());
+            const PBT_APMRESUMESUSPEND: u32 = 0x0007;
+            const PBT_POWERSETTINGCHANGE: u32 = 0x8013;
+            match _wparam.0 as u32 {
+                PBT_APMSUSPEND => {
+                    // 即将进入睡眠：标记挂起状态。采样线程会在下一次循环检测到
+                    // SAMPLER_SUSPENDED 后暂停采样（低频busy-wait），窗口隐藏时
+                    // 采样线程已通过 IsWindowVisible 挂起，这里是双保险。
+                    SAMPLER_SUSPENDED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    crate::probe::log("power: entering suspend — marking sampler paused");
                 }
+                PBT_APMRESUMEAUTOMATIC => {
+                    // 唤醒（任何方式都会发）：清除挂起标志，通知采样线程重置退避。
+                    SAMPLER_SUSPENDED.store(false, std::sync::atomic::Ordering::Relaxed);
+                    // GPU 拓扑可能已失效（睡眠期间显示器变化 / 显卡驱动重新初始化）：
+                    // 强制在下一次采样前重建拓扑，避免 GPU 行在唤醒后持续显示 --。
+                    crate::proc_gpu::invalidate_topology();
+                    if let Some(tx) = RESUME_NOTIFY.get() {
+                        let _ = tx.send(());
+                    }
+                    crate::probe::log("power: resumed (automatic)");
+                }
+                PBT_APMRESUMESUSPEND => {
+                    // 仅用户输入唤醒时跟随 PBT_APMRESUMEAUTOMATIC 之后发送。
+                    // 主恢复逻辑已在 AUTOMATIC 处理完，这里只记录。
+                    crate::probe::log("power: resumed (user input)");
+                }
+                PBT_POWERSETTINGCHANGE => {
+                    // 电源设置变化（如屏保、超时、AC/电池切换），记录日志。
+                    crate::probe::log("power: setting changed");
+                }
+                _ => {}
             }
             LRESULT(1)
         }
@@ -698,7 +969,9 @@ unsafe extern "system" fn wndproc(
         WM_DESTROY => {
             unsafe {
                 use windows::Win32::System::RemoteDesktop::WTSUnRegisterSessionNotification;
+                use windows::Win32::UI::WindowsAndMessaging::KillTimer;
                 let _ = WTSUnRegisterSessionNotification(hwnd);
+                let _ = KillTimer(hwnd, FULLSCREEN_TIMER_ID as _);
             }
             crate::tray::remove(hwnd);
             PostQuitMessage(0);
@@ -1017,6 +1290,12 @@ impl OverlayWindow {
         // 由 WM_PAINT 分支在 state 就绪后重试。
         let _ = unsafe { InvalidateRect(hwnd, None, false) };
 
+        // 启动全屏检测定时器（1s 间隔）。
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::SetTimer;
+            let _ = SetTimer(hwnd, FULLSCREEN_TIMER_ID as _, 1000, None);
+        }
+
         Ok(Self { hwnd, state })
     }
 
@@ -1086,6 +1365,10 @@ pub fn handle_second_instance() -> bool {
             if hidden {
                 mark_overlay_hidden(false);
                 unsafe { let _ = ShowWindow(hwnd, SW_SHOW); }
+                // 与托盘显示路径同理：唤醒可能阻塞在不可见等待上的采样线程
+                if let Some(tx) = RESUME_NOTIFY.get() {
+                    let _ = tx.send(());
+                }
             } else {
                 crate::settings::open_settings(hwnd);
             }
