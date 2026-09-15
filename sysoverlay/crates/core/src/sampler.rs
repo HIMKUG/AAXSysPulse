@@ -222,22 +222,33 @@ impl<'a> Iterator for DiagIter<'a> {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Backoff {
     failures: u32,
+    /// 下次允许尝试的时刻（与采样时钟同源的毫秒时间戳；`reset` 后为 0 = 立即可试）。
+    ///
+    /// ⚠️ 没有这个字段时，「是否退避中」只能由 `failures > 0` 表达，而它**无法说明
+    /// 还要等多久**。一旦把它当作跳过门使用，就会退化成「失败一次 → 永久跳过」：
+    /// 被门挡下的轮次记为 `Skipped`，`Skipped` 不复位 `failures`，于是门永远关着，
+    /// 指标在首次瞬时失败后永久冻结（2026-09-15 审计：第一批修复曾引入此回归）。
+    next_attempt_ms: u64,
 }
 
 impl Backoff {
     /// 最大档位对应的毫秒数。
     pub const MAX_DELAY_MS: u32 = 30_000;
 
-    /// 记录一次失败，返回本次应等待的毫秒数。
-    pub fn next_delay_ms(&mut self) -> u32 {
+    /// 记录一次失败；`now_ms` 为当前采样时钟。返回本次应等待的毫秒数，
+    /// 并据此刻画「下次允许尝试的时刻」。
+    pub fn next_delay_ms(&mut self, now_ms: u64) -> u32 {
         let shift = self.failures.min(5); // 1s,2s,4s,8s,16s,32s→封顶 30s
-        self.failures += 1;
-        (1_000u32 << shift).min(Self::MAX_DELAY_MS)
+        self.failures = self.failures.saturating_add(1);
+        let delay = (1_000u32 << shift).min(Self::MAX_DELAY_MS);
+        self.next_attempt_ms = now_ms.saturating_add(delay as u64);
+        delay
     }
 
-    /// 记录一次成功，复位退避。
+    /// 记录一次成功，复位退避（同时允许立即重试）。
     pub fn reset(&mut self) {
         self.failures = 0;
+        self.next_attempt_ms = 0;
     }
 
     /// 当前连续失败次数。
@@ -245,9 +256,21 @@ impl Backoff {
         self.failures
     }
 
-    /// 是否处于退避状态。
-    pub fn is_backing_off(&self) -> bool {
-        self.failures > 0
+    /// 退避窗口是否**仍未到期**（`now_ms` 早于下次允许尝试的时刻）。
+    ///
+    /// 到期后返回 `false` —— 允许再试一次；若再失败档位继续上升。这是它唯一正确的
+    /// 用法：门只会挡住**窗口内**的轮次，不会永久关死。
+    pub fn is_backing_off(&self, now_ms: u64) -> bool {
+        self.failures > 0 && now_ms < self.next_attempt_ms
+    }
+
+    /// 距下次允许尝试还剩多少毫秒（0 = 已可重试）。供 UI/调度显示。
+    pub fn remaining_delay_ms(&self, now_ms: u64) -> u32 {
+        if self.failures == 0 {
+            return 0;
+        }
+        let left = self.next_attempt_ms.saturating_sub(now_ms);
+        left.min(u32::MAX as u64) as u32
     }
 }
 
@@ -372,27 +395,45 @@ mod tests {
     #[test]
     fn backoff_doubles_then_caps() {
         let mut b = Backoff::default();
-        assert!(!b.is_backing_off());
+        let t0: u64 = 10_000;
+        assert!(!b.is_backing_off(t0));
 
-        assert_eq!(b.next_delay_ms(), 1_000);
-        assert_eq!(b.next_delay_ms(), 2_000);
-        assert_eq!(b.next_delay_ms(), 4_000);
-        assert_eq!(b.next_delay_ms(), 8_000);
-        assert_eq!(b.next_delay_ms(), 16_000);
-        assert_eq!(b.next_delay_ms(), 30_000, "封顶 30s");
-        assert_eq!(b.next_delay_ms(), 30_000, "之后保持不变");
+        assert_eq!(b.next_delay_ms(t0), 1_000);
+        assert_eq!(b.next_delay_ms(t0), 2_000);
+        assert_eq!(b.next_delay_ms(t0), 4_000);
+        assert_eq!(b.next_delay_ms(t0), 8_000);
+        assert_eq!(b.next_delay_ms(t0), 16_000);
+        assert_eq!(b.next_delay_ms(t0), 30_000, "封顶 30s");
+        assert_eq!(b.next_delay_ms(t0), 30_000, "之后保持不变");
         assert_eq!(b.failures(), 7);
     }
 
     #[test]
     fn backoff_resets_on_success() {
         let mut b = Backoff::default();
-        b.next_delay_ms();
-        b.next_delay_ms();
-        assert!(b.is_backing_off());
+        let t0: u64 = 10_000;
+        b.next_delay_ms(t0);
+        b.next_delay_ms(t0);
+        assert!(b.is_backing_off(t0));
         b.reset();
-        assert!(!b.is_backing_off());
-        assert_eq!(b.next_delay_ms(), 1_000, "复位后从第一档重新开始");
+        assert!(!b.is_backing_off(t0));
+        assert_eq!(b.next_delay_ms(t0), 1_000, "复位后从第一档重新开始");
+    }
+
+    #[test]
+    fn backoff_window_expires_and_allows_retry() {
+        // 回归锁：退避门必须**到期后放行**。若门写成 `failures > 0`，则一次瞬时失败
+        // 之后永远挡住重试（被挡的轮次记 Skipped，不复位 failures）→ 指标永久冻结。
+        let mut b = Backoff::default();
+        let t0: u64 = 10_000;
+        assert_eq!(b.next_delay_ms(t0), 1_000);
+        assert!(b.is_backing_off(t0), "刚失败：窗口内");
+        assert!(b.is_backing_off(t0 + 999), "窗口未到期");
+        assert!(!b.is_backing_off(t0 + 1_000), "到点必须放行一次重试");
+        assert_eq!(b.remaining_delay_ms(t0 + 400), 600);
+        assert_eq!(b.remaining_delay_ms(t0 + 1_000), 0);
+        b.reset();
+        assert_eq!(b.remaining_delay_ms(t0), 0);
     }
 
     #[test]

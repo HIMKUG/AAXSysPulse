@@ -528,7 +528,7 @@ mod tests {
 
     #[test]
     fn rows_shown_from_snapshot() {
-        use crate::snapshot::{MemoryStat, NetStat};
+        use crate::snapshot::{DiskStat, MemoryStat, NetStat};
         let snap = Snapshot {
             seq: 1,
             timestamp_ms: 0,
@@ -540,6 +540,7 @@ mod tests {
             power: Metric::Unavailable,
             util: Metric::Unavailable,
             util_partial: false,
+            disk: DiskStat::default(),
         };
         let rows = RowsShown::from_snapshot(&snap, true);
         assert!(rows.cpu);

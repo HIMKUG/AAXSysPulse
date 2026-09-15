@@ -221,6 +221,13 @@ impl ThreadState {
     }
 }
 
+/// 本进程悬浮窗 HWND 缓存（0 = 未知）。
+///
+/// `find_overlay_hwnd` 的快路径：全屏自动隐藏开启时，1s 定时器每秒都会调用它，
+/// 旧实现每次都 `EnumWindows` 遍历**全部**顶层窗口 + 逐窗 `GetClassNameW` ——
+/// 浏览器多进程/多开应用时是 UI 线程上的可观周期开销（与 0.03% CPU 目标冲突）。
+static OVERLAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
 // ─── Shared snapshot (sampling thread → UI thread) ───────────────────
 
 /// Shared snapshot written by the app's sampling thread, read by WM_PAINT.
@@ -342,10 +349,11 @@ pub fn publish_schedule_cfg(cfg: &Config) {
     SCHED_POWER_INTERVAL_MS.store(cfg.power_interval_ms, Ordering::Relaxed);
     SCHED_NET_LOW.store(cfg.net_low_freq, Ordering::Relaxed);
     SCHED_UTIL.store(cfg.show_util, Ordering::Relaxed);
-    // 磁盘监控由 metric_order 是否包含 DiskRead/DiskWrite 决定（无需独立 show_disk 布尔）。
-    // 若 order 含磁盘指标则开启采样；采样器会按需创建/销毁 PDH 查询。
-    let disk_in_order = cfg.metric_order.contains(&7) || cfg.metric_order.contains(&8);
-    SCHED_DISK.store(disk_in_order, Ordering::Relaxed);
+    // 磁盘监控由各自的 show_disk_read/show_disk_write 开关决定（与 CPU/Mem 等一致）：
+    // 7/8 始终在 metric_order 中，行是否采样/显示由 show 标志控制。
+    // 开启采样后采样器按需创建/销毁 PDH 查询。
+    let disk_on = cfg.show_disk_read || cfg.show_disk_write;
+    SCHED_DISK.store(disk_on, Ordering::Relaxed);
     // GPU 查询范围（主适配器/3D 引擎 only）随配置即时生效
     crate::proc_gpu::set_gpu_scope(cfg.gpu_primary_only, cfg.gpu_3d_only);
     // 唤醒采样线程（含全关停车状态）
@@ -451,6 +459,15 @@ pub const WM_GET_SAMPLER_DIAG: u32 = 0x8000 + 4;
 
 /// Overlay 回复诊断数据：Overlay → Settings。LPARAM = `*const SamplerDiag`。
 pub const WM_SAMPLER_DIAG: u32 = 0x8000 + 5;
+/// 二次启动时请求**第一实例**在自己进程内打开设置页（跨进程 PostMessage）。
+pub const WM_OPEN_SETTINGS: u32 = 0x8000 + 6;
+/// D2D 自愈回退：渲染 / 采样线程只置 D2D_BROKEN 并投递本消息，
+/// 由 UI 线程改写 Config 并落盘（ThreadState 归 UI 线程所有，不可跨线程写）。
+pub const WM_DISABLE_D2D: u32 = 0x8000 + 7;
+
+/// 关机 / 注销。旧实现完全没处理这两个消息（见 wndproc 分支注释）。
+const WM_QUERYENDSESSION: u32 = 0x0011;
+const WM_ENDSESSION: u32 = 0x0016;
 
 /// Retrieves ThreadState pointer from GWLP_USERDATA.
 ///
@@ -492,7 +509,19 @@ static SAMPLER_SUSPENDED: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 
 /// 采样线程查询：是否处于系统挂起状态（睡眠期间采样线程busy-wait低频重试）。
 pub fn sampler_suspended() -> bool {
-    SAMPLER_SUSPENDED.load(std::sync::atomic::Ordering::Relaxed)
+    // Acquire：与下方 force_clear / wndproc 的 Release store 配对，保证标志位
+    // 的跨线程可见性有正式的内存序保证（不再只依赖 x86 的实际行为）。
+    SAMPLER_SUSPENDED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// 强制清除挂起标志（采样线程的自愈出口）。
+///
+/// `SAMPLER_SUSPENDED` 的唯一正常清除点是 `PBT_APMRESUMEAUTOMATIC`；Modern Standby
+/// 下该通知可能丢失 —— 那正是采样循环里"兜底唤醒检测"存在的理由，但兜底检测位于
+/// 挂起等待循环**之后**，挂起期间永远执行不到 → 通知一丢采样就永久冻结。
+/// 因此采样线程在挂起超过阈值时调用本函数自救。
+pub fn force_clear_sampler_suspended() {
+    SAMPLER_SUSPENDED.store(false, std::sync::atomic::Ordering::Release);
 }
 
 /// 会话锁定状态（BUG-1）：锁定时采样线程挂起，解锁立即补采。
@@ -506,7 +535,7 @@ static WAS_FULLSCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 
 /// 采样线程查询：会话是否处于锁定状态（锁屏安全桌面不显示悬浮窗，采样纯烧 CPU）。
 pub fn session_locked() -> bool {
-    SESSION_LOCKED.load(std::sync::atomic::Ordering::Relaxed)
+    SESSION_LOCKED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// 是否处于远程桌面会话中（由全屏检测定时器更新，采样线程只读）。
@@ -514,7 +543,7 @@ static IN_REMOTE_SESSION: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 
 /// 采样线程查询：是否在远程会话中。远程会话中降低采样频率。
 pub fn in_remote_session() -> bool {
-    IN_REMOTE_SESSION.load(std::sync::atomic::Ordering::Relaxed)
+    IN_REMOTE_SESSION.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 unsafe extern "system" fn wndproc(
@@ -746,8 +775,8 @@ unsafe extern "system" fn wndproc(
                     const SM_REMOTESESSION: SYSTEM_METRICS_INDEX =
                         SYSTEM_METRICS_INDEX(0x1000i32);
                     let remote = unsafe { GetSystemMetrics(SM_REMOTESESSION) != 0 };
-                    if remote != IN_REMOTE_SESSION.load(Ordering::Relaxed) {
-                        IN_REMOTE_SESSION.store(remote, Ordering::Relaxed);
+                    if remote != IN_REMOTE_SESSION.load(Ordering::SeqCst) {
+                        IN_REMOTE_SESSION.store(remote, Ordering::SeqCst);
                         crate::probe::log(if remote {
                             "session: entered remote desktop — reducing sampling frequency"
                         } else {
@@ -872,8 +901,13 @@ unsafe extern "system" fn wndproc(
 
         // ── 设置窗口请求诊断数据：返回共享诊断缓冲指针 ──
         WM_GET_SAMPLER_DIAG => {
-            let diag = shared_diag();
-            let ptr = &*diag as *const SamplerDiag;
+            // ⚠️ 所有权交接：PostMessage 是**异步**的。旧实现只送 `&*diag` 的裸指针，
+            // `diag` 在本分支结束时 drop；采样线程下一轮 `update_shared_diag` 会 store
+            // 新 Arc 并释放旧对象 → 设置窗稍后解引用即 **use-after-free**。设置页只要
+            // 开着一个模态 MessageBox / 取色对话框（本项目大量使用），消息迟迟不被
+            // 处理，则必现。改为 `Arc::into_raw` 把这一份强引用**移交**给接收端，
+            // 接收端必须以 `Arc::from_raw` 接管（见 settings::on_wm_sampler_diag）。
+            let ptr = Arc::into_raw(shared_diag());
             // 发送给 settings 窗口（由 lparam 传入目标 HWND）
             let target = HWND(lparam.0 as *mut _);
             let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -913,15 +947,19 @@ unsafe extern "system" fn wndproc(
                     // 即将进入睡眠：标记挂起状态。采样线程会在下一次循环检测到
                     // SAMPLER_SUSPENDED 后暂停采样（低频busy-wait），窗口隐藏时
                     // 采样线程已通过 IsWindowVisible 挂起，这里是双保险。
-                    SAMPLER_SUSPENDED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    SAMPLER_SUSPENDED.store(true, std::sync::atomic::Ordering::SeqCst);
                     crate::probe::log("power: entering suspend — marking sampler paused");
                 }
                 PBT_APMRESUMEAUTOMATIC => {
                     // 唤醒（任何方式都会发）：清除挂起标志，通知采样线程重置退避。
-                    SAMPLER_SUSPENDED.store(false, std::sync::atomic::Ordering::Relaxed);
+                    SAMPLER_SUSPENDED.store(false, std::sync::atomic::Ordering::SeqCst);
                     // GPU 拓扑可能已失效（睡眠期间显示器变化 / 显卡驱动重新初始化）：
                     // 强制在下一次采样前重建拓扑，避免 GPU 行在唤醒后持续显示 --。
                     crate::proc_gpu::invalidate_topology();
+                    // 功耗 MSR 设备句柄同样可能在唤醒后失效：标记待重建，
+                    // 下一轮采样 `ring0()` 会重新打开设备 + 重启内核驱动服务，
+                    // 避免功耗行永久 `--`（与 GPU 对称自愈）。
+                    crate::msr::invalidate_on_resume();
                     if let Some(tx) = RESUME_NOTIFY.get() {
                         let _ = tx.send(());
                     }
@@ -947,11 +985,11 @@ unsafe extern "system" fn wndproc(
             const WTS_SESSION_UNLOCK: u32 = 0x8;
             match lparam.0 as u32 {
                 WTS_SESSION_LOCK => {
-                    SESSION_LOCKED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    SESSION_LOCKED.store(true, std::sync::atomic::Ordering::SeqCst);
                     crate::probe::log("session locked -> sampler paused");
                 }
                 WTS_SESSION_UNLOCK => {
-                    SESSION_LOCKED.store(false, std::sync::atomic::Ordering::Relaxed);
+                    SESSION_LOCKED.store(false, std::sync::atomic::Ordering::SeqCst);
                     // 复用 resume 通道：唤醒挂起中的采样线程 + 顺带重置退避，
                     // 解锁后第一个采样周期立即补采，消除数据空白窗口。
                     if let Some(tx) = RESUME_NOTIFY.get() {
@@ -964,6 +1002,32 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
 
+        // ── 关机 / 注销 ──
+        // 旧实现完全没处理：WM_QUERYENDSESSION 落 DefWindowProc 返回 TRUE（不阻止关机，
+        // 这点是对的），但 WM_ENDSESSION 也落 DefWindowProc → **不发 PostQuitMessage**
+        // → run_message_loop 不返回 → main 的退出落盘永不执行 → 关机/注销丢配置。
+        WM_QUERYENDSESSION => LRESULT(1),
+        WM_ENDSESSION => {
+            if _wparam.0 != 0 {
+                // 会话确实结束：销毁窗口走正常收尾（WM_DESTROY → PostQuitMessage →
+                // main 同步落盘）。宽限期内完成，比被 TerminateProcess 干净。
+                let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
+
+        // 二次启动（第二实例）→ 由**本实例**打开设置页
+        WM_OPEN_SETTINGS => {
+            crate::settings::open_settings(hwnd);
+            LRESULT(0)
+        }
+
+        // D2D 自愈：渲染/采样线程只投递消息，配置改写与落盘在 UI 线程完成
+        WM_DISABLE_D2D => {
+            crate::gdi::apply_d2d_fallback_ui(hwnd);
+            LRESULT(0)
+        }
+
         WM_ERASEBKGND => LRESULT(1),
 
         WM_DESTROY => {
@@ -972,7 +1036,15 @@ unsafe extern "system" fn wndproc(
                 use windows::Win32::UI::WindowsAndMessaging::KillTimer;
                 let _ = WTSUnRegisterSessionNotification(hwnd);
                 let _ = KillTimer(hwnd, FULLSCREEN_TIMER_ID as _);
+                // 三个定时器全部显式回收（窗口销毁时系统虽会连带清理，但显式对称，
+                // 便于日后改成"关窗不销毁"的模型）。
+                let _ = KillTimer(hwnd, crate::gdi::CLOCK_TIMER_ID);
+                let _ = KillTimer(hwnd, crate::gdi::ANIM_TIMER_ID);
             }
+            // DIB 缓存（HBITMAP + 内存 DC）显式释放，避免"窗口已销毁但 GDI 对象
+            // 一直留到进程退出"。同时清掉 HWND 缓存。
+            crate::gdi::invalidate_dib_cache();
+            OVERLAY_HWND.store(0, Ordering::Release);
             crate::tray::remove(hwnd);
             PostQuitMessage(0);
             LRESULT(0)
@@ -1251,6 +1323,8 @@ impl OverlayWindow {
         unsafe {
             let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA.0, state_ptr);
         }
+        // 缓存自己的 HWND（见 OVERLAY_HWND 注释）。
+        OVERLAY_HWND.store(hwnd.0 as isize, Ordering::Release);
 
         // 会话锁/解锁通知（BUG-1）：没有这个注册，WM_WTSSESSION_CHANGE 永远不会到达。
         unsafe {
@@ -1370,7 +1444,14 @@ pub fn handle_second_instance() -> bool {
                     let _ = tx.send(());
                 }
             } else {
-                crate::settings::open_settings(hwnd);
+                // ⚠️ 必须投递给**第一实例**：本函数运行在第二实例，而 SETTINGS_HWND
+                // 是本进程的模块静态（= -1）→ 直接 open_settings 会在这里 create_dialog
+                // 建窗，随后 main 立刻 `std::process::exit(0)`，窗口从未进入消息循环即
+                // 被销毁（用户现象：悬浮窗可见时双击 exe 毫无反应）。
+                unsafe {
+                    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+                    let _ = PostMessageW(hwnd, WM_OPEN_SETTINGS, WPARAM(0), LPARAM(0));
+                }
             }
         }
         None => {
@@ -1383,6 +1464,15 @@ pub fn handle_second_instance() -> bool {
 /// 用 EnumWindows + GetClassNameW 按窗口类名找悬浮窗句柄。
 /// 返回值不归调用方所有，无需 CloseHandle。
 fn find_overlay_hwnd() -> Option<HWND> {
+    // 快路径：本进程已缓存（99% 的调用来自 is_foreground_fullscreen 的每秒定时器）。
+    let cached = OVERLAY_HWND.load(Ordering::Acquire);
+    if cached != 0 {
+        let h = HWND(cached as *mut _);
+        if unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(h) }.as_bool() {
+            return Some(h);
+        }
+    }
+    // 慢路径：跨进程场景（二次启动的第二实例）本进程没有缓存，只能按类名枚举。
     unsafe {
         use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
         use windows::Win32::Foundation::BOOL;

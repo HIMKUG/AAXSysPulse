@@ -362,6 +362,8 @@ fn metric_index(m: MetricEnum) -> usize {
         MetricEnum::Power => 4,
         MetricEnum::Time => 5,
         MetricEnum::Util => 6,
+        MetricEnum::DiskRead => 7,
+        MetricEnum::DiskWrite => 8,
     }
 }
 
@@ -435,8 +437,11 @@ fn font_scale_of(size: f32) -> f32 {
 fn build_rows(snap: &Snapshot, cfg: &Config) -> RowList {
     let style = Style::derive(Rgb::default(), cfg.fg);
     let mut rows = RowList::new();
+    let mut seen = [false; 9];
     for &m_idx in cfg.metric_order.iter() {
         let Some(m) = MetricEnum::ALL.get(m_idx as usize) else { continue };
+        if seen[m_idx as usize] { continue; }
+        seen[m_idx as usize] = true;
         if let Some(row) = build_row(*m, snap, cfg, style) {
             rows.push(row);
         }
@@ -472,6 +477,58 @@ fn push_two_digits(b: &mut StrBuf, v: u32) {
     let tens = b'0' + (v / 10) as u8;
     let ones = b'0' + (v % 10) as u8;
     b.push_str(core::str::from_utf8(&[tens, ones]).unwrap_or("00"));
+}
+
+/// 格式化字节/秒为带单位的字符串（B/s, KB/s, MB/s, GB/s）。
+/// 磁盘读写速率不需要小数，用整数即可。
+fn fmt_bps(b: &mut StrBuf, bps: f64) {
+    if bps >= 1_073_741_824.0 {
+        let gb = bps / 1_073_741_824.0;
+        push_f64_fixed(b, gb, 2);
+        b.push_str("GB/s");
+    } else if bps >= 1_048_576.0 {
+        let mb = bps / 1_048_576.0;
+        push_f64_fixed(b, mb, 1);
+        b.push_str("MB/s");
+    } else if bps >= 1024.0 {
+        let kb = bps / 1024.0;
+        push_f64_fixed(b, kb, 1);
+        b.push_str("KB/s");
+    } else {
+        let n = bps as u64;
+        itoa(n, b);
+        b.push_str("B/s");
+    }
+}
+
+/// 格式化定点小数的 f64（无格式化依赖，纯整数位拼接）。
+fn push_f64_fixed(b: &mut StrBuf, v: f64, decimals: usize) {
+    let whole = v as u64;
+    itoa(whole, b);
+    if decimals > 0 {
+        b.push_str(".");
+        let frac = ((v - whole as f64) * 10_f64.powi(decimals as i32)) as u64;
+        let frac_str = format!("{:0>width$}", frac, width = decimals);
+        b.push_str(&frac_str);
+    }
+}
+
+/// 将 u64 写入 StrBuf（无 allocations）。
+fn itoa(mut n: u64, b: &mut StrBuf) {
+    if n == 0 {
+        b.push_str("0");
+        return;
+    }
+    let mut digits = [0u8; 20];
+    let mut len = 0;
+    while n > 0 {
+        digits[len] = b'0' + (n % 10) as u8;
+        n /= 10;
+        len += 1;
+    }
+    for i in (0..len).rev() {
+        b.push_str(std::str::from_utf8(&[digits[i]]).unwrap());
+    }
 }
 
 /// 构建单个指标的行；该项关闭 / 数据缺失时返回 None。
@@ -697,6 +754,51 @@ fn build_row(m: MetricEnum, snap: &Snapshot, cfg: &Config, style: Style) -> Opti
                 cfg,
                 style.ui.name,
                 color,
+            ))
+        }
+        MetricEnum::DiskRead => {
+            // 总开关：与 CPU/Mem 等一致，由 show_disk_read 控制行是否显示。
+            if !cfg.show_disk_read {
+                return None;
+            }
+            // PDH 基线未建立前（snap.disk.ready = false）不显示行。
+            if !snap.disk.ready {
+                return None;
+            }
+            const DISK_SLOT: u32 = 9; // max "XXX.XGB/s" = 9 chars
+            let mut b = StrBuf::new();
+            fmt_bps(&mut b, snap.disk.read_bps);
+            let label = metric_label(cfg, 7, "RDisk", "R");
+            Some(new_row(
+                MetricEnum::DiskRead,
+                label,
+                b,
+                DISK_SLOT,
+                cfg,
+                style.ui.name,
+                style.ui.value,
+            ))
+        }
+        MetricEnum::DiskWrite => {
+            // 总开关：与 CPU/Mem 等一致，由 show_disk_write 控制行是否显示。
+            if !cfg.show_disk_write {
+                return None;
+            }
+            if !snap.disk.ready {
+                return None;
+            }
+            const DISK_SLOT: u32 = 9;
+            let mut b = StrBuf::new();
+            fmt_bps(&mut b, snap.disk.write_bps);
+            let label = metric_label(cfg, 8, "WDisk", "W");
+            Some(new_row(
+                MetricEnum::DiskWrite,
+                label,
+                b,
+                DISK_SLOT,
+                cfg,
+                style.ui.name,
+                style.ui.value,
             ))
         }
     }
@@ -1417,7 +1519,9 @@ mod tests {
         // 顺序必须真实生效：把 Time 排到最前，行序随之改变。
         crate::clock::set_local(1, 2, 3);
         let mut cfg = demo_cfg();
-        cfg.metric_order = [5, 0, 1, 2, 3, 4, 6];
+        // DiskRead/DiskWrite 默认不在 order 中（不在默认 metric_order），不在这里测试
+        // 顺序必须是 [u8; 9]，用 0 填充末尾
+        cfg.metric_order = [5, 0, 1, 2, 3, 4, 6, 0, 0];
         let rows = build_rows(&Snapshot::placeholder(0), &cfg);
         let seq: Vec<MetricEnum> = rows.as_slice().iter().map(|r| r.metric).collect();
         assert_eq!(

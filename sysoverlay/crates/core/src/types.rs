@@ -257,11 +257,15 @@ pub enum Metric {
     Power,
     Time,
     Util,
+    /// 磁盘读速率（字节/秒，PDH `\PhysicalDisk(_Total)\Disk Read Bytes/sec`）。
+    DiskRead,
+    /// 磁盘写速率（字节/秒，PDH `\PhysicalDisk(_Total)\Disk Write Bytes/sec`）。
+    DiskWrite,
 }
 
 impl Metric {
     /// 所有合法值（下标序）。
-    pub const ALL: [Metric; 7] = [
+    pub const ALL: [Metric; 9] = [
         Metric::Cpu,
         Metric::Mem,
         Metric::Gpu,
@@ -269,6 +273,8 @@ impl Metric {
         Metric::Power,
         Metric::Time,
         Metric::Util,
+        Metric::DiskRead,
+        Metric::DiskWrite,
     ];
 
     /// 配置键里的短名：`mc_cpu_lbl` / `mc_mem_val` 等。
@@ -281,6 +287,8 @@ impl Metric {
             Metric::Power => "power",
             Metric::Time => "time",
             Metric::Util => "util",
+            Metric::DiskRead => "disk_read",
+            Metric::DiskWrite => "disk_write",
         }
     }
 }

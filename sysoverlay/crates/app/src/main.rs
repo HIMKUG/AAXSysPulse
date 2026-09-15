@@ -428,6 +428,9 @@ fn main() {
 
         let now_init = get_tick_count_ms();
         let mut last_sample_ms = now_init;
+        // 上一轮**实际计划**的睡眠时长（ms）：兜底唤醒检测的阈值必须 ≥ 它，
+        // 否则「全源关闭 → 30s 慢心跳」「远程会话 ×2 → 最长 60s」会每轮误判。
+        let mut last_sleep_ms: u64 = 0;
 
         let mut last_refresh = now_init.saturating_sub(REFRESH_FLOOR_MS);
         let mut ema_cpu_committed = 0f32;
@@ -449,16 +452,34 @@ fn main() {
         let mut need_flush = false;
 
         loop {
+            // panic 兜底（2026-09-15 审计）：渲染线程有 catch_unwind，本线程原本没有
+            // —— 任一子采样器 panic 会**静默杀死采样线程**，数值永久冻结；而渲染看门狗
+            // 只监控渲染线程（RENDER_EPOCH 不再增长被判为"健康"），永不 respawn。
+            // 兜住后记日志、短暂退避、继续下一轮，把"必须重启程序"降级为"闪一下"。
+            let __iter = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // 采样线程暂停（系统即将睡眠 / 会话已锁定）：低频轮询等待恢复信号，
             // 避免睡眠期间空转 CPU。注意窗口隐藏时采样线程已通过 IsWindowVisible
             // 挂起；这里额外检测 SAMPLER_SUSPENDED 是双保险兜底。
+            // ⚠️ 超时自愈（2026-09-15 审计）：SAMPLER_SUSPENDED 的唯一清除点是
+            // `PBT_APMRESUMEAUTOMATIC`，而 Modern Standby 下该通知可能丢失 —— 那正是
+            // 下面「兜底唤醒检测」存在的理由，但兜底检测在本循环**之后**，挂起期间
+            // 永远执行不到 → 通知一丢采样就永久冻结。因此这里必须有独立的超时自愈。
+            // 阈值 60s 远大于任何合法睡眠间隔，不会误伤正常挂起。
+            const SUSPEND_SELFHEAL_MS: u64 = 60_000;
+            let suspend_enter = get_tick_count_ms();
             while aaxsyspulse_win::sampler_suspended() {
                 // 100ms 轮询恢复信号，不使用 recv() 阻塞——让窗口隐藏时的
                 // resume_rx 信号也能唤醒本线程。
-                if resume_rx.recv_timeout(std::time::Duration::from_millis(100)).is_err() {
-                    // 无信号，超时继续等待（sampler_suspended 变 false 前每轮睡 100ms）
-                }
+                let _ = resume_rx.recv_timeout(std::time::Duration::from_millis(100));
                 // 即使收到信号也再循环一次，让 try_recv() 消费掉后再继续
+                if get_tick_count_ms().saturating_sub(suspend_enter) > SUSPEND_SELFHEAL_MS {
+                    aaxsyspulse_win::force_clear_sampler_suspended();
+                    sampler.reset_backoff();
+                    aaxsyspulse_win::probe::log(
+                        "sampler: suspend flag stuck >60s -> forced resume (resume notification lost)",
+                    );
+                    break;
+                }
             }
 
             // 覆盖层隐藏时完全停止采样：省 CPU（数值不更新，DWM 无合成）。
@@ -481,8 +502,12 @@ fn main() {
             // 若距离上次采样的时间差超过正常间隔的 3 倍，说明系统刚从睡眠恢复但通知丢了，
             // 自动触发恢复逻辑（重置退避）。
             let now_before_wait = get_tick_count_ms();
-            const FALLBACK_WAKE_GAP_MS: u64 = (REFRESH_FLOOR_MS as u64) * 3;
-            if now_before_wait.saturating_sub(last_sample_ms) > FALLBACK_WAKE_GAP_MS {
+            // ⚠️ 阈值必须与"本轮实际计划的睡眠时长"挂钩：固定 3×REFRESH_FLOOR_MS
+            // (=4500ms) 会被 30s 慢心跳（全源关闭）与远程会话 ×2（最长 60s）**每轮**
+            // 误判成"系统刚从睡眠恢复"，持续刷日志、重置退避，掩盖真实的采样失败。
+            let fallback_gap_ms =
+                ((REFRESH_FLOOR_MS as u64) * 3).max(last_sleep_ms.saturating_mul(3) / 2);
+            if now_before_wait.saturating_sub(last_sample_ms) > fallback_gap_ms {
                 sampler.reset_backoff();
                 aaxsyspulse_win::probe::log("sampler: fallback wake detected — gap exceeded 3x normal interval");
             }
@@ -689,7 +714,15 @@ fn main() {
                     mode_active as u8,
                 )
             });
+            last_sleep_ms = timeout_ms as u64;
             cfg_gen = wait_cfg_change(cfg_gen, timeout_ms as u64);
+            })); // ← 结束 catch_unwind 闭包
+            if __iter.is_err() {
+                aaxsyspulse_win::probe::log(
+                    "sampler: PANIC caught in sampling loop — thread survives (was: silent freeze)",
+                );
+                std::thread::sleep(Duration::from_millis(500));
+            }
         }
     });
 

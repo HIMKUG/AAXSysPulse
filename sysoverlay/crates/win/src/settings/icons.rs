@@ -20,7 +20,7 @@ use crate::gfx_d2d::{ColorF, Gfx, PathSeg, RectF};
 /// viewBox 边长（全部图标统一 1024）。
 const VIEW: f32 = 1024.0;
 
-/// 图标标识。前 6 个对应侧边栏导航项，顺序即侧边栏顺序。
+/// 图标标识。前 7 个对应侧边栏导航项，顺序即侧边栏顺序。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IconKind {
     General,
@@ -28,6 +28,8 @@ pub enum IconKind {
     Personalize,
     Window,
     Performance,
+    /// 诊断页（采样器状态）。复用 SOURCES 里空闲的 reset.svg（环形刷新 ≈ 重新检测）。
+    Diag,
     About,
     /// 窗口控制按钮「固定」。
     Pin,
@@ -48,13 +50,14 @@ pub enum IconKind {
 }
 
 impl IconKind {
-    /// 侧边栏 6 项（顺序 = 页面下标）。
-    pub const ALL: [IconKind; 6] = [
+    /// 侧边栏 7 项（顺序 = 页面下标：General/Layout/Metrics/Window/Performance/Diag/About）。
+    pub const ALL: [IconKind; 7] = [
         IconKind::General,
         IconKind::Layout,
         IconKind::Personalize,
         IconKind::Window,
         IconKind::Performance,
+        IconKind::Diag,
         IconKind::About,
     ];
 
@@ -66,6 +69,7 @@ impl IconKind {
             IconKind::Personalize => 2,
             IconKind::Window => 3,
             IconKind::Performance => 4,
+            IconKind::Diag => 6,
             IconKind::About => 5,
             IconKind::Pin => 7,
             IconKind::ChevronUp => 8,

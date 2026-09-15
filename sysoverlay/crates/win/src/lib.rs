@@ -20,6 +20,7 @@ pub mod render_thread;
 pub mod sampler;
 pub mod proc_cpu;
 pub mod proc_mem;
+pub mod proc_disk;
 pub mod proc_gpu;
 pub mod proc_net;
 pub mod gpu_detect;
@@ -54,5 +55,8 @@ pub use aaxsyspulse_core::snapshot::Snapshot;
 
 // Re-export main window type
 pub use window::OverlayWindow;
-pub use window::{snap_store, get_shared_seq};
+pub use window::{
+    snap_store, get_shared_seq, session_locked, sampler_suspended, in_remote_session,
+    force_clear_sampler_suspended,
+};
 pub use sampler::SystemSampler;

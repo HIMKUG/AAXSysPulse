@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn test_subset_barrel_base_adapts_to_item_count() {
         // 木桶：base = 启用源中最大的最小间隔（最慢源定节奏）。
-        let mut s = Scheduler::new(1000, true);
+        let s = Scheduler::new(1000, true);
         let cpu_only = [true, false, false, false, false];
         assert_eq!(s.base_interval_ms(&cpu_only), TICK_MS as u32);
         let gpu_only = [false, false, true, false, false];

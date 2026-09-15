@@ -44,6 +44,9 @@ pub struct SystemSampler {
 
     /// Net 上次采样时间（低频档分频用，v3 性能档）。
     last_net_ms: u64,
+
+    /// Disk I/O 采样器（按需创建，用户开启磁盘监控时才实例化）。
+    disk: Option<crate::proc_disk::DiskState>,
 }
 
 /// Net 低频档采样间隔（ms）：速率按真实 Δt 计算，拉长间隔只影响粒度不失真。
@@ -67,6 +70,7 @@ impl SystemSampler {
             backoff: [Backoff::default(); 5],
             seq: 0,
             last_net_ms: 0,
+            disk: None,
         }
     }
 
@@ -134,6 +138,7 @@ impl SystemSampler {
         now_ms: u64,
         power_enabled: bool,
         util_enabled: bool,
+        disk_enabled: bool,
     ) -> Snapshot {
         // 从上一份快照出发：未到期源直接保留旧值，失败源也不再丢数据。
         let mut snap = prev.cloned().unwrap_or_else(|| Snapshot::placeholder(now_ms));
@@ -141,24 +146,28 @@ impl SystemSampler {
         snap.timestamp_ms = now_ms;
         snap.uptime_ms = now_ms;
 
-        // CPU
-        if plan.cpu {
+        // CPU（退避中则跳过本轮：指数退避此前只被记录、从未被消费）
+        if plan.cpu && self.backoff[SamplerId::Cpu as usize].is_backing_off(now_ms) {
+            self.push_diag(SamplerId::Cpu, SampleOutcome::Skipped, 0, now_ms);
+        } else if plan.cpu {
             let t = crate::perf::begin();
             let cpu_out = self.cpu.sample(prev, now_ms, &mut snap);
             crate::perf::note_section("sample_cpu", t);
-            self.push_diag(SamplerId::Cpu, cpu_out, 0);
+            self.push_diag(SamplerId::Cpu, cpu_out, 0, now_ms);
         } else {
-            self.push_diag(SamplerId::Cpu, SampleOutcome::Skipped, 0);
+            self.push_diag(SamplerId::Cpu, SampleOutcome::Skipped, 0, now_ms);
         }
 
-        // Memory
-        if plan.mem {
+        // Memory（退避门同上）
+        if plan.mem && self.backoff[SamplerId::Memory as usize].is_backing_off(now_ms) {
+            self.push_diag(SamplerId::Memory, SampleOutcome::Skipped, 0, now_ms);
+        } else if plan.mem {
             let t = crate::perf::begin();
             let mem_out = self.mem.sample(prev, now_ms, &mut snap);
             crate::perf::note_section("sample_mem", t);
-            self.push_diag(SamplerId::Memory, mem_out, 0);
+            self.push_diag(SamplerId::Memory, mem_out, 0, now_ms);
         } else {
-            self.push_diag(SamplerId::Memory, SampleOutcome::Skipped, 0);
+            self.push_diag(SamplerId::Memory, SampleOutcome::Skipped, 0, now_ms);
         }
 
         // GPU：厂商模块优先（NVML/ADL/IGCL，用户拍板），成功时直接用，跳过 D3DKMT（省约 74ms）。
@@ -177,25 +186,35 @@ impl SystemSampler {
                 // vendor 有值：写入快照并缓存，短路 D3DKMT 调用
                 if let Some(u) = v_util {
                     gpu_vendor::set_cached_util(u);
-                    snap.gpu = Metric::Value(u.clamp(0.0, 100.0));
+                    // NaN 防护：f32::clamp 对 NaN 返回 NaN（厂商库异常时会漏进快照，
+                    // 渲染成 "NaN%"）。
+                    snap.gpu = if u.is_finite() {
+                        Metric::Value(u.clamp(0.0, 100.0))
+                    } else {
+                        Metric::Unavailable
+                    };
                     crate::perf::note_section("sample_gpu", t);
-                    self.push_diag(SamplerId::Gpu, SampleOutcome::Ok, 0);
+                    self.push_diag(SamplerId::Gpu, SampleOutcome::Ok, 0, now_ms);
                 } else {
                     // vendor 不可用：从缓存恢复；若缓存也无则用 D3DKMT
                     let gpu_out = self.gpu.sample(prev, now_ms, &mut snap);
                     crate::perf::note_section("sample_gpu", t);
                     if let Some(u) = gpu_vendor::cached_util() {
-                        snap.gpu = Metric::Value(u.clamp(0.0, 100.0));
+                        snap.gpu = if u.is_finite() {
+                            Metric::Value(u.clamp(0.0, 100.0))
+                        } else {
+                            Metric::Unavailable
+                        };
                     }
-                    self.push_diag(SamplerId::Gpu, gpu_out, 0);
+                    self.push_diag(SamplerId::Gpu, gpu_out, 0, now_ms);
                 }
             } else {
                 // 功耗行专供：只要瓦数，不要占用率（也不付 D3DKMT 那 74ms）
                 crate::perf::note_section("sample_gpu", t);
-                self.push_diag(SamplerId::Gpu, SampleOutcome::Skipped, 0);
+                self.push_diag(SamplerId::Gpu, SampleOutcome::Skipped, 0, now_ms);
             }
         } else {
-            self.push_diag(SamplerId::Gpu, SampleOutcome::Skipped, 0);
+            self.push_diag(SamplerId::Gpu, SampleOutcome::Skipped, 0, now_ms);
         }
 
         // Network：低频档（v3 性能档，默认开）独立 2s 分频；
@@ -205,28 +224,33 @@ impl SystemSampler {
         // 才跑一次 GetIfTable2（~28ms）。
         let net_due = !crate::window::schedule_net_low()
             || now_ms.saturating_sub(self.last_net_ms) >= NET_LOW_FREQ_MS;
-        if plan.net && net_due {
+        if plan.net && net_due && self.backoff[SamplerId::Net as usize].is_backing_off(now_ms) {
+            self.push_diag(SamplerId::Net, SampleOutcome::Skipped, 0, now_ms);
+        } else if plan.net && net_due {
             self.last_net_ms = now_ms;
             let t = crate::perf::begin();
             let net_out = self.net.sample(prev, now_ms, &mut snap);
             crate::perf::note_section("sample_net", t);
-            self.push_diag(SamplerId::Net, net_out, 0);
+            self.push_diag(SamplerId::Net, net_out, 0, now_ms);
         } else {
-            self.push_diag(SamplerId::Net, SampleOutcome::Skipped, 0);
+            self.push_diag(SamplerId::Net, SampleOutcome::Skipped, 0, now_ms);
         }
 
         // Power：整机功耗（用户拍板公式），分频由调度器 `Source::Power` 驱动；
         // CPU 实测不可用（无管理员/无驱动）→ 整行关闭（Unavailable = 不显示不计算）
-        if plan.power {
+        if plan.power && self.backoff[SamplerId::Power as usize].is_backing_off(now_ms) {
+            // 退避中不重复走 MSR 打开流程（SCM + 服务查询 + 设备打开，代价最高）
+            self.push_diag(SamplerId::Power, SampleOutcome::Skipped, 0, now_ms);
+        } else if plan.power {
             let t = crate::perf::begin();
             match self.syspower.sample(now_ms) {
                 Some(w) => {
                     snap.power = Metric::Value(w);
-                    self.push_diag(SamplerId::Power, SampleOutcome::Ok, 0);
+                    self.push_diag(SamplerId::Power, SampleOutcome::Ok, 0, now_ms);
                 }
                 None => {
                     snap.power = Metric::Unavailable;
-                    self.push_diag(SamplerId::Power, SampleOutcome::Skipped, 0);
+                    self.push_diag(SamplerId::Power, SampleOutcome::Skipped, 0, now_ms);
                 }
             }
             crate::perf::note_section("sample_power", t);
@@ -236,6 +260,28 @@ impl SystemSampler {
             // 查询被禁用（行开关关 / 性能页 power_query 关 / teardown 后重开）：
             // 显式置 Unavailable，覆盖 prev 带来的旧值 → 功耗行显示 `--` 而非冻结的旧瓦数。
             snap.power = Metric::Unavailable;
+        }
+
+        // Disk I/O（PDH）：读写速率，1Hz 采样。用户开启磁盘监控后（通过 metric_order 包含 DiskRead/DiskWrite）
+        // 才创建 DiskState 并采样。关闭时销毁 PDH 查询（None）。
+        if disk_enabled {
+            if self.disk.is_none() {
+                self.disk = Some(crate::proc_disk::DiskState::new());
+            }
+            if let Some(ref mut d) = self.disk {
+                let (read, write) = d.sample(now_ms);
+                // ready 只在**确实拿到有效读数**时为 true：PDH 首轮只建立基线，
+                // 旧实现无条件置 true → 前 2s 显示 "0 B/s" 而不是未就绪。
+                snap.disk.ready = read.value().is_some() || write.value().is_some();
+                snap.disk.read_bps = read.value().unwrap_or(0.0);
+                snap.disk.write_bps = write.value().unwrap_or(0.0);
+            }
+        } else {
+            // 磁盘监控关闭：销毁 PDH 查询，下次开启时重建。
+            self.disk = None;
+            if let Some(prev) = prev {
+                snap.disk = prev.disk;
+            }
         }
 
         // Util：综合占用（用户拍板：闭式解 + 非对称 EMA，等权，缺源重归一化）。
@@ -280,12 +326,16 @@ impl SystemSampler {
         snap
     }
 
-    fn push_diag(&mut self, id: SamplerId, outcome: SampleOutcome, code: u16) {
+    fn push_diag(&mut self, id: SamplerId, outcome: SampleOutcome, code: u16, now_ms: u64) {
         // Update back-off.
+        // ⚠️ 只有**真正成功**才清零退避。旧实现 `else { reset() }` 会让 Skipped
+        // （未到期 / 被退避门挡下）也清零 → 退避永远被自己重置，失败源每轮重试，
+        // Backoff 形同虚设（2026-09-15 审计）。
         let idx = id as usize;
         if outcome.is_failure() {
-            self.backoff[idx].next_delay_ms();
-        } else {
+            // 传 now_ms：退避门据此刻画「下次允许尝试的时刻」，到点即放行。
+            self.backoff[idx].next_delay_ms(now_ms);
+        } else if matches!(outcome, SampleOutcome::Ok) {
             self.backoff[idx].reset();
         }
 
@@ -302,19 +352,17 @@ impl SystemSampler {
         self.backoff[id as usize].failures()
     }
 
-    /// Back-off state for UI to display.
-    pub fn backing_off(&self, id: SamplerId) -> bool {
-        self.backoff[id as usize].is_backing_off()
+    /// Back-off state for UI to display（`now_ms` 须与采样时钟同源）。
+    pub fn backing_off(&self, id: SamplerId, now_ms: u64) -> bool {
+        self.backoff[id as usize].is_backing_off(now_ms)
     }
 
-    /// Returns how long to wait before retrying (milliseconds).
-    pub fn retry_delay_ms(&self, id: SamplerId) -> u32 {
-        let _ = self.backoff[id as usize]
-            .failures()
-            .saturating_sub(1);
-        // Exposed so the caller (sampling thread) knows how long to sleep.
-        // A real implementation would use this in the sleep loop.
-        1000 // placeholder; actual backoff tracked per-sampler above
+    /// Returns how long to wait before retrying (milliseconds)；0 = 已可重试。
+    ///
+    /// 旧实现恒返回硬编码 `1000`（自称 placeholder），调用方拿到的等待时长是假的；
+    /// 现按 `Backoff` 的实际到期时刻计算（2026-09-15 审计）。
+    pub fn retry_delay_ms(&self, id: SamplerId, now_ms: u64) -> u32 {
+        self.backoff[id as usize].remaining_delay_ms(now_ms)
     }
 }
 
@@ -348,7 +396,7 @@ mod util_probe {
         let mut prev = Snapshot::placeholder(0);
         let mut t: u64 = 1_000;
         for i in 0..6 {
-            let snap = s.sample(&plan, Some(&prev), t, false, true);
+            let snap = s.sample(&plan, Some(&prev), t, false, true, false);
             println!(
                 "i={i} cpu={:?} mem={} gpu={:?} -> util={:?} partial={}",
                 snap.cpu, snap.memory.load_pct, snap.gpu, snap.util, snap.util_partial

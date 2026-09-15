@@ -22,12 +22,13 @@
 //! 卡内内容行按展开后的固定位置排布，由 `paint_page` 按卡片矩形**裁剪**露出。
 
 use aaxsyspulse_core::config::Config;
+use aaxsyspulse_core::sampler::SamplerId;
 use aaxsyspulse_core::types::Lang;
 
 use super::cfg_ref::CfgRef;
 use super::state::{Card, Page, Row, Widget};
 use super::widget::{
-    AboutHeaderWidget, ButtonAction, ButtonKind, ButtonWidget, DisclosureWidget,
+    AboutHeaderWidget, ButtonAction, ButtonKind, ButtonWidget, DiagRowWidget, DisclosureWidget,
     MetricFontStatusWidget, MetricHeaderWidget, MetricSwatchesWidget, SegmentedWidget, SliderWidget,
     StepperWidget, ToggleWidget,
 };
@@ -222,6 +223,7 @@ pub fn page_caption(p: usize, lang: Lang) -> &'static str {
         2 => tr("PgMetrics"),
         3 => tr("PgWindow"),
         4 => tr("PgPerformance"),
+        5 => tr("PgDiag"),
         _ => tr("PgAbout"),
     }
 }
@@ -230,7 +232,8 @@ pub fn page_caption(p: usize, lang: Lang) -> &'static str {
 pub fn page_footnote(p: usize, lang: Lang) -> Option<&'static str> {
     let tr = |k: &'static str| crate::i18n::t(lang, k);
     match p {
-        5 => Some(tr("AboutCopyright")),
+        // About 是第 7 页（下标 6）；加入 Diag 页后由 5 顺延到 6。
+        6 => Some(tr("AboutCopyright")),
         _ => None,
     }
 }
@@ -385,8 +388,8 @@ type Group = (&'static str, Vec<RowDef>, Option<&'static str>, i32);
 fn page_prefs(
     ux: &Ux,
     _cfg: &Config,
-    _expand: &[f32; 7],
-    _order: &[u8; 7],
+    _expand: &[f32; 9],
+    _order: &[u8; 9],
     groups: &mut Vec<Group>,
 ) {
         // ── 偏好：显示 / 启动 / 诊断（报告 §11 w1） ──
@@ -453,8 +456,8 @@ fn page_prefs(
 fn page_layout(
     ux: &Ux,
     _cfg: &Config,
-    _expand: &[f32; 7],
-    _order: &[u8; 7],
+    _expand: &[f32; 9],
+    _order: &[u8; 9],
     groups: &mut Vec<Group>,
 ) {
         // ── 布局：排列 / 文字效果（报告 §11 w2） ──
@@ -538,12 +541,12 @@ fn mid(base: i32, i: usize) -> i32 {
 fn page_metrics(
     ux: &Ux,
     cfg: &Config,
-    expand: &[f32; 7],
-    order: &[u8; 7],
+    expand: &[f32; 9],
+    order: &[u8; 9],
     groups: &mut Vec<Group>,
 ) {
         // ── 监控项：每项一张**独立卡**（按 metric_order 排列，可拖动排序） ──
-        let metric_cfg: [CfgRef; 7] = [
+        let metric_cfg: [CfgRef; 9] = [
             CfgRef::ShowCpu,
             CfgRef::ShowMem,
             CfgRef::ShowGpu,
@@ -551,6 +554,8 @@ fn page_metrics(
             CfgRef::PowerEnabled,
             CfgRef::ShowTime,
             CfgRef::ShowUtil,
+            CfgRef::ShowDiskRead,
+            CfgRef::ShowDiskWrite,
         ];
         // 折叠头只保留 抓手 + 名称 + 贴右缘的圆形展开按钮；
         // 总开关移入展开菜单首行（「显示」）。
@@ -786,8 +791,8 @@ fn page_metrics(
 fn page_window(
     ux: &Ux,
     _cfg: &Config,
-    _expand: &[f32; 7],
-    _order: &[u8; 7],
+    _expand: &[f32; 9],
+    _order: &[u8; 9],
     groups: &mut Vec<Group>,
 ) {
         // ── 窗口：层级与交互 / 位置与外观（报告 §11 w4） ──
@@ -808,6 +813,11 @@ fn page_window(
                     ux.tr("LblClickThrough"),
                     Some(ux.tr("HintClickThrough")),
                     vec![ux.toggle_item(245, CfgRef::ClickThrough)],
+                ),
+                row_def(
+                    ux.tr("LblFullscreenAutoHide"),
+                    Some(ux.tr("HintFullscreenAutoHide")),
+                    vec![ux.toggle_item(248, CfgRef::FullscreenAutoHide)],
                 ),
             ],
             None,
@@ -844,8 +854,8 @@ fn page_window(
 fn page_perf(
     ux: &Ux,
     _cfg: &Config,
-    _expand: &[f32; 7],
-    _order: &[u8; 7],
+    _expand: &[f32; 9],
+    _order: &[u8; 9],
     groups: &mut Vec<Group>,
 ) {
         // ── 性能：统计范围 / 刷新频率 / 画面（报告 §11 w5） ──
@@ -894,11 +904,51 @@ fn page_perf(
         ));
 }
 
+fn page_diag(
+    ux: &Ux,
+    groups: &mut Vec<Group>,
+) {
+    // ── 诊断：每采样器的状态 +Unavailable(--) 原因 ──
+    // 诊断页不需要状态控件，只读展示，控件 id 从 600 开始。
+    groups.push((
+        ux.tr("GrpDiagnostics"),
+        vec![
+            row_def(
+                ux.tr("LblDiagCpu"),
+                Some(ux.tr("HintDiagCpu")),
+                vec![ux.item(600, Box::new(DiagRowWidget::new(aaxsyspulse_core::sampler::SamplerId::Cpu, ux.lang)), ux.rows_l, ux.widget_r, false)],
+            ),
+            row_def(
+                ux.tr("LblDiagMem"),
+                Some(ux.tr("HintDiagMem")),
+                vec![ux.item(601, Box::new(DiagRowWidget::new(SamplerId::Memory, ux.lang)), ux.rows_l, ux.widget_r, false)],
+            ),
+            row_def(
+                ux.tr("LblDiagGpu"),
+                Some(ux.tr("HintDiagGpu")),
+                vec![ux.item(602, Box::new(DiagRowWidget::new(SamplerId::Gpu, ux.lang)), ux.rows_l, ux.widget_r, false)],
+            ),
+            row_def(
+                ux.tr("LblDiagNet"),
+                Some(ux.tr("HintDiagNet")),
+                vec![ux.item(603, Box::new(DiagRowWidget::new(SamplerId::Net, ux.lang)), ux.rows_l, ux.widget_r, false)],
+            ),
+            row_def(
+                ux.tr("LblDiagPower"),
+                Some(ux.tr("HintDiagPower")),
+                vec![ux.item(604, Box::new(DiagRowWidget::new(SamplerId::Power, ux.lang)), ux.rows_l, ux.widget_r, false)],
+            ),
+        ],
+        None,
+        CARD_GAP,
+    ));
+}
+
 fn page_about(
     ux: &Ux,
     _cfg: &Config,
-    _expand: &[f32; 7],
-    _order: &[u8; 7],
+    _expand: &[f32; 9],
+    _order: &[u8; 9],
     groups: &mut Vec<Group>,
 ) {
         // ── 关于：头部（图标 / 名称 / 版本）/ 开发者，版权脚注 ──
@@ -935,18 +985,18 @@ fn page_about(
         ));
 }
 
-/// 依据 (cfg, lang, dpi, client_w, expand, order) 重建全部 6 页布局。
+/// 依据 (cfg, lang, dpi, client_w, expand, order) 重建全部 7 页布局.
 ///
 /// `order`：监控项显示顺序（第 k 位 = 指标下标），监控项页按它排列卡片；
 /// 拖动排序期间由调用方传入拖动中的临时顺序实现实时预览。
 pub fn build_pages(
-    pages: &mut [Page; 6],
+    pages: &mut [Page; 7],
     cfg: &Config,
     lang: Lang,
     dpi: u32,
     client_w: i32,
-    expand: &[f32; 7],
-    order: &[u8; 7],
+    expand: &[f32; 9],
+    order: &[u8; 9],
 ) {
     let tr = |k: &'static str| crate::i18n::t(lang, k);
 
@@ -981,6 +1031,7 @@ pub fn build_pages(
             2 => tr("PgMetricsSub"),
             3 => tr("PgWindowSub"),
             4 => tr("PgPerfSub"),
+            5 => tr("PgDiag"),
             _ => tr("AboutDesc"),
         };
 
@@ -993,6 +1044,7 @@ pub fn build_pages(
             2 => page_metrics(&ux, cfg, expand, order, &mut groups),
             3 => page_window(&ux, cfg, expand, order, &mut groups),
             4 => page_perf(&ux, cfg, expand, order, &mut groups),
+            5 => page_diag(&ux, &mut groups),
             _ => page_about(&ux, cfg, expand, order, &mut groups),
         }
 
@@ -1095,10 +1147,10 @@ mod spacing_tests {
     /// 测试用 DPI（100%，`s()` 恒等，断言里的数字即逻辑像素）。
     const D: u32 = 96;
 
-    fn build_all(expand: f32) -> [Page; 6] {
+    fn build_all(expand: f32) -> [Page; 7] {
         let cfg = Config::default();
-        let mut pages: [Page; 6] = Default::default();
-        build_pages(&mut pages, &cfg, Lang::Zh, D, 900, &[expand; 7], &[0, 1, 2, 6, 3, 4, 5]);
+        let mut pages: [Page; 7] = Default::default();
+        build_pages(&mut pages, &cfg, Lang::Zh, D, 900, &[expand; 9], &[0, 1, 2, 6, 3, 4, 5, 0, 0]);
         pages
     }
 
@@ -1228,7 +1280,8 @@ mod spacing_tests {
                 }
             }
         }
-        assert_eq!(checked, 14, "两种展开态 × 7 张监控项卡");
+        // 指标数 7→9（新增 DiskRead/DiskWrite）→ 卡片数同步为 9。
+        assert_eq!(checked, 18, "两种展开态 × 9 张监控项卡");
     }
 
     /// 折叠（未展开）时监控项卡只有一行（就是折叠头）。
@@ -1317,5 +1370,54 @@ mod spacing_tests {
         // 全部 6 页 × 全部控件的整体重建 < 5ms（release 实测通常远低于此）。
         // 超预算说明有人在 build_pages 循环里加了重活，先测量再优化。
         assert!(best_expanded < 5_000.0, "页面重建超预算：{best_expanded:.0}µs");
+    }
+}
+
+// ── 诊断：用用户真实配置复现「打开设置崩溃」 ──────────────
+#[cfg(test)]
+mod diag_tests {
+    use super::*;
+    use aaxsyspulse_core::config::{appearance, layout, monitor, system};
+    use std::panic;
+
+    #[test]
+    fn diag_repro_user_config_build_pages() {
+        let base = match std::env::var("APPDATA") {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("[diag] APPDATA 未设置，跳过");
+                return;
+            }
+        };
+        let dir = std::path::Path::new(&base).join("AAXSysPulseC").join("config");
+        if !dir.exists() {
+            eprintln!("[diag] 配置目录不存在，跳过: {:?}", dir);
+            return;
+        }
+        let mut cfg = Config::default();
+        if let Ok(t) = std::fs::read_to_string(dir.join("system.cfg")) {
+            system::parse(&mut cfg, &t);
+        }
+        if let Ok(t) = std::fs::read_to_string(dir.join("appearance.cfg")) {
+            appearance::parse(&mut cfg, &t);
+        }
+        if let Ok(t) = std::fs::read_to_string(dir.join("monitor.cfg")) {
+            monitor::parse(&mut cfg, &t);
+        }
+        let lay = layout::file_for(cfg.render_style);
+        if let Ok(t) = std::fs::read_to_string(dir.join(lay)) {
+            layout::parse(cfg.render_style, &mut cfg, &t);
+        }
+        let expand = [0.0f32; 9];
+        let order = cfg.metric_order;
+        eprintln!(
+            "[diag] metric_order={:?} render_style={:?} power_enabled={} show_util={}",
+            order, cfg.render_style, cfg.power_enabled, cfg.show_util
+        );
+        let result = panic::catch_unwind(|| {
+            let mut pages: [Page; 7] = Default::default();
+            build_pages(&mut pages, &cfg, Lang::Zh, 96, 900, &expand, &order);
+        });
+        assert!(result.is_ok(), "build_pages 在用户配置下 panic（见上方 backtrace）");
     }
 }

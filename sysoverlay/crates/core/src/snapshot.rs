@@ -22,6 +22,8 @@ pub struct Snapshot {
     pub gpu: Metric<f32>,
     /// Network statistics (bytes per second).
     pub net: NetStat,
+    /// Disk I/O statistics (bytes per second). 默认全零，采样器接管后按需填充。
+    pub disk: DiskStat,
     /// CPU 封装功耗（瓦）。
     ///
     /// 默认 `Unavailable`：功耗是可选附加组件（v2 决策「驱动边界」），
@@ -49,6 +51,7 @@ impl Snapshot {
             memory: MemoryStat::default(),
             gpu: Metric::Unavailable,
             net: NetStat::default(),
+            disk: DiskStat::default(),
             power: Metric::Unavailable,
             util: Metric::Unavailable,
             util_partial: false,
@@ -112,4 +115,15 @@ pub struct NetStat {
     pub rx_bps: u64,
     /// Transmitted bytes per second.
     pub tx_bps: u64,
+}
+
+/// Disk I/O statistics (bytes per second), via PDH.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct DiskStat {
+    /// Read throughput in bytes/sec.
+    pub read_bps: f64,
+    /// Write throughput in bytes/sec.
+    pub write_bps: f64,
+    /// PDH 基线是否已建立（首次采样前为 false，渲染层据此显示 `--`）。
+    pub ready: bool,
 }

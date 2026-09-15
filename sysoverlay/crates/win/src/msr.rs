@@ -42,7 +42,7 @@
 //! - `Ring0` 的 `Send/Sync`：见 impl 处 SAFETY 注释（唯一访问者是绑核采样线程）。
 
 use crate::probe;
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use aaxsyspulse_core::power::watts_from_energy_delta;
 // 辅助函数（query_service_binary_path / driver_file_exists）的签名与实现所需。
 // ring0() 内部的同名局部 use 会遮蔽此处导入，属正常显式声明。
@@ -66,14 +66,29 @@ struct Ring0 {
 }
 
 // SAFETY: Ring0 仅持有一个内核设备句柄（HANDLE 本质是不透明整数，可跨线程传递）；
-// 全部访问只发生在采样线程（app 启动时已绑定 0 号逻辑核），RING0 是 OnceLock
-// 单例，不存在同一句柄被并发读写的路径。若未来新增其他访问线程，必须重新审视此处。
+// 全部访问只发生在采样线程（app 启动时已绑定 0 号逻辑核），RING0 由 Mutex 保护，
+// 不存在同一句柄被并发读写的路径。若未来新增其他访问线程，必须重新审视此处。
 unsafe impl Send for Ring0 {}
 unsafe impl Sync for Ring0 {}
 
-static RING0: OnceLock<Option<Ring0>> = OnceLock::new();
+/// 句柄所有权 = 生命周期：`ring0()` 在唤醒后会用新 `Ring0` 替换旧的，
+/// 没有 Drop 就只丢弃结构体、不关句柄 → 每次睡眠唤醒泄漏一个 HANDLE。
+/// 有了 Drop，`*g = new` 与 `teardown` 的 `take()` 都会自动关闭旧句柄。
+impl Drop for Ring0 {
+    fn drop(&mut self) {
+        // Drop 中无 fail-safe 路径可走；关闭失败（句柄已失效）忽略即可。
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.dev);
+        }
+    }
+}
+
+static RING0: Mutex<Option<Ring0>> = Mutex::new(None);
 /// teardown 后置位：本会话内驱动已卸载，所有 MSR 访问短路返回 None（不热恢复）。
 static RING0_TORN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 系统唤醒后置位：下一轮 `ring0()` 会重新打开设备 + 重启内核驱动服务，
+/// 避免睡眠唤醒后句柄失效导致功耗永久 `--`（与 GPU `invalidate_topology` 对称）。
+static RING0_STALE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// CPU 厂商/家族（CPUID），探针与 MSR 选择用。
 struct CpuId {
@@ -85,10 +100,16 @@ struct CpuId {
 static CPUID: OnceLock<CpuId> = OnceLock::new();
 
 fn cpuid_info() -> &'static CpuId {
-    CPUID.get_or_init(|| unsafe {
+    // 注：Rust 1.96 起 `__cpuid(常量 leaf)` 已是安全函数；旧写法 `|| unsafe { .. }`
+    // 在本版会触发 unused_unsafe 警告（2026-09-15 审计顺带清理）。
+    CPUID.get_or_init(|| {
         let r0 = std::arch::x86_64::__cpuid(0);
-        let vendor = [r0.ebx, r0.edx, r0.ecx];
-        let vb: [u8; 12] = std::mem::transmute(vendor);
+        // 用 to_le_bytes 拼接，而不是 transmute([u32;3] → [u8;12])：语义等价
+        // （x86 小端）但消除了不必要的 UB 面，也不再强假设目标字节序。
+        let mut vb = [0u8; 12];
+        vb[0..4].copy_from_slice(&r0.ebx.to_le_bytes());
+        vb[4..8].copy_from_slice(&r0.edx.to_le_bytes());
+        vb[8..12].copy_from_slice(&r0.ecx.to_le_bytes());
         let amd = &vb == b"AuthenticAMD";
         let r1 = std::arch::x86_64::__cpuid(1);
         CpuId {
@@ -99,15 +120,11 @@ fn cpuid_info() -> &'static CpuId {
     })
 }
 
-/// 创建/启动驱动服务并打开设备（一次性）。
+/// 创建/启动驱动服务并打开设备（一次性，唤醒后可由 `invalidate_on_resume` 重做）。
 /// 已 teardown（行关闭卸载）后永久返回 None——本会话不热恢复，重开行显示 `--`。
-fn ring0() -> Option<&'static Ring0> {
-    if RING0_TORN.load(std::sync::atomic::Ordering::Relaxed) {
-        return None;
-    }
-    RING0.get_or_init(|| unsafe {
+unsafe fn open_ring0() -> Option<Ring0> {
         use windows::Win32::Foundation::{
-            GetLastError, GENERIC_READ, GENERIC_WRITE, ERROR_SERVICE_ALREADY_RUNNING,
+            GENERIC_READ, GENERIC_WRITE, ERROR_SERVICE_ALREADY_RUNNING,
         };
         use windows::Win32::Storage::FileSystem::CreateFileW;
         use windows::Win32::System::Services::{
@@ -259,7 +276,9 @@ fn ring0() -> Option<&'static Ring0> {
         // 此时设备本身可用。落到下方设备打开探测：能打开就照常读 MSR，
         // 与 driver-installer 的 RES_OK_DEVICE 语义对齐。
         if let Err(e) = StartServiceW(svc.0, None) {
-            if GetLastError() != ERROR_SERVICE_ALREADY_RUNNING {
+            // 用 e.code() 而非 GetLastError()：后者是"最近一次 Win32 调用"的错误码，
+            // 可能被 crate 内部后续调用污染，导致 183 判定失效。
+            if e.code().0 as u32 != ERROR_SERVICE_ALREADY_RUNNING.0 {
                 probe::log(&format!(
                     "msr StartService failed err={}（继续探测设备是否已由其他实例提供）",
                     e.code().0
@@ -302,8 +321,21 @@ fn ring0() -> Option<&'static Ring0> {
             c.model
         ));
         Some(Ring0 { dev })
-    })
-    .as_ref()
+}
+
+/// 取得 MSR 设备句柄：懒初始化；若 `invalidate_on_resume` 已标记失效则重建。
+/// 返回 `MutexGuard` 持有锁，保证采样期间句柄不被 `teardown` 关闭。
+fn ring0() -> Option<MutexGuard<'static, Option<Ring0>>> {
+    if RING0_TORN.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let mut g = RING0.lock().unwrap();
+    if g.is_none() || RING0_STALE.load(std::sync::atomic::Ordering::Relaxed) {
+        let new = unsafe { open_ring0() };
+        *g = new;
+        RING0_STALE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+    Some(g)
 }
 
 /// 读取服务的当前 BinaryPath（原样返回，含 `\??\` 内核前缀）。
@@ -352,12 +384,8 @@ pub fn teardown() {
     if RING0_TORN.swap(true, Ordering::SeqCst) {
         return; // 已卸载
     }
-    // 关设备句柄（若已初始化）
-    if let Some(Some(r)) = RING0.get() {
-        unsafe {
-            let _ = windows::Win32::Foundation::CloseHandle(r.dev);
-        }
-    }
+    // 关设备句柄（若已初始化）：take() 取得所有权，Ring0 的 Drop 自动 CloseHandle。
+    let _ = RING0.lock().unwrap().take();
     // 停止内核驱动服务
     unsafe {
         use windows::Win32::System::Services::{
@@ -383,6 +411,20 @@ pub fn teardown() {
         }
         let _ = CloseServiceHandle(scm);
     }
+}
+
+/// 系统唤醒后调用：标记 MSR 设备句柄待重建。
+///
+/// 睡眠/唤醒期间 WinRing0 内核驱动服务通常仍在运行，但设备句柄可能失效
+/// （驱动被电源管理重置 / 显卡驱动重初始化连带影响）。下一轮采样 `ring0()`
+/// 检测到 `RING0_STALE` 会重新打开设备并重启服务，避免功耗永久 `--`。
+/// 与 GPU `invalidate_topology` 对称处理唤醒自愈。
+pub fn invalidate_on_resume() {
+    if RING0_TORN.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    RING0_STALE.store(true, std::sync::atomic::Ordering::Relaxed);
+    probe::log("msr: marked stale on resume — will reopen device + restart service on next sample");
 }
 
 fn read_msr(r: &Ring0, index: u32) -> Option<u64> {
@@ -463,7 +505,8 @@ impl MsrPower {
             self.init()?;
             self.ready = true;
         }
-        let r = ring0()?;
+        let g = ring0()?;
+        let r = g.as_ref()?;
         let amd = cpuid_info().amd;
         let pkg_idx = if amd { MSR_AMD_PKG_ENERGY } else { MSR_INTEL_PKG_ENERGY };
         let pkg = read_msr(r, pkg_idx)?;
@@ -540,7 +583,8 @@ impl MsrPower {
     fn init(&mut self) -> Option<()> {
         let c = cpuid_info();
         let unit_idx = if c.amd { MSR_AMD_UNIT } else { MSR_INTEL_UNIT };
-        let r = ring0()?;
+        let g = ring0()?;
+        let r = g.as_ref()?;
         let u = read_msr(r, unit_idx)?;
         let n = (u >> 8) & 0x1F;
         self.unit_j = 1.0 / (1u64 << n) as f32;

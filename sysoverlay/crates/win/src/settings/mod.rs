@@ -61,8 +61,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::gfx_d2d::{ColorF, Gfx, HAlign, RectF};
 use crate::theme::Theme;
 use crate::titlebar::{self, TitleBarState, TitleBtn};
-use crate::window::{self, WM_RECONFIG};
+use crate::window::{self, WM_RECONFIG, WM_SAMPLER_DIAG, WM_GET_SAMPLER_DIAG};
 use crate::config_io;
+use aaxsyspulse_core::sampler::SamplerDiag;
 use state::{Action, EditState, Interaction, Page, WidgetState};
 use tasks::DebouncedSave;
 
@@ -172,7 +173,7 @@ struct SettingsCtx {
     theme: Theme,
     dpi: u32,
     hand: HCURSOR,
-    pages: [Page; 6],
+    pages: [Page; 7],
     /// 当前分页。
     page: usize,
     /// 翻页动画（None = 无动画进行中）。
@@ -181,8 +182,8 @@ struct SettingsCtx {
     interaction: Interaction,
     /// 正在编辑的输入框（buf/caret）。
     edit: Option<EditState>,
-    /// 各指标配置卡的展开态（UI 状态，不落盘）。
-    metric_expanded: [bool; 7],
+    /// 各指标配置卡的展开态（UI 状态，不落盘）。v4：含 DiskRead/DiskWrite。
+    metric_expanded: [bool; 9],
     /// 滚轮惯性的滚动速度（px/s），橡胶边界用。
     scroll_vel: f32,
     /// 当前客户区尺寸（WM_SIZE 更新，rebuild_pages 与命中测试用）。
@@ -194,6 +195,15 @@ struct SettingsCtx {
     tb: TitleBarState,
     /// 待重绘的控件下标集合（None = 全量重绘）。
     dirty: Option<Vec<usize>>,
+    /// 共享诊断数据指针（从 overlay 窗口 WM_SAMPLER_DIAG 消息获得）。
+    ///
+    /// ⚠️ 其有效性由 `diag_arc` 保证：指针指向的是 overlay 侧 `Arc::into_raw`
+    /// 移交过来的 `SamplerDiag`，本结构持有那份强引用。旧实现只存裸指针，而发送端
+    /// PostMessage 后即 drop、采样线程下一轮就释放旧对象 → 设置页此后**每一帧**都在
+    /// 解引用已释放内存（use-after-free）。
+    diag: Option<*const SamplerDiag>,
+    /// 与 `diag` 指针同一分配的那份 `Arc`（保活用，勿删）。
+    diag_arc: Option<std::sync::Arc<SamplerDiag>>,
     /// 空间网格索引：每页一个。
     spatial_grids: Vec<state::SpatialGrid>,
     /// 逐控件过渡弹簧：键 = (页下标, 控件 id)。用 id 而非下标，
@@ -201,8 +211,8 @@ struct SettingsCtx {
     transitions: std::collections::HashMap<(usize, i32), Transition>,
     /// 侧边栏选中胶囊的滑动脉簧（值 = 页面下标）。
     nav_sel: motion::Spring,
-    /// 各指标折叠卡的动画展开度（0..1）。
-    metric_expand_t: [motion::Spring; 7],
+    /// 各指标折叠卡的动画展开度（0..1）。v4：含 DiskRead/DiskWrite。
+    metric_expand_t: [motion::Spring; 9],
     /// 上一帧是否仍在推进布局类弹簧（收敛后再补一次重排）。
     layout_anim_active: bool,
     /// 翻页弹簧：水平位移（px，从 24 滑入到 0）。
@@ -234,12 +244,13 @@ struct SettingsCtx {
     /// 换位滑动弹簧（逐指标，值 = 相对基准槽位的额外 y 位移，目标恒为 0）。
     /// 换位时把「对面那张卡」弹到它的旧视觉位置，再由弹簧滑回新槽位 ——
     /// 这就是「一张张卡片挪动」的非线性动画。
-    card_slide: [motion::Spring; 7],
+    card_slide: [motion::Spring; 9],
     /// 拖拽释放时的落位弹簧动画状态（None = 无进行中释放动画）。
     drag_release: Option<ReleaseInfo>,
     /// 松手后被拖卡自己的落位弹簧（逐指标）：从拖动偏移量 spring 到 0，
     /// 弹簧收敛后才触发真正的 rebuild_pages（确保卡槽无空隙）。
-    metric_release: [motion::Spring; 7],
+    /// v4：含 DiskRead/DiskWrite。
+    metric_release: [motion::Spring; 9],
     /// 滚动条拖拽状态：`Some(grab)` = 正在拖，`grab` = 按下点相对拇指顶缘的偏移
     /// （client px）。None = 未在拖。
     ///
@@ -261,10 +272,10 @@ struct PageAnim;
 /// base 可由 `rect.top - y_off` 反推 —— rebuild 换位与增量平移两条路径都成立。
 #[derive(Clone, Copy)]
 struct CardDrag {
-    /// 被拖指标下标（0..=5；id 键控，不随显示位置变化）。
+    /// 被拖指标下标（0..=8；id 键控，不随显示位置变化）。
     metric: usize,
-    /// 拖动预览中的显示顺序（换位即时更新，抬手才落盘）。
-    order: [u8; 7],
+    /// 拖动预览中的显示顺序（换位即时更新，抬手才落盘）。v4 含 DiskRead/DiskWrite。
+    order: [u8; 9],
     /// 抓取点相对被拖卡顶缘的偏移（按下时确定，恒定 → 贴手）。
     grab_dy: i32,
     /// 被拖卡当前 y 偏移（rect 相对 base 布局位置）。
@@ -445,6 +456,8 @@ pub fn open_settings(overlay: HWND) {
                 // 置于前台：overlay 是 TOPMOST，settings 需要主动抢焦点。
                 let _ = SetForegroundWindow(hwnd);
                 let _ = SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                // 重新请求诊断数据
+                let _ = PostMessageW(overlay, WM_GET_SAMPLER_DIAG, WPARAM(0), LPARAM(hwnd.0 as isize));
             }
             return;
         }
@@ -549,17 +562,19 @@ fn create_dialog(overlay: HWND) {
             page_anim: None,
             interaction: Interaction::Idle,
             edit: None,
-            metric_expanded: [false; 7],
+            metric_expanded: [false; 9],
             scroll_vel: 0.0,
             client_size: (w, h),
             nav_hover: None,
             tracking: false,
             tb: TitleBarState::default(),
             dirty: None,
+            diag: None,
+            diag_arc: None,
             spatial_grids: Vec::new(),
             transitions: std::collections::HashMap::new(),
             nav_sel: motion::Spring::new(0.0),
-            metric_expand_t: [motion::Spring::new(0.0); 7],
+            metric_expand_t: [motion::Spring::new(0.0); 9],
             layout_anim_active: false,
             page_slide: motion::Spring::new(0.0),
             page_fade: motion::Spring::new(1.0),
@@ -574,9 +589,9 @@ fn create_dialog(overlay: HWND) {
             status: None,
             stepper_hold: None,
             card_drag: None,
-            card_slide: [motion::Spring::new(0.0); 7],
+            card_slide: [motion::Spring::new(0.0); 9],
             drag_release: None,
-            metric_release: [motion::Spring::new(0.0); 7],
+            metric_release: [motion::Spring::new(0.0); 9],
             sb_drag: None,
             sb_hover: false,
         };
@@ -597,6 +612,9 @@ fn create_dialog(overlay: HWND) {
         // 置于前台：overlay 是 TOPMOST，settings 需要主动抢焦点。
         let _ = SetForegroundWindow(hwnd);
         let _ = SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+
+        // 向 overlay 请求诊断数据（异步，WM_SAMPLER_DIAG 回调会填充 ctx.diag）
+        let _ = PostMessageW(overlay, WM_GET_SAMPLER_DIAG, WPARAM(0), LPARAM(hwnd.0 as isize));
     }
 }
 
@@ -681,7 +699,7 @@ fn sidebar_at(dpi: u32, pt: ClientPt) -> Option<usize> {
         return None;
     }
     let i = rel / step;
-    if i >= 6 {
+    if i >= 7 {
         return None;
     }
     // 落于项间距（gap）内视为未命中
@@ -838,14 +856,14 @@ fn step_drag_release(ctx: &mut SettingsCtx, dt: f32) -> bool {
     if settled {
         ctx.drag_release = None;
         ctx.card_drag = None;
-        ctx.metric_release = [motion::Spring::new(0.0); 7];
+        ctx.metric_release = [motion::Spring::new(0.0); 9];
     }
     settled
 }
 
 // ── 单向数据流：Action 分派（唯一写入口） ────────────────
 
-/// v3：Time 与 CPU/Mem/GPU/Net/Power/Util 平权，同属监控项（共 7 项）。
+/// v3：Time 与 CPU/Mem/GPU/Net/Power/Util/DiskRead/DiskWrite 平权，同属监控项（共 9 项）。
 fn is_metric_toggle(r: CfgRef) -> bool {
     matches!(
         r,
@@ -856,6 +874,8 @@ fn is_metric_toggle(r: CfgRef) -> bool {
             | CfgRef::ShowUtil
             | CfgRef::ShowTime
             | CfgRef::PowerEnabled
+            | CfgRef::ShowDiskRead
+            | CfgRef::ShowDiskWrite
     )
 }
 
@@ -870,6 +890,8 @@ fn metrics_all_off_after(cfg: &aaxsyspulse_core::config::Config, turning_off: Cf
         && (!v(CfgRef::ShowUtil) || would_off(CfgRef::ShowUtil))
         && (!v(CfgRef::ShowTime) || would_off(CfgRef::ShowTime))
         && (!v(CfgRef::PowerEnabled) || would_off(CfgRef::PowerEnabled))
+        && (!v(CfgRef::ShowDiskRead) || would_off(CfgRef::ShowDiskRead))
+        && (!v(CfgRef::ShowDiskWrite) || would_off(CfgRef::ShowDiskWrite))
 }
 
 /// v3：行关闭触发驱动/厂商库卸载时，弹原生提示框告知「重启应用恢复」。
@@ -971,6 +993,23 @@ fn dispatch(ctx: &mut SettingsCtx, action: Action) {
             }
         }
         Action::Select(r, i) => {
+            // 横竖布局切换：需要同步切换布局文件，使两份几何/偏移各自独立保留。
+            if r == CfgRef::Style {
+                let _ = apply_config(ctx, |cfg| {
+                    let old = cfg.render_style;
+                    let new = if i == 1 {
+                        aaxsyspulse_core::types::RenderStyle::Vertical
+                    } else {
+                        aaxsyspulse_core::types::RenderStyle::Strip
+                    };
+                    if old == new {
+                        return false;
+                    }
+                    crate::config_io::switch_layout_in_place(cfg, old, new);
+                    true
+                });
+                return;
+            }
             let applied = apply_config(ctx, |cfg| {
                 match r.get(cfg) {
                     Value::Select(old) => {
@@ -2059,14 +2098,14 @@ unsafe fn on_wm_lbuttondown(hwnd: HWND, _msg: u32, _wparam: WPARAM, lparam: LPAR
             {
             // 开始新的拖拽前，清理可能残留的释放落位动画（避免新旧状态打架）。
             ctx.drag_release = None;
-            ctx.metric_release = [motion::Spring::new(0.0); 7];
+            ctx.metric_release = [motion::Spring::new(0.0); 9];
             let mi = mh.index;
             let order = ctx
             .card_drag
             .as_ref()
             .map(|d| d.order)
             .unwrap_or_else(|| {
-            ctx.cfg().map(|c| c.metric_order).unwrap_or([0, 1, 2, 6, 3, 4, 5])
+            ctx.cfg().map(|c| c.metric_order).unwrap_or([0, 1, 2, 6, 3, 4, 5, 7, 8])
             });
             let pos = order.iter().position(|&m| m as usize == mi).unwrap_or(0);
             let card_top = ctx.pages[ctx.page]
@@ -2075,7 +2114,7 @@ unsafe fn on_wm_lbuttondown(hwnd: HWND, _msg: u32, _wparam: WPARAM, lparam: LPAR
             .map(|c| c.rect.top)
             .unwrap_or(cpt.0.y);
             // 清空上一次拖拽残留的换位弹簧（避免旧偏移串到本次）。
-            ctx.card_slide = [motion::Spring::new(0.0); 7];
+            ctx.card_slide = [motion::Spring::new(0.0); 9];
             ctx.card_drag = Some(CardDrag {
             metric: mi,
             order,
@@ -2402,6 +2441,24 @@ unsafe fn on_wm_diag_click(hwnd: HWND, _msg: u32, _wparam: WPARAM, _lparam: LPAR
             LRESULT(0)
         }
 
+        // 收到 overlay 回复的诊断数据：复制到 ctx 中并请求重绘。
+        unsafe fn on_wm_sampler_diag(hwnd: HWND, _msg: u32, _wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+            if let Some(ctx) = ctx_of(hwnd) {
+                // 接管 overlay 侧 `Arc::into_raw` 移交的所有权（见 window::wndproc 的
+                // WM_GET_SAMPLER_DIAG）。必须 from_raw，否则每个消息漏一份 Arc 强引用。
+                if lparam.0 != 0 {
+                    let arc = std::sync::Arc::from_raw(lparam.0 as *const SamplerDiag);
+                    ctx.diag = Some(std::sync::Arc::as_ptr(&arc));
+                    ctx.diag_arc = Some(arc);
+                } else {
+                    ctx.diag = None;
+                    ctx.diag_arc = None;
+                }
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
+
 unsafe fn on_wm_setcursor(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             if let Some(ctx) = ctx_of(hwnd) {
             if matches!(&ctx.interaction, Interaction::Hover { .. })
@@ -2488,6 +2545,7 @@ unsafe extern "system" fn settings_wndproc(
         WM_CHAR => on_wm_char(hwnd, msg, wparam, lparam),
         WM_KILLFOCUS => on_wm_killfocus(hwnd, msg, wparam, lparam),
         WM_DIAG_CLICK => on_wm_diag_click(hwnd, msg, wparam, lparam),
+        WM_SAMPLER_DIAG => on_wm_sampler_diag(hwnd, msg, wparam, lparam),
         WM_SETCURSOR => on_wm_setcursor(hwnd, msg, wparam, lparam),
         WM_SETTINGCHANGE => on_wm_settingchange(hwnd, msg, wparam, lparam),
         WM_CLOSE => on_wm_close(hwnd, msg, wparam, lparam),
@@ -2522,6 +2580,8 @@ struct PaintCtx<'a> {
     win_w: i32,
     win_h: i32,
     lang: aaxsyspulse_core::types::Lang,
+    /// 共享诊断数据指针（从 overlay 窗口 WM_SAMPLER_DIAG 消息获得）。
+    diag: Option<*const SamplerDiag>,
 }
 
 fn paint_d2d(hwnd: HWND) -> bool {
@@ -2635,7 +2695,7 @@ fn paint_d2d(hwnd: HWND) -> bool {
         let faded = if alpha < 1.0 { gfx.push_fade(rt, bounds, alpha) } else { false };
 
         // 本帧绘制上下文（渲染目标/主题/DPI/尺寸/语言），四个 paint_* 共用。
-        let pc = PaintCtx { rt, theme: &theme, dpi, win_w, win_h, lang };
+        let pc = PaintCtx { rt, theme: &theme, dpi, win_w, win_h, lang, diag: ctx.diag };
         // 侧边栏（固定在左侧，不随内容滚动）
         paint_sidebar(&pc, gfx, page_idx, nav_hover, nav_t);
 
@@ -2657,6 +2717,7 @@ fn paint_d2d(hwnd: HWND) -> bool {
             &interaction,
             edit.as_ref(),
             cfg.as_ref(),
+            pc.diag,
             ox as f32,
             oy as f32,
             body_px(dpi),
@@ -2840,7 +2901,8 @@ fn display_px(dpi: u32) -> f32 {
     20.0 * dpi as f32 / 72.0
 }
 
-/// 侧边栏（D3）：底色 + 标题 + 6 个导航项（图标 + 文案 + 胶囊选中/悬停）。
+/// 侧边栏（D3）：底色 + 标题 + 导航项（数量随 [`icons::IconKind::ALL`]，当前 7 项，
+/// 顺序 = 页面下标；图标 + 文案 + 胶囊选中/悬停）。
 /// 固定在左侧，不随内容滚动；几何必须与命中测试 `sidebar_at` 保持一致。
 fn paint_sidebar(
     pc: &PaintCtx,
@@ -2876,7 +2938,9 @@ fn paint_sidebar(
     let item_h = s(dpi, SB_ITEM_H) as f32;
     let step = s(dpi, SB_ITEM_H + SB_ITEM_GAP) as f32;
     let top = s(dpi, 8 + 30 + 12) as f32;
-    let active = (sel_t.round() as usize).min(5);
+    // 导航项数量以图标清单为准（唯一真值来源），避免「加页忘加图标」再越界。
+    let nav_n = icons::IconKind::ALL.len();
+    let active = (sel_t.round() as usize).min(nav_n.saturating_sub(1));
     // 悬停底（画在选中胶囊之下）
     if let Some(h) = nav_hover {
         let hy = top + h as f32 * step;
@@ -2888,14 +2952,14 @@ fn paint_sidebar(
         );
     }
     // 选中胶囊：沿 `sel_t` 滑到目标项（而非瞬间跳格）。
-    let py = top + sel_t.clamp(0.0, 5.0) * step;
+    let py = top + sel_t.clamp(0.0, (nav_n.saturating_sub(1)) as f32) * step;
     let pill = if hc {
         c(t, t.sidebar_selected)
     } else {
         c(t, t.sidebar_selected).with_alpha(0.12)
     };
     gfx.fill_round(rt, RectF::new(pad, py, x1 - pad, py + item_h), item_h / 2.0, pill);
-    for i in 0..6 {
+    for i in 0..nav_n {
         let y = top + i as f32 * step;
         let selected = i == active;
         let ix = pad + s(dpi, 6) as f32;
@@ -2971,21 +3035,22 @@ fn paint_scrollbar(
 fn paint_page(
     pc: &PaintCtx,
     gfx: &mut Gfx,
-    pages: &[Page; 6],
+    pages: &[Page; 7],
     page_idx: usize,
     interaction: &Interaction,
     edit: Option<&EditState>,
     cfg: Option<&aaxsyspulse_core::config::Config>,
+    _diag: Option<*const SamplerDiag>,
     ox: f32,
     oy: f32,
     body: f32,
     caption: f32,
-    _metric_expanded: &[bool; 7],
+    _metric_expanded: &[bool; 9],
     drag_pos: Option<usize>,
     transitions: &mut std::collections::HashMap<(usize, i32), Transition>,
-    card_slide: &[motion::Spring; 7],
+    card_slide: &[motion::Spring; 9],
     drag_release: Option<&ReleaseInfo>,
-    metric_release: &[motion::Spring; 7],
+    metric_release: &[motion::Spring; 9],
     dt: f32,
     focus: Option<usize>,
     keyboard_mode: bool,
@@ -3177,7 +3242,7 @@ fn paint_page(
                 ws.editing = matches!(interaction, Interaction::Editing { widget } if *widget == wi);
                 // 键盘焦点环仅键盘模式绘制（报告 §7.1 should_draw_focus_ring）。
                 ws.focused = keyboard_mode && focus == Some(wi);
-                widget::paint_widget(rt, gfx, &page.widgets[wi], &ws, dpi, t, ox, oy + total_y, body, caption, edit, cfg);
+                widget::paint_widget(rt, gfx, &page.widgets[wi], &ws, dpi, t, ox, oy + total_y, body, caption, edit, cfg, pc.diag);
             }
         }
 

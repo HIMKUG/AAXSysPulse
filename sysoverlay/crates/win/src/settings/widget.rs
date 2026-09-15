@@ -12,6 +12,7 @@
 use windows::Win32::Foundation::RECT;
 
 use aaxsyspulse_core::config::Config;
+use aaxsyspulse_core::sampler::{SampleOutcome, SamplerDiag, SamplerId};
 use aaxsyspulse_core::types::Lang;
 
 use crate::gfx_d2d::{ColorF, Gfx, HAlign, RectF};
@@ -199,6 +200,25 @@ pub struct StepperWidget {
     pub max: f64,
     pub step: f64,
     pub cfg: CfgRef,
+}
+
+/// 诊断页每行的采样器状态展示：无交互，纯读取。
+pub struct DiagRowWidget {
+    pub id: SamplerId,
+    pub lang: Lang,
+}
+
+impl DiagRowWidget {
+    pub fn new(id: SamplerId, lang: Lang) -> Self {
+        Self { id, lang }
+    }
+}
+
+impl IWidget for DiagRowWidget {
+    fn cfg(&self) -> Option<CfgRef> { None }
+    fn sync(&self, _cfg: &Config, _st: &mut WidgetState) {}
+    fn anim_target(&self, _st: &WidgetState) -> f32 { 0.0 }
+    fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 /// 关于页头部：Logo 方块 + 应用名 + 版本（报告 §11 关于页）。
@@ -415,6 +435,7 @@ pub fn paint_widget(
     small_px: f32,
     edit: Option<&EditState>,
     cfg: Option<&Config>,
+    diag: Option<*const SamplerDiag>,
 ) {
     let r = RectF::from_i32(w.rect.left, w.rect.top, w.rect.right, w.rect.bottom).offset(ox, oy);
     if let Some(_t) = w.kind.as_any().downcast_ref::<ToggleWidget>() {
@@ -445,6 +466,9 @@ pub fn paint_widget(
         paint_metric_font_status(
             rt, gfx, state, dpi, theme, r, cfg, ms.index, ms.lang, body_px, small_px,
         );
+    } else if let Some(dr) = w.kind.as_any().downcast_ref::<DiagRowWidget>() {
+        let d = diag.map(|p| unsafe { &*p });
+        paint_diag_row(rt, gfx, dpi, theme, r, dr.id, dr.lang, body_px, d);
     }
 
     // 键盘焦点环（报告 §7.1：仅键盘导航时出现，鼠标用户看不到）。
@@ -1042,8 +1066,8 @@ fn paint_metric_header(
     // cfg 不可得（overlay 句柄失效）时按「开」处理：
     // 宁可少画一枚标签，也不在状态未知时错报「已关闭」。
     let on = cfg.map_or(true, |c| matches!(on_cfg.get(c), Value::Bool(true)));
-    const KEYS: [&str; 7] = ["LblCpu", "LblMem", "LblGpu", "LblNet", "LblPower", "LblTime", "LblUtil"];
-    let name = crate::i18n::t(lang, KEYS[index.min(6)]);
+    const KEYS: [&str; 9] = ["LblCpu", "LblMem", "LblGpu", "LblNet", "LblPower", "LblTime", "LblUtil", "LblDiskRead", "LblDiskWrite"];
+    let name = crate::i18n::t(lang, KEYS[index.min(8)]);
     // 折叠头标题比正文大一档（用户反馈：字号偏小）。
     let title_px = body_px * 1.2;
 
@@ -1085,6 +1109,95 @@ fn paint_metric_header(
             );
         }
     }
+}
+
+/// 诊断页一行：采样器名称 + 状态图标 + 原因说明。
+/// `id` 是控件的 w.id（600..604 对应 Cpu/Memory/Gpu/Net/Power）。
+fn paint_diag_row(
+    rt: &windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget,
+    gfx: &mut Gfx,
+    dpi: u32,
+    t: &Theme,
+    r: RectF,
+    id: SamplerId,
+    lang: Lang,
+    body_px: f32,
+    diag: Option<&SamplerDiag>,
+) {
+    let sampler_id = id;
+
+    // 采样器名称
+    let name_key = match sampler_id {
+        SamplerId::Cpu => "DiagCpu",
+        SamplerId::Memory => "DiagMem",
+        SamplerId::Gpu => "DiagGpu",
+        SamplerId::Net => "DiagNet",
+        SamplerId::Power => "DiagPower",
+    };
+    let name = crate::i18n::t(lang, name_key);
+
+    // 状态：最近一条诊断记录
+    let (status_color, status_text) = if let Some(d) = diag {
+        if let Some(entry) = d.last() {
+            if entry.sampler == sampler_id {
+                match entry.outcome {
+                    SampleOutcome::Ok => (c(t, t.accent), crate::i18n::t(lang, "DiagOk")),
+                    SampleOutcome::Skipped => (c(t, t.secondary), crate::i18n::t(lang, "DiagOk")),
+                    SampleOutcome::Transient | SampleOutcome::Fatal => {
+                        // 根据错误码推断原因
+                        let reason = match entry.code {
+                            1 => "DiagNoDriver",
+                            2 => "DiagPerm",
+                            3 => "DiagUnavail",
+                            4 => "DiagTimeout",
+                            _ => "DiagFallback",
+                        };
+                        (c(t, t.accent), crate::i18n::t(lang, reason))
+                    }
+                }
+            } else {
+                (c(t, t.secondary), crate::i18n::t(lang, "DiagOk"))
+            }
+        } else {
+            (c(t, t.secondary), crate::i18n::t(lang, "DiagOk"))
+        }
+    } else {
+        (c(t, t.secondary), "—")
+    };
+
+    let mid = (r.t + r.b) / 2.0;
+    let label_h = super::layout::s(dpi, super::layout::ROW_H) as f32;
+    let label_top = mid - label_h / 2.0;
+
+    // 状态圆点（8px 直径）
+    let dot_r = RectF::new(r.r - 80.0, mid - 4.0, r.r - 72.0, mid + 4.0);
+    gfx.fill_ellipse(rt, dot_r, status_color);
+
+    // 原因文字（右侧，在圆点左边）
+    let reason_r = RectF::new(r.r - 300.0, label_top, r.r - 88.0, label_top + label_h);
+    gfx.text(
+        rt,
+        status_text,
+        caption_px(dpi),
+        400,
+        HAlign::Trailing,
+        reason_r,
+        status_color,
+        false,
+    );
+
+    // 采样器名称（左侧标签区）
+    let name_r = RectF::new(r.l, label_top, r.r - 310.0, label_top + label_h);
+    gfx.text(
+        rt,
+        name,
+        body_px,
+        400,
+        HAlign::Leading,
+        name_r,
+        c(t, t.label),
+        false,
+    );
 }
 
 /// 关于页头部：应用图标 + 应用名 + 版本（报告 §11 关于页布局）。

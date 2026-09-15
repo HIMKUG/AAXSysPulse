@@ -309,6 +309,12 @@ static RENDER_GEN: AtomicU64 = AtomicU64::new(0);
 /// 已为「本次停摆」触发过 respawn（幂等闸门）：避免一次卡死被每个采样 tick
 /// 重复 respawn 出多个线程。帧恢复完成后清零。
 static WEDGE_RESPAWNED: AtomicBool = AtomicBool::new(false);
+/// 本进程累计 respawn 次数（硬上限闸门）。
+///
+/// 每次 respawn 都会**遗留**一个可能永久卡在原生调用里的旧线程（Windows 无法取消
+/// 这类阻塞）——`WEDGE_RESPAWNED` 只在"一次停摆"内幂等，帧恢复后 `clear_wedge_gate`
+/// 会复位它，于是"卡死→恢复→再卡死"可以无限循环、线程无限累积。这里加会话级硬上限。
+static RESPAWN_COUNT: AtomicU32 = AtomicU32::new(0);
 /// 软停摆日志只打一次（直到帧恢复清零）。
 static WATCHDOG_WEDGED: AtomicBool = AtomicBool::new(false);
 
@@ -402,12 +408,19 @@ pub fn render_watchdog_tick(now_ms: u64) -> WatchdogAction {
             // 幂等闸门：本次停摆只触发一次 respawn。旧线程即使永不返回，
             // 也不会被反复重开（不会无限泄漏线程）。
             if !WEDGE_RESPAWNED.swap(true, AtomicOrdering::Relaxed) {
-                return WatchdogAction::Respawn; // 触发一次 respawn
+                // 会话级硬上限：超过 3 次不再新建线程（旧线程无法回收），
+                // 直接落到下面的 D2D 回退分支，避免线程无限累积。
+                if RESPAWN_COUNT.fetch_add(1, AtomicOrdering::Relaxed) < 3 {
+                    return WatchdogAction::Respawn; // 触发一次 respawn
+                }
+                crate::probe::log(
+                    "render watchdog: respawn cap (3) reached — will not spawn more render threads",
+                );
             }
             // 已 respawn 过但当前世代仍在途超过阈值 → 新线程也卡住了。
             // 优先按「D2D 原生调用卡死」处置：禁用 D2D 并持久化回退 GDI。
             // 若本来就是 GDI 引擎（D2D 已禁），不误报，退化为等纪元判据。
-            if !D2D_BROKEN.load(AtomicOrdering::Relaxed) {
+            if !D2D_BROKEN.load(AtomicOrdering::SeqCst) {
                 crate::probe::log(
                     "render watchdog: fresh thread also wedged -> disable D2D (persist GDI)",
                 );
@@ -484,9 +497,9 @@ pub fn disable_d2d_and_persist(hwnd: HWND) {
     mark_d2d_broken_and_persist_gdi(hwnd);
 }
 
-/// D2D 渲染失败后的自愈合：本会话禁用 D2D，并把持久配置回退为 Gdi。
-fn mark_d2d_broken_and_persist_gdi(hwnd: HWND) {
-    D2D_BROKEN.store(true, AtomicOrdering::Relaxed);
+/// **UI 线程侧**的 D2D 回退落地：改写 Config 并持久化。
+/// 只能由 wndproc 收到 `WM_DISABLE_D2D` 时调用 —— `ThreadState` 归 UI 线程所有。
+pub fn apply_d2d_fallback_ui(hwnd: HWND) {
     if let Some(mut cfg) = crate::window::get_config_of(hwnd) {
         if cfg.render_engine == RenderEngine::D2d {
             cfg.render_engine = RenderEngine::Gdi;
@@ -494,6 +507,25 @@ fn mark_d2d_broken_and_persist_gdi(hwnd: HWND) {
             let _ = crate::config_io::save_config(&cfg);
             crate::probe::log("d2d disabled (session) + persisted render_engine=Gdi");
         }
+    }
+}
+
+/// D2D 渲染失败后的自愈合：本会话禁用 D2D，并**请求 UI 线程**把持久配置回退为 Gdi。
+///
+/// ⚠️ 本函数会被**渲染线程**（`render` 内 D2D 失败 / panic 分支）与**采样线程**
+/// （看门狗 `DisableD2d` 分支）调用，都不是 UI 线程。旧实现直接在这里调
+/// `get_config_of` / `modify_config`（裸指针读写 `ThreadState.cfg`），并在采样线程上
+/// 同步 fsync 写盘 —— 与 UI 线程 wndproc 构成真实 data race（UB），且与退出落盘
+/// 竞争同一个 `.tmp` 文件。现改为只置原子标志 + 投递消息，配置改动全部由 UI 线程做。
+fn mark_d2d_broken_and_persist_gdi(hwnd: HWND) {
+    D2D_BROKEN.store(true, AtomicOrdering::Release);
+    unsafe {
+        let _ = PostMessageW(
+            hwnd,
+            crate::window::WM_DISABLE_D2D,
+            windows::Win32::Foundation::WPARAM(0),
+            windows::Win32::Foundation::LPARAM(0),
+        );
     }
 }
 
@@ -631,7 +663,7 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
         // 诊断探针（冻结定位）：确认 render 前导段已走完（GetLocalTime/clock/
     // sync_clock/compute_alpha/get_window_size/layout），卡点在其后。
     crate::probe::log_lazy(|| "render preamble done".to_string());
-    if cfg.render_engine == RenderEngine::D2d && !D2D_BROKEN.load(AtomicOrdering::Relaxed) {
+    if cfg.render_engine == RenderEngine::D2d && !D2D_BROKEN.load(AtomicOrdering::SeqCst) {
             static ANNOUNCED: AtomicBool = AtomicBool::new(false);
             if !ANNOUNCED.swap(true, AtomicOrdering::Relaxed) {
                 crate::probe::log("engine=D2d (high quality) — first frame");
@@ -711,7 +743,12 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
 
         // 画布复用（P2）：尺寸不变时只清零，不再分配
         let surface = SURFACE.get_or_init(|| Mutex::new(SoftwareSurface::new(0, 0)));
-        let Ok(mut surface) = surface.lock() else { return };
+        // 中毒恢复：与 render_thread / window 的处理风格保持一致。旧实现直接 return
+        // → 一次 panic 之后**所有帧永久静默跳过**，窗口冻结且无任何日志。
+        let mut surface = surface.lock().unwrap_or_else(|e| {
+            crate::probe::log("render: SURFACE mutex poisoned -> recovering inner value");
+            e.into_inner()
+        });
         surface.resize(width.max(1), height.max(1));
 
         // 脏区（A1）：alpha / cell 数 / cell 位置变化 → 整窗；否则内容变化的 cell
@@ -795,9 +832,7 @@ fn compute_dirty_in(
     let all = || vec![true; n];
     let prev_alpha_v = prev_alpha.load(AtomicOrdering::Relaxed);
     let prev = prev_cells.get_or_init(|| Mutex::new(Vec::new()));
-    let Ok(mut prev) = prev.lock() else {
-        return (Dirty::Full, all());
-    };
+    let mut prev = prev.lock().unwrap_or_else(|e| e.into_inner());
     // 上屏失败恢复：上一帧 ULW 失败 → 本帧整窗覆盖（配套帧指纹回滚，见该静态注释）。
     if NEEDS_FULL_REUPLOAD.swap(false, AtomicOrdering::Relaxed) {
         *prev = cells.to_vec();
@@ -1059,10 +1094,11 @@ fn present(
         }
 
         let dib = DIB.get_or_init(|| Mutex::new(DibCache::default()));
-        let Ok(mut dib) = dib.lock() else {
-            let _ = ReleaseDC(hwnd, screen_dc);
-            return false;
-        };
+        // 中毒恢复（同上），不再静默放弃渲染。
+        let mut dib = dib.lock().unwrap_or_else(|e| {
+            crate::probe::log("render: DIB mutex poisoned -> recovering inner value");
+            e.into_inner()
+        });
         let Some((mem_dc, bits)) = dib.get(screen_dc, width, height) else {
             drop(dib);
             let _ = ReleaseDC(hwnd, screen_dc);
@@ -1191,10 +1227,11 @@ unsafe fn upload_dib(hwnd: HWND, width: i32, height: i32, src_alpha: u8, dirty: 
         return false;
     }
     let dib = DIB.get_or_init(|| Mutex::new(DibCache::default()));
-    let Ok(mut dib) = dib.lock() else {
-        let _ = ReleaseDC(hwnd, screen_dc);
-        return false;
-    };
+    // 中毒恢复（同上），不再静默放弃渲染。
+    let mut dib = dib.lock().unwrap_or_else(|e| {
+        crate::probe::log("render: DIB mutex poisoned -> recovering inner value");
+        e.into_inner()
+    });
     let Some((mem_dc, _bits)) = dib.get(screen_dc, width, height) else {
         drop(dib);
         let _ = ReleaseDC(hwnd, screen_dc);
@@ -1337,10 +1374,11 @@ fn render_d2d(
             return false;
         }
         let dib = DIB.get_or_init(|| Mutex::new(DibCache::default()));
-        let Ok(mut dib) = dib.lock() else {
-            let _ = ReleaseDC(hwnd, screen_dc);
-            return false;
-        };
+        // 中毒恢复（同上），不再静默放弃渲染。
+        let mut dib = dib.lock().unwrap_or_else(|e| {
+            crate::probe::log("render: DIB mutex poisoned -> recovering inner value");
+            e.into_inner()
+        });
         let Some((mem_dc, _bits)) = dib.get(screen_dc, width, height) else {
             drop(dib);
             let _ = ReleaseDC(hwnd, screen_dc);
