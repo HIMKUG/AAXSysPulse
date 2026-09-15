@@ -91,6 +91,14 @@ pub fn init_net_notify() {
     });
 }
 
+/// 系统唤醒后调用：标记网卡拓扑待重枚举（与 GPU `invalidate_topology` /
+/// MSR `invalidate_on_resume` 对称的自愈入口）。睡眠期间网卡驱动可能重枚举
+/// （虚拟交换机重建 / 无线重连后接口序号变化），`NotifyIpInterfaceChange`
+/// 回调不保证覆盖唤醒事件；置位后下一次 net 采样即全表重枚举，不必等 60s 兜底。
+pub fn invalidate_topology() {
+    NET_TOPO_INVALID.store(true, Ordering::SeqCst);
+}
+
 /// Npcap / WFP / QoS 过滤器子接口的别名关键字。
 ///
 /// `GetIfTable2` 会把每个物理网卡展开成**多个接口行**：主接口

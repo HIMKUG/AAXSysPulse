@@ -960,6 +960,10 @@ unsafe extern "system" fn wndproc(
                     // 下一轮采样 `ring0()` 会重新打开设备 + 重启内核驱动服务，
                     // 避免功耗行永久 `--`（与 GPU 对称自愈）。
                     crate::msr::invalidate_on_resume();
+                    // 网卡拓扑同样可能在睡眠期间重枚举（虚拟交换机重建 / 无线重连），
+                    // NotifyIpInterfaceChange 回调不覆盖唤醒事件：置位后下次采样
+                    // 立即全表重枚举，不必等 60s 兜底（与 GPU / MSR 对称自愈）。
+                    crate::proc_net::invalidate_topology();
                     if let Some(tx) = RESUME_NOTIFY.get() {
                         let _ = tx.send(());
                     }
