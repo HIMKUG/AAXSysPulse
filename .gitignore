@@ -35,10 +35,13 @@ sysoverlay/driver-installer/obj/
 # WorkBuddy 智能体私有文件（不属于项目源码，禁止入库）
 .workbuddy/
 
+# TRAE IDE 配置与文档（非源码）
+.trae/
+
 # 构建/调试产生的备份与产物
-*.bak
+*.bak*
 *.rustbak
-dist/AAXSysPulse*
+dist/
 sysoverlay/driver-installer/bin/
 
 # 审查隔离区的二进制/死文件
