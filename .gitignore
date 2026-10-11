@@ -43,3 +43,6 @@ sysoverlay/driver-installer/bin/
 
 # 审查隔离区的二进制/死文件
 docs/reviews/_quarantine-*/
+
+# TRAE IDE 配置（非源码）
+.trae/
