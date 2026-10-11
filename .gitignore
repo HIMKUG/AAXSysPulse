@@ -30,3 +30,16 @@ sysoverlay/driver-installer/obj/
 *.swp
 *.swo
 *~
+
+# ---- 2026-10-12 上传前清洁：非源码 / 个人 / 临时 ----
+# WorkBuddy 智能体私有文件（不属于项目源码，禁止入库）
+.workbuddy/
+
+# 构建/调试产生的备份与产物
+*.bak
+*.rustbak
+dist/AAXSysPulse*
+sysoverlay/driver-installer/bin/
+
+# 审查隔离区的二进制/死文件
+docs/reviews/_quarantine-*/

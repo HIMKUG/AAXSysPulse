@@ -74,6 +74,18 @@ impl SystemSampler {
         }
     }
 
+    /// 复位 Util 的时间维度计（审查项 2.2.5 / P1-16）。
+    ///
+    /// 只在"影响数值的设置发生变化、采样线程被强制提交一次"时调用：
+    /// `MeterConfig::tau_down = 3.0` 秒意味着切布局/切字号后，Util 仍会带着
+    /// 切换前约 3 s 的拖尾（观感 = 新尺寸下显示旧平滑值）。`last_util_ms` 一并
+    /// 置 `None` ⇒ 下一帧 `dt = 0` 被计为非法窗口 ⇒ 直接全信本次读数（与首帧同语义）。
+    /// 尖峰计数清零是有意的一部分：改设置等于重新开始观测。
+    pub fn reset_util_smoothing(&mut self) {
+        self.util_meter.reset();
+        self.last_util_ms = None;
+    }
+
     /// 监控项启停转换钩子（v3「关闭即完全停止」的执行端）。
     ///
     /// 禁用 → 释放该源的后端资源（句柄/内核服务/厂商库/拓扑缓存）；
@@ -243,7 +255,13 @@ impl SystemSampler {
             self.push_diag(SamplerId::Power, SampleOutcome::Skipped, 0, now_ms);
         } else if plan.power {
             let t = crate::perf::begin();
-            match self.syspower.sample(now_ms) {
+            // 等待上限（审查项 2.2.3 / P1-15）：MSR 的实际读取在专用线程上，
+            // 这里最多阻塞 min(功耗间隔, 3s)。取 3s 上限的理由：正常 RAPL 读取是
+            // 微秒级，只有首轮惰性开服务（SCM + StartService + CreateFile）会慢，
+            // 3s 足够；超过 3s 的读取本身已经没有意义（下一帧就要来了）。
+            let power_interval_ms = crate::window::schedule_cfg().3.max(1000);
+            let timeout_ms = power_interval_ms.min(3000) as u64;
+            match self.syspower.sample(now_ms, timeout_ms) {
                 Some(w) => {
                     snap.power = Metric::Value(w);
                     self.push_diag(SamplerId::Power, SampleOutcome::Ok, 0, now_ms);

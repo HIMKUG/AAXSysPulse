@@ -264,8 +264,15 @@ pub enum Metric {
 }
 
 impl Metric {
+    /// 监控项数量 = 枚举变体数。**全工程所有定长数组的唯一容量来源**
+    /// （配置逐项数组、渲染行缓存、设置页索引等一律用 `Metric::COUNT`，不写字面量）。
+    ///
+    /// 新增监控项流程：① 枚举加变体 → ② `ALL` 追加并把 `COUNT` 改为新数量。
+    /// `ALL` 的类型写作 `[Metric; Self::COUNT]`：忘了改 COUNT 会直接编译失败
+    /// （元素过多），不存在静默截断。
+    pub const COUNT: usize = 9;
     /// 所有合法值（下标序）。
-    pub const ALL: [Metric; 9] = [
+    pub const ALL: [Metric; Self::COUNT] = [
         Metric::Cpu,
         Metric::Mem,
         Metric::Gpu,
@@ -306,6 +313,50 @@ pub struct MetricColors {
     /// 数值槽「自动色」：按占用率分档变色（<60% 绿 / 60~85% 橙 / ≥85% 红）。
     /// 开启时忽略 `value` 的自定义色（用户反馈 2026-09-11）。
     pub value_auto: bool,
+}
+
+/// 逐指标名称模式：简写/完整二选一的逐项覆盖。
+///
+/// `Follow` = 回落到全局 `short_names` 开关（默认，旧配置无此键即得此值）；
+/// `Full`/`Simple` = 该项强制全称（"CPU"）或简写（"C"）。
+/// 序列化写数值（monitor.cfg `[item.N] short`），旧版程序忽略未知键。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum NameMode {
+    #[default]
+    Follow,
+    Full,
+    Simple,
+}
+
+impl NameMode {
+    pub const ALL: [NameMode; 3] = [NameMode::Follow, NameMode::Full, NameMode::Simple];
+
+    /// 宽容解析：接受数值（0/1/2）与字符串。非法值返回 None（保留原值）。
+    pub fn from_config(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "0" | "follow" => Some(NameMode::Follow),
+            "1" | "full" => Some(NameMode::Full),
+            "2" | "simple" => Some(NameMode::Simple),
+            _ => None,
+        }
+    }
+
+    pub fn to_config(self) -> u32 {
+        match self {
+            NameMode::Follow => 0,
+            NameMode::Full => 1,
+            NameMode::Simple => 2,
+        }
+    }
+
+    /// 结合全局 `short_names` 解析出该项是否用简写。
+    pub fn resolve(self, global_short: bool) -> bool {
+        match self {
+            NameMode::Follow => global_short,
+            NameMode::Full => false,
+            NameMode::Simple => true,
+        }
+    }
 }
 
 /// 网速单位。C 版数值序：**0=KB/s 1=MB/s 2=GB/s**。

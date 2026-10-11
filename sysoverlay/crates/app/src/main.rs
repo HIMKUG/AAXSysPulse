@@ -10,6 +10,9 @@
 //! 6. Panic minidump on crash
 //! 7. Self-heal: resume notification resets sampler backoff
 
+// 批次 6·②：非测试代码禁 `unwrap()`（实测本 crate 生产代码 0 处命中）。
+#![cfg_attr(not(test), warn(clippy::unwrap_used))]
+
 use std::thread;
 use std::time::Duration;
 
@@ -69,7 +72,7 @@ fn write_minidump(_location: &str, _message: &str) {
     let dump_dir = std::env::var_os("LOCALAPPDATA")
         .map(|p| {
             std::path::PathBuf::from(p)
-                .join("AAXSysPulseC")
+                .join(aaxsyspulse_core::contract::APP_DATA_DIR_NAME)
                 .join("dumps")
         })
         .unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -236,9 +239,11 @@ fn main() {
                 eprintln!("[AAX SysPulse] 配置版本跨度过大，用户选择退出（不动配置）。");
                 std::process::exit(1);
             }
-            // 是：用默认配置覆盖，立即落盘消除版本不一致
+            // 是：用默认配置覆盖，立即落盘消除版本不一致。
+            // 必须写全 5 个文件（含非激活布局）：`save_config` 只写当前激活布局，
+            // 旧格式的非激活布局文件永远不被重写 → 下次启动版本校验再次失败 → 反复弹窗。
             let cfg = aaxsyspulse_core::config::Config::default();
-            let _ = config_io::save_config(&cfg);
+            let _ = config_io::save_config_all(&cfg);
             let done_w: Vec<u16> = std::ffi::OsStr::new(
                 "配置已重置为默认值，原配置已备份在 config 目录。",
             )
@@ -272,7 +277,9 @@ fn main() {
             .as_ref()
             .map(|a| {
                 std::path::PathBuf::from(a)
-                    .join("AAXSysPulseC\\config\\system.cfg")
+                    .join(aaxsyspulse_core::contract::APP_DATA_DIR_NAME)
+                    .join("config")
+                    .join("system.cfg")
                     .exists()
             })
             .unwrap_or(false);
@@ -294,6 +301,19 @@ fn main() {
     // 登录自启（--autostart）时**完全静默**：登录瞬间不该弹任何模态框，
     // 也不该因为用户点了「取消」就让自启变成「启动了但立刻退出」。
     let at_logon = autostart::launched_at_logon();
+    // 降级加载（某 .cfg 存在却读不出来）必须让用户知情：旧行为是静默按默认值继续、
+    // 且照常保存 ⇒ 一次读失败 + 一次点设置 = 全部设置被默认值覆盖（P1-4）。
+    // 现在这类会话内 config_io 拒绝回写，这里把原因和自救路径说清楚。
+    if config_io::config_degraded() {
+        let broken = config_io::broken_config_files();
+        aaxsyspulse_win::probe::log(&format!(
+            "config degraded (unreadable: {:?}); saving disabled this session",
+            broken
+        ));
+        if !at_logon {
+            config_io::prompt_config_degraded(&broken);
+        }
+    }
     if at_logon {
         aaxsyspulse_win::probe::log("pre-launch checks skipped (--autostart quiet mode)");
     } else {
@@ -400,6 +420,30 @@ fn main() {
     }
 
     // ── 4c. Spawn scheduler-driven sampling thread ────────────────────────
+    //
+    // ─────────────────────────────────────────────────────────────────────
+    // 线程模型与**已知取舍**（审查项 2.1.1 / 2.1.4，P2-5：这些行为是故意的，
+    // 不是 bug；被报"悬浮窗卡住"时先对照本节再查）
+    //
+    // · **UI 线程**同时泵主窗口与设置窗口（`settings_wndproc` 同线程）。
+    //   ⇒ 设置页打开、或任一处 `MessageBoxW` 模态框存续期间，主窗口的
+    //   `WM_TIMER` / `WM_NEW_SNAPSHOT`(0x8000+3) 不被处理 ⇒ **悬浮窗数值停更**
+    //   （旧值继续显示）。像素重绘不受影响，因为绘制与上屏在 `overlay-render`
+    //   线程（`render_thread.rs`），不经过 UI 线程 —— 所以症状是"数字不动"，
+    //   不是白屏/卡死。
+    // · **渲染看门狗在采样线程**（本线程循环内 `gdi::render_watchdog_tick`），
+    //   **不在 UI 线程定时器上**（审查报告 2.1.1 这一条说反了，见批次 4 勘误）。
+    //   ⇒ 模态框期间冻结仍能自愈。真正的单点是：**采样线程自己卡住**（绑核 0 +
+    //   `BELOW_NORMAL` 下若 0 号核被中断/DPC 占满，或 `DeviceIoControl` 不返回），
+    //   看门狗与采样一起停 —— 那条路径无自愈，只能靠进程重启。
+    // · **采样线程绑核 + 降优先级**：`msr::pin_sampling_thread()` 见其注释里
+    //   "为什么是位 0"；`BELOW_NORMAL` 是刻意的（后台采集不与前台交互抢 CPU），
+    //   代价是核 0 繁忙时 `snapshot.timestamp_ms` 会漂移，`dt` 变大的帧会被
+    //   `core::power::max_dt_ms`（已改为随 `power_interval_ms` 推导，2.1.4）判废。
+    // · 设置页打开期间数值"看起来不动"最长时长 = 一个模态框的停留时间；
+    //   关掉设置页/对话框后 `WM_NEW_SNAPSHOT` 队列里的事件继续处理，无需干预。
+    // ─────────────────────────────────────────────────────────────────────
+    //
     // 分频调度：GPU/Net 不快于 1s（计数器本身 1s 才更新），
     // Auto 档刷新上限 = 启用源的最大有效间隔，成本超标自动降档。
     // 事件驱动 NIC 重枚举：注册一次网卡变更通知（取代 10s 轮询 GetIfTable2）。
@@ -437,6 +481,9 @@ fn main() {
         let mut ema_mem_committed = 0f32;
         let mut ema_gpu_committed = 0f32;
         let mut ema_net_committed = 0f32;
+        // 磁盘速率不进 EMA（1Hz 直采），但参与「活跃度」判定：否则只开磁盘行时
+        // max_delta 恒为 0 → 提交退化成 IDLE_MAX_MS(4.5s) 节流，数值像卡住。
+        let mut disk_bps_committed = 0f32;
         let mut quiet_ticks: u32 = 0;
         let mut mode_active = false;
         let mut pending: aaxsyspulse_win::Snapshot = aaxsyspulse_win::Snapshot::placeholder(now_init);
@@ -506,7 +553,7 @@ fn main() {
             // (=4500ms) 会被 30s 慢心跳（全源关闭）与远程会话 ×2（最长 60s）**每轮**
             // 误判成"系统刚从睡眠恢复"，持续刷日志、重置退避，掩盖真实的采样失败。
             let fallback_gap_ms =
-                ((REFRESH_FLOOR_MS as u64) * 3).max(last_sleep_ms.saturating_mul(3) / 2);
+                (REFRESH_FLOOR_MS * 3).max(last_sleep_ms.saturating_mul(3) / 2);
             if now_before_wait.saturating_sub(last_sample_ms) > fallback_gap_ms {
                 sampler.reset_backoff();
                 aaxsyspulse_win::probe::log("sampler: fallback wake detected — gap exceeded 3x normal interval");
@@ -516,10 +563,10 @@ fn main() {
             // 挂起等待解锁信号（window 线程 UNLOCK 时发 resume），零轮询；
             // 解锁唤醒后 reset_backoff 并直达采样——立即补采消除数据空白窗口。
             // 5s 超时兜底：解锁信号万一丢失，最多 5s 后重查状态，不会永久阻塞。
-            if aaxsyspulse_win::window::session_locked() {
-                if resume_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
-                    sampler.reset_backoff();
-                }
+            if aaxsyspulse_win::window::session_locked()
+                && resume_rx.recv_timeout(Duration::from_secs(5)).is_ok()
+            {
+                sampler.reset_backoff();
             }
 
             // 设置改动即时生效（原子镜像，无锁；改动态代际 +1 会从 wait_cfg_change 提前唤醒）
@@ -575,7 +622,11 @@ fn main() {
                 }
             }
             // 空计划零开销：无源到期且无需 flush → 不克隆快照、不进采样器。
-            let snap = if plan.any() || need_flush {
+            // ⚠️ `disk_on` 必须参与该判定：磁盘不在调度器的 5 个源（cpu/mem/gpu/net/power）
+            // 里，其 1Hz 节流在 `DiskState` 内自管。若只开磁盘行而其他源全关，
+            // `plan.any()` 恒 false → 采样器永不被调用 → 磁盘数值永远出不来
+            // （2026-09-17 定位）。
+            let snap = if plan.any() || need_flush || disk_on {
                 need_flush = false;
                 sampler.sample(&plan, Some(&pending), now_ms, power_on, util_on, disk_on)
             } else {
@@ -622,13 +673,22 @@ fn main() {
                 let delta_mem = (ema_mem - ema_mem_committed).abs();
                 let delta_gpu = (ema_gpu - ema_gpu_committed).abs();
                 let delta_net = (ema_net - ema_net_committed).abs();
-                let max_delta = delta_cpu.max(delta_mem).max(delta_gpu).max(delta_net);
+                // 磁盘读写速率（读+写，字节/秒）同样计入活跃度：磁盘不在 EMA 源里，
+                // 只能拿本帧直采值比上次提交值。
+                let disk_bps = (pending.disk.read_bps + pending.disk.write_bps) as f32;
+                let delta_disk = (disk_bps - disk_bps_committed).abs();
+                let max_delta = delta_cpu
+                    .max(delta_mem)
+                    .max(delta_gpu)
+                    .max(delta_net)
+                    .max(delta_disk);
 
                 let cpu_active = ema_cpu >= ACTIVE_CPU_PCT;
                 let net_active = ema_net >= ACTIVE_NET_BPS;
+                let disk_active = delta_disk >= ACTIVE_NET_BPS;
 
                 if mode_active {
-                    if max_delta < DELTA_EXIT && !cpu_active && !net_active {
+                    if max_delta < DELTA_EXIT && !cpu_active && !net_active && !disk_active {
                         quiet_ticks += 1;
                         if quiet_ticks >= EXIT_TICKS {
                             mode_active = false;
@@ -638,17 +698,26 @@ fn main() {
                         quiet_ticks = 0;
                     }
                 } else {
-                    if max_delta >= DELTA_ENTER || cpu_active || net_active {
+                    if max_delta >= DELTA_ENTER || cpu_active || net_active || disk_active {
                         mode_active = true;
                         quiet_ticks = 0;
                     }
                 }
 
-                let should_commit = if mode_active {
+                // 强制屏障提交（审查项 2.2.5 / P1-16）：设置页改过数值类字段后，
+                // 本帧无视静止模式直接提交，避免用户看到「改了没生效」。
+                let forced = aaxsyspulse_win::window::take_barrier_commit();
+                let should_commit = if mode_active || forced {
                     true
                 } else {
                     max_delta >= DELTA_ENTER || after_ms.saturating_sub(last_refresh) >= IDLE_MAX_MS
                 };
+
+                if forced {
+                    // 采样口径变了（间隔/监控项集合），旧的 Util 平滑值不再可比：
+                    // 复位计量器与 Δt 基线，下一帧从原始读数重新起算。
+                    sampler.reset_util_smoothing();
+                }
 
                 if should_commit {
                     let mut committed = pending.clone();
@@ -662,6 +731,7 @@ fn main() {
                     ema_mem_committed = ema_mem;
                     ema_gpu_committed = ema_gpu;
                     ema_net_committed = ema_net;
+                    disk_bps_committed = disk_bps;
                     aaxsyspulse_win::perf::note_barrier_commit(
                         seq,
                         max_delta,
@@ -693,9 +763,16 @@ fn main() {
             // 远程会话中降低采样频率：把超时翻倍（原来 1s 变成 2s，原来 2s 变成 4s），
             // 减少资源占用（WM_POWERBROADCAST 在远程会话中不一定触发，靠通知驱动不可能，
             // 所以在兜底检测里额外照顾）。
-            let any_enabled = enabled.iter().any(|&x| x);
+            // 磁盘行的心跳间隔：磁盘不参与调度器分频，自身按 1Hz 采样，
+            // 只开磁盘行时也要保持 ~1s 唤醒，否则睡眠退化成 30s 慢心跳。
+            const DISK_TICK_MS: u64 = 1_000;
+            let any_enabled = enabled.iter().any(|&x| x) || disk_on;
             let base_timeout_ms: u64 = if any_enabled {
-                sched.next_wake_ms(now_after, &enabled).saturating_sub(now_after).min(30_000u64).max(1u64)
+                let t = sched
+                    .next_wake_ms(now_after, &enabled)
+                    .saturating_sub(now_after)
+                    .clamp(1, 30_000);
+                if disk_on { t.min(DISK_TICK_MS) } else { t }
             } else {
                 30_000u64
             };

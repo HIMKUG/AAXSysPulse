@@ -239,8 +239,10 @@ impl Sampler for NetSampler {
         unsafe {
             for &idx in &self.nic_cache {
                 // MIB_IF_ROW2::default() 把 InterfaceLuid 置零 → GetIfEntry2 走 InterfaceIndex 精确取数。
-                let mut row = MIB_IF_ROW2::default();
-                row.InterfaceIndex = idx;
+                let mut row = MIB_IF_ROW2 {
+                    InterfaceIndex: idx,
+                    ..Default::default()
+                };
                 if GetIfEntry2(&mut row).is_err() {
                     probe::log(&format!("net GetIfEntry2 failed idx={idx}"));
                     continue;

@@ -1,0 +1,969 @@
+/* ============================================================
+   窗口框架 / 页面容器 / 底部导航 / 弹窗 / 各页组件
+   日间模式专用 · Liquid Glass 680 × 560
+   ------------------------------------------------------------
+   配色原则：中性色 90% + 强调色 10%
+     · 页面背景 #FAFBFC，卡片 #FFFFFF —— 层次靠明度不靠色相
+     · 选中一律「浅蓝底 #F0F5FC + 2px 蓝边」，不用重填充
+     · 进度条 / 滑条填充纯色，不用渐变
+   ============================================================ */
+
+/* ============================ 窗口 ============================ */
+.guide-window {
+  position: relative;
+  width: var(--win-w);
+  height: var(--win-h);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-radius: var(--r-window);
+  color: var(--text-primary);
+  background: var(--glass-bg);
+  border: 0.5px solid var(--glass-border);
+  /* 大窗不再做任何 backdrop 模糊（用户指令：大窗保持正常）。
+     背景图清晰透过窗体 → 控件的折射层才有高频信号可折。 */
+  box-shadow: var(--shadow-window);
+  -webkit-app-region: no-drag;
+}
+@supports not (backdrop-filter: blur(1px)) {
+  .guide-window { background: var(--bg-primary); }
+}
+
+/* 第 12 页：背景透明度提高，让用户看到桌面上的悬浮窗（同样不加模糊） */
+.guide-window.translucent {
+  background: rgba(250, 251, 252, 0.4);
+}
+
+/* 顶部拖动区 */
+.titlebar {
+  position: relative;
+  flex: none;
+  height: 44px;
+  -webkit-app-region: drag;
+  app-region: drag;
+}
+
+/* 右上角关闭按钮 */
+.win-close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-tertiary); font-style: italic; font-weight: 400;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+  transition: background-color var(--dur-hover) ease-out,
+              transform var(--dur-press) var(--ease-spring), color var(--dur-hover) ease-out;
+}
+.win-close:hover { background: var(--danger-subtle); color: var(--danger); }
+.win-close:active { transform: scale(0.92); }
+
+/* ============================ 页面容器 ============================ */
+.pages { position: relative; flex: 1; min-height: 0; overflow: hidden; }
+
+.page {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 0 var(--pad-x);
+}
+.page-head { flex: none; margin-bottom: var(--gap-sub-content); }
+.page-title { font-size: var(--fs-title); font-weight: var(--fw-bold); line-height: var(--lh-title); letter-spacing: var(--ls-title); }
+.page-sub { margin-top: var(--gap-title-sub); }
+.page-body { flex: 1; min-height: 0; }
+.page-note {
+  flex: none;
+  margin-top: var(--sp-5);
+  font-size: var(--fs-foot);
+  font-style: italic; font-weight: 400;
+  color: var(--text-tertiary); font-style: italic; font-weight: 400;
+  text-align: center;
+  letter-spacing: var(--ls-foot);
+}
+
+/* 居中页（欢迎 / 完成 / 权限 / 驱动 / 透明度 / 位置）：用 flex 撑出大留白呼吸感 */
+.page--center { text-align: center; }
+.page--center .page-body {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+}
+/* 内容靠上（说明类页面：与底部操作区之间留出大面积留白） */
+.page--top .page-body { justify-content: flex-start; }
+
+/* ============================================================
+   页面切换动画 · 垂直位移 + 淡入 + 轻微缩放 + 分层错峰
+   ------------------------------------------------------------
+   · 只动画 transform / opacity（GPU 合成，不触发重排重绘）
+   · 进入 ease-out-expo，离开 ease-in
+   · 前进 500ms / 后退 450ms；退出时长 ≈ 进入的 75%
+   · 前进从下方 16px 滑入，后退从上方 12px 滑入 —— 方向相反，用户可感知
+   · will-change 只挂在 *-active 类上，动画结束 Vue 移除类即自动释放显存
+   · 两页同时存在时旧页 pointer-events: none，避免误触
+   ============================================================ */
+
+@keyframes pageIn {
+  from {
+    opacity: 0;
+    transform: translateY(var(--in-y, 16px)) scale(var(--in-scale, 0.98));
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+@keyframes pageOutForward {
+  from { opacity: 1; transform: translateY(0) scale(1); }
+  to   { opacity: 0; transform: translateY(-8px) scale(0.98); }
+}
+@keyframes pageOutBackward {
+  from { opacity: 1; transform: translateY(0) scale(1); }
+  to   { opacity: 0; transform: translateY(8px) scale(0.98); }
+}
+
+/* ---------------- 方向变量挂在 .pages 容器上 ----------------
+   不挂在 *-enter-active 上：Vue 在动画结束时移除该类，
+   若此时子元素（r4）仍在动画中，变量消失会导致延迟突变、动画跳帧。
+   容器常驻，变量始终可继承。
+   ------------------------------------------------------------ */
+.pages.is-forward {
+  --in-y: 16px;      /* 前进：新页面从下方滑入 */
+  --in-scale: 0.98;
+  --rise-dir: 1;
+  --d1: 60ms;        /* 标题 */
+  --d2: 140ms;       /* 副标题 */
+  --d3: 220ms;       /* 内容 */
+  --d4: 240ms;       /* 操作 */
+}
+.pages.is-backward {
+  --in-y: -12px;     /* 后退：新页面从上方滑入 */
+  --in-scale: 0.98;
+  --rise-dir: -1;
+  --d1: 40ms;
+  --d2: 100ms;
+  --d3: 160ms;
+  --d4: 200ms;
+}
+
+/* ---------------- 前进（点击“继续”）：总时长 ≈ 500ms ---------------- */
+.page-forward-enter-active {
+  animation: pageIn 380ms var(--ease-out-expo) 20ms both;
+  will-change: transform, opacity;
+}
+.page-forward-leave-active {
+  animation: pageOutForward 220ms var(--ease-in) both;
+  will-change: transform, opacity;
+  pointer-events: none;
+}
+
+/* ---------------- 后退（点击“上一步”）：总时长 ≈ 450ms ---------------- */
+.page-backward-enter-active {
+  animation: pageIn 330ms var(--ease-out-expo) 10ms both;
+  will-change: transform, opacity;
+}
+.page-backward-leave-active {
+  animation: pageOutBackward 180ms var(--ease-in) both;
+  will-change: transform, opacity;
+  pointer-events: none;
+}
+
+/* 第 12 页：容器只淡入，不缩放（用户此时在拖桌面悬浮窗，缩放会干扰注意力） */
+.page--plain { --in-scale: 1; }
+
+/* 动画被 WebView2 拒绝时的兜底：fill both 保证最终停在 opacity:1 / transform:none */
+
+/* ============================ 底部导航 ============================ */
+.footer { flex: none; padding: 0 var(--pad-x) var(--sp-7); }
+
+.dots {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 8px;
+  margin-top: var(--sp-4);   /* 原 footer-divider 占位，去线后补回呼吸感 */
+  margin-bottom: var(--sp-5);
+}
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: transparent;
+  border: 1px solid var(--text-tertiary);
+  transition: background-color var(--dur-hover) ease-out,
+              transform var(--dur-hover) var(--ease-spring);
+}
+.dot--done { background: var(--text-tertiary); border-color: var(--text-tertiary); }
+.dot--current { background: var(--accent); border-color: var(--accent); transform: scale(1.4); }
+
+.nav-btns { display: flex; align-items: center; gap: var(--gap-card); }
+.nav-spacer { flex: 1; }
+
+/* ============================ 统一面板 sheet ============================
+   所有对话框 / 详细调整 / 驱动进度共用一个形态（macOS sheet 版式）：
+   标题靠左 + 右上角 ×，主按钮右下角。尺寸 s/m/l 三档，宽度固定不再
+   随内容浮动（旧 .dialog 内容驱动高宽 = 「竖着的弹窗」问题根源）。
+   面板本体按整屏面板铁律不加折射，只做磨砂薄膜；内部控件是玻璃。
+   注：scrim 自带 backdrop-filter，本身即 backdrop root —— 面板内玻璃
+   在 scrim 子树内采样，与旧 .dialog 行为一致。 */
+.sheet-scrim {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--pad-x);
+  background: var(--overlay-scrim);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border-radius: var(--r-window);
+}
+.sheet {
+  display: flex;
+  flex-direction: column;
+  width: 420px;
+  max-width: 100%;
+  max-height: 100%;
+  padding: var(--sp-6) var(--sp-7);
+  border-radius: var(--r-card-lg);
+  background: rgba(255, 255, 255, 0.72);
+  border: 0.5px solid var(--glass-border);
+  box-shadow: var(--shadow-float);
+  text-align: left;
+  /* backwards：终态不留 fill，避免祖先常驻 transform 动画 */
+  animation: sheetIn 340ms var(--ease-out-expo) backwards;
+}
+@keyframes sheetIn {
+  from { opacity: 0; transform: translateY(14px) scale(0.97); }
+  to   { opacity: 1; transform: none; }
+}
+.sheet--m { width: 480px; min-height: 300px; }
+.sheet--l { width: 560px; height: 480px; }   /* 吃满 scrim 内缘（560−2×40），逐项三列一屏装下；
+                                                窄视口下窗口被压时 max-width:100% 夹窄，靠下方
+                                                紧凑覆写兜底（swatch 24 + auto-fill 列数自适应） */
+.sheet-head {
+  flex: none;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-4);
+  margin-bottom: var(--sp-5);
+}
+.sheet-title {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-body);
+  font-weight: var(--fw-medium);
+  line-height: var(--lh-subtitle);
+}
+.sheet-close {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  margin: -3px -5px 0 0;           /* 视觉贴角，抵消面板内边距 */
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-tertiary); font-style: italic; font-weight: 400;
+  cursor: pointer;
+  transition: background-color var(--dur-hover) ease-out,
+              color var(--dur-hover) ease-out,
+              transform var(--dur-release) var(--ease-spring);
+}
+.sheet-close:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+.sheet-close:active { transform: scale(0.86); transition-duration: var(--dur-press); }
+.sheet-body { flex: 1; min-height: 0; overflow-y: auto; scrollbar-width: none; }
+.sheet-body::-webkit-scrollbar { display: none; }
+/* 详细调整面板（第 9/11 页）：收紧全局区块 + 逐项网格，一屏装下不裁切。
+   窄视口（窗口被压到 ~531，sheet 夹到 449）下也不许横向裁切：
+   色块行按 391 内容宽排：picker32+8+hex≈62+8+8×24+7×6=344 ≤ 367（行内宽）；
+   逐项网格 auto-fill：449 面板 2 列、560 面板 3 列，行最小宽 140 恒不裁。 */
+.sheet--l .color-block { margin-bottom: var(--sp-3); }
+.sheet--l .color-row { padding: var(--sp-2) var(--sp-3); gap: var(--sp-2); }
+.sheet--l .color-row .swatch { width: 24px; height: 24px; }
+.sheet--l .swatch-list { gap: 6px; }
+.sheet--l .color-picker { width: 32px; height: 32px; }
+.sheet--l .per-grid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: var(--sp-1) var(--sp-4); }
+.sheet--l .per-grid .per-item-row { padding: var(--sp-1) 0; gap: var(--sp-2); }
+.sheet--l .per-grid .per-item-name { width: 64px; font-size: var(--fs-foot); }
+.sheet--l .per-grid .color-picker { width: 30px; height: 30px; }
+.sheet-desc {
+  font-size: var(--fs-foot);
+  color: var(--text-secondary); font-style: italic; font-weight: 400;
+  line-height: var(--lh-foot);
+  margin-top: calc(var(--sp-5) * -1 + 4px);
+  margin-bottom: var(--sp-4);
+}
+.sheet-foot {
+  flex: none;
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: var(--sp-3);
+  margin-top: var(--sp-6);
+}
+
+.fade-enter-active, .fade-leave-active { transition: opacity var(--dur-hover) ease-out; }
+.fade-enter-from, .fade-leave-to { opacity: 0; }
+
+/* ============================ 顶层消息 toast ============================
+   悬浮于窗口最上层（高于 sheet 遮罩 z-30），不占排版、
+   不与页面切换挂钩；自带关闭按钮，6s 后自动淡出上浮消失。
+   刻意用实色卡片而非液态玻璃：toast 自身入场位移会让内部 backdrop
+   采样截断（铁律③），玻璃态会在落定瞬间突现，正是要避免的观感。 */
+.toast-stack {
+  position: absolute;
+  top: var(--sp-4);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-2);
+  width: max-content;
+  max-width: calc(100% - var(--pad-x) * 2);
+  pointer-events: none;          /* 空隙穿透，不挡下方交互 */
+}
+.toast {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--r-ctrl);
+  background: rgba(255, 255, 255, 0.94);
+  border: 1px solid var(--border-light);
+  box-shadow: var(--shadow-float);
+  font-size: var(--fs-foot);
+  font-weight: var(--fw-medium);
+  line-height: var(--lh-foot);
+  letter-spacing: var(--ls-foot);
+  color: var(--text-primary);
+}
+.toast--warn  .toast__icon { color: var(--warning); }
+.toast--error .toast__icon { color: var(--danger); }
+.toast--info  .toast__icon { color: var(--accent); }
+.toast__text { flex: 1; min-width: 0; }
+.toast__close {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-tertiary); font-style: italic; font-weight: 400;
+  cursor: pointer;
+  transition: background-color var(--dur-hover) ease-out,
+              color var(--dur-hover) ease-out,
+              transform var(--dur-release) var(--ease-spring);
+}
+.toast__close:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+.toast__close:active { transform: scale(0.86); transition-duration: var(--dur-press); }
+
+/* 入场：非线性淡入下浮（spring 过冲）；离场：淡出上浮 */
+.toast-enter-active {
+  transition: opacity 180ms ease-out,
+              translate 420ms var(--ease-spring);
+}
+.toast-enter-from { opacity: 0; translate: 0 -18px; }
+.toast-leave-active {
+  position: absolute;            /* 抽离文档流：其余 toast 平滑上移 */
+  left: 50%;
+  transform: translateX(-50%);
+  width: max-content;            /* 绝对定位会 shrink-to-fit：不补宽度离场瞬间塌窄 */
+  max-width: 600px;              /* 不能用 100%：唯一子项出流后 stack(max-content) 宽归零，
+                                    100%−80 反把 toast 压成竖排窄条。600 = 680 窗宽 − 2×40 边距 */
+  transition: opacity 280ms var(--ease-in),
+              translate 280ms var(--ease-in-out);
+}
+.toast-leave-to { opacity: 0; translate: 0 -14px; }
+
+/* ============================ 详细调整逐项行（sheet 面板内复用） ============================ */
+.per-item-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-3) 0;
+  border-bottom: 1px solid var(--border);
+}
+.per-item-row:last-child { border-bottom: none; }
+.per-item-name {
+  width: 96px;
+  flex: none;
+  font-size: var(--fs-body);
+  color: var(--text-secondary); font-style: italic; font-weight: 400;
+}
+
+/* 逐项网格：两列排布；9 项 5 行时超出 sheet--l 可视高，sheet-body 静默滚动兜底 */
+.sub-hint {
+  font-size: var(--fs-foot);
+  color: var(--text-tertiary); font-style: italic; font-weight: 400;
+  margin-bottom: var(--sp-3);
+}
+.per-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: var(--sp-2) var(--sp-6);
+  align-content: start;
+}
+.per-grid .per-item-row {
+  padding: var(--sp-2) 0;
+  border-bottom: none;
+  gap: var(--sp-3);
+}
+.per-grid .per-item-name {
+  width: 80px;
+  font-size: var(--fs-aux);
+}
+.per-grid .color-picker { width: 34px; height: 34px; }
+/* 字号子界面：单行「名称 + 滑条 + 数值」，单列排布
+   （2026-09-20 用户裁决：两列滑条太短不符合人体工学；行高收紧到 30 让 9 项一屏装下） */
+.font-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: var(--sp-1);
+  align-content: start;
+}
+.font-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 28px;               /* 9 项满载时 9×28+8×4+全局区块+hint ≈ 376 ≤ body 385，无纵滚 */
+}
+.font-row .per-item-name { width: 86px; font-size: var(--fs-aux); white-space: nowrap; }
+.font-row input[type="range"] { flex: 1; min-width: 0; }
+.font-row .slider-value { width: 44px; flex: none; text-align: right; font-size: var(--fs-foot); }
+
+/* ============================ 进度条（sheet / 安装页共用） ============================ */
+.progress-wrap { display: flex; align-items: center; gap: var(--sp-4); }
+.progress-track {
+  position: relative;
+  width: 360px;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  border-radius: 4px;
+  background: var(--accent);          /* 纯色，不用渐变 */
+  transition: width 280ms var(--ease-in-out);
+}
+.progress-pct {
+  font-size: var(--fs-body);
+  font-weight: var(--fw-semi);
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+  text-shadow: var(--glow-value);
+  min-width: 52px;
+  text-align: left;
+}
+/* 安装页（page 3）：标题 30px Bold；进度条 360×8 圆角 4（复用 .progress-*）；步骤文字 15px Regular */
+.install-body {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--sp-6);
+  width: 360px;
+  margin: 0 auto;
+}
+.install-title { font-size: 30px; font-weight: var(--fw-bold); line-height: 1.3; letter-spacing: var(--ls-title); }
+.install-step-text { font-size: var(--fs-aux); font-weight: var(--fw-regular); color: var(--text-secondary); min-height: 1.6em; }
+.install-error { font-size: var(--fs-aux); color: var(--danger); line-height: 1.6; }
+
+/* 第九部分：已安装检测四选一（2×2）与卸载确认复选框 */
+.installed-choices {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--sp-3);
+  width: 100%;
+}
+.uninstall-keep {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--fs-aux);
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+
+.status-failed .page-title { color: var(--danger); }
+
+/* ============================ 第 4 页：样式 Bento Grid ============================
+   3 列 × 2 行：680×560 下每格约 173×140，六张卡片无需滚动即可完整展示。 */
+.style-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+  gap: var(--sp-3);
+  max-width: 560px;
+  height: 100%;          /* 撑满 page-body，行高由 1fr 自动均分，避免溢出被裁切 */
+  min-height: 0;
+  margin: 0 auto;
+}
+.style-card {
+  width: 100%;
+  height: 100%;          /* 跟随网格行高，不写死 150px，防止第三行被窗口底边裁掉 */
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-1);
+  padding: var(--sp-1) 0;
+  border: 1px solid var(--border-light);
+  border-radius: var(--r-card-lg);
+  background: var(--surface-white);
+  cursor: pointer;
+  transition: border-color 250ms ease-out, box-shadow var(--dur-hover) ease-out,
+              transform var(--dur-hover) var(--ease-expo), background-color 250ms ease-out;
+}
+.style-card:hover { border-color: var(--border-medium); box-shadow: var(--shadow-card); }
+.style-card:active { transform: scale(0.97); }
+.style-card.selected {
+  border: 2px solid var(--accent);
+  background: var(--surface-accent);
+}
+.style-card__key {
+  font-size: var(--fs-aux);
+  font-weight: var(--fw-semi);
+  letter-spacing: var(--ls-foot);
+  line-height: var(--lh-aux);
+}
+.style-card__label {
+  font-size: var(--fs-aux);
+  font-weight: var(--fw-medium);
+  color: var(--text-secondary); font-style: italic; font-weight: 400;
+  line-height: var(--lh-aux);
+  letter-spacing: var(--ls-foot);
+}
+
+/* 卡片内悬浮窗预览图（纯 CSS 绘制，自适应宽度）
+   高度刻意压到 36px：第 4 页在提示条出现时（最坏情况）行高仅约 100px，
+   预览 + 字母 + 名称必须仍完整可见。第 5 页通过 .orient-card 覆盖为大号。 */
+.mini-preview {
+  width: 100%;
+  max-width: 84px;
+  height: 36px;
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 7px 8px;
+  justify-content: center;
+}
+.mini-preview--v { flex-direction: row; align-items: center; gap: 5px; }
+.mini-preview__bar { height: 4px; border-radius: 2px; background: var(--accent); opacity: 0.9; }
+.mini-preview--v .mini-preview__bar { height: 100%; width: 5px; }
+.mini-preview__bar:nth-child(2) { opacity: 0.6; }
+.mini-preview__bar:nth-child(3) { opacity: 0.35; }
+
+/* GDI 开关 */
+.gdi-row {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  margin-top: var(--sp-6);
+  padding: var(--sp-4);
+  border-radius: var(--r-ctrl);
+  background: var(--surface-subtle);
+  cursor: pointer;
+}
+.gdi-text { display: flex; flex-direction: column; gap: 2px; }
+.gdi-title { font-size: var(--fs-aux); font-weight: var(--fw-regular); }
+.gdi-desc {
+  font-size: var(--fs-foot);
+  font-style: italic; font-weight: 400;                /* 技术性说明用斜体 */
+  color: var(--text-tertiary); font-style: italic; font-weight: 400;
+  line-height: var(--lh-foot);
+  letter-spacing: var(--ls-foot);
+}
+
+/* ============================ 第 5 页：布局方向 ============================ */
+.orient-list { display: flex; flex-direction: column; gap: var(--gap-card); }
+.orient-card {
+  display: flex;
+  align-items: center;
+  gap: var(--pad-card);
+  height: 130px;
+  padding: 0 var(--pad-card);
+  border: 2px solid transparent;
+  border-radius: var(--r-card-lg);
+  background: var(--surface-subtle);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 250ms ease-out, background-color 250ms ease-out,
+              transform var(--dur-hover) var(--ease-expo), box-shadow var(--dur-hover) ease-out;
+}
+.orient-card:hover { background: var(--bg-secondary); }
+.orient-card.selected {
+  border-color: var(--accent);
+  background: var(--surface-accent);
+}
+.orient-card .mini-preview { width: 90px; max-width: 90px; height: 90px; padding: 14px 12px; }
+.orient-card__title { font-size: var(--fs-body); font-weight: var(--fw-medium); }
+.orient-card__desc { font-size: var(--fs-foot); color: var(--text-secondary); font-style: italic; font-weight: 400; margin-top: var(--sp-1); line-height: var(--lh-foot); }
+
+/* ============================ 第 6 页：监控项列表 ============================ */
+.item-list { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+
+/* ============================ 第 7 页：拖动排序（单页无滚动） ============================
+   列表撑满整个内容区，行高用 flex:1 均分——无论多少监控项都同屏装下；
+   拖动步长在按下时实测相邻行真实间距（见 Page07Order.vue 的 measurePitch），
+   不与本文件里的任何数字耦合。 */
+.page--order { padding: 0 var(--sp-6); }            /* 收窄左右留白 → 拖动区更宽 */
+.page--order .page-head { margin-bottom: var(--sp-4); }
+.page--order .page-body { display: flex; flex-direction: column; }
+.drag-list {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: var(--sp-2);
+  border-radius: var(--r-card);
+  background: transparent;
+}
+.drag-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1 1 0;               /* 均分总高：项越多行越窄，始终一页装下 */
+  min-height: 0;
+  padding: 0 var(--sp-3);
+  border-radius: var(--r-ctrl);
+  background: transparent;
+  user-select: none;
+  /* 用独立的 translate / scale 属性而非 transform：
+     内联样式只写 translate，就不会覆盖这里的 scale 与位移，两者可叠加 */
+  transition: translate 240ms var(--ease-out-expo),
+              transform 240ms var(--ease-out-expo),
+              box-shadow var(--dur-hover) ease-out,
+              background-color var(--dur-hover) ease-out;
+}
+.drag-item.dragging {
+  background: var(--surface-white);
+  box-shadow: var(--shadow-float);
+  scale: 1.02;
+  transform: translateY(-2px);
+  cursor: grabbing;
+  z-index: 2;
+}
+.drag-handle {
+  flex: none;
+  width: 22px;
+  color: var(--text-quaternary); font-style: italic; font-weight: 400;
+  font-size: 16px;
+  line-height: 1;
+  cursor: grab;
+  text-align: center;
+}
+.drag-name {
+  font-size: var(--fs-aux);
+  font-weight: var(--fw-medium);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/* ============================ 第 8 页：名称模式（单页无滚动） ============================
+   上部：全局三档分段；下部：逐项芯片 3×3 网格，点击循环 跟随→简单→完整→隐藏。 */
+.nm-global { display: flex; align-items: center; gap: var(--sp-4); }
+.nm-label { flex: none; font-size: var(--fs-aux); color: var(--text-secondary); font-style: italic; font-weight: 400; }
+.nm-hint {
+  margin-top: var(--sp-3);
+  font-size: var(--fs-foot);
+  color: var(--text-tertiary); font-style: italic; font-weight: 400;
+  line-height: var(--lh-foot);
+}
+.nm-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-top: var(--sp-3);
+}
+.nm-chip {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-height: 54px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-light);
+  border-radius: var(--r-card);
+  background: var(--surface-white);
+  cursor: pointer;
+  user-select: none;
+  transition: border-color 250ms ease-out, background-color 250ms ease-out,
+              box-shadow var(--dur-hover) ease-out, transform var(--dur-press) var(--ease-spring);
+}
+.nm-chip:hover { border-color: var(--border-medium); box-shadow: var(--shadow-card); }
+.nm-chip:active { transform: scale(0.97); }
+.nm-chip--set { border: 2px solid var(--accent); background: var(--surface-accent); }
+.nm-chip__name {
+  font-size: var(--fs-aux);
+  font-weight: var(--fw-medium);
+  color: var(--text-primary);
+}
+.nm-chip__mode {
+  font-size: var(--fs-foot);
+  color: var(--text-tertiary); font-style: italic; font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+.nm-chip--set .nm-chip__mode { color: var(--accent); }
+
+/* ============================ 第 9 页：颜色 ============================ */
+/* 尺寸刻意收紧：两个色块 + 详细调整按钮必须在 282px 的 page-body 内不滚动 */
+.color-block { margin-bottom: var(--sp-4); }
+.color-block__title {
+  font-size: var(--fs-aux);
+  color: var(--text-secondary); font-style: italic; font-weight: 400;
+  margin-bottom: 8px;
+}
+.color-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-3);
+  border-radius: var(--r-card);
+  background: var(--surface-subtle);
+}
+.color-picker {
+  position: relative;
+  width: 40px;
+  height: 40px;
+  flex: none;
+  border-radius: var(--r-ctrl);
+  border: 1px solid var(--border-medium);
+  background: var(--surface-white);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  overflow: hidden;
+  transition: transform var(--dur-hover) var(--ease-spring), box-shadow var(--dur-hover) ease-out;
+}
+.color-picker:hover { transform: scale(1.06); box-shadow: var(--shadow-btn); }
+.color-picker input[type="color"] {
+  position: absolute;
+  inset: -6px;
+  opacity: 0;
+  width: 200%;
+  height: 200%;
+  cursor: pointer;
+  border: none;
+  padding: 0;
+}
+.color-hex {
+  font-family: var(--font-mono);
+  font-size: var(--fs-foot);
+  font-weight: var(--fw-medium);
+  color: var(--text-secondary); font-style: italic; font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: var(--ls-foot);
+}
+.swatch-list { display: flex; gap: 10px; margin-left: auto; }
+.swatch {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 1px solid var(--border-medium);
+  cursor: pointer;
+  padding: 0;
+  transition: transform var(--dur-press) var(--ease-spring), box-shadow var(--dur-hover) ease-out;
+}
+.swatch:hover { transform: scale(1.14); }
+.swatch.active { box-shadow: 0 0 0 3px var(--accent-subtle); border-color: var(--accent); }
+
+/* ============================ 第 12 页：拖动位置 ============================ */
+.pos-form { display: flex; gap: var(--sp-4); }
+.pos-field {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: var(--fs-aux);
+  color: var(--text-secondary); font-style: italic; font-weight: 400;
+}
+.pos-field input {
+  width: 100%;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border-medium);
+  border-radius: var(--r-ctrl);
+  background: var(--surface-white);
+  font-size: var(--fs-body);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+  outline: none;
+  transition: border-color var(--dur-hover) ease-out, box-shadow var(--dur-hover) ease-out;
+}
+.pos-field input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-subtle); }
+.pos-hint {
+  margin-top: var(--sp-4);
+  font-size: var(--fs-foot);
+  color: var(--text-tertiary); font-style: italic; font-weight: 400;
+  line-height: var(--lh-foot);
+}
+
+/* ============================ 第 13 页：开机自启 ============================ */
+.autostart-list { display: flex; flex-direction: column; gap: 18px; }
+.autostart-card {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: var(--sp-1);
+  height: 96px;
+  padding: 0 var(--pad-card);
+  border: 2px solid transparent;
+  border-radius: var(--r-card);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 250ms ease-out, background-color 250ms ease-out,
+              transform var(--dur-hover) var(--ease-expo), box-shadow var(--dur-hover) ease-out;
+}
+.autostart-card:hover { transform: translateY(-2px); box-shadow: var(--shadow-card); }
+.autostart-card--yes { background: var(--surface-accent); color: var(--text-primary); }
+.autostart-card--no { background: var(--surface-subtle); color: var(--text-secondary); font-style: italic; font-weight: 400; }
+.autostart-card.selected { border-color: var(--accent); background: var(--surface-accent); }
+.autostart-card__title { font-size: var(--fs-body); font-weight: var(--fw-medium); }
+.autostart-card__desc { font-size: var(--fs-foot); opacity: 0.85; line-height: var(--lh-foot); }
+
+/* ============================ 第 14 页：完成 ============================ */
+.stat-grid { display: flex; gap: var(--gap-card); justify-content: center; }
+.stat-card {
+  width: 220px;
+  height: 120px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-1);
+  padding: var(--sp-4);
+  border-radius: var(--r-card-lg);
+  background: var(--bg-secondary);
+  box-shadow: var(--shadow-card);
+}
+.stat-card__num {
+  font-size: var(--fs-data);
+  font-weight: var(--fw-bold);
+  color: var(--accent);
+  line-height: 1.15;
+  letter-spacing: var(--ls-title);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+  text-shadow: var(--glow-data);     /* 唯一 2 层发光：0 0 8px + 0 0 16px */
+}
+.stat-card__desc {
+  font-size: var(--fs-foot);
+  font-weight: var(--fw-regular);
+  color: var(--text-secondary); font-style: italic; font-weight: 400;
+  line-height: var(--lh-foot);
+  letter-spacing: var(--ls-foot);
+  text-align: center;
+}
+.done-text {
+  margin-top: var(--sp-10);
+  font-size: var(--fs-aux);
+  font-weight: var(--fw-regular);
+  color: var(--text-secondary); font-style: italic; font-weight: 400;
+  line-height: var(--lh-aux);
+  letter-spacing: var(--ls-aux);
+}
+.done-foot {
+  margin-top: var(--sp-4);
+  font-size: var(--fs-foot);
+  color: var(--text-tertiary); font-style: italic; font-weight: 400;
+  text-align: center;
+  letter-spacing: var(--ls-foot);
+}
+
+/* ── 卸载逐步结果清单（P0-9：后端逐步回报，界面如实列出） ───────────── */
+.uninstall-steps {
+  list-style: none;
+  margin: 0; padding: 0;
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: var(--fs-foot);
+  line-height: var(--lh-foot);
+}
+.uninstall-steps li { display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: baseline; }
+.uninstall-steps__name { flex: none; min-width: 84px; color: var(--text-primary); }
+.uninstall-steps__status { flex: none; color: var(--text-tertiary); font-style: italic; }
+.uninstall-steps li.is-ok .uninstall-steps__status { color: var(--success); }
+.uninstall-steps li.is-fail .uninstall-steps__status { color: var(--danger); font-style: normal; font-weight: var(--fw-medium); }
+.uninstall-steps__detail {
+  flex: 1; min-width: 120px;
+  color: var(--text-tertiary);
+  word-break: break-all;
+}
+
+/* ── 日志 / 桥层诊断入口（P1-10：这些失败以前只在 console 里） ───────── */
+.win-diag {
+  position: absolute;
+  top: 14px;
+  left: 16px;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: 5px 10px;
+  border: 1px solid var(--border-light);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.7);
+  color: var(--text-secondary); font-style: italic; font-weight: 400;
+  font-size: var(--fs-foot);
+  cursor: pointer;
+  transition: color var(--dur-hover) ease-out, border-color var(--dur-hover) ease-out;
+}
+.win-diag:hover { color: var(--text-primary); border-color: var(--border-strong); }
+.win-diag__badge {
+  flex: none;
+  min-width: 16px; height: 16px; padding: 0 4px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 999px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 10px; font-style: normal; font-weight: var(--fw-medium);
+}
+.log-view {
+  margin: 0;
+  padding: var(--sp-3);
+  max-height: 300px;
+  overflow: auto;
+  background: rgba(255, 255, 255, 0.6);
+  border: 1px solid var(--border-light);
+  border-radius: var(--r-ctrl);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text-secondary);
+}
+.log-path {
+  margin: var(--sp-2) 0 0;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-tertiary);
+  word-break: break-all;
+}

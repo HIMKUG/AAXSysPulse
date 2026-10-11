@@ -43,9 +43,10 @@ const MIN_DT_MS: u64 = 50;
 static TOPO_INVALID: AtomicBool = AtomicBool::new(false);
 
 /// GPU 查询范围开关（v3 性能档，默认最佳性能）：
-///   - `PRIMARY_ONLY`：只查节点数最大的适配器（= 主 dGPU），跳过虚拟/副卡；
-///   - `ENGINE_3D_ONLY`：只查节点 0（3D 引擎），不再逐引擎取 max。
-///   两者叠加时每周期仅 **1 次**内核查询（~1.4ms）。
+/// - `PRIMARY_ONLY`：只查节点数最大的适配器（= 主 dGPU），跳过虚拟/副卡；
+/// - `ENGINE_3D_ONLY`：只查节点 0（3D 引擎），不再逐引擎取 max。
+///
+/// 两者叠加时每周期仅 **1 次**内核查询（~1.4ms）。
 static PRIMARY_ONLY: AtomicBool = AtomicBool::new(true);
 static ENGINE_3D_ONLY: AtomicBool = AtomicBool::new(true);
 
@@ -138,9 +139,11 @@ fn enum_topology(probe_on: bool) -> Option<Vec<(LUID, u32)>> {
         let mut topo = Vec::with_capacity(infos.len());
         for (ai, info) in infos.iter().enumerate() {
             // 引擎数
-            let mut qa = D3DKMT_QUERYSTATISTICS::default();
-            qa.Type = QUERY_TYPE_ADAPTER;
-            qa.AdapterLuid = info.AdapterLuid;
+            let qa = D3DKMT_QUERYSTATISTICS {
+                Type: QUERY_TYPE_ADAPTER,
+                AdapterLuid: info.AdapterLuid,
+                ..Default::default()
+            };
             let node_count = if D3DKMTQueryStatistics(&qa).is_ok() {
                 qa.QueryResult.AdapterInformation.NodeCount
             } else {
@@ -216,9 +219,11 @@ fn collect_running_times(
         let nodes = if engine_3d_only { 1 } else { *node_count };
         for node in 0..nodes {
             let rt = unsafe {
-                let mut qn = D3DKMT_QUERYSTATISTICS::default();
-                qn.Type = QUERY_TYPE_NODE;
-                qn.AdapterLuid = *luid;
+                let mut qn = D3DKMT_QUERYSTATISTICS {
+                    Type: QUERY_TYPE_NODE,
+                    AdapterLuid: *luid,
+                    ..Default::default()
+                };
                 qn.Anonymous.QueryNode = D3DKMT_QUERYSTATISTICS_QUERY_NODE { NodeId: node };
                 if D3DKMTQueryStatistics(&qn).is_ok() {
                     // 100ns 累计运行时间

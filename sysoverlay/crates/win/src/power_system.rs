@@ -9,7 +9,7 @@
 //!   （`sample()` 返回 `None` → `snap.power = Unavailable` → 不显示、不再计算）；
 //! - GPU 功耗拿不到 → 该项记 0 继续显示（利用率还有 D3DKMT 兜底）。
 
-use crate::msr::MsrPower;
+use crate::msr::MsrPowerAsync;
 use crate::probe;
 use crate::sysinfo;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -34,7 +34,7 @@ pub fn cpu_watts_global() -> Option<f32> {
 }
 
 pub struct SystemPower {
-    msr: MsrPower,
+    msr: MsrPowerAsync,
     ram_sticks: usize,
     /// 内存估算重量（瓦）：Intel DRAM 域可用时置 0（避免与实测 DRAM 双计）。
     ram_est_w: f32,
@@ -55,7 +55,7 @@ impl Default for SystemPower {
 
 impl SystemPower {
     pub fn new() -> Self {
-        let msr = MsrPower::new();
+        let msr = MsrPowerAsync::new();
         let ram_sticks = sysinfo::ram_stick_count();
         let disks = sysinfo::physical_disk_count();
         // RAM 估算先按条数计（5W/条）；首帧成功读 MSR 后若 DRAM 域可用，
@@ -87,14 +87,18 @@ impl SystemPower {
     }
 
     /// 整机功耗（瓦）。`None` = CPU 实测不可用 → Power 行关闭。
-    pub fn sample(&mut self, now_ms: u64) -> Option<f32> {
-        let cpu = self.msr.sample(now_ms)?;
+    ///
+    /// `timeout_ms` 是本轮允许等待的最长时间（审查项 2.2.3 / P1-15）：MSR 读取
+    /// 跑在专用线程上，超时只让功耗行掉成 `--`，不再拖停整条采样线程。
+    pub fn sample(&mut self, now_ms: u64, timeout_ms: u64) -> Option<f32> {
+        let frame = self.msr.sample(now_ms, timeout_ms)?;
+        let cpu = frame.watts?;
         self.last_cpu_w = Some(cpu);
         // 每帧重新评估内存估算（撤掉「一次性锁存」）：
         // DRAM 域可用 → 内存功耗已被 PKG+DRAM 实测覆盖，撤掉条数估算避免双计；
         // DRAM 域不可用（驱动未就绪 / MSR 读取失败 / 驱动重新加载）→ 回落条数估算，
         // 保证内存功耗在实测缺失时仍不为零，且驱动恢复后不会永久漏算。
-        self.ram_est_w = if self.msr.dram_available() {
+        self.ram_est_w = if frame.dram_available {
             0.0
         } else {
             self.ram_sticks as f32 * EST_RAM_W_PER_STICK

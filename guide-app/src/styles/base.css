@@ -1,0 +1,435 @@
+/* ============================================================
+   基础与通用控件 · v2
+   按钮 / 复选框 / 单选 / 滑条 / 卡片 / 滚动条 / 排版层级
+   ============================================================ */
+
+* { box-sizing: border-box; }
+
+html, body, #app { height: 100%; }
+
+body {
+  margin: 0;
+  font-family: var(--font-family);
+  font-size: var(--fs-body);
+  font-weight: var(--fw-regular);
+  line-height: var(--lh-body);
+  color: var(--text-primary);
+  background: transparent;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow: hidden;
+}
+
+button { font-family: inherit; }
+
+/* 键盘可达性（审查项 8B.K / P2-9）：统一焦点环。
+   UA 默认环在本项目的深色玻璃背景上对比不足，键盘用户看不出焦点在哪。
+   用 :where() 保持 0 特异度 —— 卡片自己的圆角/边框规则不会被这条覆盖。 */
+:where(button, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ============================ 排版层级 ============================
+   层次主要靠字重 + 字号 + 灰阶构建；阴影只做到“可感知不可见”
+   ================================================================== */
+.t-hero {
+  font-size: var(--fs-hero);
+  font-weight: var(--fw-bold);
+  line-height: var(--lh-hero);
+  letter-spacing: var(--ls-hero);
+  text-shadow: var(--ts-hero);
+}
+.t-title {
+  font-size: var(--fs-title);
+  font-weight: var(--fw-bold);
+  line-height: var(--lh-title);
+  letter-spacing: var(--ls-title);
+  text-shadow: var(--ts-title);
+}
+.t-subtitle {
+  font-size: var(--fs-subtitle);
+  font-weight: var(--fw-bold);
+  line-height: var(--lh-subtitle);
+  letter-spacing: var(--ls-subtitle);
+  text-shadow: var(--ts-card);
+}
+.t-body {
+  font-size: var(--fs-body);
+  font-weight: var(--fw-regular);
+  line-height: var(--lh-body);
+  letter-spacing: var(--ls-body);
+}
+.t-aux {
+  font-size: var(--fs-aux);
+  font-weight: var(--fw-regular);
+  line-height: var(--lh-aux);
+  letter-spacing: var(--ls-aux);
+  color: var(--text-secondary); font-style: italic; font-weight: 400;
+}
+.t-foot {
+  font-size: var(--fs-foot);
+  font-weight: var(--fw-regular);
+  line-height: var(--lh-foot);
+  letter-spacing: var(--ls-foot);
+  color: var(--text-secondary); font-style: italic; font-weight: 400;
+}
+.t-mini {
+  font-size: var(--fs-foot);
+  font-weight: var(--fw-regular);
+  line-height: var(--lh-foot);
+  letter-spacing: var(--ls-foot);
+  color: var(--text-tertiary); font-style: italic; font-weight: 400;
+}
+.t-semi { font-weight: var(--fw-semi); }
+.t-medium { font-weight: var(--fw-medium); }
+.t-center { text-align: center; }
+.t-accent { color: var(--accent); }
+
+/* ============================ 斜体：仅路径 / 坐标 / 技术术语 ============================
+   斜体不用于强调（强调用字重），不用于标题，不用于整段文字；
+   中文里斜体效果不明显，因此只作用于英文与数字，统一搭配等宽字体。
+   ==================================================================================== */
+.t-mono {
+  font-family: var(--font-mono);
+  font-style: italic; font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+.path-text {                       /* 文件路径 / 版本 / 技术术语 */
+  font-family: var(--font-mono);
+  font-style: italic; font-weight: 400;
+  font-size: var(--fs-foot);
+  font-weight: var(--fw-regular);
+  color: var(--text-tertiary); font-style: italic; font-weight: 400;
+  letter-spacing: var(--ls-foot);
+}
+.coordinate {                      /* 实时坐标：斜体 + 等宽，避免数字跳动 */
+  font-family: var(--font-mono);
+  font-style: italic; font-weight: 400;
+  font-size: var(--fs-foot);
+  color: var(--text-tertiary); font-style: italic; font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: var(--ls-aux);
+}
+.install-path {                    /* 安装路径 */
+  font-family: var(--font-mono);
+  font-style: italic; font-weight: 400;
+  font-size: var(--fs-aux);
+  color: var(--text-secondary); font-style: italic; font-weight: 400;
+}
+.note-italic {                     /* 辅助说明中的术语性斜体 */
+  font-style: italic; font-weight: 400;
+  font-size: var(--fs-foot);
+  color: var(--text-tertiary); font-style: italic; font-weight: 400;
+  line-height: var(--lh-foot);
+}
+
+/* ============================ 下划线：仅可点击元素 ============================ */
+.link {
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-color: var(--accent);
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 3px;
+  transition: text-decoration-color 150ms ease;
+  cursor: pointer;
+}
+.link:hover { text-decoration-color: var(--accent-hover); }
+
+/* ============================ 数字：等宽，避免实时刷新时跳动 ============================ */
+.t-num {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+/* ============================ Kinetic Typography / 分层错峰 ============================
+   标题 → 副标题 → 内容 → 按钮，依次从下方（后退时从上方）淡入
+
+   · 只动画 transform 与 opacity —— GPU 合成器处理，不触发重排重绘
+   · 位移距离由 --rise-y 控制，方向由 --rise-dir 控制（前进 1 / 后退 -1）
+   · 延迟由 --d1~--d4 控制，由常驻容器 .pages.is-forward / .is-backward 注入，
+     实现前进 / 后退不对称（见 wizard.css）
+
+   预设：r1 标题 / r2 副标题 / r3 内容 / r4 操作
+   自定义：.rise + 内联 --rise-y / --rise-delay / --rise-dur
+   ========================================================================== */
+@keyframes riseIn {
+  from { opacity: 0; transform: translateY(calc(var(--rise-y, 8px) * var(--rise-dir, 1))); }
+  /* 终点写 none 只是第一道保险；真正的根因是 fill 模式 —— Blink 会把
+     「挂着影响 transform 的动画（含 fill 常驻态）」的元素强制合成并
+     当作 backdrop root，后代 backdrop-filter 采样被截死在该祖先内部。
+     即便终帧 computed 为 none 也照样中枪（六卡矩阵第一轮 A~E 全灭实证，
+     第二轮清掉常驻动画的 A/B/C 全部复活）。解法在下面：backwards。 */
+  to   { opacity: 1; transform: none; }
+}
+
+.r1, .r2, .r3, .r4, .rise {
+  /* backwards 而非 both：只在延迟期回填 from 帧，动画结束后不再「应用」
+     于元素 → 不驻留合成态 → 不做 backdrop root。
+     终态本就等于自然态（opacity:1 / transform:none），观感零差异。 */
+  animation: riseIn var(--rise-dur, 340ms) var(--ease-out-expo) var(--rise-delay, 0ms) backwards;
+}
+.r1 { --rise-y: 12px; --rise-delay: var(--d1, 60ms); }
+.r2 { --rise-y: 8px;  --rise-delay: var(--d2, 140ms); }
+.r3 { --rise-y: 8px;  --rise-delay: var(--d3, 220ms); }
+.r4 { --rise-y: 4px;  --rise-delay: var(--d4, 240ms); --rise-dur: 240ms; }
+
+/* 无障碍：用 0.01ms 而非 0 —— 真正的 0 会跳过 animationend，破坏 JS 状态机。
+   同时清零 delay：否则 fill:both 会让元素在延迟期间停在 opacity:0 的起始态。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ============================ 按钮 ============================ */
+.btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  height: 48px;
+  padding: 0 var(--sp-6);
+  font-size: var(--fs-body);
+  font-weight: var(--fw-semi);
+  border: none;
+  border-radius: var(--r-btn);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  box-shadow: var(--shadow-btn);
+  transition: transform var(--dur-release) var(--ease-spring),
+              background-color var(--dur-hover) ease-out,
+              box-shadow var(--dur-hover) ease-out,
+              opacity var(--dur-hover) ease-out;
+}
+.btn:active { transform: scale(0.96); transition-duration: var(--dur-press); }
+.btn:disabled { cursor: not-allowed; box-shadow: none; }
+.btn:disabled:active { transform: none; }
+
+/* 主按钮：#3B7DD8 → 悬停 #2E6BC4 → 按下 #2559A8
+   文字 17px Semibold(600)；悬停时叠 1 层白色微光 */
+.btn-primary {
+  color: #fff;
+  background: var(--accent);
+  font-weight: var(--fw-semi);
+  text-shadow: var(--ts-btn);
+}
+.btn-primary:hover:not(:disabled) { background: var(--accent-hover); text-shadow: var(--ts-btn), var(--glow-btn); }
+.btn-primary:active:not(:disabled) { background: var(--accent-pressed); }
+
+/* 次按钮：透明底 + 灰边框，文字 17px Regular（与主按钮形成两档字重差） */
+.btn-secondary {
+  font-weight: var(--fw-regular);
+  color: var(--text-secondary); font-style: italic; font-weight: 400;
+  background: transparent;
+  box-shadow: none;
+  border: 1px solid var(--border-medium);
+}
+.btn-secondary:hover:not(:disabled) {
+  background: var(--bg-secondary);
+  border-color: var(--border-strong);
+}
+.btn-secondary:active:not(:disabled) { background: var(--bg-tertiary); }
+
+.btn-ghost { color: var(--accent); background: transparent; box-shadow: none; border: 1px solid transparent; }
+.btn-ghost:hover:not(:disabled) { background: var(--accent-subtle); }
+
+.btn-danger { color: #fff; background: var(--danger); }
+.btn-danger:hover:not(:disabled) { filter: brightness(0.94); }
+
+/* 禁用：灰底 + 灰字，不用透明度 */
+.btn:disabled { background: var(--bg-tertiary); color: var(--text-tertiary); font-style: italic; font-weight: 400; opacity: 1; }
+
+/* 尺寸变体 */
+.btn-block { width: 100%; }
+.btn-w220 { width: 220px; }
+.btn-w240 { width: 240px; }
+.btn-w180 { width: 180px; }
+.btn-w140 { width: 140px; }
+
+/* ============================ 复选框 ============================ */
+.check {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  height: 48px;
+  padding: 0 var(--sp-4);
+  border-radius: var(--r-ctrl);
+  cursor: pointer;
+  user-select: none;
+  transition: background-color var(--dur-hover) ease-out;
+}
+.check:hover { background: var(--bg-secondary); }
+.check.disabled { opacity: 0.45; cursor: not-allowed; }
+.check.disabled:hover { background: transparent; }
+
+.check-box {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+  border: 1.5px solid var(--border-medium);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background-color var(--dur-hover) ease-out, border-color var(--dur-hover) ease-out;
+}
+.check-box svg { opacity: 0; transform: scale(0.6); transition: all var(--dur-hover) var(--ease-expo); }
+.check.checked .check-box { background: var(--success); border-color: var(--success); }
+.check.checked .check-box svg { opacity: 1; transform: scale(1); }
+.check-label { font-size: var(--fs-body); color: var(--text-tertiary); font-style: italic; font-weight: 400; transition: color var(--dur-hover) ease-out; }
+.check.checked .check-label { color: var(--text-primary); font-weight: var(--fw-medium); }
+.check-tag {
+  margin-left: auto;
+  font-size: var(--fs-foot);
+  color: var(--text-tertiary); font-style: italic; font-weight: 400;
+}
+
+/* ============================ 单选圆圈 ============================ */
+.radio-dot {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 1.5px solid var(--border-medium);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: border-color var(--dur-hover) ease-out;
+}
+.radio-dot::after {
+  content: "";
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--accent);
+  transform: scale(0);
+  transition: transform var(--dur-hover) var(--ease-expo);
+}
+.opt-row.selected .radio-dot { border-color: var(--accent); }
+.opt-row.selected .radio-dot::after { transform: scale(1); }
+
+/* 通用选项卡片 */
+.opt-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 var(--pad-card);
+  border: 2px solid transparent;
+  border-radius: var(--r-card);
+  background: var(--bg-secondary);
+  cursor: pointer;
+  user-select: none;
+  box-shadow: var(--shadow-card);
+  transition: border-color 250ms ease-out, background-color 250ms ease-out,
+              transform var(--dur-hover) var(--ease-expo), box-shadow var(--dur-hover) ease-out;
+}
+.opt-row:hover { background: var(--bg-tertiary); }
+.opt-row.selected {
+  border-color: var(--accent);
+  background: var(--surface-accent);
+}
+.opt-main { display: flex; flex-direction: column; gap: var(--sp-1); min-width: 0; }
+.opt-title {
+  font-size: var(--fs-body);
+  font-weight: var(--fw-medium);
+  line-height: var(--lh-subtitle);
+  text-shadow: var(--ts-card);
+}
+.opt-desc { font-size: var(--fs-foot); color: var(--text-secondary); font-style: italic; font-weight: 400; line-height: var(--lh-foot); }
+
+/* ============================ 滑条 ============================ */
+.slider-row { display: flex; flex-direction: column; gap: var(--sp-3); }
+.slider-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  font-size: var(--fs-aux);
+  color: var(--text-secondary); font-style: italic; font-weight: 400;
+}
+.slider-value {
+  font-size: var(--fs-body);
+  font-weight: var(--fw-semi);
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+  text-shadow: var(--glow-value);   /* 1 层 4px，关键数值 */
+}
+
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 26px;
+  margin: 0;
+  background: transparent;
+  cursor: pointer;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 5px;
+  border-radius: 3px;
+  background: var(--bg-tertiary);
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 26px;
+  height: 26px;
+  margin-top: -10.5px;
+  border-radius: 50%;
+  background: #fff;
+  border: 1px solid var(--border-medium);
+  box-shadow: var(--shadow-btn);
+  transition: none; /* 拖动无过渡，实时响应 */
+}
+input[type="range"]::-moz-range-track { height: 5px; border-radius: 3px; background: var(--bg-tertiary); }
+input[type="range"]::-moz-range-progress { height: 5px; border-radius: 3px; background: var(--accent); }
+input[type="range"]::-moz-range-thumb {
+  width: 26px; height: 26px; border: none; border-radius: 50%;
+  background: #fff; box-shadow: var(--shadow-btn);
+}
+/* 轨道填充：纯色（渐变更花，纯色更克制）；WebKit 无 range-progress，用硬色标模拟 */
+.slider-fill::-webkit-slider-runnable-track {
+  background: linear-gradient(
+    to right,
+    var(--accent) 0%, var(--accent) var(--fill, 50%),
+    var(--bg-tertiary) var(--fill, 50%), var(--bg-tertiary) 100%
+  );
+}
+
+/* ============================ 滚动条 ============================ */
+/* 引导程序界面一律不显示可视滚动条；内容若超出仍可滚轮/触控板滚动，但不出现滚动条 */
+.scroll {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: none;       /* Firefox */
+  -ms-overflow-style: none;    /* 旧 Edge / IE */
+}
+.scroll::-webkit-scrollbar { width: 0; height: 0; display: none; }
+.scroll::-webkit-scrollbar-thumb,
+.scroll::-webkit-scrollbar-track { display: none; }
+
+/* ============================ 分段控件（子界面用） ============================ */
+.seg { display: flex; gap: var(--sp-2); flex: 1; }
+.seg-item {
+  flex: 1;
+  height: 34px;
+  border-radius: var(--r-ctrl);
+  border: 1px solid var(--border-medium);
+  background: transparent;
+  color: var(--text-secondary); font-style: italic; font-weight: 400;
+  font-size: var(--fs-foot);
+  font-weight: var(--fw-medium);
+  cursor: pointer;
+  transition: all var(--dur-hover) ease-out;
+}
+.seg-item:hover { background: var(--bg-secondary); }
+.seg-item.active { background: var(--accent); border-color: var(--accent); color: #fff; }

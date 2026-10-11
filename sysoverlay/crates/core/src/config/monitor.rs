@@ -2,12 +2,13 @@
 //!
 //! 按用户拍板的「数字 ID 顺延」约定，监控项以 **1-based 数字 ID** 在配置里寻址：
 //! ```text
-//! 1=cpu 2=mem 3=gpu 4=net 5=power 6=time 7=util  （新增从 8 起）
+//! 1=cpu 2=mem 3=gpu 4=net 5=power 6=time 7=util 8=disk_read 9=disk_write
 //! ```
+//! ID = `Metric` 枚举下标 + 1：新增监控项只需扩枚举，配置 ID 自然顺延。
 //! 内部 [`Config`] 仍用 0-based 下标（`Metric::ALL` 序），读写时按 `id = index + 1` 转换。
 //!
 //! - `[monitor]`：显示顺序 `order`（ID 列表）、整屏级开关、时间项开关、简化名等。
-//! - `[item.{id}]`：逐指标的「整项显隐 `show` / 名称显隐 `name` / 字号 `font` /
+//! - `[item.{id}]`：逐指标的「整项显隐 `show` / 名称显隐 `name` / 名称模式 `short` / 字号 `font` /
 //!   名称色 `color_l` / 数值色 `color_v` / 数值自动色 `auto`」。
 //! - `[power]`：功耗行的查询/显示语义/间隔/虚拟网卡排除。
 //!
@@ -15,20 +16,21 @@
 
 use crate::config::ini::{fmt_color, parse_bool, parse_color, parse_u32, Ini, Writer};
 use crate::config::{Config, FONT_PX_MAX, FONT_PX_MIN};
-use crate::types::PowerDisplay;
+use crate::types::{Metric, NameMode, PowerDisplay};
 
 pub const MONITOR_FILE: &str = "monitor.cfg";
 
 fn id_to_idx(id: u32) -> Option<usize> {
-    if (1..=7).contains(&id) {
+    if (1..=Metric::COUNT as u32).contains(&id) {
         Some((id - 1) as usize)
     } else {
         None
     }
 }
 
-/// 7 个监控项「整项显隐」与数字 ID 的对齐（下标 = id-1）。
-fn visibility(cfg: &Config) -> [bool; 7] {
+/// 全部监控项「整项显隐」与数字 ID 的对齐（下标 = id-1，序 = `Metric::ALL`）。
+/// 新增指标时必须在此补对应 `show_*` 字段（长度不符 = 编译错误）。
+fn visibility(cfg: &Config) -> [bool; Metric::COUNT] {
     [
         cfg.show_cpu,
         cfg.show_mem,
@@ -37,6 +39,8 @@ fn visibility(cfg: &Config) -> [bool; 7] {
         cfg.power_enabled,
         cfg.show_time,
         cfg.show_util,
+        cfg.show_disk_read,
+        cfg.show_disk_write,
     ]
 }
 
@@ -52,13 +56,14 @@ pub fn serialize(cfg: &Config) -> String {
     w.kv("show_time", cfg.show_time as u8);
     w.kv("time_seconds", cfg.time_show_seconds as u8);
 
-    // 逐监控项定义（按 ID 1..7）
+    // 逐监控项定义（按 ID 1..=Metric::COUNT）
     let vis = visibility(cfg);
-    for id in 1..=7u32 {
+    for id in 1..=Metric::COUNT as u32 {
         let idx = (id - 1) as usize;
         w.section(&format!("item.{}", id));
         w.kv("show", vis[idx] as u8);
         w.kv("name", cfg.metric_show_labels[idx] as u8);
+        w.kv("short", cfg.metric_name_modes[idx].to_config());
         match cfg.metric_font_sizes[idx] {
             Some(f) => w.kv("font", format!("{:.1}", f)),
             None => w.kv("font", 0),
@@ -110,8 +115,8 @@ pub fn parse(cfg: &mut Config, text: &str) {
         cfg.time_show_seconds = parse_bool(v, cfg.time_show_seconds);
     }
 
-    // 逐监控项
-    for id in 1..=7u32 {
+    // 逐监控项（按 ID 1..=Metric::COUNT）
+    for id in 1..=Metric::COUNT as u32 {
         let idx = match id_to_idx(id) {
             Some(i) => i,
             None => continue,
@@ -127,11 +132,18 @@ pub fn parse(cfg: &mut Config, text: &str) {
                     5 => cfg.power_enabled = b,
                     6 => cfg.show_time = b,
                     7 => cfg.show_util = b,
+                    8 => cfg.show_disk_read = b,
+                    9 => cfg.show_disk_write = b,
                     _ => {}
                 }
             }
             if let Some(v) = sec.get("name") {
                 cfg.metric_show_labels[idx] = parse_bool(v, cfg.metric_show_labels[idx]);
+            }
+            if let Some(v) = sec.get("short") {
+                if let Some(m) = NameMode::from_config(v) {
+                    cfg.metric_name_modes[idx] = m;
+                }
             }
             if let Some(v) = sec.get("font") {
                 let t = v.trim();
@@ -203,7 +215,7 @@ mod tests {
         assert_eq!(c2.show_net, cfg.show_net);
         assert_eq!(c2.show_util, cfg.show_util);
         // order 已移至 layout 文件，monitor 文件不负责顺序
-        assert_eq!(c2.metric_order, [0, 1, 2, 6, 3, 4, 5, 7, 8]); // 默认不变
+        assert_eq!(c2.metric_order, [0, 1, 2, 6, 3, 5, 4, 7, 8]); // 默认 = 当前配置顺序
     }
 
     #[test]
@@ -218,12 +230,63 @@ mod tests {
         let text = serialize(&cfg);
         let mut c2 = Config::default();
         parse(&mut c2, &text);
-        assert_eq!(c2.show_cpu, true);
-        assert_eq!(c2.show_gpu, true);
-        assert_eq!(c2.show_util, false);
+        assert!(c2.show_cpu);
+        assert!(c2.show_gpu);
+        assert!(!c2.show_util);
         assert_eq!(c2.metric_colors[3].value, Some(Rgb::new(10, 20, 30)));
         assert!(c2.metric_colors[3].value_auto);
         assert_eq!(c2.metric_font_sizes[1], Some(18.5));
+    }
+
+    #[test]
+    fn per_item_name_mode_roundtrip() {
+        let mut cfg = Config::default();
+        cfg.metric_name_modes[0] = NameMode::Simple;
+        cfg.metric_name_modes[3] = NameMode::Full;
+        // item.7 保持 Follow，验证读回后仍为 Follow（旧文件无 short 键时同样落回默认）
+        let text = serialize(&cfg);
+        assert!(text.contains("short = 2"), "CPU 简写应写 short = 2");
+        let mut c2 = Config::default();
+        c2.metric_name_modes[6] = NameMode::Full; // 打乱，确保被覆盖回 Follow
+        parse(&mut c2, &text);
+        assert_eq!(c2.metric_name_modes[0], NameMode::Simple);
+        assert_eq!(c2.metric_name_modes[3], NameMode::Full);
+        assert_eq!(c2.metric_name_modes[6], NameMode::Follow);
+        assert_eq!(c2.metric_name_modes[8], NameMode::Follow);
+    }
+
+    #[test]
+    fn name_mode_resolve_semantics() {
+        // Follow 回落全局；Full/Simple 强制覆盖
+        assert!(NameMode::Follow.resolve(true));
+        assert!(!NameMode::Follow.resolve(false));
+        assert!(!NameMode::Full.resolve(true));
+        assert!(NameMode::Simple.resolve(false));
+    }
+
+    #[test]
+    fn disk_items_persisted() {
+        // 磁盘项的「整项显隐 / 名称 / 字号 / 配色 / 自动色」必须随 monitor.cfg 往返，
+        // 否则设置页改了磁盘样式，重启即丢失。
+        let mut cfg = Config::default();
+        cfg.show_disk_read = true;
+        cfg.show_disk_write = true;
+        cfg.metric_show_labels[7] = false; // DiskRead 不显示名称
+        cfg.metric_font_sizes[8] = Some(22.0); // DiskWrite 字号
+        cfg.metric_colors[7].value = Some(Rgb::new(1, 2, 3));
+        cfg.metric_colors[7].value_auto = true;
+        let text = serialize(&cfg);
+        assert!(text.contains("[item.8]"), "必须写出 [item.8]");
+        assert!(text.contains("[item.9]"), "必须写出 [item.9]");
+        let mut c2 = Config::default();
+        c2.metric_colors[7].value = Some(Rgb::new(9, 9, 9));
+        parse(&mut c2, &text);
+        assert!(c2.show_disk_read);
+        assert!(c2.show_disk_write);
+        assert!(!c2.metric_show_labels[7]);
+        assert_eq!(c2.metric_font_sizes[8], Some(22.0));
+        assert_eq!(c2.metric_colors[7].value, Some(Rgb::new(1, 2, 3)));
+        assert!(c2.metric_colors[7].value_auto);
     }
 
     #[test]

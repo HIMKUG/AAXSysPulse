@@ -20,7 +20,7 @@
 
 use aaxsyspulse_core::color::Rgb;
 use aaxsyspulse_core::config::{Config, OFFSET_MAX, OFFSET_MIN, SNAP_CORNER_FREE};
-use aaxsyspulse_core::types::{Appearance, Lang, NetMode, RenderEngine, RenderStyle};
+use aaxsyspulse_core::types::{Appearance, Lang, NameMode, NetMode, RenderEngine, RenderStyle};
 
 /// 控件写入/读出的泛化值。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -85,6 +85,9 @@ impl CfgRef {
             CfgRef::ShowDiskRead => Value::Bool(cfg.show_disk_read),
             CfgRef::ShowDiskWrite => Value::Bool(cfg.show_disk_write),
             CfgRef::MetricShowLabel(i) => Value::Bool(*cfg.metric_show_labels.get(i).unwrap_or(&true)),
+            CfgRef::MetricNameMode(i) => Value::Select(
+                cfg.metric_name_modes.get(i).copied().unwrap_or(NameMode::Follow).to_config() as usize,
+            ),
             // ⚠️ get 侧一律用 `.get(i)` 防护：旧实现是裸下标
             // （`metric_font_sizes[i]` / `metric_colors[i]`），越界即 panic；而 set 侧
             // 有 `i < len` 检查返回 false —— 两侧不对称，且 get 挂在 wndproc 调用链上
@@ -145,6 +148,7 @@ impl CfgRef {
             (CfgRef::ShowDiskRead, v) => {  match v { Value::Bool(x) => { cfg.show_disk_read = x; true } _ => { eprintln!("[CfgRef] 类型错配: ShowDiskRead <- {:?}", v); false }  } },
             (CfgRef::ShowDiskWrite, v) => {  match v { Value::Bool(x) => { cfg.show_disk_write = x; true } _ => { eprintln!("[CfgRef] 类型错配: ShowDiskWrite <- {:?}", v); false }  } },
             (CfgRef::MetricShowLabel(i), v) => {  match v { Value::Bool(x) => { if let Some(slot) = cfg.metric_show_labels.get_mut(i) { *slot = x; true } else { false } } _ => { eprintln!("[CfgRef] 类型错配: MetricShowLabel <- {:?}", v); false }  } },
+            (CfgRef::MetricNameMode(i), v) => {  match v { Value::Select(x) => { match NameMode::ALL.get(x) { Some(m) => { if let Some(slot) = cfg.metric_name_modes.get_mut(i) { *slot = *m; true } else { false } } None => false } } _ => { eprintln!("[CfgRef] 类型错配: MetricNameMode <- {:?}", v); false }  } },
             (CfgRef::MetricFont(i), v) => {  match v { Value::Num(x) => {
                   if i < cfg.metric_font_sizes.len() {
                       let v2 = x as f32;
@@ -177,7 +181,7 @@ pub enum CfgRef {
     Appearance, ClickThrough, SnapCorner,
     FullscreenAutoHide,
     ShowDiskRead, ShowDiskWrite,
-    MetricShowLabel(usize), MetricFont(usize), MetricOffset(usize, u8),
+    MetricShowLabel(usize), MetricNameMode(usize), MetricFont(usize), MetricOffset(usize, u8),
     MetricLabel(usize), MetricValue(usize), MetricValueAuto(usize),
 }
 
@@ -206,6 +210,9 @@ mod tests {
             (CfgRef::TimeSeconds, Value::Bool(true)),
             (CfgRef::TimeSeconds, Value::Bool(false)),
             (CfgRef::MetricShowLabel(0), Value::Bool(false)),
+            (CfgRef::MetricNameMode(0), Value::Select(0)),
+            (CfgRef::MetricNameMode(2), Value::Select(1)),
+            (CfgRef::MetricNameMode(5), Value::Select(2)),
             (CfgRef::MetricShowLabel(3), Value::Bool(false)),
             (CfgRef::MetricShowLabel(5), Value::Bool(true)),
             (CfgRef::ShortNames, Value::Bool(true)),

@@ -9,11 +9,11 @@ use windows::Win32::UI::Shell::{
     NIM_MODIFY, NOTIFY_ICON_INFOTIP_FLAGS, NOTIFYICONDATAW,
 };
 
-/// 托盘回调消息（wndproc 里按 `msg == WM_TRAY` 处理，lparam 低 16 位为鼠标消息）。
-pub const WM_TRAY: u32 = 0x8000 + 1; // WM_APP + 1
+/// 托盘回调消息（与 `window.rs` 同一契约常量，审查项 7.1.1 / P1-22）。
+pub const WM_TRAY: u32 = aaxsyspulse_core::contract::WM_TRAY;
 
 /// 托盘提示文字（悬停显示）。
-const TRAY_TIP: &str = "AAX SysPulse";
+const TRAY_TIP: &str = aaxsyspulse_core::contract::APP_USER_NAME;
 
 /// 注册托盘图标。
 pub fn add(hwnd: HWND) -> bool {

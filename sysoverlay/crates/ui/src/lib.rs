@@ -14,6 +14,12 @@
 //! - `palette` — `Style`：把 `core::color` 的纯逻辑调色板转成预乘色
 //! - `renderer` — 渲染器接口 + 横版/竖版两种条状实现
 
+// 批次 6·①分类基线：与 core 同一口径 —— fixture 用「default() 后逐字段赋值」，
+// 只在测试编译时放过该 lint（生产代码 0 处命中）。
+#![cfg_attr(test, allow(clippy::field_reassign_with_default))]
+// 批次 6·②：非测试代码禁 `unwrap()`（生产代码实测 0 处命中，只挡未来回归）。
+#![cfg_attr(not(test), warn(clippy::unwrap_used))]
+
 pub mod render;
 pub mod offscreen;
 pub mod font;

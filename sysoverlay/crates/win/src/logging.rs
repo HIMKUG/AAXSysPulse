@@ -1,4 +1,5 @@
-//! 统一日志出口：probe（诊断探针）与 perf（性能统计）两个流共用的单一落盘模块。
+//! 统一日志出口：probe（诊断探针）、perf（性能统计）与 diag（降级事件）三个流
+//! 共用的单一落盘模块。
 //!
 //! # 设计意图
 //!
@@ -25,11 +26,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// 日志流：probe = 诊断探针（AAXSYSPULSE_PROBE / 设置面板「调试日志」），
-/// perf = 性能统计（AAXSYSPULSE_PERF）。
+/// perf = 性能统计（AAXSYSPULSE_PERF），
+/// diag = **会话级降级事件**（不受任何开关门控，见 [`crate::probe::degrade`]）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Stream {
     Probe,
     Perf,
+    Diag,
 }
 
 impl Stream {
@@ -38,6 +41,7 @@ impl Stream {
         match self {
             Stream::Probe => "probe",
             Stream::Perf => "perf",
+            Stream::Diag => "diag",
         }
     }
 }
@@ -96,9 +100,12 @@ fn write_inner(stream: Stream, text: &str) {
         let Some(dir) = std::env::var_os("LOCALAPPDATA") else {
             return;
         };
-        let dir = std::path::PathBuf::from(dir).join("AAXSysPulseC");
+        let dir = std::path::PathBuf::from(dir).join(aaxsyspulse_core::contract::APP_DATA_DIR_NAME);
         let _ = std::fs::create_dir_all(&dir);
         let name = session_name();
+        // 首次打开时清理旧会话（7.3.2）。放在这里而不是启动路径上：
+        // 只有真的会写日志才需要清理，且本进程内天然只跑一次。
+        prune_dir(&dir, &name);
         match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -158,9 +165,91 @@ fn prefixed(prefix: &str, text: &str) -> String {
     out
 }
 
+// ── 跨会话保留策略（审查项 7.3.2）────────────────────────────────
+//
+// 本模块原先**只有会话内保险丝**（`SESSION_CAP_BYTES`），没有跨会话清理：
+// 文件名带 `YYYYMMDD_HHMM` ⇒ 每次启动新建一个、永不删除旧的。天天开关机
+// 一年就是 365 × ≤8 MB（最坏 ≈ 2.9 GB）无上限增长，且没有任何入口能清掉。
+//
+// 策略（与引导侧同一口径，写进 docs/RUNTIME_ISSUES 的"日志"一节）：
+// · 保留 14 天；
+// · 且目录内本前缀文件总量 ≤ 64 MB（超了从最旧开始删）；
+// · **本会话正在写的文件永不删**（否则会把当前日志截掉）；
+// · 清理失败一律静默 —— 日志是尽力而为，绝不阻塞启动。
+
+const LOG_PREFIX: &str = "aaxsyspulse_";
+const KEEP_DAYS: u64 = 14;
+const KEEP_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// 纯决策函数（可单测，不碰文件系统）：
+/// 入参 = `(文件名, mtime 秒, 字节数)` 列表 + 当前会话文件名；
+/// 返回应当删除的文件名。时间桶相同时按名字序删，保证结果确定。
+fn prune_plan(entries: &[(String, u64, u64)], now_secs: u64, current: &str) -> Vec<String> {
+    let cutoff = now_secs.saturating_sub(KEEP_DAYS * 86_400);
+    let mut doomed: Vec<String> = Vec::new();
+    let mut kept: Vec<&(String, u64, u64)> = Vec::new();
+    for e in entries {
+        if e.0 == current {
+            kept.push(e);
+        } else if e.1 < cutoff {
+            doomed.push(e.0.clone());
+        } else {
+            kept.push(e);
+        }
+    }
+    let mut total: u64 = kept.iter().map(|e| e.2).sum();
+    if total > KEEP_TOTAL_BYTES {
+        kept.sort_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
+        for e in kept {
+            if total <= KEEP_TOTAL_BYTES {
+                break;
+            }
+            if e.0 == current {
+                continue; // 本会话文件豁免：宁可不达标也不截断正在写的日志
+            }
+            total = total.saturating_sub(e.2);
+            doomed.push(e.0.clone());
+        }
+    }
+    doomed
+}
+
+/// 按上面的策略清理日志目录。只在**首次落盘打开文件时**调用一次。
+fn prune_dir(dir: &std::path::Path, current: &str) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut entries: Vec<(String, u64, u64)> = Vec::new();
+    for entry in rd.flatten() {
+        let name = match entry.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if !name.starts_with(LOG_PREFIX) || !name.ends_with(".log") {
+            continue; // 历史 probe_*.log / perf.log 不动（见模块头）
+        }
+        let Ok(md) = entry.metadata() else { continue };
+        if !md.is_file() {
+            continue;
+        }
+        let mtime = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        entries.push((name, mtime, md.len()));
+    }
+    for name in prune_plan(&entries, now, current) {
+        let _ = std::fs::remove_file(dir.join(&name));
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::prefixed;
+    use super::{prune_plan, prefixed};
 
     #[test]
     fn prefix_applies_to_every_line_of_multiline_text() {
@@ -180,5 +269,54 @@ mod tests {
         let b = prefixed("[p] ", "x");
         assert_eq!(a, "[p] x\n");
         assert_eq!(a, b);
+    }
+
+    fn e(name: &str, age_days: u64, mb: u64) -> (String, u64, u64) {
+        const DAY: u64 = 86_400;
+        let now = 1_700_000_000;
+        (
+            name.to_string(),
+            now - age_days * DAY,
+            mb * 1024 * 1024,
+        )
+    }
+
+    #[test]
+    fn prune_drops_only_files_over_14_days() {
+        let now = 1_700_000_000;
+        let list = vec![e("aaxsyspulse_old.log", 15, 1), e("aaxsyspulse_new.log", 3, 1)];
+        let doomed = prune_plan(&list, now, "aaxsyspulse_cur.log");
+        assert_eq!(doomed, vec!["aaxsyspulse_old.log".to_string()]);
+    }
+
+    #[test]
+    fn prune_cuts_oldest_first_until_under_total_cap() {
+        // 5 个各 20 MB（共 100 MB > 64 MB），全部还在 14 天内；**i 越大越新**。
+        let now = 1_700_000_000;
+        let list: Vec<(String, u64, u64)> = (0..5)
+            .map(|i| e(&format!("aaxsyspulse_{i}.log"), 5 - i as u64, 20))
+            .collect();
+        let current = "aaxsyspulse_4.log"; // 本会话文件 = 最新那个
+        let doomed = prune_plan(&list, now, current);
+        // 需删到 ≤64 MB ⇒ 从最旧的两个下手（i=0 满 5 天、i=1 满 4 天）。
+        assert_eq!(
+            doomed,
+            vec!["aaxsyspulse_0.log".to_string(), "aaxsyspulse_1.log".to_string()]
+        );
+    }
+
+    #[test]
+    fn prune_never_deletes_the_session_file_being_written() {
+        // 极端：唯一文件 = 当前会话文件且已超总量上限 ⇒ 豁免，一个都不删。
+        let now = 1_700_000_000;
+        let list = vec![e("aaxsyspulse_cur.log", 1, 100)];
+        assert!(prune_plan(&list, now, "aaxsyspulse_cur.log").is_empty());
+        // 超龄也不删：正在写的文件被截掉比留一天更糟。
+        let old_cur = vec![(
+            "aaxsyspulse_cur.log".to_string(),
+            now - 400 * 86_400,
+            1u64,
+        )];
+        assert!(prune_plan(&old_cur, now, "aaxsyspulse_cur.log").is_empty());
     }
 }

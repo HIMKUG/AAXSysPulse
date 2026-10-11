@@ -22,11 +22,11 @@ use windows::Win32::System::Registry::{
     REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_BINARY, RRF_RT_REG_SZ,
 };
 
-const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const RUN_KEY: &str = aaxsyspulse_core::contract::RUN_KEY;
 /// 任务管理器「启动」页的启用/禁用状态（12 字节二进制块）存放处。
-const APPROVED_KEY: &str =
-    "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
-const VALUE_NAME: &str = "AAX SysPulse";
+const APPROVED_KEY: &str = aaxsyspulse_core::contract::APPROVED_RUN_KEY;
+/// Run 键值名 —— 契约常量：卸载清理（引导 `install.rs`）引用同一份（7.1.2 / P1-22）。
+const VALUE_NAME: &str = aaxsyspulse_core::contract::RUN_VALUE_MAIN;
 
 /// 自启启动参数：登录时启动走这条路径，**不弹任何对话框、不弹 UAC**。
 pub const AUTOSTART_FLAG: &str = "--autostart";
@@ -207,6 +207,17 @@ pub fn current() -> bool {
     !matches!(mode(), Mode::None)
 }
 
+/// 把系统状态折算成「开关应该显示成什么」（**纯函数**，便于单测）。
+///
+/// 关键：写失败回滚时**不能简单取反**。用户在任务管理器里可能动过开关，
+/// 取反会把真实状态写反，下一轮幂等同步又改回来 ⇒ 开关反复横跳。
+/// 以系统真实状态为准才是自愈。
+pub fn state_as_switch(s: State) -> bool {
+    // DisabledByUser 也算"已注册"：启动项在，只是被禁用 —— 开关应显示为开
+    // （用户的显式禁用是另一件事，不该被一次写失败悄悄改掉）。
+    matches!(s, State::Enabled | State::DisabledByUser)
+}
+
 // ── 计划任务（schtasks） ──────────────────────────────────
 //
 // 为什么用计划任务：`Run` 项启动**拿不到管理员权限**，而功耗监控需要读 MSR，
@@ -218,7 +229,8 @@ pub fn current() -> bool {
 // - 未提权时 → 退回 `Run` 项（不做"静默弹 UAC"，避免开关一按就跳授权框）；
 // - 关闭时若任务已存在而未提权 → 起一个提权的自身进程去删（会弹一次 UAC）。
 
-const TASK_NAME: &str = "AAX SysPulse";
+/// 计划任务名 —— 契约常量，卸载侧删的是同一个名字（3.1.14 / P1-22）。
+const TASK_NAME: &str = aaxsyspulse_core::contract::TASK_NAME;
 /// 登录后延迟启动，错开登录高峰（格式 `HHHH:MM`）。
 const TASK_DELAY: &str = "0000:30";
 /// 提权辅助进程参数：创建 / 删除计划任务后立即退出。
@@ -388,6 +400,52 @@ pub fn apply_user(enabled: bool) -> bool {
     }
 }
 
+/// 设置面板「开机自启」开关的**异步**应用入口（**UI 线程安全**）。
+///
+/// # 为什么必须异步
+///
+/// [`apply_user`] 是阻塞的，且最坏会弹 UAC 并 [`WaitForSingleObject`] 60s
+/// （删计划任务需要提权）。设置开关跑在 **UI 线程**上（`settings` 的
+/// `Action::Toggle` → `apply_config` → [`CfgRef::set`]），同步调用会让整个
+/// 程序（悬浮窗 + 设置窗）无响应最长一分钟 —— 那比"自启没写成功"严重得多。
+///
+/// # 契约
+///
+/// - 立即返回，绝不阻塞 UI 线程；
+/// - 开关值（`cfg.autostart`）**照旧由调用方同步写入**（纯内存，见
+///   [`crate::settings::cfg_ref`]），因此 UI 立刻回显、落盘不受影响；
+/// - 系统侧结果通过 [`WM_AUTOSTART_DONE`] 异步回报 UI 线程：
+///   `WPARAM` = 请求值（1/0），`LPARAM` = 是否成功；
+/// - 失败时调用方**按系统真实状态回滚开关**并提示，绝不留下"显示已开、其实没开"。
+///
+/// 用后台线程 + [`PostMessageW`] 回报，而不是 `Send` 句柄：与本模块既有的
+/// 提权辅助进程（[`ARG_TASK_CREATE`] / [`ARG_TASK_REMOVE`]）同一套模式。
+pub fn apply_user_async(hwnd: windows::Win32::Foundation::HWND, enabled: bool) {
+    // HWND 不是 Send（裸指针不保证线程安全）→ 跨线程只传地址，线程内重建。
+    // 与 main.rs 采样线程传 hwnd 的做法一致。
+    let hwnd_addr = hwnd.0 as usize;
+    std::thread::spawn(move || {
+        let ok = apply_user(enabled);
+        crate::probe::log(&format!(
+            "autostart: async apply_user({enabled}) ok={ok} mode={:?} os_state={:?}",
+            mode(),
+            state()
+        ));
+        use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+        use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+        let hwnd = HWND(hwnd_addr as *mut _);
+        // 投递失败（窗口已销毁）无副作用可做：进程正在退出，系统侧状态已写完。
+        let _ = unsafe {
+            PostMessageW(
+                hwnd,
+                aaxsyspulse_core::contract::WM_AUTOSTART_DONE,
+                WPARAM(enabled as usize),
+                LPARAM(ok as isize),
+            )
+        };
+    });
+}
+
 /// 写入 `Run` 项。
 fn write_value(cmd: &str) -> bool {
     unsafe {
@@ -460,5 +518,17 @@ mod tests {
         let cmd = command_line().expect("GetModuleFileNameW 应能取到自身路径");
         assert!(cmd.starts_with('"'), "路径必须带引号：{cmd}");
         assert!(cmd.contains("\" --autostart"), "必须带自启标记：{cmd}");
+    }
+
+    /// 自愈决策：回滚时开关必须**跟随系统真实状态**，不是简单取反。
+    #[test]
+    fn state_as_switch_reflects_registration_not_enablement() {
+        // 启动项不存在 → 显示关。
+        assert!(!state_as_switch(State::Absent));
+        // 存在且启用 → 显示开。
+        assert!(state_as_switch(State::Enabled));
+        // 存在但被用户在任务管理器禁用 → 仍显示"开"（禁用是另一件事，
+        // 不该被一次写失败悄悄改成关，反之亦然 —— 否则开关反复横跳）。
+        assert!(state_as_switch(State::DisabledByUser));
     }
 }

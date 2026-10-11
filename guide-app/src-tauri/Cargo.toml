@@ -1,0 +1,53 @@
+[package]
+name = "guide-app"
+# 版本继承 workspace（审查项 4.2.2 / 8B.M）：这里曾硬编码 `0.7.1`，与根 Cargo.toml
+# 是两个互不相干的副本 —— 发版只改一处就会静默漂移。`build.rs` 里有构建期断言兜底。
+version.workspace = true
+description = "AAXSysPulse 引导程序"
+authors = ["AAXSysPulse"]
+edition = "2021"
+
+[lints]
+workspace = true
+
+[lib]
+name = "guide_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# 跨进程契约唯一真源（审查项 P1-22）：exe / 服务 / 任务名、消息号、窗口类名、
+# CONFIG_VERSION 都从这里取。core 零依赖 ⇒ 不会把 windows 0.58 拉进本次编译。
+aaxsyspulse-core = { path = "../../sysoverlay/crates/core" }
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+notify = "8"
+once_cell = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+dirs = "6"
+tokio = { version = "1", features = ["time", "rt"] }
+# 安装日志时间戳（第五部分）；workspace 内已由 tauri-utils 引入，复用同一编译产物
+chrono = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Services",
+  "Win32_System_Registry",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Threading",
+  "Win32_System_Com",
+  "Win32_Storage_FileSystem",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging"
+] }
+
+# [profile.release] 已上移到仓库根 Cargo.toml（workspace 成员 profile 会被 cargo 忽略）

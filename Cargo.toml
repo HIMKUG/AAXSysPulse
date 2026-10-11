@@ -1,0 +1,40 @@
+# 单一 Cargo workspace：主程序（sysoverlay/crates/*）与引导程序（guide-app/src-tauri）同源编译。
+# 引导程序 build.rs 会在这里编译 aaxsyspulse-app 并把产物作为资源打包（见 guide-app/src-tauri/build.rs）。
+# 注意：原 sysoverlay/Cargo.toml 的 [workspace] 已上移到本文件，crate 通过 version.workspace = true 继承。
+
+[workspace]
+resolver = "2"
+members = [
+    "sysoverlay/crates/core",
+    "sysoverlay/crates/win",
+    "sysoverlay/crates/ui",
+    "sysoverlay/crates/app",
+    "guide-app/src-tauri",
+]
+
+[workspace.package]
+version = "0.7.1"
+edition = "2021"
+license = "MIT"
+
+# ── 全仓共享 lint 策略（批次 6·①②）───────────────────────────────
+# 定位：**声明式口径，不阻塞构建**。这里只集中放「经逐条判定后决定长期放过」
+# 的 lint；判定为「该修」的一律改代码，不用 allow。
+# 各成员 crate 用 `lints.workspace = true` 继承（见各 crate 的 Cargo.toml）。
+# 例外：只在测试里成立的 allow（如字段逐个赋值的 fixture）无法用 workspace
+# 表达 cfg(test)，因此写在 crate 根的 `#![cfg_attr(test, allow(...))]`。
+[workspace.lints.clippy]
+# 光栅化 / 绘制原语（ui::font、win::gfx_d2d、settings::widget）参数多而固定：
+# 包一层 Params 结构体只为消 lint，换来逐帧构造开销与调用点可读性下降。
+# 逐帧签名稳定 = 这里想要性质，而不是坏味道。
+too_many_arguments = "allow"
+
+[profile.release]
+# 体积优先，但 panic 必须保持 unwind：gdi.rs 的 D2D 自愈依赖 catch_unwind
+# （panic=abort 会使其失效 → D2D panic 时进程直接崩溃，用户无法自救）。
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "unwind"
+strip = true
+overflow-checks = false

@@ -1,4 +1,5 @@
-//! 性能测量开关（P5）：**默认开**，`AAXSYSPULSE_PERF=0` 关闭。统计渲染开销并落盘。
+//! 性能测量开关（P5）：**默认跟随「调试日志」总开关**，`AAXSYSPULSE_PERF=0` 关闭、
+//! `AAXSYSPULSE_PERF=1` 强制开。统计渲染开销并落盘。
 //!
 //! # 为什么需要它
 //!
@@ -27,14 +28,33 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-/// 是否启用：**默认开**（2026-09-14 起，便于随时取数）；
-/// `AAXSYSPULSE_PERF=0` / `false` 显式关闭。进程内只读一次环境变量。
+/// 是否启用：**默认跟随「调试日志」总开关**（`probe::enabled()`，即设置面板
+/// 「调试日志」+ `AAXSYSPULSE_PROBE`）。`AAXSYSPULSE_PERF` 可独立强制开/关：
+/// 设 `0`/`false` 强制关，设 `1`/`true` 强制开（例如 perf 专用脚本）。
+///
+/// 关键修复：旧实现 `unwrap_or(true)` 让 perf 在**无任何环境变量**时默认开，
+/// 且与 `debug_log` 开关脱钩 —— 用户关掉「调试日志」后日志仍以 `[perf]` 行每 5s
+/// 持续写入，表现为"写入控制失效"。现在默认跟随总开关，关掉「调试日志」即停。
 fn enabled() -> bool {
-    static E: OnceLock<bool> = OnceLock::new();
+    match env_perf_force() {
+        Some(v) => v,
+        // 未显式设环境变量 → 跟随「调试日志」总开关（含 probe 的环境变量覆盖）。
+        None => crate::probe::enabled(),
+    }
+}
+
+/// `AAXSYSPULSE_PERF` 独立强制开关（进程内只读一次）。未设置 → `None`（交总开关决定）。
+fn env_perf_force() -> Option<bool> {
+    static E: OnceLock<Option<bool>> = OnceLock::new();
     *E.get_or_init(|| {
-        std::env::var("AAXSYSPULSE_PERF")
-            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-            .unwrap_or(true)
+        let v = std::env::var("AAXSYSPULSE_PERF").ok()?;
+        if v == "0" || v.eq_ignore_ascii_case("false") {
+            Some(false)
+        } else if v == "1" || v.eq_ignore_ascii_case("true") {
+            Some(true)
+        } else {
+            None
+        }
     })
 }
 
@@ -151,11 +171,7 @@ fn maybe_report() {
         }
         Err(_) => (0, 0),
     };
-    let skip_pct = if frames + skipped > 0 {
-        skipped * 100 / (frames + skipped)
-    } else {
-        0
-    };
+    let skip_pct = (skipped * 100).checked_div(frames + skipped).unwrap_or(0);
 
     let mut line = format!(
         "frames={:<6} skipped={:<6} skip_pct={:<3}% avg_us={:<6} p50_us={:<6} p99_us={:<6} max_us={:<6}\n",
@@ -391,4 +407,32 @@ fn elapsed_us(start: u64) -> u64 {
 
 fn qpc_ms() -> u64 {
     (qpc() as u128 * 1_000 / freq() as u128) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归锁：「调试日志」关闭时，perf 不得再默认开启。
+    ///
+    /// 旧实现是 `unwrap_or(true)`（无环境变量即开），且与 `debug_log` 脱钩
+    /// ⇒ 用户关掉「调试日志」后 `[perf]` 行仍每 5s 写盘（"写入控制失效"）。
+    /// 本测试在**没有** `AAXSYSPULSE_PERF` 的进程内验证"跟随总开关"。
+    #[test]
+    fn perf_follows_debug_log_when_env_unset() {
+        // 前置：本进程未设 AAXSYSPULSE_PERF（测试进程由 cargo 拉起，不继承它）。
+        assert_eq!(
+            env_perf_force(),
+            None,
+            "测试前提：AAXSYSPULSE_PERF 未设置，否则本用例无意义"
+        );
+        // 总开关关 → perf 必须关。
+        crate::probe::set_debug(false);
+        assert!(!enabled(), "调试日志关闭时 perf 不得开启");
+        // 总开关开 → perf 才开。
+        crate::probe::set_debug(true);
+        assert!(enabled(), "调试日志开启时 perf 应随之开启");
+        // 复位，避免影响同进程内其他用例。
+        crate::probe::set_debug(false);
+    }
 }

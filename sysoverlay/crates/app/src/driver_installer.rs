@@ -1,5 +1,12 @@
 //! Driver installer launcher
 //!
+//! ⚠️ **本文件当前不在编译单元内**（批次 7 核验，审查项 9.5 的同一种形状）：
+//! `crates/app` 里唯一的模块声明是 `main.rs:29 mod pre_launch_checks;`，
+//! 没有任何地方 `mod driver_installer;`，`Cargo.toml` 也只声明了一个 `[[bin]]`。
+//! ⇒ 全文件为零行被编译的死代码，"driver-installer 是一个独立二进制" 这个承诺
+//! 在本仓库里并不成立（真正的驱动安装在引导程序 `guide-app/src-tauri/src/driver.rs`）。
+//! 保留待决策：接上（作为提权预启动器）或删除 —— 见批次 7 报告"等待用户决策"。
+//!
 //! This module manages the driver-installer pre-launcher.
 //! The driver-installer is a separate binary that:
 //! 1. Checks for admin privileges

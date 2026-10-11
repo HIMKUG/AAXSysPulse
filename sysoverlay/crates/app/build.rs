@@ -1,51 +1,25 @@
 //! Build script for aaxsyspulse-app
 //!
-//! 1. 把应用图标（`crates/win/assets/app_icon.ico`，多尺寸 16/64/128）
-//!    编成 Windows 资源链接进 exe —— 这样资源管理器、任务栏、属性面板
-//!    看到的都是真实图标，而不是系统默认的 exe 图标。
-//! 2. 检查 driver-installer 是否已构建（真正的嵌入走 `include_bytes!`）。
+//! 只做一件事：把应用图标（`crates/win/assets/app_icon.ico`，多尺寸 16/64/128）
+//! 编成 Windows 资源链接进 exe —— 这样资源管理器、任务栏、属性面板看到的都是真实图标，
+//! 而不是系统默认的 exe 图标。
+//!
+//! 曾经这里还有一段"检查 `../driver-installer/bin/driver-installer.exe` 是否存在，
+//! 并提示运行 `driver-installer/build.bat` 去构建"的逻辑（批次 7 删除，审查项 9.6 的
+//! **真正源头**）：
+//!
+//! - 那个 exe 从未存在过 ⇒ `else` 分支**每次构建都发一条 warning**，让每个编译过
+//!   本仓库的人（含写 README 的那位）都以为存在一套 Zig/CMake 的 `build.bat` 构建流程；
+//! - 注释承诺的"真正的嵌入走 `include_bytes!`"没有对应代码（全仓 `include_bytes!` 只有
+//!   图标两处），唯一的消费者 `driver_installer.rs` 又从没被 `mod` 声明（死文件，见 §11 决策）；
+//! - 实际的驱动安装由**引导程序**做：`guide-app/src-tauri/src/driver.rs` +
+//!   `install.rs`，主程序只负责运行期打开 `\\.\WinRing0_1_2_0`（`win/src/msr.rs`）。
 
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    // Path to driver-installer binary
-    let driver_installer_path =
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("driver-installer")
-        .join("bin")
-        .join("driver-installer.exe");
-
-    if driver_installer_path.exists() {
-        println!("cargo:rerun-if-changed={}", driver_installer_path.display());
-
-        // Embed the binary as a resource
-        //
-        // On Windows, we use the Windows API to embed the resource.
-        // The embedded binary will be written to a temporary file and executed.
-        //
-        // We just tell Cargo that this file is a dependency
-        println!("cargo:warning=Driver installer found at: {}", driver_installer_path.display());
-
-        // For now, we just check the file exists. The actual embedding
-        // happens via the include_bytes! macro in the Rust code.
-    } else {
-        // Derive the build.bat location from the manifest dir so the hint
-        // stays correct even if the workspace folder is renamed or moved.
-        let build_bat = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("driver-installer")
-            .join("build.bat");
-        eprintln!(
-            "cargo:warning=Driver installer not found at {}. \
-             Run '{}' to build it.",
-            driver_installer_path.display(),
-            build_bat.display()
-        );
-    }
-
     embed_app_icon();
 }
 

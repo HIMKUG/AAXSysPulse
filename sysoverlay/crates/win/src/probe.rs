@@ -88,6 +88,21 @@ pub fn log_lazy<F: FnOnce() -> String>(f: F) {
     log(&f());
 }
 
+/// **会话级降级事件**：不受 `AAXSYSPULSE_PROBE` / 「调试日志」门控，永远落盘。
+///
+/// 为什么单开一条流（审查项 P1-15 余部 / 2.2.8 可观测性）：D2D 熔断、脏矩形自动
+/// 关闭、MSR 功耗源本会话放弃这三件事都是**一次性**的行为改变 —— 用户看到的只是
+/// "某行恒为 `--`"或"少了高画质"，而记录原因的 [`log`] 默认是关的（`cfg.debug_log`
+/// 默认 false ⇒ `main.rs` 会覆盖掉 `DEBUG` 的初值）。等到用户报障再让他开日志复现，
+/// 等于把一次性事件变成不可复现事件。
+///
+/// 调用纪律：**每个降级动作只调一次**（调用点自己用 `swap`/`AtomicBool` 去重），
+/// 因此这条流不可能被刷爆；本数的体积保险丝（[`crate::logging`]）仍在。
+pub fn degrade(line: &str) {
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    crate::logging::write(crate::logging::Stream::Diag, &format!("#{n:06} {line}"));
+}
+
 /// 启动头：版本 + 环境摘要，便于在日志里定位一次运行。
 pub fn log_startup() {
     if !enabled() {

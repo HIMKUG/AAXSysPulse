@@ -49,7 +49,7 @@
 //! - `metric_order` / `metric_offsets`（布局偏移，熟悉后可恢复）
 
 pub use crate::color::Rgb;
-pub use crate::types::{Lang, Metric, MetricColors, NetMode, NetUnit, PowerDisplay, Appearance, RenderEngine, RenderMode, RenderStyle, VertLayout, Zoom};
+pub use crate::types::{Lang, Metric, MetricColors, NameMode, NetMode, NetUnit, PowerDisplay, Appearance, RenderEngine, RenderMode, RenderStyle, VertLayout, Zoom};
 
 // ── v3 多文件配置（2026-09-14）：纯解析/序列化放本目录 ──
 // system / appearance / monitor / layout 各负责一个 .cfg 文件的读写；
@@ -66,7 +66,10 @@ pub mod legacy;
 ///
 /// v3 起配置拆分为 5 个 `.cfg`（`%APPDATA%\AAXSysPulseC\config\`），
 /// 每个文件头写 `version = 3`。
-pub const CONFIG_VERSION: u32 = 3;
+///
+/// 真源在 `crate::contract`：引导程序写盘时必须用**同一个**值，
+/// 否则两端各自 3、实际不同版时会触发主程序的版本跨度弹窗（审查项 7.1.3）。
+pub use crate::contract::CONFIG_VERSION;
 
 /// 允许的刷新间隔（毫秒），从慢到快排列。
 /// 对应：0.2fps / 0.5fps / 1fps / 5fps / 10fps。
@@ -156,7 +159,7 @@ pub struct Config {
     pub font_size: f32,
     /// 逐指标字号覆盖（None = 跟随全局 `font_size`）。
     /// 索引与 [`Metric`] 顺序一致：CPU/MEM/GPU/Net/Power/Time/Util/DiskRead/DiskWrite。
-    pub metric_font_sizes: [Option<f32>; 9],
+    pub metric_font_sizes: [Option<f32>; Metric::COUNT],
     /// 字重档位（0=细 / 1=中 / 2=粗，默认 2=粗）。
     ///
     /// 位图字体只有一套字形，三档以**笔画覆盖率**区分（alpha 调制：
@@ -172,7 +175,7 @@ pub struct Config {
     /// 窗口翻页的过渡动画时长（ms，100..=2000，默认 300）。
     pub anim_ms: u32,
     /// 逐项配色：每个指标的名称/数值色槽，None = 跟随 `fg`。
-    pub metric_colors: [MetricColors; 9],
+    pub metric_colors: [MetricColors; Metric::COUNT],
     /// 文字阴影（颜色自动取字体反色：白字黑影 / 黑字白影）。
     pub text_shadow: bool,
     /// 文字描边（1px 四向，颜色同阴影规则）。
@@ -248,17 +251,20 @@ pub struct Config {
     /// 时间显示秒（HH:MM:SS）；关闭 = 仅 HH:MM。默认开。
     pub time_show_seconds: bool,
     /// 逐指标名称显示开关（默认全开）。索引与 [`Metric`] 顺序一致：CPU/Mem/Gpu/Net/Power/Time/Util/DiskRead/DiskWrite。
-    pub metric_show_labels: [bool; 9],
+    pub metric_show_labels: [bool; Metric::COUNT],
     /// 逐指标文字偏移：`[指标][分量]`。分量 0=名称X 1=名称Y 2=数值X 3=数值Y（px，可负；默认全 0）。
-    pub metric_offsets: [[i32; 4]; 9],
+    pub metric_offsets: [[i32; 4]; Metric::COUNT],
     /// 简化名称：CPU→C、Mem→M、GPU→G、Net→N、Power→P、Time→T、Util→U（默认关）。
     pub short_names: bool,
-    /// 监控项显示顺序：第 k 位元素 = 显示在第 k 位的指标下标（0..=8 排列）。
-    /// 下标序与 [`Metric`] 枚举序一致：CPU/Mem/Gpu/Net/Power/Time/Util/DiskRead/DiskWrite。
-    /// 9 个监控项始终都在排列中（含 DiskRead/DiskWrite）；某项是否真正显示由各自的
-    /// `show_*` 开关决定（磁盘默认 `show_disk_read/write = false` → 默认不采样、不显示）。
-    /// 末尾两位旧配置用重复值填充（build_rows 的去重 guard 跳过，不影响显示顺序）。
-    pub metric_order: [u8; 9],
+    /// 逐指标名称模式（默认全 `Follow` = 回落全局 [`Self::short_names`]）。
+    /// 索引与 [`Metric`] 顺序一致。monitor.cfg `[item.N] short` 键。
+    pub metric_name_modes: [NameMode; Metric::COUNT],
+    /// 监控项显示顺序：第 k 位元素 = 显示在第 k 位的指标下标（`0..COUNT` 排列）。
+    /// 下标序与 [`Metric`] 枚举序一致。全部监控项始终都在排列中；某项是否真正
+    /// 显示由各自的 `show_*`/`[item.N] show` 开关决定。
+    /// 容量唯一来源 [`Metric::COUNT`]：新增监控项后旧配置文件缺的槽位按默认值
+    /// 补齐，多出的排列项由解析端去重/越界跳过，无需迁移。
+    pub metric_order: [u8; Metric::COUNT],
 
     // ── 全屏自动隐藏（v6 新增） ─────────────────────────────
     /// 全屏时自动隐藏悬浮窗（默认开）。
@@ -278,7 +284,7 @@ impl Default for Config {
             minimal: false,
             zoom: Zoom::Zoom100,
             net_unit: NetUnit::MB,
-            net_mode: NetMode::Both,
+            net_mode: NetMode::Down,
             vert: VertLayout::SingleRow,
             bg: Rgb::default(),
             fg: Rgb::new(238, 241, 244),
@@ -286,8 +292,10 @@ impl Default for Config {
             interval_ms: 1000,
             refresh_auto: true,
             topmost: true,
-            window_pos: None,
-            window_size: None,
+            // 默认窗口位置 = 当前用户配置（system.cfg [system] 的 x/y）。
+            // Some 即「自由定位」，启动直接采用；不再回退 (screen_w/4, 24) 兜底。
+            window_pos: Some((625, -9)),
+            window_size: Some((781, 44)),
             size_locked: false,
             // 用户拍板：CPU/内存/GPU 显示默认关，Util/网络/时间默认开。
             show_cpu: false,
@@ -301,15 +309,15 @@ impl Default for Config {
             mem_show_gb: false,
             // 32px ≈ 旧默认 font_scale 2（16px 基准 ×2）
             font_size: 32.0,
-            metric_font_sizes: [None; 9],
+            metric_font_sizes: [None; Metric::COUNT],
             font_weight: 2,
-            metric_gap: 8,
-            label_value_gap: 6,
-            normal_opacity: 35,
+            metric_gap: 18,
+            label_value_gap: 0,
+            normal_opacity: 100,
             anim_ms: 300,
-            metric_colors: [MetricColors::default(); 9],
+            metric_colors: [MetricColors::default(); Metric::COUNT],
             text_shadow: true,
-            text_outline: false,
+            text_outline: true,
             autostart: false,
             render_mode: RenderMode::Quality,
             power_enabled: false,
@@ -319,13 +327,13 @@ impl Default for Config {
             exclude_virtual_nic: true,
             // 2026-09-14：默认开（诊断优先）。关闭方式：设置面板「调试日志」开关，
             // 或环境变量 AAXSYSPULSE_PROBE=0（probe）/ AAXSYSPULSE_PERF=0（perf）。
-            debug_log: true,
+            debug_log: false,
             render_style: RenderStyle::Strip,
-            lang: Lang::En,
+            lang: Lang::Zh,
             gpu_primary_only: true,
             gpu_3d_only: true,
             net_low_freq: true,
-            render_engine: RenderEngine::Gdi,
+            render_engine: RenderEngine::D2d,
             appearance: Appearance::System,
             settings_size: (720, 560),
             click_through: false,
@@ -336,14 +344,15 @@ impl Default for Config {
             driver_check_last_date: 0,
             show_time: true,
             time_show_seconds: true,
-            metric_show_labels: [true; 9],
-            metric_offsets: [[0; 4]; 9],
+            metric_show_labels: [true; Metric::COUNT],
+            metric_offsets: [[0; 4]; Metric::COUNT],
             short_names: false,
+            metric_name_modes: [NameMode::Follow; Metric::COUNT],
             // Util（下标 6）默认排在 GPU 之后。DiskRead(7)/DiskWrite(8) 也纳入排列：
             // 与 CPU/Mem/GPU 一致——它们**始终在 metric_order 中**，默认是否显示由各自的
             // show_* 开关决定（磁盘默认 show_disk_read/write = false → 默认不采样、不显示）。
             // 用户在设置页开启磁盘卡片的「显示」开关即点亮 7/8。
-            metric_order: [0, 1, 2, 6, 3, 4, 5, 7, 8],
+            metric_order: [0, 1, 2, 6, 3, 5, 4, 7, 8],
             // 全屏自动隐藏（默认开）。
             fullscreen_auto_hide: true,
         }
@@ -524,7 +533,7 @@ impl Config {
                     }
                 }
                 "short_names" => cfg.short_names = Self::parse_bool(value, cfg.short_names),
-                // 监控项显示顺序：6 个 0..=5 的排列，非法值整体回落默认。
+                // 监控项显示顺序：`0..Metric::COUNT` 的任意子集，缺项尾部按自然序补齐。
                 "morder" | "metric_order" => {
                     if let Some(order) = parse_metric_order(value) {
                         cfg.metric_order = order;
@@ -722,18 +731,11 @@ impl Config {
             }
         }
         s.push_str(&format!("short_names {}\n", self.short_names as u32));
-        s.push_str(&format!(
-            "morder {} {} {} {} {} {} {} {} {}\n",
-            self.metric_order[0],
-            self.metric_order[1],
-            self.metric_order[2],
-            self.metric_order[3],
-            self.metric_order[4],
-            self.metric_order[5],
-            self.metric_order[6],
-            self.metric_order[7],
-            self.metric_order[8]
-        ));
+        s.push_str("morder");
+        for &v in self.metric_order.iter() {
+            s.push_str(&format!(" {}", v));
+        }
+        s.push('\n');
         s.push_str(&format!("mem_gb {}\n", self.mem_show_gb as u32));
         s.push_str(&format!("font_size {:.1}\n", self.font_size));
         // Rust 专属键：字重档位（0=细 / 1=中 / 2=粗）。C 版忽略未知键。
@@ -901,6 +903,8 @@ fn parse_metric_color(key: &str, value: &str) -> Option<((Metric, bool), Option<
         "power" => Metric::Power,
         "time" => Metric::Time,
         "util" => Metric::Util,
+        "disk_read" => Metric::DiskRead,
+        "disk_write" => Metric::DiskWrite,
         _ => return None,
     };
     let slot = match slot_part {
@@ -933,6 +937,8 @@ fn parse_metric_show_label(key: &str) -> Option<usize> {
         "power" => Some(4),
         "time" => Some(5),
         "util" => Some(6),
+        "disk_read" => Some(7),
+        "disk_write" => Some(8),
         _ => None,
     }
 }
@@ -997,18 +1003,15 @@ fn parse_metric_offset(key: &str, value: &str) -> Option<(usize, [i32; 4])> {
     Some((idx, out))
 }
 
-/// 解析监控项显示顺序（`morder a b c d e f [g]`）。
+/// 解析监控项显示顺序（`morder a b c ...`）。
 ///
-/// 接受两种长度：
-/// - **7 个值**（新版）：0..=6 的排列，直接采用；
-/// - **6 个值**（旧版迁移）：0..=5 的排列，把 Util（6）插到 GPU（2）之后，
-///   与新默认序 [0,1,2,6,3,4,5] 的相对位置一致。
-///
-/// 值须彼此不重复（空格/逗号/Tab 分隔），任何违规整体返回 None
+/// 柔性框架：接受 `0..Metric::COUNT` 的**任意子集**（不重复），
+/// 未列出的项按枚举自然序自动补到末尾 —— 旧配置缺新监控项（如磁盘之前的
+/// 6/7 值排列）天然迁移，无需逐版本特例；越界 / 重复值整体返回 None
 /// （调用方回落默认排列，永不部分应用）。
-fn parse_metric_order(value: &str) -> Option<[u8; 9]> {
-    let mut seen = [false; 9];
-    let mut out = [0u8; 9];
+fn parse_metric_order(value: &str) -> Option<[u8; Metric::COUNT]> {
+    let mut seen = [false; Metric::COUNT];
+    let mut out = [0u8; Metric::COUNT];
     let mut n = 0usize;
     for tok in value.split(|c: char| c.is_ascii_whitespace() || c == ',') {
         let tok = tok.trim();
@@ -1016,47 +1019,25 @@ fn parse_metric_order(value: &str) -> Option<[u8; 9]> {
             continue;
         }
         let v: u8 = tok.parse().ok()?;
-        if v > 8 || seen[v as usize] {
+        let idx = v as usize;
+        if idx >= Metric::COUNT || seen[idx] {
             return None;
         }
-        seen[v as usize] = true;
-        if n < 9 {
-            out[n] = v;
-        }
+        seen[idx] = true;
+        out[n] = v;
         n += 1;
     }
-    match n {
-        // 完整 9 值排列：0..=8 的任意排列
-        9 => Some(out),
-        // 旧版 7 值排列（无 DiskRead/DiskWrite）：**不**自动追加磁盘。
-        // 末尾用重复值填充（build_rows 的去重 guard 会跳过，不影响显示顺序），
-        // 以此保持「磁盘默认关闭」——用户需在配置里显式写出 8/9 才会开启。
-        7 => {
-            out[7] = out[0];
-            out[8] = out[0];
-            Some(out)
-        }
-        // 旧版 6 值排列（含 Util(6) 缺失）：迁移为「GPU 之后插入 Util」，末尾填充重复值
-        6 => {
-            if !seen[2] || seen[6] {
-                return None;
-            }
-            let mut migrated = [0u8; 9];
-            let mut k = 0usize;
-            for &v in out.iter().take(6) {
-                migrated[k] = v;
-                k += 1;
-                if v == 2 {
-                    migrated[k] = 6; // Util 插 GPU 后
-                    k += 1;
-                }
-            }
-            migrated[7] = migrated[0];
-            migrated[8] = migrated[0];
-            Some(migrated)
-        }
-        _ => None,
+    if n == 0 {
+        return None;
     }
+    // 缺项按自然序补到末尾
+    for (m, is_seen) in seen.iter().enumerate() {
+        if !is_seen {
+            out[n] = m as u8;
+            n += 1;
+        }
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -1087,7 +1068,7 @@ fg F4F1EE
 
         assert_eq!(cfg.window_pos, Some((1200, 40)), "pos 必须能被读回（此前写而不读）");
         assert!(cfg.topmost);
-        assert_eq!(cfg.normal_opacity, 35, "没有 normal_opacity 行时用默认 35");
+        assert_eq!(cfg.normal_opacity, 100, "没有 normal_opacity 行时用默认 100（当前用户默认）");
         assert_eq!(cfg.interval_ms, 1000, "C 版 interval 10 = 10×100ms");
         assert!(!cfg.minimal);
         assert_eq!(cfg.zoom, Zoom::Zoom100);
@@ -1096,6 +1077,25 @@ fg F4F1EE
         // COLORREF(BBGGRR)：0x1B1614 → R=0x14=20, G=0x16=22, B=0x1B=27
         assert_eq!(cfg.bg, Rgb::new(20, 22, 27), "bg 必须按 COLORREF 解析，不能 R/B 互换");
         assert_eq!(cfg.fg, Rgb::new(238, 241, 244));
+    }
+
+    /// 回归：Config::default() 必须等于用户当前的「默认状态」配置。
+    /// 任何把默认改回旧值（window_pos 重变 None、lang 变 En、net_mode 变 Both 等）
+    /// 的改动都会在此失败 —— 这是「当前配置文件即程序默认」的契约测试。
+    #[test]
+    fn default_matches_current_user_config() {
+        let d = Config::default();
+        assert_eq!(d.window_pos, Some((625, -9)), "默认窗口位置必须 = system.cfg 的 x/y");
+        assert_eq!(d.window_size, Some((781, 44)));
+        assert_eq!(d.net_mode, NetMode::Down, "默认网络模式 = down（当前配置）");
+        assert_eq!(d.normal_opacity, 100);
+        assert!(!d.debug_log, "默认关闭调试日志（当前配置）");
+        assert_eq!(d.lang, Lang::Zh, "默认中文（当前配置）");
+        assert_eq!(d.render_engine, RenderEngine::D2d, "默认 D2D 高画质（当前配置）");
+        assert_eq!(d.metric_gap, 18);
+        assert_eq!(d.label_value_gap, 0);
+        assert!(d.text_outline, "默认开启描边（当前配置）");
+        assert_eq!(d.metric_order, [0, 1, 2, 6, 3, 5, 4, 7, 8], "默认顺序 = layout_h.cfg 的 order");
     }
 
     #[test]
@@ -1164,8 +1164,8 @@ fg F4F1EE
 
     #[test]
     fn test_render_engine_roundtrip_and_default() {
-        // 默认 Gdi（性能模式，升级后行为逐帧一致）
-        assert_eq!(Config::default().render_engine, RenderEngine::Gdi);
+        // 默认 D2d（高画质，对应 system.cfg 的 render_engine = 1）
+        assert_eq!(Config::default().render_engine, RenderEngine::D2d);
         // 数值与字符串都读得动
         assert_eq!(Config::parse("render_engine 1\n").render_engine, RenderEngine::D2d);
         assert_eq!(Config::parse("render_engine quality\n").render_engine, RenderEngine::D2d);
@@ -1296,7 +1296,7 @@ fg F4F1EE
         let cfg = Config::parse("topmost=0\nopacity=70\nshape=square\nnetunit=gb\nvert=splitcol\n");
         assert!(!cfg.topmost);
         // shape / opacity 是旧版遗留键：应被静默忽略，不影响其它解析
-        assert_eq!(cfg.normal_opacity, 35);
+        assert_eq!(cfg.normal_opacity, 100);
         assert_eq!(cfg.net_unit, NetUnit::GB);
         assert_eq!(cfg.vert, VertLayout::SplitCol);
     }
@@ -1448,10 +1448,10 @@ fg F4F1EE
         let cfg = Config::default();
         assert!(!cfg.minimal);
         assert_eq!(cfg.zoom, Zoom::Zoom100);
-        assert_eq!(cfg.normal_opacity, 35);
+        assert_eq!(cfg.normal_opacity, 100);
         assert_eq!(cfg.font_size, 32.0);
-        assert_eq!(cfg.metric_gap, 8);
-        assert_eq!(cfg.label_value_gap, 6);
+        assert_eq!(cfg.metric_gap, 18);
+        assert_eq!(cfg.label_value_gap, 0);
         // Default impl(300) 与 settings 动画兜底值(300) 三处必须同步
         assert_eq!(cfg.anim_ms, 300);
         assert!(cfg.topmost);
@@ -1514,7 +1514,7 @@ fg F4F1EE
     #[test]
     fn test_metric_font_size_default_follows_global() {
         let cfg = Config::default();
-        assert_eq!(cfg.metric_font_sizes, [None; 9], "默认全部跟随全局字号");
+        assert_eq!(cfg.metric_font_sizes, [None; Metric::COUNT], "默认全部跟随全局字号");
     }
 
     #[test]
@@ -1551,8 +1551,8 @@ fg F4F1EE
         assert!(cfg.time_show_seconds, "默认显示秒");
         assert_eq!(
             cfg.metric_order,
-            [0, 1, 2, 6, 3, 4, 5, 7, 8],
-            "默认 Util 排在 GPU 之后"
+            [0, 1, 2, 6, 3, 5, 4, 7, 8],
+            "默认顺序 = layout_h.cfg 的 order（Power/Time 与当前配置一致）"
         );
     }
 
@@ -1574,33 +1574,39 @@ fg F4F1EE
     fn test_metric_order_validation() {
         // 非法输入一律整体回落默认排列（永不部分应用）。
         for bad in [
-            "0 1 2 3 4",         // 缺两个
             "0 1 2 3 4 5 5 6",   // 重复
             "0 1 2 3 4 x 6",     // 非数字
             "",                  // 空
             "9 9 9 9 9 9 9",     // 全越界
-            "0 1 2 3 4 6",       // 6 值但含 6：非法截断，拒绝
+            "0 1 2 3 4 5 6 7 9", // 单个越界
         ] {
             let cfg = Config::parse(&format!("morder {bad}"));
             assert_eq!(
                 cfg.metric_order,
-                [0, 1, 2, 6, 3, 4, 5, 7, 8],
+                [0, 1, 2, 6, 3, 5, 4, 7, 8],
                 "非法 morder {:?} 应回落默认",
                 bad
             );
         }
-        // 合法：新版 7 值（含 DiskRead/DiskWrite）+ 逗号分隔
+        // 合法：全排列 + 逗号分隔
         let cfg = Config::parse("morder 8,7,6,5,4,3,2,1,0");
         assert_eq!(cfg.metric_order, [8, 7, 6, 5, 4, 3, 2, 1, 0]);
-        // 合法：旧版 7 值排列（无磁盘）→ 末尾填充重复值，**不**追加磁盘（保持默认关闭）
+    }
+
+    #[test]
+    fn test_metric_order_subset_tailfills_in_natural_order() {
+        // 柔性框架：任意子集合法，缺项按自然序补到末尾。
+        // 旧配置项目数少于新版（如磁盘之前的 6/7 值排列）天然迁移，无需逐版本特例；
+        // 补进来的磁盘项是否显示仍由各自 show_* 开关决定（默认关 → 行为不变）。
         let cfg = Config::parse("morder 6,5,4,3,2,1,0");
-        assert_eq!(cfg.metric_order, [6, 5, 4, 3, 2, 1, 0, 6, 6]);
-        // 合法：旧版 6 值排列（含 Util(6) 缺失）：迁移为「GPU 之后插入 Util」，末尾填充重复值
+        assert_eq!(cfg.metric_order, [6, 5, 4, 3, 2, 1, 0, 7, 8]);
         let cfg = Config::parse("morder 5 4 3 2 1 0");
-        assert_eq!(
-            cfg.metric_order, [5, 4, 3, 2, 6, 1, 0, 5, 5],
-            "旧 6 值排列必须在 GPU(2) 后插入 Util(6)"
-        );
+        assert_eq!(cfg.metric_order, [5, 4, 3, 2, 1, 0, 6, 7, 8]);
+        let cfg = Config::parse("morder 0 1 2 3 4");
+        assert_eq!(cfg.metric_order, [0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        // 单项也合法
+        let cfg = Config::parse("morder 0");
+        assert_eq!(cfg.metric_order, [0, 1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]
@@ -1702,7 +1708,7 @@ fg F4F1EE
     #[test]
     fn test_metric_font_size_unknown_ignored() {
         let cfg = Config::parse("mfs_xxx 20.0\nmfs");
-        assert_eq!(cfg.metric_font_sizes, [None; 9]);
+        assert_eq!(cfg.metric_font_sizes, [None; Metric::COUNT]);
     }
 
     #[test]

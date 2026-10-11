@@ -326,7 +326,7 @@ mod tests {
     #[test]
     fn test_curve_ease_is_valid() {
         for v in FLUENT.light.curve_easy_ease {
-            assert!(v >= 0.0 && v <= 1.0, "curve_easy_ease value {v} out of range");
+            assert!((0.0..=1.0).contains(&v), "curve_easy_ease value {v} out of range");
         }
     }
 

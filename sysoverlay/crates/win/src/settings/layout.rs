@@ -26,6 +26,7 @@ use aaxsyspulse_core::sampler::SamplerId;
 use aaxsyspulse_core::types::Lang;
 
 use super::cfg_ref::CfgRef;
+use super::N_METRICS;
 use super::state::{Card, Page, Row, Widget};
 use super::widget::{
     AboutHeaderWidget, ButtonAction, ButtonKind, ButtonWidget, DiagRowWidget, DisclosureWidget,
@@ -87,6 +88,11 @@ pub const CAPTION_GAP: i32 = 8;
 
 /// 基础行高 = **控件带**高度（标签 + 控件垂直居中于其中）。
 pub const ROW_H: i32 = 34;
+// 间距量级关系放在**编译期**（批次 6 clippy 分类）：这三条曾在 `#[test]` 里比较常量，
+// 运行时永远不可能失败 ⇒ 改成 `const assert` 后，改错一个数字立刻编译不过。
+const _: () = assert!(CAPTION_GAP > 0 && CAPTION_GAP < ROW_GAP);
+const _: () = assert!(ROW_GAP < CARD_PAD);
+const _: () = assert!(CARD_PAD < CARD_GAP);
 /// 行内说明（hint）每行附加高度。
 /// 20 > 说明字号 14（Fluent base300），行盒上下各留 ~3px。
 /// S5 字阶 Fluent 化时由 22 调来：body(16)+caption(14)=30 后，
@@ -388,8 +394,8 @@ type Group = (&'static str, Vec<RowDef>, Option<&'static str>, i32);
 fn page_prefs(
     ux: &Ux,
     _cfg: &Config,
-    _expand: &[f32; 9],
-    _order: &[u8; 9],
+    _expand: &[f32; N_METRICS],
+    _order: &[u8; N_METRICS],
     groups: &mut Vec<Group>,
 ) {
         // ── 偏好：显示 / 启动 / 诊断（报告 §11 w1） ──
@@ -456,8 +462,8 @@ fn page_prefs(
 fn page_layout(
     ux: &Ux,
     _cfg: &Config,
-    _expand: &[f32; 9],
-    _order: &[u8; 9],
+    _expand: &[f32; N_METRICS],
+    _order: &[u8; N_METRICS],
     groups: &mut Vec<Group>,
 ) {
         // ── 布局：排列 / 文字效果（报告 §11 w2） ──
@@ -541,12 +547,12 @@ fn mid(base: i32, i: usize) -> i32 {
 fn page_metrics(
     ux: &Ux,
     cfg: &Config,
-    expand: &[f32; 9],
-    order: &[u8; 9],
+    expand: &[f32; N_METRICS],
+    order: &[u8; N_METRICS],
     groups: &mut Vec<Group>,
 ) {
         // ── 监控项：每项一张**独立卡**（按 metric_order 排列，可拖动排序） ──
-        let metric_cfg: [CfgRef; 9] = [
+        let metric_cfg: [CfgRef; N_METRICS] = [
             CfgRef::ShowCpu,
             CfgRef::ShowMem,
             CfgRef::ShowGpu,
@@ -630,6 +636,19 @@ fn page_metrics(
                     ux.tr("LblShowLabel"),
                     Some(ux.tr("HintShowLabel")),
                     vec![ux.toggle_item(mid(260, i), CfgRef::MetricShowLabel(i))],
+                ));
+                // 名称模式：逐项覆盖全局简化名称（跟随/完整/简写）。
+                // id 用 700 段：mid() 的 base+10i 分配在 i≥7 时会串号，且 4xx 段已满。
+                rows.push(row_def(
+                    ux.tr("LblNameMode"),
+                    Some(ux.tr("HintNameMode")),
+                    vec![ux.ctrl_item(
+                        700 + i as i32,
+                        Box::new(ux.seg(
+                            &["SegNameFollow", "SegNameFull", "SegNameSimple"],
+                            CfgRef::MetricNameMode(i),
+                        )),
+                    )],
                 ));
                 // 数据格式：内存单位 / 网络显示（用户反馈：从「布局」页并入
                 // 对应卡片，就近配置；与字号/配色一样只影响这一项）。
@@ -791,8 +810,8 @@ fn page_metrics(
 fn page_window(
     ux: &Ux,
     _cfg: &Config,
-    _expand: &[f32; 9],
-    _order: &[u8; 9],
+    _expand: &[f32; N_METRICS],
+    _order: &[u8; N_METRICS],
     groups: &mut Vec<Group>,
 ) {
         // ── 窗口：层级与交互 / 位置与外观（报告 §11 w4） ──
@@ -854,8 +873,8 @@ fn page_window(
 fn page_perf(
     ux: &Ux,
     _cfg: &Config,
-    _expand: &[f32; 9],
-    _order: &[u8; 9],
+    _expand: &[f32; N_METRICS],
+    _order: &[u8; N_METRICS],
     groups: &mut Vec<Group>,
 ) {
         // ── 性能：统计范围 / 刷新频率 / 画面（报告 §11 w5） ──
@@ -947,8 +966,8 @@ fn page_diag(
 fn page_about(
     ux: &Ux,
     _cfg: &Config,
-    _expand: &[f32; 9],
-    _order: &[u8; 9],
+    _expand: &[f32; N_METRICS],
+    _order: &[u8; N_METRICS],
     groups: &mut Vec<Group>,
 ) {
         // ── 关于：头部（图标 / 名称 / 版本）/ 开发者，版权脚注 ──
@@ -995,8 +1014,8 @@ pub fn build_pages(
     lang: Lang,
     dpi: u32,
     client_w: i32,
-    expand: &[f32; 9],
-    order: &[u8; 9],
+    expand: &[f32; N_METRICS],
+    order: &[u8; N_METRICS],
 ) {
     let tr = |k: &'static str| crate::i18n::t(lang, k);
 
@@ -1150,7 +1169,7 @@ mod spacing_tests {
     fn build_all(expand: f32) -> [Page; 7] {
         let cfg = Config::default();
         let mut pages: [Page; 7] = Default::default();
-        build_pages(&mut pages, &cfg, Lang::Zh, D, 900, &[expand; 9], &[0, 1, 2, 6, 3, 4, 5, 0, 0]);
+        build_pages(&mut pages, &cfg, Lang::Zh, D, 900, &[expand; N_METRICS], &[0, 1, 2, 6, 3, 4, 5, 0, 0]);
         pages
     }
 
@@ -1330,11 +1349,10 @@ mod spacing_tests {
 
     /// 相邻量级必须拉开：分组标题↔卡片(8) < 行↔行(12) < 卡片内边距(16)
     /// < 卡片↔卡片(24)。否则视觉上读不出分组关系。
+    /// （这三条本身已上移为 `const assert`，见 `ROW_H` 处；本测试只保留**依赖函数**
+    /// 的那几条 —— 它们必须在运行期算。）
     #[test]
     fn spacing_scale_is_monotonic_with_contrast() {
-        assert!(CAPTION_GAP > 0 && CAPTION_GAP < ROW_GAP);
-        assert!(ROW_GAP < CARD_PAD);
-        assert!(CARD_PAD < CARD_GAP);
         // 行盒必须放得下自己的字号，否则字会被行盒挤住（「贴到一起」的根因之一）。
         // 直接引用字号函数（而非写字面量）——字阶调整时测试自动跟随。
         assert!((HINT_EXTRA as f32) > caption_px(D), "说明行高放不下说明字号");
@@ -1389,7 +1407,9 @@ mod diag_tests {
                 return;
             }
         };
-        let dir = std::path::Path::new(&base).join("AAXSysPulseC").join("config");
+        let dir = std::path::Path::new(&base)
+            .join(aaxsyspulse_core::contract::APP_DATA_DIR_NAME)
+            .join("config");
         if !dir.exists() {
             eprintln!("[diag] 配置目录不存在，跳过: {:?}", dir);
             return;
@@ -1408,7 +1428,7 @@ mod diag_tests {
         if let Ok(t) = std::fs::read_to_string(dir.join(lay)) {
             layout::parse(cfg.render_style, &mut cfg, &t);
         }
-        let expand = [0.0f32; 9];
+        let expand = [0.0f32; N_METRICS];
         let order = cfg.metric_order;
         eprintln!(
             "[diag] metric_order={:?} render_style={:?} power_enabled={} show_util={}",

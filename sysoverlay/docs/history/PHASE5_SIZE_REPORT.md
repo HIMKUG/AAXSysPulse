@@ -29,10 +29,17 @@
    opt-level = "z"          # 优先体积
    lto = true               # 链接时优化
    codegen-units = 1        # 最大化优化
-   panic = "abort"          # 移除 unwind 表
+   panic = "abort"          # ❌ 本节写错了，见下方勘误 —— 仓库里是 "unwind"，且必须是
    strip = true             # 剥离符号
    overflow-checks = false
    ```
+
+   > **勘误（2026-09-21，架构全量审查 9.1）**：上面这行 `panic = "abort"` **从未是仓库现实**：
+   > 根 `Cargo.toml` 的 release profile 一直是 `panic = "unwind"`，而且**必须**保持 unwind
+   > —— `gdi.rs`（D2D 自愈）、`msr.rs`、`render_thread.rs`、`app/main.rs` 的兜底都建立在
+   > `catch_unwind` 上，改回 abort 会让这四条自愈静默退化成"直接崩进程"，而编译与单测
+   > 全部照常通过。该约束现由 `crates/win/src/lib.rs` 的 `profile_guard_tests` 钉住。
+   > **禁止**为体积把 `panic` 改成 `abort`。代码块原文照抄保留，仅供考古。
 
 2. **windows crate features 精简**:
    ```toml
@@ -88,7 +95,9 @@ GPU 和 Network 采样器采用延迟初始化策略：
 
 3. **移除 arc-swap**: 如果 snapshot 更新频率不高，可用 `Mutex<Snapshot>` 替代
 
-4. **静态链接**: 切换到 `#[panic = "abort"]` + 完全静态链接可减少 CRT 依赖
+4. **静态链接**: ~~切换到 `#[panic = "abort"]`~~ + 完全静态链接可减少 CRT 依赖
+   —— **`abort` 这一半已作废**（审查项 9.1）：本项目的 D2D / MSR / 渲染线程自愈依赖
+   `catch_unwind`，`panic` 必须保持 `"unwind"`，改回 abort 会让自愈静默失效。
 
 ## 结论
 

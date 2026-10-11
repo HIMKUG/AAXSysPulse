@@ -3,11 +3,12 @@
 //! # 过渡（H2 扩展）
 //! 每个控件有一组弹簧（hover / press / val，见 `mod.rs::Transition`）。
 //! `WidgetState::anim_v` 携带 `val` 弹簧的当前值：
-//!   - Toggle → 0..1（旋钮滑动 + 轨道渐变）
-//!   - Segmented / Swatches → 选中下标（指示条 / 选中环滑动）
-//!   - Slider → 数值（滑块滑动）
-//!   - Disclosure → 0..1（箭头展开角度）
-//!   因此**所有可切换控件都是「滑过去」而非「跳过去」**。
+//! - Toggle → 0..1（旋钮滑动 + 轨道渐变）
+//! - Segmented / Swatches → 选中下标（指示条 / 选中环滑动）
+//! - Slider → 数值（滑块滑动）
+//! - Disclosure → 0..1（箭头展开角度）
+//!
+//! 因此**所有可切换控件都是「滑过去」而非「跳过去」**。
 
 use windows::Win32::Foundation::RECT;
 
@@ -788,6 +789,9 @@ fn paint_metric_swatches(
     let custom_i = sw_custom(auto);
     let wd = r.w() / n as f32;
     let m = super::layout::s(dpi, 3) as f32;
+    // `i` 首先是色板格子的**几何**下标（宽度均分 + 三种特殊格判定），
+    // 只有 `i < SW_COLORS` 那一支才查表，改成 `enumerate()` 反而要再造下标。
+    #[allow(clippy::needless_range_loop)]
     for i in 0..n {
         let sw = RectF::new(r.l + i as f32 * wd, r.t, r.l + (i + 1) as f32 * wd, r.b);
         let inner = RectF::new(sw.l + m, sw.t + m, sw.r - m, sw.b - m);
@@ -984,9 +988,10 @@ fn paint_disclosure(
 }
 
 /// 字号状态条（理想布局）：字号滑杆下方的一行。
-///   - 未覆盖：「跟随全局」药丸（右侧「恢复跟随全局」按钮）。
-///   - 已覆盖：「已自定义」标签（右侧「恢复跟随全局」按钮）。
-///   整行可点（命中右侧链接区域即重置）。
+/// - 未覆盖：「跟随全局」药丸（右侧「恢复跟随全局」按钮）。
+/// - 已覆盖：「已自定义」标签（右侧「恢复跟随全局」按钮）。
+///
+/// 整行可点（命中右侧链接区域即重置）。
 #[allow(clippy::too_many_arguments)]
 fn paint_metric_font_status(
     rt: &windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget,
@@ -1065,9 +1070,9 @@ fn paint_metric_header(
 ) {
     // cfg 不可得（overlay 句柄失效）时按「开」处理：
     // 宁可少画一枚标签，也不在状态未知时错报「已关闭」。
-    let on = cfg.map_or(true, |c| matches!(on_cfg.get(c), Value::Bool(true)));
-    const KEYS: [&str; 9] = ["LblCpu", "LblMem", "LblGpu", "LblNet", "LblPower", "LblTime", "LblUtil", "LblDiskRead", "LblDiskWrite"];
-    let name = crate::i18n::t(lang, KEYS[index.min(8)]);
+    let on = cfg.is_none_or(|c| matches!(on_cfg.get(c), Value::Bool(true)));
+    const KEYS: [&str; super::N_METRICS] = ["LblCpu", "LblMem", "LblGpu", "LblNet", "LblPower", "LblTime", "LblUtil", "LblDiskRead", "LblDiskWrite"];
+    let name = crate::i18n::t(lang, KEYS[index.min(super::N_METRICS - 1)]);
     // 折叠头标题比正文大一档（用户反馈：字号偏小）。
     let title_px = body_px * 1.2;
 

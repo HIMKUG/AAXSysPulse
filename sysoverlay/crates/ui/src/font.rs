@@ -656,8 +656,7 @@ fn render_char_scaled_f_blend(
     let bitmap = get_char_bitmap(c);
     let factor = 1.0 - fg_color.alpha_float();
 
-    for row in 0..FONT_HEIGHT as usize {
-        let bits = bitmap[row];
+    for (row, &bits) in bitmap.iter().enumerate() {
         if bits == 0 {
             continue;
         }

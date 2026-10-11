@@ -193,7 +193,11 @@ fn main() {
 - workspace：`members = [core, ui, win, app]`，`resolver = "2"`。
 - `core` 无 `[dependencies]` → 可纯离线编译与单测（已验证 `cargo test -p aaxsyspulse-core --offline` 通过）。
 - `win`/`app` 依赖 `windows` crate（目标：升级到含 `GlobalMemoryStatusEx`/`GetIfTable2` 绑定的版本，解决 proc_mem/proc_net 占位）。
-- Release profile：`opt-level="z"` + `lto` + `codegen-units=1` + `panic="abort"` + `strip` + 关 `overflow-checks`（体积优先）。
+- Release profile：`opt-level="z"` + `lto` + `codegen-units=1` + **`panic="unwind"`** + `strip` + 关 `overflow-checks`（体积优先）。
+  - ⚠️ 本行原文写的是 `panic="abort"`，与根 `Cargo.toml` 不符（审查项 9.1）。**不得改回 abort**：
+    `gdi.rs` 的 D2D 自愈、`msr.rs`、`render_thread.rs`、`app/main.rs` 的兜底都建立在
+    `catch_unwind` 上，abort 会让它们静默失效；该约束由 `crates/win/src/lib.rs` 的
+    `profile_guard_tests` 在 `cargo test` 中断言。
 - **建议**（可选）：为 `core` 的纯逻辑单测加 `cfg(test)` 之外不引入 dev-dep 干扰；`ui` 的 `png` 仅作 dev/test 依赖（已在 `ui/Cargo.toml` 的 `[dev-dependencies]`）。
 
 ---

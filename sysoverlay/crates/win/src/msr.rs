@@ -30,6 +30,7 @@
 //!    `target/release` 等）→ 扫描候选位置，找到文件后用
 //!    `ChangeServiceConfigW` 把服务重定向过去（自愈）；
 //! 3. 服务不存在（首次部署）→ 用第一个存在的候选位置创建服务。
+//!
 //! 候选位置：`C:\Windows\AAXSysPulse\`（稳定目录，优先）→ exe 同目录（兜底）。
 //!
 //! # Safety（本文件 unsafe 汇总）
@@ -139,10 +140,13 @@ unsafe fn open_ring0() -> Option<Ring0> {
         // 1. 驱动文件候选位置（见模块头「驱动文件查找策略」）：
         //    稳定目录优先——不随 exe 移动/清理而失效；exe 同目录只作兜底。
         let sys_candidates: [std::path::PathBuf; 2] = [
-            std::path::PathBuf::from(r"C:\Windows\AAXSysPulse\WinRing0x64.sys"),
+            std::path::Path::new(aaxsyspulse_core::contract::DRIVER_DIR)
+                .join(aaxsyspulse_core::contract::DRIVER_FILE_NAME),
             std::env::current_exe()
                 .ok()
-                .and_then(|e| e.parent().map(|d| d.join("WinRing0x64.sys")))
+                .and_then(|e| {
+                    e.parent().map(|d| d.join(aaxsyspulse_core::contract::DRIVER_FILE_NAME))
+                })
                 .unwrap_or_default(),
         ];
         let found_sys = sys_candidates.iter().find(|p| p.exists());
@@ -174,8 +178,16 @@ unsafe fn open_ring0() -> Option<Ring0> {
                 return None;
             }
         };
-        let svc_name = windows::core::w!("AAXSysPulseWinRing0");
-        let svc_display = windows::core::w!("AAXSysPulse WinRing0 MSR Driver");
+        // 服务名走契约常量 + 运行期宽字符（审查项 7.1.2 / P1-22）：`w!` 只吃字面量，
+        // 用它就等于在本 crate 再存一份副本。显示名同样收敛 —— 之前这里是
+        // "…WinRing0 MSR Driver"，而引导 `driver.rs` 建的是 "…WinRing0 Driver"，
+        // 谁先建服务谁决定 services.msc 里看到的名字。
+        let svc_name_w =
+            aaxsyspulse_core::contract::wide_of(aaxsyspulse_core::contract::DRIVER_SERVICE_NAME);
+        let svc_display_w =
+            aaxsyspulse_core::contract::wide_of(aaxsyspulse_core::contract::DRIVER_DISPLAY_NAME);
+        let svc_name = windows::core::PCWSTR(svc_name_w.as_ptr());
+        let svc_display = windows::core::PCWSTR(svc_display_w.as_ptr());
         let svc: SvcHandleGuard = match OpenServiceW(scm.0, svc_name, SERVICE_ALL_ACCESS) {
             Ok(h) => {
                 let h = SvcHandleGuard(h);
@@ -323,13 +335,24 @@ unsafe fn open_ring0() -> Option<Ring0> {
         Some(Ring0 { dev })
 }
 
+/// 取 `RING0` 的锁：**中毒不致命**（审查项 7.2.1 / P1-20）。
+///
+/// 这行在采样热路径上。旧写法 `lock().unwrap()` 意味着"任何一个持锁线程 panic 过，
+/// 此后每轮采样都 panic" ⇒ 采样线程反复死亡、五个指标永久定格，而现场看起来只是
+/// 数字不更新（比崩溃更难诊断）。取中毒锁的正确姿势是 `into_inner()` 继续用：
+/// 本字段的不变量只有「句柄要么有效要么 None」，`Option<Ring0>` 自身没有可被
+/// 撕开的多字段一致性，中毒后照用安全。
+fn lock_ring0() -> MutexGuard<'static, Option<Ring0>> {
+    RING0.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// 取得 MSR 设备句柄：懒初始化；若 `invalidate_on_resume` 已标记失效则重建。
 /// 返回 `MutexGuard` 持有锁，保证采样期间句柄不被 `teardown` 关闭。
 fn ring0() -> Option<MutexGuard<'static, Option<Ring0>>> {
     if RING0_TORN.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
-    let mut g = RING0.lock().unwrap();
+    let mut g = lock_ring0();
     if g.is_none() || RING0_STALE.load(std::sync::atomic::Ordering::Relaxed) {
         let new = unsafe { open_ring0() };
         *g = new;
@@ -385,7 +408,15 @@ pub fn teardown() {
         return; // 已卸载
     }
     // 关设备句柄（若已初始化）：take() 取得所有权，Ring0 的 Drop 自动 CloseHandle。
-    let _ = RING0.lock().unwrap().take();
+    // 用 try_lock 而不是 lock（审查项 2.2.3）：功耗线程可能正卡在 `DeviceIoControl`
+    // 上并持有该锁，阻塞等待会把采样线程挂回同一个死点上。取不到锁时只跳过
+    // 显式关闭 —— 那次阻塞调用返回后 `Ring0` 的 Drop 仍会 CloseHandle。
+    match RING0.try_lock() {
+        Ok(mut g) => {
+            let _ = g.take();
+        }
+        Err(_) => probe::log("msr teardown: 功耗线程仍持有设备锁，句柄将在其调用返回后关闭"),
+    }
     // 停止内核驱动服务
     unsafe {
         use windows::Win32::System::Services::{
@@ -396,7 +427,9 @@ pub fn teardown() {
             probe::log("msr teardown: OpenSCManager failed（非管理员？驱动服务保留未停止）");
             return;
         };
-        let svc_name = windows::core::w!("AAXSysPulseWinRing0");
+        let svc_name_w =
+            aaxsyspulse_core::contract::wide_of(aaxsyspulse_core::contract::DRIVER_SERVICE_NAME);
+        let svc_name = windows::core::PCWSTR(svc_name_w.as_ptr());
         match OpenServiceW(scm, svc_name, SERVICE_ALL_ACCESS) {
             Ok(svc) => {
                 let mut status = Default::default();
@@ -455,6 +488,15 @@ fn read_msr(r: &Ring0, index: u32) -> Option<u64> {
 /// 一次性绑定后读数零迁移、零系统调用——`read_msr` 直接读即可。
 ///
 /// `SetThreadAffinityMask` 失败（极少）不影响后续采样，仅退化回"不绑核"。
+///
+/// **为什么是 0 号核（审查项 2.1.4）**：掩码 `1` = 位 0。RAPL 的 PKG 能量计数是
+/// **封装级**的，语义上要求同一读者连续读同一物理封装 —— 真正要防的是"批量读
+/// 途中线程被迁到另一个封装"（双路机器上那是两个不同的能量域），跨域会让
+/// delta 直接失真（不是精度问题而是数值错误）。绑到任意**一个**核都能达到这个
+/// 目的，选 0 只是因为它在 `GetActiveProcessorCount` 非零的机器上必然存在，
+/// 不需要先查拓扑。多处理器组（>64 逻辑核）机器上 `SetThreadAffinityMask` 只能
+/// 覆盖 group 0，此处忽略失败即退化为不绑核 —— 与"读不到就 None"相比是可接受的
+/// 降级（记录于 2.1.4，未做 group 感知）。
 pub fn pin_sampling_thread() {
     unsafe {
         use windows::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
@@ -556,9 +598,12 @@ impl MsrPower {
         self.prev = Some((now_ms, pkg, dram));
 
         // 几何筛（单周期窗口 + 回绕上限）→ core::power 物理钳制。
+        // 窗口上界必须按**当前生效的功耗间隔**推导（2.1.4）：`power_interval_ms`
+        // 允许到 60 s，写死的 5 s 上界会把大间隔下的每一帧都判为非法。
+        let interval_ms = crate::window::schedule_cfg().3 as u64;
         if pkg_delta < WRAP_LIMIT_RAW && dram_delta < WRAP_LIMIT_RAW {
             let delta_j = (pkg_delta + dram_delta) as f64 * self.unit_j as f64;
-            if let Some(w) = watts_from_energy_delta(delta_j, dt_ms) {
+            if let Some(w) = watts_from_energy_delta(delta_j, dt_ms, interval_ms) {
                 self.invalid = 0;
                 self.last_watts = Some(w);
                 if probe::enabled() {
@@ -599,3 +644,207 @@ impl MsrPower {
         Some(())
     }
 }
+
+// ─── 执行隔离（审查项 2.2.3 / P1-15）───────────────────────────
+//
+// `MsrPower::sample` 底层是同步阻塞的 `DeviceIoControl`。它原本与 CPU/内存/GPU/
+// 网络跑在同一条采样线程上：设备无响应（驱动卡死、电源状态切换瞬间设备栈抖动）
+// 时整条采样线程停在一次读取上，**五个源一起定格**，而渲染看门狗只管渲染线程，
+// 对卡住的采样线程无所作为。
+//
+// 这里把阻塞调用挪到专用线程，采样线程只 `recv_timeout` 等一个期限：
+// · 超时 → 本帧功耗记 `--`，其余四源照常更新；
+// · 工作线程仍卡在设备调用里时不重复派单（否则每轮超时泄漏一条线程）；
+// · 连续 3 次真实超时 → 本会话放弃功耗源（丢弃通道，工作线程自行退出）。
+//
+// 附带效应：`teardown` 里对 `RING0` 的 `lock` 改成 `try_lock` —— 工作线程卡死时
+// 它正持有该锁，阻塞等待会让"隔离"退化成把采样线程挂回同一个死点上。
+
+/// 一轮 MSR 采样回传给调用方的结果。
+#[derive(Clone, Copy)]
+pub struct MsrFrame {
+    /// 封装功率（瓦）；`None` = 本帧无有效读数（首轮建基线 / 驱动不可用）。
+    pub watts: Option<f32>,
+    /// Intel DRAM 能量域是否可用（`SystemPower` 据此与"内存条 ×5W"估算去重）。
+    pub dram_available: bool,
+}
+
+/// 连续超时多少次后放弃本会话的功耗采样。
+const MSR_TIMEOUT_GIVEUP: u32 = 3;
+
+fn msr_worker(req: std::sync::mpsc::Receiver<u64>, reply: std::sync::mpsc::Sender<MsrFrame>) {
+    let mut msr = MsrPower::new();
+    while let Ok(now_ms) = req.recv() {
+        let watts = msr.sample(now_ms);
+        if reply
+            .send(MsrFrame {
+                watts,
+                dram_available: msr.dram_available(),
+            })
+            .is_err()
+        {
+            break; // 调用方已丢弃回包通道（放弃或退出）
+        }
+    }
+}
+
+/// `MsrPower` 的超时隔离外壳，供采样线程持有。
+pub struct MsrPowerAsync {
+    req_tx: Option<std::sync::mpsc::Sender<u64>>,
+    reply_rx: Option<std::sync::mpsc::Receiver<MsrFrame>>,
+    /// 上一次请求还没回来（工作线程仍在设备调用里）。
+    in_flight: bool,
+    timeouts: u32,
+    disabled: bool,
+}
+
+impl Default for MsrPowerAsync {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MsrPowerAsync {
+    pub fn new() -> Self {
+        Self {
+            req_tx: None,
+            reply_rx: None,
+            in_flight: false,
+            timeouts: 0,
+            disabled: false,
+        }
+    }
+
+    /// 取一次功耗读数。返回 `None` = 本帧无可信读数（超时 / 已放弃 / 工作线程在路上），
+    /// 调用方按既有语义把功耗行置 `Unavailable`。
+    ///
+    /// 本函数**不会阻塞超过 `timeout_ms`**。
+    pub fn sample(&mut self, now_ms: u64, timeout_ms: u64) -> Option<MsrFrame> {
+        use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+        if self.disabled {
+            return None;
+        }
+        if self.in_flight {
+            // 上一轮派出去的任务还没回来：不重复派单。若回包已在队列里，说明
+            // 那次阻塞调用最终返回了 —— 收下迟到结果、复位状态，下一帧重新计时。
+            match self.reply_rx.as_ref().map(|rx| rx.try_recv()) {
+                Some(Ok(_)) => self.in_flight = false,
+                Some(Err(TryRecvError::Disconnected)) => {
+                    self.in_flight = false;
+                    self.drop_channels();
+                }
+                Some(Err(TryRecvError::Empty)) => {}
+                None => self.in_flight = false,
+            }
+            return None;
+        }
+        if self.req_tx.is_none() {
+            self.spawn_worker();
+        }
+        // 借用只在块内有效：块结束后才能改 self（记超时 / 放弃）。
+        let outcome = match (self.req_tx.as_ref(), self.reply_rx.as_ref()) {
+            (Some(tx), Some(rx)) => {
+                // 丢弃任何迟到的回包：只接受本次请求的结果，避免把上一轮的旧窗口当成新值。
+                while rx.try_recv().is_ok() {}
+                if tx.send(now_ms).is_err() {
+                    Err(RecvTimeoutError::Disconnected)
+                } else {
+                    rx.recv_timeout(std::time::Duration::from_millis(timeout_ms.max(1)))
+                }
+            }
+            _ => Err(RecvTimeoutError::Disconnected),
+        };
+        match outcome {
+            Ok(frame) => {
+                self.timeouts = 0;
+                Some(frame)
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                self.in_flight = true;
+                self.timeouts = self.timeouts.saturating_add(1);
+                probe::log(&format!(
+                    "msr timeout after {timeout_ms}ms (consecutive={}) — 功耗行本帧跳过，其余指标不受影响",
+                    self.timeouts
+                ));
+                if self.timeouts >= MSR_TIMEOUT_GIVEUP {
+                    self.disable("连续超时");
+                }
+                None
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.drop_channels();
+                None
+            }
+        }
+    }
+
+    fn spawn_worker(&mut self) {
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<u64>();
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<MsrFrame>();
+        let spawned = std::thread::Builder::new()
+            .name("msr-power".into())
+            .spawn(move || msr_worker(req_rx, reply_tx));
+        match spawned {
+            Ok(_) => {
+                self.req_tx = Some(req_tx);
+                self.reply_rx = Some(reply_rx);
+            }
+            Err(e) => {
+                probe::log(&format!("msr: 无法启动功耗线程（{e}）→ 本会话关闭功耗行"));
+                self.disable("线程创建失败");
+            }
+        }
+    }
+
+    fn drop_channels(&mut self) {
+        self.req_tx = None;
+        self.reply_rx = None;
+    }
+
+    fn disable(&mut self, why: &str) {
+        if self.disabled {
+            return; // 已经降级过：degrade 流要求"每个降级动作只记一次"
+        }
+        self.disabled = true;
+        // 丢弃请求通道：工作线程要么立刻 recv 到断开，要么从卡住的设备调用返回后
+        // 发现回包通道已死而退出；两条路都不会留下长期驻留的线程。
+        self.drop_channels();
+        self.in_flight = false;
+        probe::log(&format!(
+            "msr: {why} → 本会话停止功耗采样（行显示 --，重启应用恢复）"
+        ));
+        // 降级事件默认可见：调试日志关着也要留下"这一整行的 `--` 是从何时、为何起"。
+        probe::degrade(&format!(
+            "degrade: MSR 功耗源本会话放弃（{why}）—— 功耗行将持续显示 --，重启应用后重试"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    /// 采样热路径的锁**中毒后仍不得 panic**（审查项 7.2.1 / P1-20）。
+    ///
+    /// 只测 `lock_ring0()`，**不测 `ring0()`**：后者会真的 `OpenSCManager` 并尝试
+    /// 打开/启动内核驱动设备，单元测试不该带这种副作用（且在管理员机器上会留下服务状态）。
+    #[test]
+    fn poisoned_ring0_lock_still_usable() {
+        let h = std::thread::spawn(|| {
+            let _g = RING0.lock().unwrap_or_else(|e| e.into_inner());
+            panic!("故意在持锁时 panic，制造中毒状态");
+        });
+        let _ = h.join();
+        assert!(RING0.is_poisoned(), "前置条件失败：锁未被投毒");
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut g = lock_ring0();
+            g.take(); // 顺带复位，不把句柄留给后续测试
+        }));
+        RING0.clear_poison(); // 中毒是进程级状态，别外溢给同 crate 的其它测试
+        assert!(
+            outcome.is_ok(),
+            "lock_ring0() 在中毒时 panic —— 采样线程会从此每轮死亡、五个指标永久定格"
+        );
+    }
+}
+

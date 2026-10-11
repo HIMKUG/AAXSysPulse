@@ -1,0 +1,65 @@
+# 审查项 9.14 / 8B.M 勘误（批次 8）：
+#
+# 本文件原先的 4 个步骤**全都指向不存在的东西**——下载 Zig 0.11、执行仓库根的构建脚本
+# （v1 时代已删除）、把 `sysoverlay-c.exe` 压成 `sys-overlay-c.zip`、用 softprops/action-gh-release
+# 发布。也就是说：这条"发布流水线"从未构建过当前代码，任何人看它以为"发布是跑通的"。
+# 这正是审查报告 §9.14 把"从未跑过打包形态 ⇒ 只在打包后暴露的缺陷（9.15）活到今天"
+# 记为最要命一条的出处。
+#
+# 现在按项目当前口径（开发态为主、安装包产物未经人工核验 ⇒ 不做无人核验的发布）
+# 改成**只做构建 + 静态检查 + 测试**。三项在本地实测的基线见
+# docs/reviews/2026-09-21-修复记录-批次7.md §12。
+#
+# 若将来要恢复发布产物，需要先补齐：代码签名、NSIS 安装包实测、`resources/` 两个
+# 资源文件的来源核验（见批次 1–4 登记的 12 项待决策清单）。
+name: Build and Test
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  workspace:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: clippy
+
+      - name: Cache cargo target dir
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # ⚠️ 必须在【仓库根】跑：workspace 清单是根 Cargo.toml，
+      # sysoverlay/Cargo.toml 只是 app crate 的成员清单。
+      - name: cargo check (workspace, all targets)
+        run: cargo check --workspace --all-targets
+
+      # 不加 `-D warnings`：clippy 口径里有刻意保留的 warn 级项（见根 Cargo.toml
+      # [workspace.lints.clippy] 与各 crate 根的 cfg_attr），升级为 deny 是待决策项。
+      - name: cargo clippy (workspace, all targets)
+        run: cargo clippy --workspace --all-targets
+
+      - name: cargo test (workspace)
+        run: cargo test --workspace
+
+      # check-bridge.mjs 是 npm run build 的前置门禁：后端 generate_handler![]
+      # 与前端 invoke('cmd') 字面量对不上就直接失败（审查项 P1-12）。
+      - name: Guide frontend build (check-bridge + vite)
+        working-directory: guide-app
+        run: |
+          npm ci
+          npm run build

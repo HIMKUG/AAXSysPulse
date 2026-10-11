@@ -171,7 +171,7 @@ pub fn get_proc_pub(h: windows::Win32::Foundation::HMODULE, name: &str) -> *mut 
         n.push_str(name);
         n.push('\0');
         windows::Win32::System::LibraryLoader::GetProcAddress(
-            h, windows::core::PCSTR(n.as_ptr() as *const u8))
+            h, windows::core::PCSTR(n.as_ptr()))
             .map(|f| f as *mut c_void)
             .unwrap_or(std::ptr::null_mut())
     }
@@ -567,7 +567,7 @@ impl Adl {
                             }
                         }
                         card_util = pmlog_sensor(&out, ADL_PMLOG_INFO_ACTIVITY_GFX)
-                            .map(|a| (a.max(0).min(100)) as f32);
+                            .map(|a| a.clamp(0, 100) as f32);
                         if probing {
                             self.probe_rounds
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

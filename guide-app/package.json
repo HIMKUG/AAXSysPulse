@@ -1,0 +1,23 @@
+{
+  "name": "aaxsyspulse-guide",
+  "private": true,
+  "version": "0.7.1",
+  "type": "module",
+  "description": "AAXSysPulseC 引导程序（14 页拆分方案 · Liquid Glass 设计）",
+  "scripts": {
+    "dev": "vite",
+    "check-bridge": "node scripts/check-bridge.mjs",
+    "build": "node scripts/check-bridge.mjs && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "vue": "^3.4.21"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
+    "@vitejs/plugin-vue": "^5.2.4",
+    "vite": "^6.4.3"
+  }
+}

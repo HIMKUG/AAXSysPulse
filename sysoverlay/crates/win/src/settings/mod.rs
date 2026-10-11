@@ -68,6 +68,10 @@ use state::{Action, EditState, Interaction, Page, WidgetState};
 use tasks::DebouncedSave;
 
 use cfg_ref::{CfgRef, Value};
+
+/// 监控项容量（柔性框架）：恒随 `Metric::COUNT` 扩展，设置页逐指标数组一律用它。
+const N_METRICS: usize = aaxsyspulse_core::types::Metric::COUNT;
+
 use layout::{
     build_pages, content_origin, content_viewport, page_caption, s, CARD_PAD, CARD_RADIUS,
     CAPTION_GAP, CAPTION_H, FOOTNOTE_H,
@@ -100,7 +104,7 @@ const WM_CAPTURECHANGED: u32 = 0x0215;
 const WM_KEYDOWN: u32 = 0x0100;
 const WM_CHAR: u32 = 0x0102;
 const WM_KILLFOCUS: u32 = 0x0008;
-const WM_DIAG_CLICK: u32 = 0x8000 + 41;
+const WM_DIAG_CLICK: u32 = aaxsyspulse_core::contract::WM_DIAG_CLICK;
 const WM_TIMER: u32 = 0x0113;
 const WM_GETMINMAXINFO: u32 = 0x0024;
 const WM_SIZE: u32 = 0x0005;
@@ -183,7 +187,7 @@ struct SettingsCtx {
     /// 正在编辑的输入框（buf/caret）。
     edit: Option<EditState>,
     /// 各指标配置卡的展开态（UI 状态，不落盘）。v4：含 DiskRead/DiskWrite。
-    metric_expanded: [bool; 9],
+    metric_expanded: [bool; N_METRICS],
     /// 滚轮惯性的滚动速度（px/s），橡胶边界用。
     scroll_vel: f32,
     /// 当前客户区尺寸（WM_SIZE 更新，rebuild_pages 与命中测试用）。
@@ -212,7 +216,7 @@ struct SettingsCtx {
     /// 侧边栏选中胶囊的滑动脉簧（值 = 页面下标）。
     nav_sel: motion::Spring,
     /// 各指标折叠卡的动画展开度（0..1）。v4：含 DiskRead/DiskWrite。
-    metric_expand_t: [motion::Spring; 9],
+    metric_expand_t: [motion::Spring; N_METRICS],
     /// 上一帧是否仍在推进布局类弹簧（收敛后再补一次重排）。
     layout_anim_active: bool,
     /// 翻页弹簧：水平位移（px，从 24 滑入到 0）。
@@ -244,13 +248,13 @@ struct SettingsCtx {
     /// 换位滑动弹簧（逐指标，值 = 相对基准槽位的额外 y 位移，目标恒为 0）。
     /// 换位时把「对面那张卡」弹到它的旧视觉位置，再由弹簧滑回新槽位 ——
     /// 这就是「一张张卡片挪动」的非线性动画。
-    card_slide: [motion::Spring; 9],
+    card_slide: [motion::Spring; N_METRICS],
     /// 拖拽释放时的落位弹簧动画状态（None = 无进行中释放动画）。
     drag_release: Option<ReleaseInfo>,
     /// 松手后被拖卡自己的落位弹簧（逐指标）：从拖动偏移量 spring 到 0，
     /// 弹簧收敛后才触发真正的 rebuild_pages（确保卡槽无空隙）。
     /// v4：含 DiskRead/DiskWrite。
-    metric_release: [motion::Spring; 9],
+    metric_release: [motion::Spring; N_METRICS],
     /// 滚动条拖拽状态：`Some(grab)` = 正在拖，`grab` = 按下点相对拇指顶缘的偏移
     /// （client px）。None = 未在拖。
     ///
@@ -272,10 +276,10 @@ struct PageAnim;
 /// base 可由 `rect.top - y_off` 反推 —— rebuild 换位与增量平移两条路径都成立。
 #[derive(Clone, Copy)]
 struct CardDrag {
-    /// 被拖指标下标（0..=8；id 键控，不随显示位置变化）。
+    /// 被拖指标下标（0..Metric::COUNT；id 键控，不随显示位置变化）。
     metric: usize,
-    /// 拖动预览中的显示顺序（换位即时更新，抬手才落盘）。v4 含 DiskRead/DiskWrite。
-    order: [u8; 9],
+    /// 拖动预览中的显示顺序（换位即时更新，抬手才落盘）。
+    order: [u8; N_METRICS],
     /// 抓取点相对被拖卡顶缘的偏移（按下时确定，恒定 → 贴手）。
     grab_dy: i32,
     /// 被拖卡当前 y 偏移（rect 相对 base 布局位置）。
@@ -492,12 +496,18 @@ fn create_dialog(overlay: HWND) {
         let Ok(hinst) = GetModuleHandleW(None) else { return };
 
         static REGISTERED: std::sync::Once = std::sync::Once::new();
+        // 类名由契约常量运行期转宽字符（审查项 7.1.2 / P1-22），本函数内两个
+        // 使用点（注册 + 建窗）共用同一份缓冲，`class_w` 必须活过 CreateWindowExW。
+        let class_w = aaxsyspulse_core::contract::wide_of(
+            aaxsyspulse_core::contract::SETTINGS_WINDOW_CLASS,
+        );
+        let class_pcw = windows::core::PCWSTR(class_w.as_ptr());
         REGISTERED.call_once(|| {
             let wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
                 lpfnWndProc: Some(settings_wndproc),
                 hInstance: hinst.into(),
-                lpszClassName: windows::core::w!("AAXSysPulse_Settings"),
+                lpszClassName: class_pcw,
                 hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH::default(),
                 ..Default::default()
             };
@@ -531,7 +541,7 @@ fn create_dialog(overlay: HWND) {
 
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
-            windows::core::w!("AAXSysPulse_Settings"),
+            class_pcw,
             windows::core::PCWSTR(title_wide.as_ptr()),
             WS_POPUP | WS_MINIMIZEBOX,
             x,
@@ -562,7 +572,7 @@ fn create_dialog(overlay: HWND) {
             page_anim: None,
             interaction: Interaction::Idle,
             edit: None,
-            metric_expanded: [false; 9],
+            metric_expanded: [false; N_METRICS],
             scroll_vel: 0.0,
             client_size: (w, h),
             nav_hover: None,
@@ -574,7 +584,7 @@ fn create_dialog(overlay: HWND) {
             spatial_grids: Vec::new(),
             transitions: std::collections::HashMap::new(),
             nav_sel: motion::Spring::new(0.0),
-            metric_expand_t: [motion::Spring::new(0.0); 9],
+            metric_expand_t: [motion::Spring::new(0.0); N_METRICS],
             layout_anim_active: false,
             page_slide: motion::Spring::new(0.0),
             page_fade: motion::Spring::new(1.0),
@@ -589,9 +599,9 @@ fn create_dialog(overlay: HWND) {
             status: None,
             stepper_hold: None,
             card_drag: None,
-            card_slide: [motion::Spring::new(0.0); 9],
+            card_slide: [motion::Spring::new(0.0); N_METRICS],
             drag_release: None,
-            metric_release: [motion::Spring::new(0.0); 9],
+            metric_release: [motion::Spring::new(0.0); N_METRICS],
             sb_drag: None,
             sb_hover: false,
         };
@@ -856,7 +866,7 @@ fn step_drag_release(ctx: &mut SettingsCtx, dt: f32) -> bool {
     if settled {
         ctx.drag_release = None;
         ctx.card_drag = None;
-        ctx.metric_release = [motion::Spring::new(0.0); 9];
+        ctx.metric_release = [motion::Spring::new(0.0); N_METRICS];
     }
     settled
 }
@@ -905,7 +915,7 @@ fn show_teardown_notice(overlay: HWND, i18n_key: &str) {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    let caption: Vec<u16> = "AAXSysPulse\0".encode_utf16().collect();
+    let caption = aaxsyspulse_core::contract::wide_of(aaxsyspulse_core::contract::APP_TECH_NAME);
     crate::probe::log(&format!("teardown notice shown: {i18n_key}"));
     unsafe {
         MessageBoxW(
@@ -967,6 +977,17 @@ fn dispatch(ctx: &mut SettingsCtx, action: Action) {
                         CfgRef::ClickThrough => {
                             window::apply_click_through(overlay, cfg.click_through);
                         }
+                        CfgRef::AutoStart => {
+                            // 「开机自启」必须**立刻**落到系统侧：只改内存的话，
+                            // 注册表 Run 项要等下次启动 main.rs 的 apply(cfg.autostart)
+                            // 才写 —— 而那条路径只在程序已被启动时才跑（鸡生蛋），
+                            // 用户开着开关直接重启 = 什么都没发生（"开机自启失效"）。
+                            //
+                            // 必须异步：apply_user 可能弹 UAC 并阻塞至多 60s
+                            // （删计划任务需提权），这里是 UI 线程，同步调用会冻结
+                            // 整个程序。成败由 WM_AUTOSTART_DONE 异步回报。
+                            crate::autostart::apply_user_async(overlay, cfg.autostart);
+                        }
                         CfgRef::PowerEnabled if !cfg.power_enabled => {
                             // v3「行关即完全停止」：MSR 内核驱动会被卸载，
                             // 本会话重开不热恢复 → 原生弹窗告知重启恢复。
@@ -974,7 +995,7 @@ fn dispatch(ctx: &mut SettingsCtx, action: Action) {
                         }
                         CfgRef::ShowGpu
                             if !cfg.show_gpu
-                                && !(cfg.power_enabled && cfg.power_query)
+                                && (!cfg.power_enabled || !cfg.power_query)
                                 && !cfg.show_util =>
                         {
                             // 厂商驱动库（NVML/ADL）只在「GPU 行、功耗行、Util 行
@@ -1161,7 +1182,7 @@ fn open_log_folder(ctx: &mut SettingsCtx) {
         return;
     };
     use std::os::windows::ffi::OsStrExt;
-    let dir = std::path::PathBuf::from(dir).join("AAXSysPulseC");
+    let dir = std::path::PathBuf::from(dir).join(aaxsyspulse_core::contract::APP_DATA_DIR_NAME);
     let _ = std::fs::create_dir_all(&dir);
     let dir_w: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
     let verb: Vec<u16> = "open\0".encode_utf16().collect();
@@ -1362,12 +1383,14 @@ fn open_color_picker(ctx: &mut SettingsCtx, color_cfg: CfgRef, auto_cfg: Option<
     });
 
     let Ok(mut cust) = CUST.lock() else { return };
-    let mut cc = CHOOSECOLORW::default();
-    cc.lStructSize = std::mem::size_of::<CHOOSECOLORW>() as u32;
-    cc.hwndOwner = find_hwnd(ctx);
-    cc.rgbResult = COLORREF(cur.map(|rgb| rgb.to_colorref()).unwrap_or(0x00FF_FFFF));
-    cc.lpCustColors = cust.as_mut_ptr();
-    cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+    let mut cc = CHOOSECOLORW {
+        lStructSize: std::mem::size_of::<CHOOSECOLORW>() as u32,
+        hwndOwner: find_hwnd(ctx),
+        rgbResult: COLORREF(cur.map(|rgb| rgb.to_colorref()).unwrap_or(0x00FF_FFFF)),
+        lpCustColors: cust.as_mut_ptr(),
+        Flags: CC_FULLOPEN | CC_RGBINIT,
+        ..Default::default()
+    };
 
     MODAL_DIALOG.store(true, Ordering::SeqCst);
     let ok = unsafe { ChooseColorW(&mut cc) }.as_bool();
@@ -2098,14 +2121,14 @@ unsafe fn on_wm_lbuttondown(hwnd: HWND, _msg: u32, _wparam: WPARAM, lparam: LPAR
             {
             // 开始新的拖拽前，清理可能残留的释放落位动画（避免新旧状态打架）。
             ctx.drag_release = None;
-            ctx.metric_release = [motion::Spring::new(0.0); 9];
+            ctx.metric_release = [motion::Spring::new(0.0); N_METRICS];
             let mi = mh.index;
             let order = ctx
             .card_drag
             .as_ref()
             .map(|d| d.order)
             .unwrap_or_else(|| {
-            ctx.cfg().map(|c| c.metric_order).unwrap_or([0, 1, 2, 6, 3, 4, 5, 7, 8])
+            ctx.cfg().map(|c| c.metric_order).unwrap_or([0, 1, 2, 6, 3, 5, 4, 7, 8])
             });
             let pos = order.iter().position(|&m| m as usize == mi).unwrap_or(0);
             let card_top = ctx.pages[ctx.page]
@@ -2114,7 +2137,7 @@ unsafe fn on_wm_lbuttondown(hwnd: HWND, _msg: u32, _wparam: WPARAM, lparam: LPAR
             .map(|c| c.rect.top)
             .unwrap_or(cpt.0.y);
             // 清空上一次拖拽残留的换位弹簧（避免旧偏移串到本次）。
-            ctx.card_slide = [motion::Spring::new(0.0); 9];
+            ctx.card_slide = [motion::Spring::new(0.0); N_METRICS];
             ctx.card_drag = Some(CardDrag {
             metric: mi,
             order,
@@ -2154,8 +2177,7 @@ unsafe fn on_wm_lbuttonup(hwnd: HWND, _msg: u32, _wparam: WPARAM, lparam: LPARAM
             // 卡片拖拽排序收尾：moved → 弹簧落位动画；未动 → 按点击处理（展开/收起）。
             // 注意：保留 card_drag（不为 None），这样 paint_page 知道在拖；
             // step_drag_release 收敛后才清空并触发 rebuild_pages。
-            if ctx.card_drag.is_some() {
-            let d = ctx.card_drag.unwrap(); // 借来读数据（card_drag 保留，不要 take）
+            if let Some(d) = ctx.card_drag { // 拷出来读（CardDrag: Copy），card_drag 保留不要 take
             ctx.interaction = Interaction::Idle;
             let _ = ReleaseCapture();
             if d.moved {
@@ -2245,8 +2267,7 @@ unsafe fn on_wm_capturechanged(hwnd: HWND, _msg: u32, _wparam: WPARAM, _lparam: 
             let _ = InvalidateRect(hwnd, None, false);
             }
             // 若拖拽中被打断：启动落位动画（与正常松手同处理路径）。
-            if ctx.card_drag.is_some() {
-            let d = ctx.card_drag.unwrap();
+            if let Some(d) = ctx.card_drag {
             if d.moved {
             apply_config(ctx, |cfg| {
             if cfg.metric_order != d.order {
@@ -2299,12 +2320,14 @@ unsafe fn on_wm_timer(hwnd: HWND, _msg: u32, wparam: WPARAM, _lparam: LPARAM) ->
             } else if wparam.0 == STEPPER_TIMER {
             // 步进器长按连发：仍在按住同一控件则步进并续期，否则停止。
             if let Some(ctx) = ctx_of(hwnd) {
-            let holding = match (&ctx.interaction, ctx.stepper_hold) {
-            (Interaction::Pressing { widget }, Some((hi, _))) => *widget == hi,
-            _ => false,
+            // 连发条件成立时把持有值一起带出来：旧写法判完 `holding` 再
+            // `stepper_hold.unwrap()`，中间隔着一次 `stepper_step` 的可变性，
+            // 属"当时不会炸"而不是"不可能炸"（审查项 7.2.1 / P1-20）。
+            let held = match (&ctx.interaction, ctx.stepper_hold) {
+            (Interaction::Pressing { widget }, Some(v)) if *widget == v.0 => Some(v),
+            _ => None,
             };
-            if holding {
-            let (idx, dir) = ctx.stepper_hold.unwrap();
+            if let Some((idx, dir)) = held {
             stepper_step(ctx, idx, dir);
             start_timer(hwnd, STEPPER_TIMER, STEPPER_REPEAT_MS);
             } else {
@@ -3045,12 +3068,12 @@ fn paint_page(
     oy: f32,
     body: f32,
     caption: f32,
-    _metric_expanded: &[bool; 9],
+    _metric_expanded: &[bool; N_METRICS],
     drag_pos: Option<usize>,
     transitions: &mut std::collections::HashMap<(usize, i32), Transition>,
-    card_slide: &[motion::Spring; 9],
+    card_slide: &[motion::Spring; N_METRICS],
     drag_release: Option<&ReleaseInfo>,
-    metric_release: &[motion::Spring; 9],
+    metric_release: &[motion::Spring; N_METRICS],
     dt: f32,
     focus: Option<usize>,
     keyboard_mode: bool,

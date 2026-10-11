@@ -449,12 +449,9 @@ fn parse(d: &str) -> Vec<PathSeg> {
             'a' => {
                 // SVG 椭圆弧（Fluent 图标大量使用）→ 升为 ≤90° 的三次贝塞尔段。
                 // 参数组：rx ry rot large sweep x y，可连续重复（隐式重复同一命令）。
-                loop {
-                    let (Some(rx), Some(ry), Some(rot)) =
-                        (read_num(&mut i), read_num(&mut i), read_num(&mut i))
-                    else {
-                        break;
-                    };
+                while let (Some(rx), Some(ry), Some(rot)) =
+                    (read_num(&mut i), read_num(&mut i), read_num(&mut i))
+                {
                     let (Some(large), Some(sweep)) = (read_flag(&mut i), read_flag(&mut i)) else {
                         break;
                     };

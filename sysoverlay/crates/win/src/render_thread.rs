@@ -52,7 +52,7 @@ pub fn start() {
     crate::gdi::begin_render_generation();
     // 本线程捕获自己的世代号（此后不再变），随每次帧心跳回写。
     let my_gen = crate::gdi::render_generation();
-    let _ = std::thread::Builder::new()
+    let spawn_result = std::thread::Builder::new()
         .name("overlay-render".into())
         .spawn(move || {
             // 启动期预热（2026-09-14）：把 DWrite 首次字体解析的一次性成本
@@ -84,6 +84,18 @@ pub fn start() {
                 }
             }
         });
+    // 2.2.9：spawn 结果原本被 `let _ =` 直接丢弃。失败时通道里仍留着一个 Sender，
+    // `request()` 以为有人消费 ⇒ 悬浮窗永久不重绘，而看门狗每 30 s 又 respawn 一次
+    // （每次都同样失败）⇒ 静默死循环、日志零线索。收回 Sender 让 request() 走
+    // 它的"未启动"分支，并把失败原因落进日志（唯一能归因的地方）。
+    if let Err(e) = spawn_result {
+        crate::probe::log(&format!(
+            "rt: thread spawn FAILED ({e}) -> 渲染通道已关闭，悬浮窗不会再重绘"
+        ));
+        if let Ok(mut g) = RENDER_TX.lock() {
+            *g = None;
+        }
+    }
 }
 
 /// 只发布配置镜像、不投递渲染请求。
@@ -170,4 +182,13 @@ pub fn request(hwnd: HWND, cfg: &Config) {
         // 通道不可用（未启动/正在 respawn）：交还排队权，下一个请求重试。
         RENDER_QUEUED.store(false, Ordering::Relaxed);
     }
+}
+
+/// 交还"排队权"（供 `gdi::request_render` 的跨线程唤醒失败时使用，审查项 2.1.3）。
+///
+/// `RENDER_EPOCH` 已自增而唤醒消息没投出去时，若 `RENDER_QUEUED` 仍为 true，
+/// 下一次 `request()` 会在 `:174` 直接 return —— 于是"已请求但无人被叫醒"
+/// 要等 30 s 纪元判据 respawn 才自愈。清掉标志后，下一个请求立刻重试投递。
+pub(crate) fn note_wake_lost() {
+    RENDER_QUEUED.store(false, Ordering::Relaxed);
 }

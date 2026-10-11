@@ -4,6 +4,9 @@
 //! 而是是否收到 `NIN_BALLOONSHOW` 回调 —— 那是系统在气泡真正显示时发的。
 //!
 //! 运行：`cargo run -p aaxsyspulse-win --example balloon_probe`
+//!
+//! 这是**开发探针**，不是产品代码：只在 `--examples` / `--all-targets` 下编译，
+//! `cargo build --release -p aaxsyspulse-app` 的发布物里不含它。
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -16,7 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TranslateMessage, MSG, WINDOW_EX_STYLE, WS_OVERLAPPED,
 };
 
-const WM_TRAY: u32 = 0x8000 + 1;
+const WM_TRAY: u32 = aaxsyspulse_core::contract::WM_TRAY;
 /// 气泡相关回调（lParam 低 16 位）
 const NIN_BALLOONSHOW: u32 = 0x0402;
 const NIN_BALLOONHIDE: u32 = 0x0403;
@@ -75,7 +78,7 @@ fn main() {
         };
         RegisterClassExW(&wc);
 
-        let hwnd = CreateWindowExW(
+        let hwnd = match CreateWindowExW(
             WINDOW_EX_STYLE(0),
             windows::core::w!("BalloonProbeCls"),
             windows::core::w!("probe"),
@@ -88,8 +91,17 @@ fn main() {
             None,
             hinst,
             None,
-        )
-        .expect("create window");
+        ) {
+            // 探针的失败口径（审查项 P1-20 余部）：examples 不参与 `cargo build --release`
+            // 的发布物（只有 `--examples` / `--all-targets` 才编译它），但它仍在
+            // 「非测试代码不得 panic」这条统计口径里被人工逐条过一遍 ——
+            // 与其留一个 `expect` 解释"为什么可以"，不如直接不走 panic。
+            Ok(hwnd) => hwnd,
+            Err(e) => {
+                eprintln!("balloon_probe: 创建窗口失败（{e}），探针中止");
+                return;
+            }
+        };
 
         // ── 1. 添加托盘图标（用真实的应用图标） ──
         let mut nid = NOTIFYICONDATAW {

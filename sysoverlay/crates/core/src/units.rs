@@ -71,8 +71,8 @@ impl StrBuf {
         }
     }
 
-    /// 写入无符号整数（十进制）。
-    fn push_u64(&mut self, mut v: u64) {
+    /// 写入无符号整数（十进制）。无分配、无 panic、缓冲满即截断。
+    pub fn push_u64(&mut self, mut v: u64) {
         if v == 0 {
             self.push_byte(b'0');
             return;

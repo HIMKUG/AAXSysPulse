@@ -83,7 +83,7 @@ pub const CLOCK_TIMER_ID: usize = 8;
 static CLOCK_TIMER_MODE: AtomicU8 = AtomicU8::new(0);
 
 /// 最近一次成功整窗上传时的时钟秒值。局部脏区上传（UpdateLayeredWindowIndirect
-/// + prcDirty）在部分合成器（本机实测）上不会触发该子区重混 → 时间单元格每秒
+/// `+ prcDirty`）在部分合成器（本机实测）上不会触发该子区重混 → 时间单元格每秒
 /// 都上传了但屏幕不更新，只有等下一次整窗重绘机会才"攒着一起显现"——视觉上
 /// 就是时间跟着调度器几秒一跳。秒变化时强制 Full 上传（每秒 1 次），其余帧
 /// 仍走脏区优化。
@@ -249,6 +249,48 @@ static DIRTY_DISABLED: LazyLock<bool> =
 /// 指纹回滚保证重试帧不被跳过，本闸门保证重试帧整窗覆盖（缺一会冻结）。
 static NEEDS_FULL_REUPLOAD: AtomicBool = AtomicBool::new(false);
 
+// ─── 脏矩形运行期自适应（审查项 2.2.8 / P2-4）─────────────────
+//
+// 上面的闸门是**逐帧**兜底：失败一帧 → 下一帧整窗。如果失败是稳态性的
+// （驱动/远程桌面/异常显示栈下 ULWIndirect 持续返回失败），就会退化成
+// "每帧都先失败再整窗"——每帧成本翻倍且永远不回本，而项目里只有
+// `AAXSYSPULSE_NODIRTY` 这个**手动**开关。这里补上运行期自动降级：
+// 连续失败到阈值即永久关闭脏矩形（本进程生命周期），并只记一次日志。
+const DIRTY_AUTOCUTOFF_STREAK: u32 = 30;
+static PRESENT_FAIL_STREAK: AtomicU32 = AtomicU32::new(0);
+static DIRTY_AUTO_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// 脏矩形是否停用：手动开关 ∨ 运行期自动降级。
+fn dirty_disabled() -> bool {
+    *DIRTY_DISABLED || DIRTY_AUTO_DISABLED.load(AtomicOrdering::Relaxed)
+}
+
+/// 降级判据（纯函数，便于单测边界）：连续失败到阈值即关闭脏矩形。
+fn should_autocutoff(streak: u32) -> bool {
+    streak >= DIRTY_AUTOCUTOFF_STREAK
+}
+
+/// 上屏失败：记账 + 置整窗兜底闸门 + 到阈值自动关闭脏矩形优化。
+fn note_present_failure(label: &str) {
+    let streak = PRESENT_FAIL_STREAK.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+    NEEDS_FULL_REUPLOAD.store(true, AtomicOrdering::Relaxed);
+    crate::probe::log(&format!("{label}: UpdateLayeredWindow failed"));
+    if should_autocutoff(streak) && !DIRTY_AUTO_DISABLED.swap(true, AtomicOrdering::Relaxed) {
+        crate::probe::log(&format!(
+            "present: 连续 {streak} 帧上屏失败 → 自动关闭脏矩形优化，本进程改走整窗上传（等同 AAXSYSPULSE_NODIRTY=1）"
+        ));
+        // 一次性降级事件必须默认可见（`swap` 已保证本进程只记这一条）。
+        crate::probe::degrade(&format!(
+            "degrade: 连续 {streak} 帧上屏失败 → 本进程永久关闭脏矩形优化（等同 AAXSYSPULSE_NODIRTY=1）"
+        ));
+    }
+}
+
+/// 上屏成功：清零连续失败计数（只有**连续**失败才说明是稳态问题）。
+fn note_present_success() {
+    PRESENT_FAIL_STREAK.store(0, AtomicOrdering::Relaxed);
+}
+
 /// 诊断开关（`AAXSYSPULSE_NODRAW=1`）：D2D 路径跳过 `paint_cells`，但保留
 /// `begin_draw` / `clear` / `end_draw`。用于判定 `seg_d2d_end` 的成本性质——
 /// 随内容变化 = 真在光栅化；基本不变 = 固定 flush/提交开销（2026-09-14 调查用）。
@@ -315,6 +357,30 @@ static WEDGE_RESPAWNED: AtomicBool = AtomicBool::new(false);
 /// 这类阻塞）——`WEDGE_RESPAWNED` 只在"一次停摆"内幂等，帧恢复后 `clear_wedge_gate`
 /// 会复位它，于是"卡死→恢复→再卡死"可以无限循环、线程无限累积。这里加会话级硬上限。
 static RESPAWN_COUNT: AtomicU32 = AtomicU32::new(0);
+/// 会话级 respawn 硬上限（2.2.9）。
+///
+/// 3 的来历：每次 respawn **必然遗留**一个可能永久卡在原生调用里的旧线程（Windows
+/// 无法取消这类阻塞），而进程能承受的泄漏线程数是个位数而非几十；3 次足够覆盖
+/// "偶发驱动毛刺 → 新线程即恢复"，第 4 次仍卡死则说明是持久性故障，重开线程无收益。
+/// 两条 respawn 路径（卡帧 / 纪元停滞）**必须共用这一个预算**，否则各看一半、
+/// 合计上限翻倍，且停滞那条完全没有闸门。
+const RESPAWN_BUDGET: u32 = 3;
+/// 取一次 respawn 预算：有则计数 +1 并返回 true，用尽返回 false（并只记一次日志）。
+fn take_respawn_budget(reason: &str) -> bool {
+    let n = RESPAWN_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+    if n < RESPAWN_BUDGET {
+        return true;
+    }
+    RESPAWN_COUNT.fetch_sub(1, AtomicOrdering::Relaxed); // 用尽不再累计
+    if !RESPAWN_GAVE_UP.swap(true, AtomicOrdering::Relaxed) {
+        crate::probe::log(&format!(
+            "render watchdog: respawn cap ({RESPAWN_BUDGET}) reached ({reason}) — 不再新建渲染线程，保持当前渲染后端"
+        ));
+    }
+    false
+}
+/// 预算耗尽日志只打一次。
+static RESPAWN_GAVE_UP: AtomicBool = AtomicBool::new(false);
 /// 软停摆日志只打一次（直到帧恢复清零）。
 static WATCHDOG_WEDGED: AtomicBool = AtomicBool::new(false);
 
@@ -408,14 +474,11 @@ pub fn render_watchdog_tick(now_ms: u64) -> WatchdogAction {
             // 幂等闸门：本次停摆只触发一次 respawn。旧线程即使永不返回，
             // 也不会被反复重开（不会无限泄漏线程）。
             if !WEDGE_RESPAWNED.swap(true, AtomicOrdering::Relaxed) {
-                // 会话级硬上限：超过 3 次不再新建线程（旧线程无法回收），
+                // 会话级硬上限：超过 RESPAWN_BUDGET 次不再新建线程（旧线程无法回收），
                 // 直接落到下面的 D2D 回退分支，避免线程无限累积。
-                if RESPAWN_COUNT.fetch_add(1, AtomicOrdering::Relaxed) < 3 {
+                if take_respawn_budget("frame wedge") {
                     return WatchdogAction::Respawn; // 触发一次 respawn
                 }
-                crate::probe::log(
-                    "render watchdog: respawn cap (3) reached — will not spawn more render threads",
-                );
             }
             // 已 respawn 过但当前世代仍在途超过阈值 → 新线程也卡住了。
             // 优先按「D2D 原生调用卡死」处置：禁用 D2D 并持久化回退 GDI。
@@ -451,7 +514,17 @@ pub fn render_watchdog_tick(now_ms: u64) -> WatchdogAction {
         ));
     }
     if stalled_for > STALL_RESPAWN_MS {
-        WatchdogAction::Respawn
+        // 2.2.9：这条分支原本**完全没有上限** —— 纪元停滞每个采样 tick 都会再走到这里，
+        // 而 respawn 出来的新线程若同样起不来/卡死，就每 30s 遗留一条死线程，
+        // 线程与内核句柄单调增长直到进程资源耗尽。
+        // 与卡帧分支共用 `RESPAWN_BUDGET`；用尽后**只做一次告知式日志并收手**：
+        // 不再 respawn（那只会继续泄漏），也不擅自禁 D2D（纪元停滞的成因可能是
+        // `UpdateLayeredWindow` 阻塞，与 D2D 无关，误禁会永久降画质）。
+        if take_respawn_budget("epoch stall") {
+            WatchdogAction::Respawn
+        } else {
+            WatchdogAction::None
+        }
     } else {
         WatchdogAction::None
     }
@@ -462,13 +535,22 @@ pub fn render_watchdog_tick(now_ms: u64) -> WatchdogAction {
 /// 这里；秒对齐 CLOCK 定时器的例行唤醒**不得**自增纪元（否则快速路径失效）。
 pub fn request_render(hwnd: HWND) {
     RENDER_EPOCH.fetch_add(1, AtomicOrdering::Relaxed);
-    unsafe {
-        let _ = PostMessageW(
+    // ⚠️ 返回值必须判（审查项 2.1.3）：纪元已在上一行自增，投不出去就是
+    // 「标记为已请求、但没人被叫醒」。旧写法 `let _ =` 把它整个吞掉，最坏要等
+    // 30 s 纪元判据触发 respawn 才暴露；现在交还排队权 + 留痕 ⇒ 下一个请求即刻重试。
+    let wake = unsafe {
+        PostMessageW(
             hwnd,
             crate::window::WM_NEW_SNAPSHOT,
             windows::Win32::Foundation::WPARAM(0),
             windows::Win32::Foundation::LPARAM(0),
-        );
+        )
+    };
+    if let Err(e) = wake {
+        crate::render_thread::note_wake_lost();
+        crate::probe::log(&format!(
+            "gdi: 渲染唤醒消息投递失败（{e}）—— 已交还排队权，下一个请求重试"
+        ));
     }
 }
 
@@ -491,6 +573,16 @@ fn invalidate_present_size() {
 /// 并回退 Gdi——否则配置持久为 `render_engine=D2d` 时重启也会进 D2D 卡死，
 /// 用户无法从设置里改回来（「设置也打不开」）。
 static D2D_BROKEN: AtomicBool = AtomicBool::new(false);
+
+/// 连续多少**帧**D2D 绘制失败才判定"本机 D2D 不可用"并持久回退 GDI。
+///
+/// 经验值，不是推导出来的（审查项 7.1.4）：单次失败极常见（设备丢失、DIB 绑定
+/// 暂时失败），一次就永久回退过于激进 —— 每次失败本帧都已由 GDI 兜底上屏，
+/// 用户看不到异常；但连续 5 帧（默认 1s 刷新 ≈ 5 秒）仍失败，说明是可复现的
+/// 驱动/工厂级失效，继续逐帧重试只是白付 try-失败-回退的开销。
+/// 调大 = 更可宽容但真坏的机器上多浪费 N 帧；调小 = 更快永久回退，可能误伤
+/// 一次性的设备丢失。改这里不影响 panic 分支（panic 仍立即回退）。
+const D2D_BIND_FAIL_THRESHOLD: u32 = 5;
 
 /// 看门狗 DisableD2d 动作的公开入口（供采样线程在持有 hwnd 时调用）。
 pub fn disable_d2d_and_persist(hwnd: HWND) {
@@ -518,14 +610,29 @@ pub fn apply_d2d_fallback_ui(hwnd: HWND) {
 /// 同步 fsync 写盘 —— 与 UI 线程 wndproc 构成真实 data race（UB），且与退出落盘
 /// 竞争同一个 `.tmp` 文件。现改为只置原子标志 + 投递消息，配置改动全部由 UI 线程做。
 fn mark_d2d_broken_and_persist_gdi(hwnd: HWND) {
-    D2D_BROKEN.store(true, AtomicOrdering::Release);
-    unsafe {
-        let _ = PostMessageW(
+    // `swap` 的旧值 = "本进程是否第一次熔断"，用来给 degrade 流去重
+    // （调用方有两处：渲染线程失败分支 + 采样线程看门狗，可能连着各调一次）。
+    let first = !D2D_BROKEN.swap(true, AtomicOrdering::SeqCst);
+    if first {
+        crate::probe::degrade(
+            "degrade: D2D 渲染失败 → 本会话改用 GDI 绘制，并请求把 render_engine 永久回退为 Gdi",
+        );
+    }
+    // 本会话的禁用靠上面的原子标志已经生效；投给 UI 线程的消息只负责**持久化**。
+    // 投失败 = 下次启动仍按 D2D 起跑（然后再走一遍这里）⇒ 不重试、不 panic，
+    // 但必须留痕（审查项 2.1.3 同族：静默丢弃返回值让人以为已经落盘）。
+    let wake = unsafe {
+        PostMessageW(
             hwnd,
             crate::window::WM_DISABLE_D2D,
             windows::Win32::Foundation::WPARAM(0),
             windows::Win32::Foundation::LPARAM(0),
-        );
+        )
+    };
+    if let Err(e) = wake {
+        crate::probe::log(&format!(
+            "gdi: WM_DISABLE_D2D 投递失败（{e}）—— 本会话已禁 D2D，但配置回退未落盘"
+        ));
     }
 }
 
@@ -682,10 +789,10 @@ pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config) {
                     // 本帧 D2D 绘制失败（bind 失败/设备丢失等）。⚠️ 关键修复：
                     // 旧实现直接 return → 每帧都空过 → 悬浮窗整体消失（用户实测
                     // 「切渲染模式后悬浮窗不见了」的根因）。现在立即走 GDI 分支
-                    // 兜底上屏；连续失败 5 次判定 D2D 不可用并持久回退。
+                    // 兜底上屏；连续失败达阈值判定 D2D 不可用并持久回退。
                     let n = D2D_FAILS.fetch_add(1, AtomicOrdering::Relaxed) + 1;
                     crate::probe::log(&format!("d2d frame failed x{n} → gdi fallback this frame"));
-                    if n >= 5 {
+                    if n >= D2D_BIND_FAIL_THRESHOLD {
                         D2D_FAILS.store(0, AtomicOrdering::Relaxed);
                         mark_d2d_broken_and_persist_gdi(hwnd);
                     }
@@ -1077,6 +1184,7 @@ impl DibCache {
 /// - `Dirty::Full` 或 `AAXSYSPULSE_NODIRTY=1` → 整窗拷贝 + 经典 `UpdateLayeredWindow`。
 /// - `Dirty::Rects(rects)` → 逐矩形拷进 DIB + 逐矩形 ULWIndirect；空列表 = 无像素
 ///   变化，跳过上屏（DIB 与窗口内容本就一致）。
+///
 /// 返回 false = 上屏失败（调用方回滚帧指纹；NEEDS_FULL_REUPLOAD 保证下帧整窗恢复）。
 #[allow(clippy::too_many_arguments)]
 fn present(
@@ -1116,7 +1224,7 @@ fn present(
             AlphaFormat: windows::Win32::Graphics::Gdi::AC_SRC_ALPHA as u8,
         };
 
-        let ok = if *DIRTY_DISABLED || matches!(dirty, Dirty::Full) {
+        let ok = if dirty_disabled() || matches!(dirty, Dirty::Full) {
             // A2 整窗拷贝（历史：187KB 中间拷贝在 Full 帧不可避免）
             let rect = RECT { left: 0, top: 0, right: width, bottom: height };
             copy_rect_to_dib(bits, surface, &rect, width, height);
@@ -1156,8 +1264,9 @@ fn present(
             false
         };
         if !ok {
-            NEEDS_FULL_REUPLOAD.store(true, AtomicOrdering::Relaxed);
-            crate::probe::log("present: UpdateLayeredWindow failed");
+            note_present_failure("present");
+        } else {
+            note_present_success();
         }
 
         // P2：不删除 mem_dc / bitmap —— 它们留在 DIB 缓存里逐帧复用。
@@ -1220,6 +1329,7 @@ unsafe fn ulw_indirect_rect(
 /// 只需把 DIB 上屏。`dirty` 决定上屏方式（与 GDI 路径同一套 A1/A2 语义）：
 /// - `Dirty::Full` 或 `AAXSYSPULSE_NODIRTY=1` → 经典 `UpdateLayeredWindow`。
 /// - `Dirty::Rects(rects)` → 逐矩形 ULWIndirect；空列表 = 跳过上屏。
+///
 /// 返回 false = 上屏失败（调用方应回滚帧指纹，否则相同内容帧会被跳过 → 冻结）。
 unsafe fn upload_dib(hwnd: HWND, width: i32, height: i32, src_alpha: u8, dirty: &Dirty) -> bool {
     let screen_dc = GetDC(hwnd);
@@ -1247,7 +1357,7 @@ unsafe fn upload_dib(hwnd: HWND, width: i32, height: i32, src_alpha: u8, dirty: 
     // 唯一剩余阻塞点在 upload_dib 内部（GetDC / DIB.lock / ULW）。
     // ULW 前后各打一条，下次复现即可把挂起点钉死到具体 API。
     crate::probe::log_lazy(|| format!("upload-begin {width}x{height} dirty={}", fmt_dirty(dirty)));
-    let ok = if *DIRTY_DISABLED || matches!(dirty, Dirty::Full) {
+    let ok = if dirty_disabled() || matches!(dirty, Dirty::Full) {
         let sz = SIZE { cx: width, cy: height };
         let src_pt = POINT::default();
         UpdateLayeredWindow(
@@ -1281,8 +1391,9 @@ unsafe fn upload_dib(hwnd: HWND, width: i32, height: i32, src_alpha: u8, dirty: 
         false
     };
     if !ok {
-        NEEDS_FULL_REUPLOAD.store(true, AtomicOrdering::Relaxed);
-        crate::probe::log("upload_dib: UpdateLayeredWindow failed");
+        note_present_failure("upload_dib");
+    } else {
+        note_present_success();
     }
     crate::probe::log_lazy(|| format!("upload-end ok={ok}"));
     let _ = ReleaseDC(hwnd, screen_dc);
@@ -1639,136 +1750,4 @@ pub fn invalidate_frame_hash() {
 }
 
 #[cfg(test)]
-mod dirty_tests {
-    use super::*;
-    use aaxsyspulse_core::units::StrBuf;
-    use aaxsyspulse_ui::Rgba;
-
-    /// 最小可比对 CellSig：脏判定只看 x/y/bbox_x/w/h/hash。
-    fn cell(x: i32, hash: u64) -> CellSig {
-        CellSig {
-            x,
-            y: 8,
-            w: 40,
-            h: 28,
-            bbox_x: x,
-            right_align: false,
-            hash,
-            text: StrBuf::new(),
-            color: Rgba::default(),
-            shade: Rgba::default(),
-            shadow: false,
-            outline: false,
-            scale: 1.0,
-        }
-    }
-
-    fn fresh_state() -> (OnceLock<Mutex<Vec<CellSig>>>, AtomicU8) {
-        (OnceLock::new(), AtomicU8::new(0))
-    }
-
-    fn run(
-        state: &(OnceLock<Mutex<Vec<CellSig>>>, AtomicU8),
-        cells: &[CellSig],
-    ) -> (Dirty, Vec<bool>) {
-        compute_dirty_in(&state.0, &state.1, cells, 255)
-    }
-
-    #[test]
-    fn first_frame_is_full() {
-        let st = fresh_state();
-        let (d, changed) = run(&st, &[cell(0, 1), cell(100, 2)]);
-        assert!(d.is_full());
-        assert!(changed.iter().all(|&c| c), "首帧必须全部重画");
-    }
-
-    #[test]
-    fn two_far_changed_cells_yield_two_rects() {
-        let st = fresh_state();
-        run(&st, &[cell(0, 1), cell(100, 2), cell(300, 3)]); // 建立基线
-        // 第 0、2 格变化（相距远，中间隔第 1 格）→ 2 个矩形，空隙不上传
-        let cells = [cell(0, 99), cell(100, 2), cell(300, 98)];
-        let (d, changed) = run(&st, &cells);
-        let Dirty::Rects(rs) = d else { panic!("应为 Rects，实际 {}", fmt_dirty(&d)) };
-        assert_eq!(rs.len(), 2, "相距远的变化格不得合并");
-        assert!(rs[0].right <= rs[1].left, "矩形之间必须隔开空隙");
-        assert!(changed[0] && changed[2] && !changed[1], "邻接传播不得标记不相交邻居");
-    }
-
-    #[test]
-    fn adjacent_changed_cells_merge_into_one_rect() {
-        let st = fresh_state();
-        // ⚠️ cells_intersect 用半开区间严格判定（right/bottom 边界不算相交）：
-        // 「相触」（0..40 与 40..80）**不算**相交，必须真正重叠才并成一簇。
-        run(&st, &[cell(0, 1), cell(30, 2)]); // 包围盒 0..40 与 30..70 重叠
-        let cells = [cell(0, 99), cell(30, 98)];
-        let (d, _) = run(&st, &cells);
-        let Dirty::Rects(rs) = d else { panic!("应为 Rects") };
-        assert_eq!(rs.len(), 1, "重叠的变化格必须并成一簇");
-        assert_eq!((rs[0].left, rs[0].right), (0, 70));
-    }
-
-    #[test]
-    fn unchanged_neighbor_is_not_uploaded() {
-        // 传播邻居（changed=true）不应扩大上传矩形：上传只由内容变化格构成
-        let st = fresh_state();
-        // 两格重叠：0..40 与 20..60（真重叠才会触发邻接传播）；基线后只改第 0 格
-        run(&st, &[cell(0, 1), cell(20, 2)]);
-        let cells = [cell(0, 99), cell(20, 2)];
-        let (d, changed) = run(&st, &cells);
-        let Dirty::Rects(rs) = d else { panic!("应为 Rects") };
-        assert_eq!(rs.len(), 1);
-        assert_eq!((rs[0].left, rs[0].right), (0, 40), "未变化的邻居格不得进入上传矩形");
-        assert!(changed[1], "但 paint 位图要标记邻居（clear_rect 擦除防线）");
-    }
-
-    #[test]
-    fn no_change_yields_empty_rects_not_full() {
-        let st = fresh_state();
-        let cells = [cell(0, 1), cell(100, 2)];
-        run(&st, &cells);
-        let (d, _) = run(&st, &cells); // 同内容再来一帧
-        let Dirty::Rects(rs) = d else { panic!("应为 Rects") };
-        assert!(rs.is_empty(), "无变化必须是空矩形列表（跳过上屏）");
-    }
-
-    #[test]
-    fn alpha_change_is_full() {
-        let st = fresh_state();
-        run(&st, &[cell(0, 1)]);
-        let (d, _) = compute_dirty_in(&st.0, &st.1, &[cell(0, 1)], 128); // alpha 变了
-        assert!(d.is_full());
-    }
-
-    #[test]
-    fn position_drift_is_full() {
-        let st = fresh_state();
-        run(&st, &[cell(0, 1)]);
-        let (d, _) = run(&st, &[cell(10, 1)]); // x 漂移
-        assert!(d.is_full());
-    }
-
-    #[test]
-    fn too_many_components_folds_to_full() {
-        let st = fresh_state();
-        let base: Vec<CellSig> = (0..10).map(|i| cell(i * 100, i as u64 + 1)).collect();
-        run(&st, &base);
-        let changed: Vec<CellSig> = (0..10).map(|i| cell(i * 100, i as u64 + 100)).collect();
-        let (d, _) = run(&st, &changed);
-        assert!(d.is_full(), "超过 MAX_DIRTY_RECTS(8) 必须折叠整窗");
-    }
-
-    #[test]
-    fn upload_failure_gate_forces_full_next_frame() {
-        let st = fresh_state();
-        let cells = [cell(0, 1), cell(100, 2)];
-        run(&st, &cells);
-        run(&st, &cells);
-        NEEDS_FULL_REUPLOAD.store(true, AtomicOrdering::Relaxed);
-        let (d, changed) = run(&st, &cells);
-        assert!(d.is_full(), "闸门置位后下一帧必须整窗");
-        assert!(changed.iter().all(|&c| c));
-        // 闸门一次性：消费后回到正常路径
-        assert!(!NEEDS_FULL_REUPLOAD.load(AtomicOrdering::Relaxed));
-    }
-}
+mod dirty_tests;

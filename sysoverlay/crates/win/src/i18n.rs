@@ -5,7 +5,8 @@
 //!
 //! 数据布局：每行是一个 `(key, en, zh)` 三元组，按 key 字典序升序排列，
 //! 供 `lookup` 做 const fn 二分查找。新增一种语言只需：
-//!   1) 给每个三元组再加一列 `&str`；2) 在 `t()` 里按需选择该列。
+//! 1) 给每个三元组再加一列 `&str`；2) 在 `t()` 里按需选择该列。
+//!
 //! 编译期 `CHECK_TABLE` 会断言「无重复 key、且按 key 有序」，从根上消除
 //! 原先 en/zh 分 arm 编写时两语言漏配对的隐患。
 
@@ -106,6 +107,7 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("Interface language. Takes effect after restart.", "界面显示语言，重启后生效", "HintLanguage"),
     ("Percent shows usage; GB shows the actual amount.", "百分比显示占用率，GB 显示实际用量", "HintMemUnit"),
     ("Color of the metric's name.", "监控项名称的显示颜色。", "HintNameColor"),
+    ("Override the global simplified-name switch for this metric: Full = CPU, Short = C.", "单独覆盖全局简化名称：完整显示 CPU，简写显示 C；跟随则回到全局开关。", "HintNameMode"),
     ("Show upload and download rates together.", "双向同时显示上下行速率", "HintNetDisplay"),
     ("Saves resources; the network rate updates with a short delay.", "减少资源占用，网速显示会有短暂延迟。", "HintNetLowFreq"),
     ("Distance between a label and its value.", "每项内部标签与数值之间的距离", "HintNvGap"),
@@ -155,6 +157,7 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("Memory", "内存", "LblMem"),
     ("Memory Unit", "内存单位", "LblMemUnit"),
     ("Name Color", "名称色", "LblNameColor"),
+    ("Name Style", "名称模式", "LblNameMode"),
     ("Network", "网络", "LblNet"),
     ("Lower Net Refresh Rate", "降低网络刷新频率", "LblNetLowFreq"),
     ("Network Display", "网络显示", "LblNetMode"),
@@ -228,6 +231,9 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("GB", "GB", "SegGb"),
     ("Horizontal", "横版", "SegHorizontal"),
     ("Medium", "中", "SegMedium"),
+    ("Follow", "跟随", "SegNameFollow"),
+    ("Full", "完整", "SegNameFull"),
+    ("Short", "简写", "SegNameSimple"),
     ("None", "无", "SegNone"),
     ("Percent", "百分比", "SegPercent"),
     ("Performance", "性能", "SegPerf"),

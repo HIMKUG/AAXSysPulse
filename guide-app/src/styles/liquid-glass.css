@@ -1,0 +1,253 @@
+/* ============================================================
+   Liquid Glass 液态玻璃材质层 · v8（回归 backdrop 实时采样 + 磨砂垫底）
+   ------------------------------------------------------------
+   v8 路线（2026-09-20，用户复核推翻 v7）：假层平铺「看起来仍是预烘焙，
+   根本不是下方的实时图像」→ ::before 逐字恢复 v5 backdrop 实时采样；
+   用户「预渲染一个基础模糊」的诉求改由本体底色承担：元素自带轻纱
+   白底 —— 切页/祖先合成期 backdrop 被截断（铁律③）时，控件仍呈现
+   「有色磨砂胚」而非空白，落定后真折射在其上浮现。预烘焙贴图路线
+   同日亦被判死（观感差），不再采用。
+   材质四层数值逐字复制 lucasromerodb/liquid-glass-effect-macos：
+     wrapper → 本体：overflow:hidden · box-shadow · transition
+     effect  → ::before z-2：blur(3px) + url(#glass-distortion) + isolate（v5 原样）
+     tint    → ::after 底色 rgba(255,255,255,0.25)
+     shine   → ::after 高光 inset 2px 2px 1px 0 / inset -1px -1px 1px 1px
+   滤镜在 App.vue，与示例逐字一致；背景图 400px 平铺提供折射信号。
+
+   三条铁律（v8 起全量重新生效 —— 折射回到 backdrop 实时采样）：
+   ① 玻璃元素本体必须 isolation:isolate —— 否则负 z 折射伪元素排在
+      根层叠上下文的「负 z 绘制阶段」，比页面背景先画，采样到白纸；
+   ② 玻璃元素本体不得带 filter（元素自带 filter = 子树 backdrop root，
+      采样截断在元素内部）。danger 悬停的 brightness 滤镜已覆掉；
+      .check.disabled 的 opacity:0.45 同理会让禁用行变平 —— 禁用态
+      本来就要弱化，接受此副作用。
+   ③ 玻璃元素的任何祖先不得常驻「影响 transform 的动画」—— Blink 会
+      把挂着此类动画（哪怕处于 fill 常驻终态）的元素强制合成并当作
+      backdrop root，截死后代采样。按钮活/卡片死的第一轮全灭之谜就是
+      .style-grid.r2 的 riseIn fill:both；改 backwards 后六卡矩阵
+      A/B/C 全部正常出玻璃（2026-09-19 用户复核）。
+   悬停/按下的 transform（scale/translateY）经实测不影响采样，保留。
+
+   范围（用户指令）：只到控件级。大窗 / 子页 / 对话框 / 排序列表容器
+   等整屏尺寸面板一律不加折射。
+
+   实现注记：本文件用普通逗号选择器列表，不用 :is() —— :is() 的特异度
+   取参数最高者，双类参数（.drag-item.dragging）会把整条规则抬到
+   (0,2,0)，压死后续单类覆写（v4 的按钮染色就是这么失效的）。
+   ============================================================ */
+
+:root {
+  --glass-shine:
+    inset 2px 2px 1px 0 rgba(255, 255, 255, 0.5),
+    inset -1px -1px 1px 1px rgba(255, 255, 255, 0.5);
+  --glass-tint: rgba(255, 255, 255, 0.25);
+}
+
+/* ============================ 1. 三层骨架（示例原值） ============================ */
+.btn-primary, .btn-secondary, .btn-danger,
+.style-card, .orient-card, .nm-chip, .opt-row, .check,
+.autostart-card, .stat-card, .color-row, .per-item-row,
+.drag-item.dragging, .seg-item.active {
+  position: relative;
+  isolation: isolate;               /* 铁律①：自持层叠上下文 */
+  overflow: hidden;                 /* wrapper 原值 */
+  background: rgba(250, 251, 252, 0.4);    /* v8 磨砂垫底：backdrop 被截时的「基础模糊」胚
+                                              （实色让位给玻璃，但留一层轻纱白撑场面） */
+  box-shadow: 0 6px 6px rgba(0, 0, 0, 0.2),
+              0 0 20px rgba(0, 0, 0, 0.1);   /* wrapper 原值 */
+  transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 2.2); /* wrapper 原值 */
+}
+
+/* effect 层 = .liquidGlass-effect 逐字（z 用 -2：文字未包进独立层）·
+   v8 回归 v5：真实 backdrop 采样（下方 = 页面背景 + 大窗白纱 +
+   磨砂垫底色 + 一切真实内容），切页/祖先合成期采样被截时
+   本层不绘，由本体磨砂垫底继续撑起「有色玻璃胚」。 */
+.btn-primary::before, .btn-secondary::before, .btn-danger::before,
+.style-card::before, .orient-card::before, .nm-chip::before, .opt-row::before, .check::before,
+.autostart-card::before, .stat-card::before, .color-row::before, .per-item-row::before,
+.drag-item.dragging::before, .seg-item.active::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -2;
+  border-radius: inherit;
+  pointer-events: none;
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+  filter: url(#glass-distortion);
+  overflow: hidden;
+  isolation: isolate;
+}
+
+/* tint + shine 层 = .liquidGlass-tint + .liquidGlass-shine 逐字合并 */
+.btn-primary::after, .btn-secondary::after, .btn-danger::after,
+.style-card::after, .orient-card::after, .nm-chip::after, .opt-row::after, .check::after,
+.autostart-card::after, .stat-card::after, .color-row::after, .per-item-row::after,
+.drag-item.dragging::after, .seg-item.active::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  pointer-events: none;
+  background: var(--glass-tint);
+  box-shadow: var(--glass-shine);
+  /* 选中态切换动画：描边环以 spring 过冲生长（1px→2px），色调同步淡入。
+     未选中侧需带同结构 0 扩圈占位才能平滑插值，见第 2 节各基态 ::after。 */
+  transition: background-color 280ms var(--ease-out-expo),
+              box-shadow 380ms var(--ease-spring);
+}
+
+/* ============================ 2. 状态覆写 ============================
+   元素本体的实色背景 / 彩色边框按原特异度改回透明（本体的 border 会画在
+   折射层之下被位移搅边，边框一律改画 ::after 的 inset 环）。 */
+
+/* —— 按钮（demo 已验证，保持不动） —— */
+.btn-primary, .btn-secondary, .btn-danger { color: black; }  /* wrapper 原值 */
+.btn-primary:hover:not(:disabled), .btn-primary:active:not(:disabled),
+.btn-secondary:hover:not(:disabled), .btn-secondary:active:not(:disabled),
+.btn-danger:hover:not(:disabled) {
+  background: transparent;
+}
+.btn-secondary, .btn-secondary:hover:not(:disabled) { border-color: transparent; }
+.btn-danger:hover:not(:disabled) { filter: none; }           /* 铁律② */
+.btn:disabled { background: transparent; }
+.btn:disabled::after { background: color-mix(in srgb, var(--bg-tertiary) 88%, transparent); }
+
+/* —— 样式卡（第 4 页） —— */
+.style-card, .style-card:hover, .style-card.selected { border-color: transparent; }
+.style-card.selected { background: transparent; }
+.style-card::after { box-shadow: inset 0 0 0 1px var(--border-light), var(--glass-shine); }
+.style-card:hover::after { box-shadow: inset 0 0 0 1px var(--border-medium), var(--glass-shine); }
+.style-card.selected::after {
+  background: color-mix(in srgb, var(--accent) 12%, var(--glass-tint));
+  box-shadow: inset 0 0 0 2px var(--accent), var(--glass-shine);
+}
+
+/* —— 方向卡（第 5 页） —— */
+.orient-card, .orient-card.selected { border-color: transparent; }
+.orient-card:hover, .orient-card.selected { background: transparent; }
+/* 透明占位环：与 selected 的 2px 实环同结构，box-shadow 才能插值生长 */
+.orient-card::after { box-shadow: inset 0 0 0 1px transparent, var(--glass-shine); }
+.orient-card:hover::after { background: rgba(255, 255, 255, 0.38); }
+.orient-card.selected::after {
+  background: color-mix(in srgb, var(--accent) 12%, var(--glass-tint));
+  box-shadow: inset 0 0 0 2px var(--accent), var(--glass-shine);
+}
+
+/* —— 选项行（第 6/2 页复用 .opt-row） —— */
+.opt-row, .opt-row.selected { border-color: transparent; }
+.opt-row:hover, .opt-row.selected { background: transparent; }
+.opt-row::after { box-shadow: inset 0 0 0 1px transparent, var(--glass-shine); }
+.opt-row:hover::after { background: rgba(255, 255, 255, 0.38); }
+.opt-row.selected::after {
+  background: color-mix(in srgb, var(--accent) 12%, var(--glass-tint));
+  box-shadow: inset 0 0 0 2px var(--accent), var(--glass-shine);
+}
+
+/* —— 监控项复选行（第 6 页） —— */
+.check:hover { background: transparent; }
+.check:hover::after { background: rgba(255, 255, 255, 0.4); }
+
+/* —— 名称芯片（第 8 页） —— */
+.nm-chip, .nm-chip--set { border-color: transparent; }
+.nm-chip::after { box-shadow: inset 0 0 0 1px var(--border-light), var(--glass-shine); }
+.nm-chip:hover::after { box-shadow: inset 0 0 0 1px var(--border-medium), var(--glass-shine); }
+.nm-chip--set::after {
+  background: color-mix(in srgb, var(--accent) 12%, var(--glass-tint));
+  box-shadow: inset 0 0 0 2px var(--accent), var(--glass-shine);
+}
+
+/* —— 排序行（第 7 页，仅拖动中的那张浮起） —— */
+.drag-item.dragging {
+  background: transparent;
+  /* 骨架的 transition:all 会给内联 translate 加上 0.4s 弹性 —— 拖动会
+     拖影跟不住手。translate 归零，其余保持 wrapper 原值。 */
+  transition: translate 0s,
+              scale 0.4s cubic-bezier(0.175, 0.885, 0.32, 2.2),
+              transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 2.2),
+              box-shadow 0.4s cubic-bezier(0.175, 0.885, 0.32, 2.2);
+}
+.drag-item.dragging::after { background: rgba(255, 255, 255, 0.5); }
+
+/* —— 自启卡（第 13 页） —— */
+.autostart-card, .autostart-card.selected { border-color: transparent; }
+.autostart-card.selected { background: transparent; }
+.autostart-card::after { box-shadow: inset 0 0 0 1px transparent, var(--glass-shine); }
+.autostart-card--yes::after {
+  background: color-mix(in srgb, var(--accent) 12%, var(--glass-tint));
+}
+.autostart-card.selected::after {
+  box-shadow: inset 0 0 0 2px var(--accent), var(--glass-shine);
+}
+
+/* —— 按压回弹（统一态）——
+   按下用 --dur-press 快速下沉 scale 0.96，松手由骨架
+   「transition: all 0.4s 弹性 bezier」过冲回弹。玻璃元素本体上的
+   transform 经按钮 demo 验证不伤采样（铁律③只管祖先）。
+   .btn 已在 base.css 自带同款按压，不在此重复。 —— */
+.style-card:active, .orient-card:active, .nm-chip:active, .opt-row:active,
+.check:not(.disabled):active, .autostart-card:active,
+.seg-item:active, .drag-handle:active {
+  transform: scale(0.96);
+  transition-duration: var(--dur-press);
+}
+
+/* —— 分段控件（仅激活段；文字为白色，需保留品牌色底） —— */
+.seg-item.active { background: transparent; border-color: transparent; }
+.seg-item.active::after {
+  background: color-mix(in srgb, var(--accent) 55%, var(--glass-tint));
+  box-shadow: inset 0 0 0 1px var(--accent), var(--glass-shine);
+}
+
+/* ============================ 3. 技术回退 ============================
+   v7 假层路线不依赖 backdrop 采样，理论上无兼容断档；但 @supports
+   仍以 backdrop-filter 为探针 —— 支持的引擎必然支持本路线全部特性，
+   不支持的老引擎走下面的实色回退。
+   （本表按特异度重放 wizard.css / base.css 的原始背景与边框色） */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .btn-primary::before, .btn-secondary::before, .btn-danger::before,
+  .style-card::before, .orient-card::before, .nm-chip::before, .opt-row::before, .check::before,
+  .autostart-card::before, .stat-card::before, .color-row::before, .per-item-row::before,
+  .drag-item.dragging::before, .seg-item.active::before,
+  .btn-primary::after, .btn-secondary::after, .btn-danger::after,
+  .style-card::after, .orient-card::after, .nm-chip::after, .opt-row::after, .check::after,
+  .autostart-card::after, .stat-card::after, .color-row::after, .per-item-row::after,
+  .drag-item.dragging::after, .seg-item.active::after {
+    display: none;
+  }
+  .btn-primary, .btn-secondary, .btn-danger,
+  .style-card, .orient-card, .nm-chip, .opt-row, .check,
+  .autostart-card, .stat-card, .color-row, .per-item-row,
+  .drag-item.dragging, .seg-item.active {
+    box-shadow: none;
+  }
+  .style-card            { background: var(--surface-white); border-color: var(--border-light); }
+  .style-card:hover      { border-color: var(--border-medium); }
+  .style-card.selected   { background: var(--surface-accent); border-color: var(--accent); }
+  .orient-card           { background: var(--surface-subtle); }
+  .orient-card:hover     { background: var(--bg-secondary); }
+  .orient-card.selected  { background: var(--surface-accent); border-color: var(--accent); }
+  .opt-row               { background: var(--bg-secondary); }
+  .opt-row:hover         { background: var(--bg-tertiary); }
+  .opt-row.selected      { background: var(--surface-accent); border-color: var(--accent); }
+  .check:hover           { background: var(--bg-secondary); }
+  .nm-chip               { background: var(--surface-white); border-color: var(--border-light); }
+  .nm-chip--set          { background: var(--surface-accent); border-color: var(--accent); }
+  .drag-item.dragging    { background: var(--surface-white); }
+  .autostart-card--yes   { background: var(--surface-accent); }
+  .autostart-card--no    { background: var(--surface-subtle); }
+  .autostart-card.selected { background: var(--surface-accent); border-color: var(--accent); }
+  .stat-card             { background: var(--bg-secondary); box-shadow: var(--shadow-card); }
+  .color-row, .per-item-row { background: var(--surface-subtle); }
+  .btn-primary           { background: var(--accent); color: #fff; box-shadow: var(--shadow-btn); }
+  .btn-primary:hover:not(:disabled)  { background: var(--accent-hover); }
+  .btn-primary:active:not(:disabled) { background: var(--accent-pressed); }
+  .btn-secondary         { background: transparent; color: var(--text-secondary); font-style: italic; font-weight: 400; border-color: var(--border-medium); }
+  .btn-secondary:hover:not(:disabled)  { background: var(--bg-secondary); border-color: var(--border-strong); }
+  .btn-secondary:active:not(:disabled) { background: var(--bg-tertiary); }
+  .btn-danger            { background: var(--danger); color: #fff; box-shadow: var(--shadow-btn); }
+  .btn-danger:hover:not(:disabled)   { filter: brightness(0.94); }
+  .btn:disabled          { background: var(--bg-tertiary); color: var(--text-tertiary); font-style: italic; font-weight: 400; }
+  .seg-item.active       { background: var(--accent); border-color: var(--accent); }
+}

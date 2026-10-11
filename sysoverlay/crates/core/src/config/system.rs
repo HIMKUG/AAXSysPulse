@@ -14,10 +14,13 @@ pub const SYSTEM_FILE: &str = "system.cfg";
 
 fn snap_interval(ms: u32) -> u32 {
     const ALLOWED: [u32; 5] = [5000, 2000, 1000, 200, 100];
+    // `min_by_key` 在空迭代器上返回 None。这里迭代的是定长常量数组，实际不可能空
+    // （审查报告"上游传入空集合即 panic"的前提不成立），但仍写成不可失败的形式：
+    // 兜底值 = 中间档 1000 ms，日后有人把 ALLOWED 改成切片/迭代器时行为依旧确定。
     *ALLOWED
         .iter()
         .min_by_key(|&&a| (a as i64 - ms as i64).abs())
-        .unwrap()
+        .unwrap_or(&1000)
 }
 
 pub fn serialize(cfg: &Config) -> String {
@@ -99,14 +102,13 @@ pub fn parse(cfg: &mut Config, text: &str) {
         cfg.version = parse_u32(v, cfg.version);
     }
 
-    // 窗口几何（全局，横竖共享）——从 [system] 段读取
+    // 窗口几何（全局，横竖共享）——从 [system] 段读取。
+    // 负坐标合法（副屏 / 顶边外），只有序列化端的 -1/-1「未设置」哨兵对
+    // 才视为无位置。旧判据 `x>=0 && y>=0` 会把 y<0 的窗口位置判丢，
+    // 且下一次退出把真位置反写成 -1/-1，表现为"不记忆窗口位置"。
     let x = ini.get(s, "x").map(|v| parse_i32(v, -1)).unwrap_or(-1);
     let y = ini.get(s, "y").map(|v| parse_i32(v, -1)).unwrap_or(-1);
-    cfg.window_pos = if x >= 0 && y >= 0 {
-        Some((x, y))
-    } else {
-        None
-    };
+    cfg.window_pos = if x == -1 && y == -1 { None } else { Some((x, y)) };
     let ww = ini.get(s, "w").map(|v| parse_i32(v, 0)).unwrap_or(0);
     let hh = ini.get(s, "h").map(|v| parse_i32(v, 0)).unwrap_or(0);
     cfg.window_size = if ww > 0 && hh > 0 && ww <= 2048 && hh <= 2048 {
@@ -240,6 +242,26 @@ mod tests {
         assert_eq!(c2.appearance, cfg.appearance);
         assert_eq!(c2.lang, cfg.lang);
         assert_eq!(c2.admin_check_continue_count, cfg.admin_check_continue_count);
+    }
+
+    #[test]
+    fn negative_positions_roundtrip_and_sentinel() {
+        // 回归锁（2026-09-19）：负坐标（副屏/顶边外）必须原样往返；
+        // 只有 -1/-1 哨兵对表示"未设置"。
+        let mut cfg = Config::default();
+        cfg.window_pos = Some((473, -58));
+        let mut c2 = Config::default();
+        c2.window_pos = None;
+        parse(&mut c2, &serialize(&cfg));
+        assert_eq!(c2.window_pos, Some((473, -58)), "负 y 位置不得被丢弃");
+
+        let mut none_cfg = Config::default();
+        none_cfg.window_pos = None;
+        let t = serialize(&none_cfg);
+        assert!(t.contains("x = -1") && t.contains("y = -1"));
+        let mut c3 = Config::default();
+        parse(&mut c3, &t);
+        assert_eq!(c3.window_pos, None, "-1/-1 哨兵 = 未设置");
     }
 
     #[test]

@@ -17,8 +17,8 @@
 //! 的几何与偏移和顺序。
 
 use crate::config::ini::{parse_u32, Ini, Writer};
-use crate::config::{Config, OFFSET_MAX, OFFSET_MIN};
-use crate::types::RenderStyle;
+use crate::config::{parse_metric_order, Config, OFFSET_MAX, OFFSET_MIN};
+use crate::types::{Metric, RenderStyle};
 
 pub const LAYOUT_H_FILE: &str = "layout_h.cfg";
 pub const LAYOUT_V_FILE: &str = "layout_v.cfg";
@@ -35,32 +35,11 @@ pub fn serialize(_style: RenderStyle, cfg: &Config) -> String {
     let mut w = Writer::new();
     w.section("meta");
     w.kv("version", crate::config::CONFIG_VERSION);
-    w.section("window");
-    match cfg.window_pos {
-        Some((x, y)) => {
-            w.kv("x", x);
-            w.kv("y", y);
-        }
-        None => {
-            w.kv("x", -1);
-            w.kv("y", -1);
-        }
-    }
-    match cfg.window_size {
-        Some((width, height)) => {
-            w.kv("w", width);
-            w.kv("h", height);
-        }
-        None => {
-            w.kv("w", 0);
-            w.kv("h", 0);
-        }
-    }
-    w.kv("locked", cfg.size_locked as u8);
-
+    // 窗口几何（x/y/w/h/locked）唯一归属 system.cfg 的 [system] 段，
+    // 此处不再写 [window]，避免两份窗口坐标互相打架（layout parse 本就忽略它）。
     w.section("metrics");
-    w.comment("逐监控项 4 分量文字偏移 lx ly vx vy（像素，可负）");
-    for id in 1..=7u32 {
+    w.comment("逐监控项 4 分量文字偏移 lx ly vx vy（像素，可负）；ID = Metric 下标 + 1");
+    for id in 1..=Metric::COUNT as u32 {
         let idx = (id - 1) as usize;
         let off = cfg.metric_offsets[idx];
         w.kv(
@@ -89,7 +68,7 @@ pub fn parse(_style: RenderStyle, cfg: &mut Config, text: &str) {
     // 此处只解析 [metrics] 偏移和 [layout] order。
 
     if let Some(sec) = ini.section("metrics") {
-        for id in 1..=7u32 {
+        for id in 1..=Metric::COUNT as u32 {
             let idx = (id - 1) as usize;
             let key = format!("offset.{}", id);
             if let Some(v) = sec.get(&key) {
@@ -111,27 +90,19 @@ pub fn parse(_style: RenderStyle, cfg: &mut Config, text: &str) {
     }
 
     // ── order：监控项显示顺序（1-based ID → 0-based 下标）──
-    // 解析失败则保持 cfg 原有顺序（来自 default 或 monitor.cfg 旧值）
+    // 解析失败则保持 cfg 原有顺序（来自 default 或旧版文件）。
     if let Some(sec) = ini.section("layout") {
         if let Some(v) = sec.get("order") {
-            let mut order = [0u8; 9];
-            let mut count = 0;
-            for tok in v.split_whitespace() {
-                if let Ok(id) = tok.parse::<u32>() {
-                    // v4: 支持 1..=9（1..=7 为原有监控项，8=DiskRead, 9=DiskWrite）
-                    if (1..=9).contains(&id) && count < 9 {
-                        order[count] = (id - 1) as u8;
-                        count += 1;
-                    }
-                }
-            }
-            if count > 0 {
-                // 填充不足 9 项的剩余槽：用**重复值**（build_rows 去重 guard 会跳过）。
-                // 不可填 `i`（i=7/8 即 DiskRead/DiskWrite）——那会让旧配置解析后
-                // 自动开启磁盘监控，违背「默认关闭」。
-                for i in count..9 {
-                    order[i] = order[0];
-                }
+            // ID 转 0-based 后交给共用的柔性解析器（任意子集 + 缺项尾部自然序补齐）。
+            // 补进来的新监控项是否显示仍由各自 show_* 开关决定，不会因缺项被误开启。
+            let zeros = v
+                .split_whitespace()
+                .filter_map(|t| t.parse::<u32>().ok())
+                .filter(|id| *id >= 1)
+                .map(|id| (id - 1).to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if let Some(order) = parse_metric_order(&zeros) {
                 cfg.metric_order = order;
             }
         }
@@ -145,12 +116,12 @@ mod tests {
     #[test]
     fn layout_roundtrip_geometry() {
         // window_pos/size 属于 system.cfg，layout 文件只保存 metric_offsets。
-        // serialize 仍写 [window] 段（兼容性），但 parse 不读它。
+        // 窗口几何（x/y/w/h/locked）唯一由 system.cfg 承载，layout 文件不再写 [window] 段。
         let mut cfg = Config::default();
         cfg.metric_offsets[2] = [5, -3, 7, 9];
 
         let text = serialize(RenderStyle::Strip, &cfg);
-        assert!(text.contains("[window]"), "layout 文件写 [window] 段（兼容性占位）");
+        assert!(!text.contains("[window]"), "layout 文件不再写 [window] 段（窗口几何唯一归属 system.cfg）");
         assert!(text.contains("offset.3 = 5 -3 7 9"), "offset 序列化格式正确");
 
         let mut c2 = Config::default();
@@ -158,6 +129,23 @@ mod tests {
         parse(RenderStyle::Strip, &mut c2, &text);
         assert_eq!(c2.metric_offsets[2], [5, -3, 7, 9], "offset 往返一致");
         assert_eq!(c2.window_pos, Some((100, 200)), "window_pos 来自 system.cfg，不被 layout parse 覆盖");
+    }
+
+    #[test]
+    fn layout_disk_offsets_roundtrip() {
+        // 磁盘项（DiskRead/DiskWrite，下标 7/8）的文字偏移必须随 layout.cfg 往返。
+        let mut cfg = Config::default();
+        cfg.metric_offsets[7] = [1, -2, 3, -4];
+        cfg.metric_offsets[8] = [5, 6, -7, 8];
+        let text = serialize(RenderStyle::Strip, &cfg);
+        assert!(text.contains("offset.8 = 1 -2 3 -4"), "必须写出 offset.8");
+        assert!(text.contains("offset.9 = 5 6 -7 8"), "必须写出 offset.9");
+        let mut c2 = Config::default();
+        c2.metric_offsets[7] = [0; 4];
+        c2.metric_offsets[8] = [0; 4];
+        parse(RenderStyle::Strip, &mut c2, &text);
+        assert_eq!(c2.metric_offsets[7], [1, -2, 3, -4]);
+        assert_eq!(c2.metric_offsets[8], [5, 6, -7, 8]);
     }
 
     #[test]

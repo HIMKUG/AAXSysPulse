@@ -34,11 +34,12 @@ impl Sampler for MemSampler {
         out: &mut Snapshot,
     ) -> SampleOutcome {
         unsafe {
-            let mut mem_status =
-                windows::Win32::System::SystemInformation::MEMORYSTATUSEX::default();
-            mem_status.dwLength =
-                std::mem::size_of::<windows::Win32::System::SystemInformation::MEMORYSTATUSEX>()
-                    as u32;
+            let mut mem_status = windows::Win32::System::SystemInformation::MEMORYSTATUSEX {
+                dwLength: std::mem::size_of::<
+                    windows::Win32::System::SystemInformation::MEMORYSTATUSEX,
+                >() as u32,
+                ..Default::default()
+            };
 
             if windows::Win32::System::SystemInformation::GlobalMemoryStatusEx(&mut mem_status).is_err() {
                 return SampleOutcome::Transient;

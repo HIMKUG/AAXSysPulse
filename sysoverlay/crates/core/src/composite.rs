@@ -34,6 +34,13 @@
 //! 闭式解本身已非线性放大饱和资源（单资源 90% ⇒ 等效 75%+），
 //! 等权是最中立、无魔法常数的方案；差异化权重（游戏/渲染/办公）留作后续可选。
 
+// 本模块**刻意**对 f64 使用否定式比较（`!(x > 0.0)` 而不是 `x <= 0.0`）：
+// NaN 与任何数比较都返回 false ⇒ `!(x > 0.0)` 一次性拦住 NaN 与负数，
+// 而 `x <= 0.0` 会把 NaN 放过去（设计约束 3「零 NaN 逃逸」）。
+// clippy 的 `neg_cmp_op_on_partial_ord` 要求改写 `partial_cmp`，采纳它等于拆掉这条约束
+// （审查项 P2 家族 / 批次 6 clippy 分类：本类 14 条告警按"lint 前提不成立"整模块豁免）。
+#![allow(clippy::neg_cmp_op_on_partial_ord)]
+
 /// 单资源占用率上限，同时定义了"最大可表达延迟因子" = `1/(1-RHO_MAX)` = 1000×。
 ///
 /// 取 0.999 而非 1.0：一是保证 `1.0 - ρ ≥ 1e-3 > 0`，从根上杜绝除零；
@@ -120,12 +127,12 @@ pub type Weights3 = Weights<3>;
 #[must_use]
 pub fn aggregate<const N: usize>(rho: &[f64; N], w: &Weights<N>) -> f64 {
     debug_assert!(
-        rho.iter().all(|&r| r >= 0.0 && r <= RHO_MAX),
+        rho.iter().all(|&r| (0.0..=RHO_MAX).contains(&r)),
         "rho must be sanitized into [0, RHO_MAX]"
     );
     let mut l_eff = 0.0_f64;
-    for i in 0..N {
-        l_eff += w.w[i] / (1.0 - rho[i]);
+    for (&ri, &wi) in rho.iter().zip(w.w.iter()) {
+        l_eff += wi / (1.0 - ri);
     }
     let s = 1.0 - 1.0 / l_eff;
     // NaN 安全的饱和：!(s>0.0) 同时拦下 NaN 与负数
@@ -311,6 +318,19 @@ impl Meter {
         }
     }
 
+    /// 回到 [`Meter::new`] 的初始状态（配置 `cfg` 保留）。
+    ///
+    /// 用途（审查项 2.2.5）：用户改设置等于"重新开始观测"，旧的 ~3 s 下降拖尾
+    /// （`tau_down`）不该被带进新布局。调用方见 `win::sampler::reset_util_smoothing`。
+    pub fn reset(&mut self) {
+        self.ema = 0.0;
+        self.duty = 0.0;
+        self.prev = 0.0;
+        self.armed = false;
+        self.spikes = 0;
+        self.ticks = 0;
+    }
+
     /// 喂入一个 0..=1 的综合占用值与距上次调用的秒数。
     ///
     /// 关键形式：`ema += (s - ema) * a`
@@ -444,10 +464,10 @@ mod tests {
                     ];
                     let mut num = 0.0;
                     let mut den = 0.0;
-                    for t in 0..3 {
-                        let l = 1.0 / (1.0 - r[t]);
-                        num += w.as_slice()[t] * r[t] * l;
-                        den += w.as_slice()[t] * l;
+                    for (&rt, &wt) in r.iter().zip(w.as_slice().iter()) {
+                        let l = 1.0 / (1.0 - rt);
+                        num += wt * rt * l;
+                        den += wt * l;
                     }
                     let two = num / den;
                     let closed = aggregate(&r, &w);
@@ -465,7 +485,7 @@ mod tests {
                 for &c in bad.iter() {
                     let s = s3([a, b, c]);
                     assert!(s.is_finite(), "non-finite for {a},{b},{c}");
-                    assert!(s >= 0.0 && s <= 1.0, "range {s}");
+                    assert!((0.0..=1.0).contains(&s), "range {s}");
                 }
             }
         }

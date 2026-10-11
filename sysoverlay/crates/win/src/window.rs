@@ -72,11 +72,11 @@ fn is_foreground_fullscreen() -> bool {
     unsafe {
         // 方法一：SHQueryUserNotificationState
         let mut state: u32 = 0;
-        if SHQueryUserNotificationState(&mut state).is_ok() {
-            if state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_PRESENTATION_MODE {
-                crate::probe::log("is_foreground_fullscreen: API says fullscreen");
-                return true;
-            }
+        if SHQueryUserNotificationState(&mut state).is_ok()
+            && (state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_PRESENTATION_MODE)
+        {
+            crate::probe::log("is_foreground_fullscreen: API says fullscreen");
+            return true;
         }
 
         // 方法二：前台窗口矩形 vs 整个显示器矩形（备选：无边框全屏）
@@ -89,7 +89,7 @@ fn is_foreground_fullscreen() -> bool {
         }
 
         // 跳过悬浮窗自身
-        let my_hwnd = find_overlay_hwnd().unwrap_or(HWND::default());
+        let my_hwnd = find_overlay_hwnd().unwrap_or_default();
         if fg_hwnd == my_hwnd {
             return false;
         }
@@ -123,8 +123,8 @@ fn is_foreground_fullscreen() -> bool {
         let fg_h = fg_rect.bottom - fg_rect.top;
 
         let overlap = (
-            (fg_rect.left.max(mon.left) .. fg_rect.right.min(mon.right)).len().max(0) as i32,
-            (fg_rect.top.max(mon.top) .. fg_rect.bottom.min(mon.bottom)).len().max(0) as i32,
+            (fg_rect.left.max(mon.left) .. fg_rect.right.min(mon.right)).len() as i32,
+            (fg_rect.top.max(mon.top) .. fg_rect.bottom.min(mon.bottom)).len() as i32,
         );
 
         let overlap_ratio = if fg_w > 0 && fg_h > 0 && mon_w > 0 && mon_h > 0 {
@@ -156,8 +156,11 @@ fn is_foreground_fullscreen() -> bool {
 const OVERLAY_STATE_FILE: &str = "overlay_hidden.dat";
 
 fn overlay_state_dir() -> std::path::PathBuf {
+    // 安装目录名是契约常量：引导卸载时删的正是这个目录（3.1.14 / P1-22）。
     std::env::var("LOCALAPPDATA")
-        .map(|p| std::path::PathBuf::from(p).join("AAXSysPulse"))
+        .map(|p| {
+            std::path::PathBuf::from(p).join(aaxsyspulse_core::contract::INSTALL_DIR_NAME)
+        })
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
@@ -356,6 +359,15 @@ pub fn publish_schedule_cfg(cfg: &Config) {
     SCHED_DISK.store(disk_on, Ordering::Relaxed);
     // GPU 查询范围（主适配器/3D 引擎 only）随配置即时生效
     crate::proc_gpu::set_gpu_scope(cfg.gpu_primary_only, cfg.gpu_3d_only);
+    // 数值类字段变化 ⇒ 请求一次强制屏障提交（审查项 2.2.5 / P1-16）。
+    note_numeric_change(&NumericFields {
+        interval_ms: cfg.interval_ms,
+        refresh_auto: cfg.refresh_auto,
+        mask,
+        power_interval_ms: cfg.power_interval_ms,
+        disk_on,
+        net_low: cfg.net_low_freq,
+    });
     // 唤醒采样线程（含全关停车状态）
     let mut gen = CFG_GEN.lock().unwrap_or_else(|e| e.into_inner());
     *gen += 1;
@@ -365,6 +377,45 @@ pub fn publish_schedule_cfg(cfg: &Config) {
 
 /// 磁盘采样开关：默认 false，用户在 monitor 配置文件里手动开启后变为 true。
 static SCHED_DISK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// ─── 强制屏障提交（审查项 2.2.5 / P1-16） ──────────────────────
+//
+// 采样循环的提交门有静止模式：活跃度不足时最长 IDLE_MAX_MS（4.5s）才提交一帧。
+// 用户刚改完刷新率/监控项开关，若数值本身没波动，overlay 会停留旧值数秒，
+// 看起来像「设置没生效」。这里在配置发布点检测数值类字段变化，置位一次性
+// 请求标志，由采样线程下一帧消费并强制提交。
+//
+// 只跟踪会影响采样/数值语义的字段：颜色、字体、位置等纯外观项不动数值，无需
+// 惊动提交门（外观由渲染线程即时重绘）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct NumericFields {
+    interval_ms: u32,
+    refresh_auto: bool,
+    /// cpu/mem/gpu/net/power 采样位合成掩码。
+    mask: u32,
+    power_interval_ms: u32,
+    disk_on: bool,
+    net_low: bool,
+}
+
+/// 首次发布只建立基线，不触发强制提交（启动阶段本来就要出第一帧）。
+static LAST_NUMERIC_FIELDS: std::sync::Mutex<Option<NumericFields>> = std::sync::Mutex::new(None);
+static FORCE_BARRIER_COMMIT: AtomicBool = AtomicBool::new(false);
+
+fn note_numeric_change(now: &NumericFields) {
+    let mut last = LAST_NUMERIC_FIELDS.lock().unwrap_or_else(|e| e.into_inner());
+    match *last {
+        Some(prev) if prev == *now => {}
+        Some(_) => FORCE_BARRIER_COMMIT.store(true, Ordering::Relaxed),
+        None => {}
+    }
+    *last = Some(*now);
+}
+
+/// 采样线程消费强制提交请求（读取即清零）。
+pub fn take_barrier_commit() -> bool {
+    FORCE_BARRIER_COMMIT.swap(false, Ordering::Relaxed)
+}
 
 /// 采样线程读取 Util 计算开关（设置页改动即时生效）。
 pub fn schedule_util() -> bool {
@@ -447,23 +498,37 @@ const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
 const WM_EXITSIZEMOVE: u32 = 0x0232;
 
 /// 托盘回调消息（tray.rs 同值，此处独立定义避免跨模块 const 依赖）。
-const WM_TRAY: u32 = 0x8000 + 1;
+pub const WM_TRAY: u32 = aaxsyspulse_core::contract::WM_TRAY;
 /// 设置面板改动通知：重排版 + 自适应窗口尺寸。
-pub const WM_RECONFIG: u32 = 0x8000 + 2;
+pub const WM_RECONFIG: u32 = aaxsyspulse_core::contract::WM_RECONFIG;
 /// 采样线程新快照通知：**推送式渲染**——UI 线程不再轮询，
 /// 阻塞在 GetMessageW 上（空闲 0% CPU），有新数据才画。
-pub const WM_NEW_SNAPSHOT: u32 = 0x8000 + 3;
+pub const WM_NEW_SNAPSHOT: u32 = aaxsyspulse_core::contract::WM_NEW_SNAPSHOT;
 
 /// 设置窗口请求诊断数据：Settings → Overlay。
-pub const WM_GET_SAMPLER_DIAG: u32 = 0x8000 + 4;
+pub const WM_GET_SAMPLER_DIAG: u32 = aaxsyspulse_core::contract::WM_GET_SAMPLER_DIAG;
 
-/// Overlay 回复诊断数据：Overlay → Settings。LPARAM = `*const SamplerDiag`。
-pub const WM_SAMPLER_DIAG: u32 = 0x8000 + 5;
+/// Overlay 回复诊断数据：Settings ← Overlay。LPARAM = `*const SamplerDiag`。
+pub const WM_SAMPLER_DIAG: u32 = aaxsyspulse_core::contract::WM_SAMPLER_DIAG;
 /// 二次启动时请求**第一实例**在自己进程内打开设置页（跨进程 PostMessage）。
-pub const WM_OPEN_SETTINGS: u32 = 0x8000 + 6;
+pub const WM_OPEN_SETTINGS: u32 = aaxsyspulse_core::contract::WM_OPEN_SETTINGS;
 /// D2D 自愈回退：渲染 / 采样线程只置 D2D_BROKEN 并投递本消息，
 /// 由 UI 线程改写 Config 并落盘（ThreadState 归 UI 线程所有，不可跨线程写）。
-pub const WM_DISABLE_D2D: u32 = 0x8000 + 7;
+pub const WM_DISABLE_D2D: u32 = aaxsyspulse_core::contract::WM_DISABLE_D2D;
+/// 开机自启开关的异步应用结果（后台线程 → UI 线程）。
+/// `WPARAM` = 请求值（1=开 / 0=关），`LPARAM` = 是否成功。
+/// 失败时在此**按系统真实状态回滚开关**并提示，绝不留下"显示已开、其实没开"。
+pub const WM_AUTOSTART_DONE: u32 = aaxsyspulse_core::contract::WM_AUTOSTART_DONE;
+/// 外部程序请求重新读取配置文件并刷新悬浮窗。
+/// 与 WM_RECONFIG 的区别：WM_RECONFIG 用内存里的配置刷新，
+/// WM_RELOAD_CONFIG 会先重新读文件，再刷新。
+/// **跨进程契约**：引导 `notify.rs` 投递同一个常量（审查项 7.1.1 / P1-22）。
+pub const WM_RELOAD_CONFIG: u32 = aaxsyspulse_core::contract::WM_RELOAD_CONFIG;
+
+/// 外部程序（引导程序「完成」页）请求快速重启：先同步落盘当前配置，
+/// 再走 `restart::quick_restart()`（拉起带 `--restart` 的新实例并退出）。
+/// **跨进程契约**：同 `WM_RELOAD_CONFIG`。
+pub const WM_QUICK_RESTART: u32 = aaxsyspulse_core::contract::WM_QUICK_RESTART;
 
 /// 关机 / 注销。旧实现完全没处理这两个消息（见 wndproc 分支注释）。
 const WM_QUERYENDSESSION: u32 = 0x0011;
@@ -500,8 +565,35 @@ pub fn is_window_hovered(hwnd: HWND) -> bool {
     }
 }
 
-/// Notifies the app's sampling thread of a system resume event via a oneshot.
+/// 唤醒采样线程的 oneshot 通道（app 侧 `setup_resume_channel()` 建立，rx 归采样线程）。
+///
+/// 语义是**降延迟，不是保正确**：采样线程所有等待点都带超时（`main.rs` 的
+/// `recv_timeout` 100 ms / 1 s / 5 s），所以一次丢失的 poke 最多让数值晚 5 秒，
+/// 不会永久定格。反过来说，它也不允许"静默失效"——通道失效意味着降延迟那一半
+/// 的能力没了，而现场只会表现为"偶尔慢半拍"，最难归因（审查项 2.1.6 / P1-21）。
+///
+/// ⚠️ 隐含契约：`OnceLock<Sender>` 只在**本进程**有效，且 rx 一旦被 drop 就永久失效。
+/// 现在靠"采样线程每轮 `catch_unwind`、永不退出"成立；若哪天改成"panic 即退出并重启"，
+/// 必须把这里换成 `Mutex<Option<Sender>>` 并在线程重建时装新值。
+/// 只有第一实例持有本通道：第二实例里 `get()` 恒为 `None`（见 `handle_second_instance`）。
 static RESUME_NOTIFY: OnceLock<std::sync::mpsc::Sender<()>> = OnceLock::new();
+
+/// poke 采样线程：**发送失败必须留痕**（审查项 2.1.6 / P1-21）。
+///
+/// 旧写法是 5 处 `let _ = tx.send(())` —— 通道正是"采样线程不退出"这一隐含契约的
+/// 唯一观测点，把返回值丢掉等于把唯一的报警器拆了。
+fn poke_sampler(reason: &str) {
+    match RESUME_NOTIFY.get() {
+        None => crate::probe::log(&format!("resume poke 跳过（{reason}）：通道尚未建立")),
+        Some(tx) => {
+            if let Err(e) = tx.send(()) {
+                crate::probe::log(&format!(
+                    "resume poke 失败（{reason}）：{e} —— 采样线程已退出？最多晚 5 秒刷新"
+                ));
+            }
+        }
+    }
+}
 
 /// 即将挂起标志：wndproc 在 PBT_APMSUSPEND 时置位，采样线程检测到后暂停采样。
 /// 避免睡眠期间空转 CPU（窗口隐藏时采样线程已挂起，这里是双保险）。
@@ -636,23 +728,31 @@ unsafe extern "system" fn wndproc(
         WM_LBUTTONUP => {
             if let Some(state) = get_state_ptr(hwnd).as_mut() {
                 state.dragging = false;
-                if state.pos_dirty {
-                    let mut rect = RECT::default();
-                    if GetWindowRect(hwnd, &mut rect).as_bool() {
-                        state.cfg.window_pos = Some((rect.left, rect.top));
-                        // 用户自由拖动 → 解除贴角：让保存的位置成为唯一定位来源，
-                        // 否则残留的 snap_corner<=3 会在下次启动把窗口强行拉回旧角，
-                        // 表现为"不记忆窗口位置"。与 WM_EXITSIZEMOVE 的清理逻辑一致。
-                        state.cfg.snap_corner = aaxsyspulse_core::config::SNAP_CORNER_FREE;
+                let mut changed = false;
+                if state.pos_dirty || state.size_dirty {
+                    // 释放时统一做一次安全钳制（WM_MOUSEMOVE 拖动中刻意不 clamp）。
+                    if let Some(rect) = clamp_window_into_view(hwnd) {
+                        if state.pos_dirty {
+                            state.cfg.window_pos = Some((rect.left, rect.top));
+                            changed = true;
+                            // 用户自由拖动 → 解除贴角：让保存的位置成为唯一定位来源，
+                            // 否则残留的 snap_corner<=3 会在下次启动把窗口强行拉回旧角，
+                            // 表现为"不记忆窗口位置"。与 WM_EXITSIZEMOVE 的清理逻辑一致。
+                            state.cfg.snap_corner = aaxsyspulse_core::config::SNAP_CORNER_FREE;
+                        }
+                        if state.size_dirty {
+                            state.cfg.window_size =
+                                Some((rect.right - rect.left, rect.bottom - rect.top));
+                            changed = true;
+                        }
                     }
                     state.pos_dirty = false;
-                }
-                if state.size_dirty {
-                    let mut rect = RECT::default();
-                    if GetWindowRect(hwnd, &mut rect).as_bool() {
-                        state.cfg.window_size = Some((rect.right - rect.left, rect.bottom - rect.top));
-                    }
                     state.size_dirty = false;
+                }
+                // 拖动结束即落盘：此前只有正常退出/进设置页改项才保存，
+                // 崩溃或被任务管理器结束时位置丢失（表现为"不记忆窗口位置"）。
+                if changed {
+                    crate::config_io::save_config_async(&state.cfg);
                 }
             }
             let _ = ReleaseCapture();
@@ -671,8 +771,9 @@ unsafe extern "system" fn wndproc(
         // WM_LBUTTONUP 在该循环中不会到达，必须在循环结束后落盘。
         WM_EXITSIZEMOVE => {
             if let Some(state) = get_state_ptr(hwnd).as_mut() {
-                let mut rect = RECT::default();
-                if GetWindowRect(hwnd, &mut rect).as_bool() {
+                // 标题栏拖动 / 边框缩放同样做一次钳制，
+                // 否则窗口可以被完全拖出显示器（再也抓不回来）。
+                if let Some(rect) = clamp_window_into_view(hwnd) {
                     state.cfg.window_pos = Some((rect.left, rect.top));
                     state.cfg.window_size =
                         Some((rect.right - rect.left, rect.bottom - rect.top));
@@ -684,6 +785,8 @@ unsafe extern "system" fn wndproc(
                 }
                 state.pos_dirty = false;
                 state.size_dirty = false;
+                // 与 WM_LBUTTONUP 同理：拖拽/缩放结束即落盘，不依赖退出时机。
+                crate::config_io::save_config_async(&state.cfg);
                 let was_dragging = state.dragging;
                 state.dragging = false;
                 if was_dragging {
@@ -755,9 +858,7 @@ unsafe extern "system" fn wndproc(
                             // 唤醒采样线程：隐藏期间到期的 sleep 醒来后，它会阻塞在
                             // 「不可见 → 等待 resume」上；本路径漏发信号曾导致采样
                             // 永久冻结（2026-09-14 实测：20:44 起数值停更 3 小时）。
-                            if let Some(tx) = RESUME_NOTIFY.get() {
-                                let _ = tx.send(());
-                            }
+                            poke_sampler("fullscreen-restore");
                             // 恢复时立即渲染一帧
                             if let Some(state) = get_state_ptr(hwnd).as_ref() {
                                 crate::render_thread::request(hwnd, &state.cfg);
@@ -839,9 +940,7 @@ unsafe extern "system" fn wndproc(
                     } else {
                         mark_overlay_hidden(false);
                         // E1：唤醒采样线程（事件驱动，不再依赖其隐藏轮询）
-                        if let Some(tx) = RESUME_NOTIFY.get() {
-                            let _ = tx.send(());
-                        }
+                        poke_sampler("tray-show");
                         if let Some(state) = get_state_ptr(hwnd).as_ref() {
                             crate::render_thread::request(hwnd, &state.cfg);
                         }
@@ -852,7 +951,11 @@ unsafe extern "system" fn wndproc(
                     if let Some(cmd) = crate::menu::show_tray_menu(hwnd) {
                         match cmd {
                             crate::menu::IDM_SETTINGS => crate::settings::open_settings(hwnd),
-                            crate::menu::IDM_RESTART => crate::restart::quick_restart(),
+                            crate::menu::IDM_RESTART => {
+                                // 快速重启的 exit(0) 会跳过退出保存路径，先同步落盘。
+                                save_current_config(hwnd);
+                                crate::restart::quick_restart();
+                            }
                             crate::menu::IDM_QUIT => {
                                 let _ = DestroyWindow(hwnd);
                             }
@@ -881,6 +984,19 @@ unsafe extern "system" fn wndproc(
                 crate::probe::log("WM_RECONFIG: no state");
             }
             crate::perf::note_section("wnd_reconfig", r0);
+            LRESULT(0)
+        }
+
+        // ── 外部程序（引导程序）通知：重新读配置文件并刷新 ──
+        WM_RELOAD_CONFIG => {
+            reload_config_and_refresh(hwnd);
+            LRESULT(0)
+        }
+
+        // ── 外部程序（引导程序「完成」）请求快速重启：先同步落盘再让出互斥体 ──
+        WM_QUICK_RESTART => {
+            save_current_config(hwnd);
+            crate::restart::quick_restart();
             LRESULT(0)
         }
 
@@ -964,9 +1080,7 @@ unsafe extern "system" fn wndproc(
                     // NotifyIpInterfaceChange 回调不覆盖唤醒事件：置位后下次采样
                     // 立即全表重枚举，不必等 60s 兜底（与 GPU / MSR 对称自愈）。
                     crate::proc_net::invalidate_topology();
-                    if let Some(tx) = RESUME_NOTIFY.get() {
-                        let _ = tx.send(());
-                    }
+                    poke_sampler("power-resume-automatic");
                     crate::probe::log("power: resumed (automatic)");
                 }
                 PBT_APMRESUMESUSPEND => {
@@ -996,9 +1110,7 @@ unsafe extern "system" fn wndproc(
                     SESSION_LOCKED.store(false, std::sync::atomic::Ordering::SeqCst);
                     // 复用 resume 通道：唤醒挂起中的采样线程 + 顺带重置退避，
                     // 解锁后第一个采样周期立即补采，消除数据空白窗口。
-                    if let Some(tx) = RESUME_NOTIFY.get() {
-                        let _ = tx.send(());
-                    }
+                    poke_sampler("session-unlock");
                     crate::probe::log("session unlocked -> sampler resumed");
                 }
                 _ => {}
@@ -1029,6 +1141,10 @@ unsafe extern "system" fn wndproc(
         // D2D 自愈：渲染/采样线程只投递消息，配置改写与落盘在 UI 线程完成
         WM_DISABLE_D2D => {
             crate::gdi::apply_d2d_fallback_ui(hwnd);
+            LRESULT(0)
+        }
+        WM_AUTOSTART_DONE => {
+            apply_autostart_result_ui(hwnd, _wparam.0 != 0, lparam.0 != 0);
             LRESULT(0)
         }
 
@@ -1082,6 +1198,69 @@ pub fn modify_config(hwnd: HWND, f: impl FnOnce(&mut Config)) {
         // 写入路径（托盘项/代码直改/未来新增路径）。一次原子写，零负担。
         unsafe { crate::probe::set_debug((*p).cfg.debug_log) };
     }
+}
+
+/// 同步落盘悬浮窗当前内存配置。
+/// 快速重启的 `exit(0)` 会带走后台写线程，`save_config_async` 在重启路径上不可用。
+fn save_current_config(hwnd: HWND) {
+    if let Some(state) = unsafe { get_state_ptr(hwnd).as_ref() } {
+        crate::config_io::save_config(&state.cfg);
+    }
+}
+
+/// 外部程序（引导程序）通知：重新读配置文件并刷新悬浮窗。
+/// 与 WM_RECONFIG 的区别：WM_RECONFIG 用内存里的配置刷新，
+/// 本函数会先重新读文件，再刷新。
+fn reload_config_and_refresh(hwnd: HWND) {
+    // 1. 重新读配置文件
+    let new_cfg = match crate::config_io::load_config() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            crate::probe::log(&format!("WM_RELOAD_CONFIG: load_config failed: {:?}", e));
+            return; // 保持当前内存配置不变
+        }
+    };
+
+    // 2. 更新内存配置（`Config: Copy`，无需 clone）
+    modify_config(hwnd, |c| *c = new_cfg);
+
+    // 3. 如果配置文件里有窗口位置，应用它（只在位置和当前不同时才调用，避免闪烁）
+    let do_move = new_cfg.window_pos.is_some();
+    let do_resize = new_cfg.window_size.is_some();
+    if do_move || do_resize {
+        let mut rect = RECT::default();
+        if unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect)
+        }
+        .is_ok()
+        {
+            let (new_x, new_y) = new_cfg.window_pos.unwrap_or((rect.left, rect.top));
+            let (new_w, new_h) = new_cfg.window_size.unwrap_or((rect.right - rect.left, rect.bottom - rect.top));
+            if rect.left != new_x || rect.top != new_y || rect.right - rect.left != new_w || rect.bottom - rect.top != new_h {
+                unsafe {
+                    let mut flags = windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
+                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE;
+                    if !do_move { flags |= windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE; }
+                    if !do_resize { flags |= windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE; }
+                    let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                        hwnd,
+                        None,
+                        new_x,
+                        new_y,
+                        new_w,
+                        new_h,
+                        flags,
+                    );
+                }
+            }
+        }
+    }
+
+    // 4. 触发刷新（和 WM_RECONFIG 一样的逻辑）
+    crate::gdi::invalidate_frame_hash();
+    crate::gdi::force_full_refresh();
+    publish_schedule_cfg(&new_cfg);
+    crate::render_thread::request(hwnd, &new_cfg);
 }
 
 /// 读取悬浮窗当前尺寸（缓存；未缓存或窗口未就绪时回退到 `GetWindowRect` 并写回缓存）。
@@ -1172,6 +1351,68 @@ const GWL_EXSTYLE: i32 = -20;
 
 /// 应用「鼠标可穿透」（设置面板开关，报告 §5 窗口页）。
 /// 悬浮窗本就是 WS_EX_LAYERED，切换 WS_EX_TRANSPARENT 即可让鼠标事件穿透。
+/// **UI 线程侧**落地「开机自启」开关的异步应用结果（`WM_AUTOSTART_DONE`）。
+///
+/// # 为什么要有这一层（自愈 / 防御）
+///
+/// 开关值是**先**写进内存并立刻回显的（设置页不能等注册表），系统侧则由
+/// [`crate::autostart::apply_user_async`] 在后台线程完成。两者可能不一致：
+///
+/// - 成功 → 什么都不用做，内存值即真相；
+/// - 失败（组策略 / 权限 / 用户取消 UAC）→ **按系统真实状态回滚**并提示。
+///   回滚目标取自 [`crate::autostart::state`]（读注册表与 StartupApproved），
+///   而不是简单取反 —— 用户可能在任务管理器里动过开关，"取反"会把真实状态
+///   写反、下一轮幂等同步又改回来，反复横跳。
+///
+/// 落盘同样在这里做：内存值与磁盘必须一致，否则重启后开关又变回原样。
+fn apply_autostart_result_ui(hwnd: HWND, requested: bool, ok: bool) {
+    if ok {
+        crate::probe::log(&format!("autostart: toggle ON={requested} applied OK"));
+        return;
+    }
+    // 失败：系统真实状态 = 已注册？（true=仍自启 / false=确实没注册）
+    let real = crate::autostart::state_as_switch(crate::autostart::state());
+    crate::probe::log(&format!(
+        "autostart: toggle ON={requested} FAILED -> real={real}; rolling switch back"
+    ));
+    if let Some(mut cfg) = get_config_of(hwnd) {
+        if cfg.autostart != real {
+            cfg.autostart = real;
+            modify_config(hwnd, |c| *c = cfg);
+            let _ = crate::config_io::save_config(&cfg);
+        }
+    }
+    show_autostart_failed_notice(hwnd, requested, real);
+}
+
+/// 自启写入失败的用户提示。用系统 `MessageBoxW`（与 `show_teardown_notice`
+/// 同款：设置页正在被操作，模态框挂在悬浮窗句柄上最稳）。
+///
+/// `requested=false` 且系统里本来就没有自启项时**不打扰用户** ——
+/// 那不是失败，只是"本来就没开"。
+fn show_autostart_failed_notice(hwnd: HWND, requested: bool, real: bool) {
+    if !requested && !real {
+        return;
+    }
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND,
+    };
+    let lang = crate::i18n::global_lang();
+    let body: Vec<u16> = crate::i18n::t(lang, "AutoStartFailed")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let caption = aaxsyspulse_core::contract::wide_of(aaxsyspulse_core::contract::APP_TECH_NAME);
+    unsafe {
+        MessageBoxW(
+            hwnd,
+            windows::core::PCWSTR(body.as_ptr()),
+            windows::core::PCWSTR(caption.as_ptr()),
+            MB_OK | MB_ICONWARNING | MB_SETFOREGROUND,
+        );
+    }
+}
+
 pub fn apply_click_through(hwnd: HWND, on: bool) {
     use windows::Win32::UI::WindowsAndMessaging::{WS_EX_TRANSPARENT, SWP_NOMOVE, SWP_NOSIZE, SWP_FRAMECHANGED};
     unsafe {
@@ -1226,6 +1467,73 @@ fn get_screen_size() -> (i32, i32) {
     }
 }
 
+/// 钳制时窗口至少留在显示器内的像素数（保证还能抓到它）。
+const MIN_VISIBLE: i32 = 40;
+
+/// 把位置收进「离窗口中心最近的显示器」的可见范围内。
+///
+/// 用 `MonitorFromPoint(TONEAREST)` 而不是主屏矩形 / 虚拟桌面矩形：
+/// - 主屏矩形（`get_screen_size` 来自 `GetDC(None)`，只是主显示器）会把
+///   合法停在副屏的位置拉回主屏；
+/// - 副屏常在主屏左侧/上方，坐标为**负值且合法**，不能用 `max(0, …)` 夹掉。
+///
+/// 窗口一旦完全离开所有显示器就无法再被拖回（悬浮窗没有任务栏/标题栏入口），
+/// 所以这里保证至少 `MIN_VISIBLE` 像素落在屏内。
+fn clamp_to_visible(x: i32, y: i32, w: i32, h: i32) -> (i32, i32) {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    };
+    let center = POINT { x: x + w / 2, y: y + h / 2 };
+    unsafe {
+        let hmon = MonitorFromPoint(center, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(hmon, &mut mi).as_bool() {
+            return (x, y);
+        }
+        let rc = mi.rcMonitor;
+        let (min_x, max_x) = (rc.left - w + MIN_VISIBLE, rc.right - MIN_VISIBLE);
+        let (min_y, max_y) = (rc.top - h + MIN_VISIBLE, rc.bottom - MIN_VISIBLE);
+        // 窗口比显示器还宽时 min > max，clamp 会直接 panic
+        let (min_x, min_y) = (min_x.min(max_x), min_y.min(max_y));
+        (x.clamp(min_x, max_x), y.clamp(min_y, max_y))
+    }
+}
+
+/// 拖动 / 缩放结束后做一次安全钳制（兑现 `WM_MOUSEMOVE` 里"释放时统一钳制"的承诺）。
+/// 返回钳制后的窗口矩形；取不到矩形时返回 `None`，调用方沿用旧值。
+fn clamp_window_into_view(hwnd: HWND) -> Option<RECT> {
+    let mut rect = RECT::default();
+    unsafe {
+        if !GetWindowRect(hwnd, &mut rect).as_bool() {
+            return None;
+        }
+    }
+    let w = rect.right - rect.left;
+    let h = rect.bottom - rect.top;
+    let (x, y) = clamp_to_visible(rect.left, rect.top, w, h);
+    if x != rect.left || y != rect.top {
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                x,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+            );
+        }
+        rect.left = x;
+        rect.top = y;
+        rect.right = x + w;
+        rect.bottom = y + h;
+    }
+    Some(rect)
+}
+
 // ─── OverlayWindow ─────────────────────────────────────────────────────
 
 pub struct OverlayWindow {
@@ -1237,7 +1545,15 @@ pub struct OverlayWindow {
 /// Sets up the resume-notification channel (sampling thread end).
 pub fn setup_resume_channel() -> std::sync::mpsc::Receiver<()> {
     let (tx, rx) = std::sync::mpsc::channel();
-    let _ = RESUME_NOTIFY.set(tx);
+    // `set` 失败 = 已有通道（采样线程被重建后再次 setup）。旧写法 `let _ =` 把
+    // 「新 rx 永不收到 poke」这一事实吞掉：此时 poke 会打到**旧** Sender，
+    // 而旧 rx 早已丢弃 ⇒ send 报错（由 `poke_sampler` 留痕），但线程重建的
+    // 事实必须在这里可见，否则只看到一串 send 失败却不知其因（审查项 2.1.6）。
+    if RESUME_NOTIFY.set(tx).is_err() {
+        crate::probe::log(
+            "resume notify: 通道已存在，本次 setup 的 receiver 不会收到 poke（依赖超时兜底）",
+        );
+    }
     rx
 }
 
@@ -1253,6 +1569,17 @@ impl OverlayWindow {
             .map(|h| windows::Win32::Foundation::HINSTANCE(h.0))
             .unwrap_or_default();
 
+        // 类名 / 标题由契约常量在**运行期**转宽字符（审查项 7.1.2 / P1-22）：
+        // `w!()` 只接受字面量，用它就等于在本 crate 再存一份副本。
+        // 两个 Vec 必须活到 RegisterClassExW 与 CreateWindowExW 都返回为止。
+        let class_w = aaxsyspulse_core::contract::wide_of(
+            aaxsyspulse_core::contract::OVERLAY_WINDOW_CLASS,
+        );
+        let title_w = aaxsyspulse_core::contract::wide_of(
+            aaxsyspulse_core::contract::OVERLAY_WINDOW_TITLE,
+        );
+        let class_pcw = windows::core::PCWSTR(class_w.as_ptr());
+
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW,
@@ -1264,7 +1591,7 @@ impl OverlayWindow {
             hCursor: cursor,
             hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH::default(),
             lpszMenuName: windows::core::PCWSTR::null(),
-            lpszClassName: windows::core::w!("AAXSysPulse_WndClass"),
+            lpszClassName: class_pcw,
             hIconSm: crate::app_icon::small_icon(),
         };
 
@@ -1296,6 +1623,10 @@ impl OverlayWindow {
             (strip_w, strip_h)
         };
 
+        // 历史保存的位置可能因为拔掉副屏 / 改分辨率而完全落到显示器外，
+        // 悬浮窗没有任务栏入口，一旦出屏就再也拖不回来 —— 启动时先钳一次。
+        let (pos_x, pos_y) = clamp_to_visible(pos_x, pos_y, win_w, win_h);
+
         let mut ex_style = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
         if state.cfg.topmost {
             ex_style |= WS_EX_TOPMOST;
@@ -1304,8 +1635,8 @@ impl OverlayWindow {
         let hwnd = unsafe {
             CreateWindowExW(
                 ex_style,
-                windows::core::w!("AAXSysPulse_WndClass"),
-                windows::core::w!("AAX SysPulse"),
+                class_pcw,
+                windows::core::PCWSTR(title_w.as_ptr()),
                 WS_POPUP | WS_VISIBLE,
                 pos_x,
                 pos_y,
@@ -1336,6 +1667,29 @@ impl OverlayWindow {
                 WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
             };
             let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
+        }
+
+        // UIPI 放行引导程序发来的两个跨进程消息。
+        // 主程序以管理员运行时完整性为 High，而引导程序的多数页面跑在 Medium
+        // （只有点了"提权"才升上去）；不同完整性之间投递窗口消息会被系统
+        // **静默丢弃**（PostMessageW 仍返回成功），表现为「引导里改了设置，
+        // 悬浮窗毫无反应」。加入过滤白名单后该消息可跨完整性送达。
+        // 注意：Ex 版 API 的常量是 MSGFLT_ALLOW（值 1，与 MSGFLT_ADD 同值但不同类型）。
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                ChangeWindowMessageFilterEx, MSGFLT_ALLOW,
+            };
+            for msg in [WM_RELOAD_CONFIG, WM_QUICK_RESTART] {
+                // 这条 API 的返回值**必须判**（批次 5 项 ⑥ 的 A 层同族）：放行失败时
+                // 引导侧的 `PostMessageW` **仍返回成功**（UIPI 是静默丢弃），于是
+                // 「引导改了设置、悬浮窗毫无反应」在两端的日志里都显示成功。
+                if let Err(e) = ChangeWindowMessageFilterEx(hwnd, msg, MSGFLT_ALLOW, None) {
+                    // 放行失败是**整条跨完整性通路**的永久降级 ⇒ 走默认可见的 degrade 流。
+                    crate::probe::degrade(&format!(
+                        "degrade: uipi 消息 {msg:#x} 放行失败（{e}）—— 引导与主程序完整性不同时，投递会被系统静默丢弃"
+                    ));
+                }
+            }
         }
 
         // 启动定位优先级（修复"每次启动都回到右下角 / 不记忆窗口位置"）：
@@ -1443,10 +1797,10 @@ pub fn handle_second_instance() -> bool {
             if hidden {
                 mark_overlay_hidden(false);
                 unsafe { let _ = ShowWindow(hwnd, SW_SHOW); }
-                // 与托盘显示路径同理：唤醒可能阻塞在不可见等待上的采样线程
-                if let Some(tx) = RESUME_NOTIFY.get() {
-                    let _ = tx.send(());
-                }
+                // 这里**不**poke 采样线程：`RESUME_NOTIFY` 是本进程的 `OnceLock`，
+                // 第二实例里恒为 `None`，旧写法 `if let Some(tx) = …` 是纯死代码
+                // （审查项 2.1.6）。显示后的唤醒由采样线程自身的 1s 可见性重查兜底
+                // （`main.rs` 隐藏等待循环），代价最多 1s 延迟，不会漏刷新。
             } else {
                 // ⚠️ 必须投递给**第一实例**：本函数运行在第二实例，而 SETTINGS_HWND
                 // 是本进程的模块静态（= -1）→ 直接 open_settings 会在这里 create_dialog
@@ -1489,17 +1843,21 @@ fn find_overlay_hwnd() -> Option<HWND> {
         let result_ptr = Box::into_raw(result) as u64;
 
         unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-            // LPARAM(i64) → 原始指针：先 as isize 再 as u64 再 as 指针
-            let raw = lparam.0 as isize as u64;
+            // LPARAM(i64) → 原始指针：`LPARAM.0` 本身是 `isize`，只需一步 `as u64`
+            let raw = lparam.0 as u64;
             let result = &*(raw as *const Mutex<Option<HWND>>);
             let mut buf = [0u16; 256];
             let len = GetClassNameW(hwnd, &mut buf);
-            let class_name = windows::core::w!("AAXSysPulse_WndClass");
+            // 契约常量而非字面量（审查项 7.1.2 / P1-22）。名字保证 ASCII
+            // （core::contract 的 `names_are_ascii_for_lossless_wide_literals`），
+            // 故 UTF-16 码元数 == UTF-8 字节数，可直接先比长度。
+            let class_name = aaxsyspulse_core::contract::OVERLAY_WINDOW_CLASS;
             let matches = len > 0
+                && len as usize == class_name.len()
                 && buf[..len as usize]
                     .iter()
-                    .zip(class_name.as_wide().iter())
-                    .all(|(a, b)| (*a as u8).to_ascii_lowercase() == (*b as u8).to_ascii_lowercase());
+                    .zip(class_name.encode_utf16())
+                    .all(|(a, b)| (*a as u8).eq_ignore_ascii_case(&(b as u8)));
             if matches {
                 if let Ok(mut r) = result.lock() {
                     *r = Some(hwnd);

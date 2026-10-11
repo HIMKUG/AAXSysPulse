@@ -24,7 +24,7 @@
 //!   不存在跨线程 DC 共享。
 
 use std::collections::HashMap;
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::OnceLock;
 
 use windows::core::{w, Interface, PCWSTR};
@@ -52,14 +52,25 @@ use aaxsyspulse_core::config::{Config, RenderEngine};
 use aaxsyspulse_ui::Rgba;
 use aaxsyspulse_ui::{Rect, RenderTarget};
 
-// ── 进程级工厂（与设置页的 Gfx 独立，悬浮窗独占） ──────────
+// ── 线程级工厂（与设置页的 Gfx 独立，悬浮窗独占） ──────────
 
-fn d2d_factory() -> Option<&'static ID2D1Factory> {
-    static F: OnceLock<Option<ID2D1Factory>> = OnceLock::new();
-    F.get_or_init(|| unsafe {
-        D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).ok()
+/// 悬浮窗 D2D 工厂。
+///
+/// **必须是 `thread_local!`，不能是进程级 `OnceLock`**（2026-09-21，审查项 2.2.10）：
+/// `D2D1_FACTORY_TYPE_SINGLE_THREADED` 的契约是"工厂及其派生对象不得跨线程使用"，
+/// 而渲染线程自愈（2.2.9 `WatchdogAction::Respawn`）会**换一条新线程**继续跑本模块。
+/// 进程级工厂会被新线程拿去 `CreateDCRenderTarget` + `BindDC` ⇒ 未定义行为，
+/// 实测倾向是 `D2DERR_WRONG_STATE` 连续 5 帧 → 被 `gdi.rs` 的兜底永久降级回 GDI
+/// （用户只看到"变卡了"，无人解释）。与 `RT_CACHE`/`BRUSH_CACHE` 同作用域，
+/// 换线程时自然重建，代价是多创建一次工厂（进程生命周期内 ≤ respawn 次数）。
+fn d2d_factory() -> Option<ID2D1Factory> {
+    thread_local! {
+        static F: OnceCell<Option<ID2D1Factory>> = const { OnceCell::new() };
+    }
+    F.with(|f| {
+        f.get_or_init(|| unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).ok() })
+            .clone()
     })
-    .as_ref()
 }
 
 /// D2D RenderTarget 缓存：避免每帧调用 `CreateDCRenderTarget`（昂贵的 GPU 上下文创建）。

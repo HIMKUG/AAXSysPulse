@@ -45,11 +45,16 @@ pub enum ConfigError {
 /// 配置子目录名（位于 `%APPDATA%\AAXSysPulseC\` 下）。
 const CONFIG_SUBDIR: &str = "config";
 
-/// 迁移一次性执行标记文件（写在 config/ 同级的 APPDATA 目录下）。
-const MIGRATION_DONE_FILE: &str = "config_migrated_v3";
+/// 迁移一次性执行标记文件名：由 `CONFIG_VERSION` 推导（审查项 7.1.3 / P1-22），
+/// 升版不会留下一个还在写 v3 标记的硬编码。
+fn migration_done_file() -> String {
+    aaxsyspulse_core::contract::migration_marker_name()
+}
 
 fn appdata_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("APPDATA").map(|s| std::path::PathBuf::from(s).join("AAXSysPulseC"))
+    std::env::var_os("APPDATA").map(|s| {
+        std::path::PathBuf::from(s).join(aaxsyspulse_core::contract::APP_DATA_DIR_NAME)
+    })
 }
 
 fn config_dir() -> Option<std::path::PathBuf> {
@@ -57,7 +62,7 @@ fn config_dir() -> Option<std::path::PathBuf> {
 }
 
 fn migration_marker_path() -> Option<std::path::PathBuf> {
-    appdata_dir().map(|d| d.join(MIGRATION_DONE_FILE))
+    appdata_dir().map(|d| d.join(migration_done_file()))
 }
 
 fn to_wide(s: &OsStr) -> Vec<u16> {
@@ -98,6 +103,11 @@ const ALL_FILES: [&str; 5] = [
     LAYOUT_V_FILE,
 ];
 
+/// 剥离 UTF-8 BOM（见 [`read_if`] 的说明）。
+fn strip_bom(s: String) -> String {
+    s.strip_prefix('\u{feff}').map(str::to_string).unwrap_or(s)
+}
+
 /// 读文件内容，不存在返回 `None`（不报错）。
 fn read_if(dir: &std::path::Path, name: &str) -> Option<String> {
     // ⚠️ 必须剥离 UTF-8 BOM。记事本 / VSCode「另存为 UTF-8 with BOM」会在文件首
@@ -105,9 +115,98 @@ fn read_if(dir: &std::path::Path, name: &str) -> Option<String> {
     // **整个文件的键静默回退默认**；且 version 读不到被当成 v1，与其他 v3 文件
     // 组成 span=2 → 触发「版本跨度过大 → 用默认配置覆盖全部配置」的破坏性弹窗。
     // 2026-09-15 审计定位。
-    std::fs::read_to_string(dir.join(name))
-        .ok()
-        .map(|s| s.strip_prefix('\u{feff}').map(str::to_string).unwrap_or(s))
+    std::fs::read_to_string(dir.join(name)).ok().map(strip_bom)
+}
+
+/// 读文件，并把**「不存在」**与**「存在但读不出来」**分开。
+///
+/// `read_if` 两者一律返回 `None` —— 于是「权限不足 / 文件被占用 / 非 UTF-8 / 半截文件」
+/// 与「首次运行、本就没有」长得一模一样（报告 2.3.1 / 8.32）。前者必须留证并禁用回写，
+/// 否则「读失败 → 内存里是全默认值 → 用户点一下设置 → 默认值写回磁盘」= 全量设置销毁。
+///
+/// - `Ok(None)` 文件不存在（正常：首次运行）
+/// - `Ok(Some(text))` 正常读到
+/// - `Err(reason)` 文件存在但读不出来
+fn read_probe(dir: &std::path::Path, name: &str) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(dir.join(name)) {
+        Ok(text) => Ok(Some(strip_bom(text))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 降级加载闸门（P1-4）
+//
+// 某个 `.cfg` 存在却读不出来时，本次加载是**残缺**的（缺失字段回落了默认值）。
+// 这种会话里任何保存都会把默认值固化到磁盘、覆盖用户其余设置，故：
+//   · 读不出来的原件先**复制**为 `<name>.broken.<ts>`（不覆盖既有备份、不动原件）；
+//   · 置 `CONFIG_DEGRADED`，`save_config` / `save_config_async` 一律拒绝回写；
+//   · 只有**用户显式确认**的破坏性重置能解锁（`save_config_all`、`import_config`）。
+// 每次 `load_config` 进入时重算（`WM_RELOAD_CONFIG` 读到完好文件即自动解除）。
+// ──────────────────────────────────────────────────────────────────────────────
+
+static CONFIG_DEGRADED: AtomicBool = AtomicBool::new(false);
+static BROKEN_FILES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// 本会话是否处于降级加载态（禁用配置回写）。
+pub fn config_degraded() -> bool {
+    CONFIG_DEGRADED.load(Ordering::SeqCst)
+}
+
+/// 降级原因清单（读不出来的文件名），供 UI / 日志告知用户。
+pub fn broken_config_files() -> Vec<String> {
+    BROKEN_FILES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+fn mark_degraded(name: &str) {
+    CONFIG_DEGRADED.store(true, Ordering::SeqCst);
+    if let Ok(mut v) = BROKEN_FILES.lock() {
+        if !v.iter().any(|n| n == name) {
+            v.push(name.to_string());
+        }
+    }
+}
+
+/// 存在但读不出来的文件：复制留证 + 置降级标志。原件**不删不改**。
+fn quarantine_unreadable(dir: &std::path::Path, name: &str, reason: &str) {
+    let src = dir.join(name);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dst = dir.join(format!("{}.broken.{}", name, ts));
+    // 时间戳到秒：同名重复时复制失败即说明证据已在，不再重试。
+    match std::fs::copy(&src, &dst) {
+        Ok(_) => eprintln!(
+            "[config_io] ⚠️ {} 存在但读取失败（{}）。原件保留，已另存证据 {}；\
+             本次按默认值继续，并**禁用配置保存**以免默认值覆盖你的设置。",
+            name, reason, dst.display()
+        ),
+        Err(e) => eprintln!(
+            "[config_io] ⚠️ {} 存在但读取失败（{}），留证副本也没写成（{}）；\
+             本次按默认值继续，并**禁用配置保存**以免默认值覆盖你的设置。",
+            name, reason, e
+        ),
+    }
+    mark_degraded(name);
+}
+
+/// 读 + 解析单个配置文件；「不存在」与「读不出来」分别处理（见 [`read_probe`]）。
+fn parse_file_scoped(
+    dir: &std::path::Path,
+    name: &str,
+    cfg: &mut Config,
+    apply: impl FnOnce(&mut Config, &str),
+) {
+    match read_probe(dir, name) {
+        Ok(Some(text)) => apply(cfg, &text),
+        Ok(None) => {}
+        Err(reason) => quarantine_unreadable(dir, name, &reason),
+    }
 }
 
 /// 原子写单个文件：临时文件 + `MoveFileExW` 同卷替换。
@@ -269,6 +368,99 @@ fn check_version_consistency(dir: &std::path::Path) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// 就地升级单个配置文件（版本缺失或落后时）。
+///
+/// 升级方式 = 用该文件自己的 `parse` 读入一份默认 [`Config`]，再用其 `serialize`
+/// 写回；`serialize` 会把文件头版本号写成 `CONFIG_VERSION`。
+///
+/// **为什么升级前后 UI / 系统设置不变**：每个模块的 `parse` / `serialize` 对
+/// *该文件所拥有的字段* 是无损往返（serialize 写出的键 == parse 读入的键，
+/// 见 `system/appearance/monitor/layout` 各自 roundtrip 测试）。于是
+/// 「加载升级后的文件」与「加载升级前的文件」得到的 [`Config`] 逐字段相同，
+/// 唯一变化是文件格式 / 版本号被推进到当前。
+///
+/// - 缺失 version（旧格式）或 `version < CONFIG_VERSION` → 升级。
+/// - `version == CONFIG_VERSION` → 跳过。
+/// - `version > CONFIG_VERSION`（更新版程序写的）→ 不碰，不降级。
+/// - 升级前把原文件备份为 `<name>.bak`。
+///
+/// 返回 `true` 表示确实执行了升级。
+fn upgrade_one(
+    dir: &std::path::Path,
+    name: &str,
+    parse: impl Fn(&mut Config, &str),
+    serialize: impl Fn(&Config) -> String,
+) -> bool {
+    let cur = aaxsyspulse_core::config::CONFIG_VERSION;
+    let Some(text) = read_if(dir, name) else {
+        return false; // 不存在：交 ensure_default_files 生成
+    };
+    match read_file_version(dir, name) {
+        Some(v) if v == cur => return false, // 已最新
+        Some(v) if v > cur => {
+            eprintln!(
+                "[config_io] {} version {} 高于程序版本 {}，跳过就地升级（不降级）",
+                name, v, cur
+            );
+            return false;
+        }
+        _ => {} // 缺失 version（旧格式）或落后 → 升级
+    }
+
+    // parse 到一份默认配置 → 序列化回写：字段值无损，仅格式/版本推进
+    let mut cfg = Config::default();
+    parse(&mut cfg, &text);
+    let new_text = serialize(&cfg);
+
+    let src = dir.join(name);
+    let _ = std::fs::copy(&src, dir.join(format!("{}.bak", name))); // 升级前备份
+    if write_file_atomic(dir, name, &new_text) {
+        eprintln!("[config_io] {} 已就地升级到 v{}（各字段值保持不变）", name, cur);
+        true
+    } else {
+        eprintln!("[config_io] {} 就地升级写入失败，保留原文件", name);
+        false
+    }
+}
+
+/// 单文件升级步骤：`(文件名, 解析器, 序列化器)`。
+type UpgradeStep = (&'static str, fn(&mut Config, &str), fn(&Config) -> String);
+
+/// 启动时就地升级全部配置文件的格式版本（取代「版本跨度过大 → 弹窗」的破坏性路径）。
+///
+/// 逐文件独立升级、互不影响；某文件升级失败只保留该文件并记日志，
+/// 由随后的 `check_version_consistency` 兜底（仍不一致才走弹窗）。
+/// 返回升级成功的文件数。
+fn upgrade_legacy_files_in_place(dir: &std::path::Path) -> usize {
+    let mut n = 0usize;
+
+    // 非布局文件：parse(&mut Config, &str) / serialize(&Config) -> String
+    let plain: [UpgradeStep; 3] = [
+        (system::SYSTEM_FILE, system::parse, system::serialize),
+        (appearance::APPEARANCE_FILE, appearance::parse, appearance::serialize),
+        (monitor::MONITOR_FILE, monitor::parse, monitor::serialize),
+    ];
+    for (name, parse, serialize) in plain {
+        if upgrade_one(dir, name, parse, serialize) {
+            n += 1;
+        }
+    }
+
+    // 布局文件（横 / 竖各一）：按各自 style 解析 / 序列化，保留各自 offsets / order
+    for (name, style) in [(LAYOUT_H_FILE, RenderStyle::Strip), (LAYOUT_V_FILE, RenderStyle::Vertical)] {
+        if upgrade_one(
+            dir,
+            name,
+            |cfg, text| layout::parse(style, cfg, text),
+            |cfg| layout::serialize(style, cfg),
+        ) {
+            n += 1;
+        }
+    }
+
+    n
+}
+
 /// 用内置默认值生成缺失的配置文件（首次启动或用户误删某个文件时调用）。
 /// 已在的文件不受影响。
 fn ensure_default_files(cfg: &Config) {
@@ -339,6 +531,13 @@ fn run_migration_if_needed() {
             return;
         }
     };
+    // 先验格式再迁移：`Config::parse` 是宽容读，任何内容都能解出「全默认值」。
+    // 少了这道判定，一个与本项目无关的 config.txt（或已损坏的旧文件）会被解成
+    // 默认配置写进 5 个 .cfg，同时原文件被改名成 .bak —— 静默丢设置。
+    if !legacy::looks_like_legacy(&text) {
+        eprintln!("[config_io] {} 不含旧版 v2 特征键，跳过迁移（文件保持原样）", old.display());
+        return;
+    }
     let cfg = legacy::parse_v2(&text);
 
     // 2. 生成 5 文件内容
@@ -395,22 +594,23 @@ pub fn load_config() -> Result<Config, ConfigError> {
         None => return Ok(Config::default()),
     };
 
+    // ── 就地升级：把版本落后 / 缺失 version 的文件先升级到当前版本 ──
+    // 升级只推进格式与版本号，各字段值不变（见 upgrade_one 文档），
+    // 从而后续 check_version_consistency 恒通过、不再弹「版本跨度过大」。
+    upgrade_legacy_files_in_place(&dir);
+
     // ── 正常载入 ──
+    // 降级态每次重新判定：WM_RELOAD_CONFIG 会再次进这里，文件修好后禁写闸门自动解除。
+    clear_degraded();
+
     let mut cfg = Config::default();
-    if let Some(text) = read_if(&dir, system::SYSTEM_FILE) {
-        system::parse(&mut cfg, &text);
-    }
-    if let Some(text) = read_if(&dir, appearance::APPEARANCE_FILE) {
-        appearance::parse(&mut cfg, &text);
-    }
-    if let Some(text) = read_if(&dir, monitor::MONITOR_FILE) {
-        monitor::parse(&mut cfg, &text);
-    }
+    parse_file_scoped(&dir, system::SYSTEM_FILE, &mut cfg, system::parse);
+    parse_file_scoped(&dir, appearance::APPEARANCE_FILE, &mut cfg, appearance::parse);
+    parse_file_scoped(&dir, monitor::MONITOR_FILE, &mut cfg, monitor::parse);
     // 依据 system.cfg 的 layout 锚点载入对应布局文件
     let lay_file = layout::file_for(cfg.render_style);
-    if let Some(text) = read_if(&dir, lay_file) {
-        layout::parse(cfg.render_style, &mut cfg, &text);
-    }
+    let style = cfg.render_style;
+    parse_file_scoped(&dir, lay_file, &mut cfg, |c, t| layout::parse(style, c, t));
 
     // ── version 一致性检查（span > 1 直接拒绝）──
     check_version_consistency(&dir)?;
@@ -422,10 +622,56 @@ pub fn load_config() -> Result<Config, ConfigError> {
 }
 
 /// 同步落盘（进程退出/关键变更用）。仅写当前激活布局，保留另一布局文件。
+///
+/// 返回 `false` = 未写入。降级加载会话（见 [`config_degraded`]）一律拒绝，
+/// 否则内存里的默认值会把用户其余设置覆盖掉。
 pub fn save_config(cfg: &Config) -> bool {
+    if config_degraded() {
+        eprintln!("[config_io] 配置处于降级加载态，本次拒绝落盘（详见 .broken.<ts> 备份）");
+        return false;
+    }
     match config_dir() {
         Some(d) => write_bundle(&d, &bundle_for(cfg)),
         None => false,
+    }
+}
+
+/// 全量同步落盘（**5 个文件**，含横 / 竖两个布局）。
+///
+/// 仅用于「版本跨度过大 → 用户选择用默认配置覆盖全部」这一破坏性重置。
+/// 必须写全 5 个文件：`save_config` 只写当前激活布局，非激活布局文件
+/// **永远不被重写**；若它是旧格式（缺 `[meta] version` → 被
+/// `check_version_consistency` 判为 v1），则每次启动都会重复弹「版本跨度过大」，
+/// 且用户点「是」也消除不了（因为重置同样只写 4 个文件）——2026-09-15 定位。
+/// 写前把每个已存在文件备份为 `<name>.bak`，与弹窗「原文件已自动备份」的承诺一致。
+///
+/// 这条路径**正是**降级闸门等待的「用户显式确认」：弹窗里用户已经看过
+/// 「全部重置为默认值」并点了「是」，故写成功后解除降级态、恢复正常保存。
+pub fn save_config_all(cfg: &Config) -> bool {
+    let dir = match config_dir() {
+        Some(d) => d,
+        None => return false,
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    for name in ALL_FILES {
+        let src = dir.join(name);
+        if src.exists() {
+            let _ = std::fs::copy(&src, dir.join(format!("{}.bak", name)));
+        }
+    }
+    let ok = write_bundle(&dir, &bundle_all(cfg));
+    if ok {
+        clear_degraded();
+    }
+    ok
+}
+
+/// 解除降级态（用户已显式确认覆盖 / 导入完成：磁盘上不再是"内存默认值 vs 磁盘真值"
+/// 的危险组合，可以恢复保存）。
+fn clear_degraded() {
+    CONFIG_DEGRADED.store(false, Ordering::SeqCst);
+    if let Ok(mut v) = BROKEN_FILES.lock() {
+        v.clear();
     }
 }
 
@@ -527,6 +773,10 @@ fn start_writer_thread() {
 ///
 /// ⚠️ 进程退出路径（关窗/隐藏 flush）请用 [`save_config`] 同步落盘保数据。
 pub fn save_config_async(cfg: &Config) -> bool {
+    if config_degraded() {
+        eprintln!("[config_io] 配置处于降级加载态，异步保存已跳过（避免默认值覆盖设置）");
+        return false;
+    }
     // 第一次调用时启动写线程
     start_writer_thread();
 
@@ -648,11 +898,9 @@ fn confirm_import(max_compat: bool) -> bool {
         eprintln!("[config_io] 导入已取消（用户拒绝确认）");
         return false;
     }
-    if max_compat {
-        if !prompt_max_compat() {
-            eprintln!("[config_io] 导入已取消（用户拒绝最大化兼容）");
-            return false;
-        }
+    if max_compat && !prompt_max_compat() {
+        eprintln!("[config_io] 导入已取消（用户拒绝最大化兼容）");
+        return false;
     }
     true
 }
@@ -905,9 +1153,48 @@ pub fn import_config(text: &str) -> bool {
     for (_, bak) in &bak_entries {
         let _ = std::fs::remove_file(bak);
     }
+    // 磁盘内容已是用户知情选择导入的那份 → 降级禁写闸门解除（见 P1-4）。
+    clear_degraded();
 
     prompt_import_success();
     true
+}
+
+/// 测试环境：不弹窗。
+#[cfg(test)]
+pub fn prompt_config_degraded(_broken: &[String]) {}
+
+/// 降级加载的用户可见信号（P1-4 的 (a) 项：原来只有 `eprintln!`，
+/// 用户看到的是"设置全没了"却没有任何解释）。
+/// 由 `app` 入口在启动早期调用；登录自启（`--autostart`）静默模式不调用。
+#[cfg(not(test))]
+pub fn prompt_config_degraded(broken: &[String]) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND,
+    };
+    let title = "部分配置文件读取失败";
+    let msg = format!(
+        "以下配置文件存在但读不出来（损坏 / 被占用 / 编码异常）：\n\
+         {}\n\n\
+         本次启动这些设置按默认值生效，悬浮窗上看到的不是你的配置。\n\
+         为防止把默认值写回磁盘覆盖其余设置，**本次运行期间已停止保存配置**。\n\
+         坏文件的副本已另存为 `<文件名>.broken.<时间戳>`：可从里面手工找回设置，\n\
+         或修复/删除坏文件后重启程序。",
+        broken.join("\n")
+    );
+    let title_w: Vec<u16> =
+        std::ffi::OsStr::new(title).encode_wide().chain(std::iter::once(0)).collect();
+    let msg_w: Vec<u16> =
+        std::ffi::OsStr::new(&msg).encode_wide().chain(std::iter::once(0)).collect();
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            windows::core::PCWSTR(msg_w.as_ptr()),
+            windows::core::PCWSTR(title_w.as_ptr()),
+            MB_ICONWARNING | MB_OK | MB_SETFOREGROUND,
+        );
+    }
 }
 
 /// 返回配置文件路径（用于 UI 展示/诊断），无则返回 `None`。
@@ -939,6 +1226,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// P1-4：`read_probe` 必须把「不存在」与「存在但读不出来」分开。
+    /// 用「同名目录」制造稳定的读失败（`read_to_string` 返回非 NotFound 错误）。
+    #[test]
+    fn read_probe_distinguishes_missing_from_unreadable() {
+        let dir = std::env::temp_dir().join(format!("aaxsp_probe_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        assert!(
+            matches!(read_probe(&dir, "missing.cfg"), Ok(None)),
+            "不存在应是 Ok(None)（首次运行，正常）"
+        );
+        let _ = std::fs::write(dir.join("appearance.cfg"), "[meta]\nversion = 3\n");
+        assert!(
+            matches!(read_probe(&dir, "appearance.cfg"), Ok(Some(_))),
+            "能读的文件应是 Ok(Some(text))"
+        );
+        let _ = std::fs::create_dir(dir.join("monitor.cfg"));
+        assert!(
+            read_probe(&dir, "monitor.cfg").is_err(),
+            "存在但读不出来必须是 Err，不能与缺失混淆"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-4：读不出来的文件 ⇒ 留证 + 置降级标志（禁写闸门由此触发）；
+    /// `clear_degraded`（显式重置 / 导入 / 下次成功加载）解除。
+    #[test]
+    fn unreadable_file_degrades_session_and_blocks_saving() {
+        let dir = std::env::temp_dir().join(format!("aaxsp_degrade_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::remove_dir(dir.join(monitor::MONITOR_FILE));
+        let _ = std::fs::create_dir(dir.join(monitor::MONITOR_FILE));
+
+        clear_degraded();
+        assert!(!config_degraded(), "起点应为非降级态");
+        let mut cfg = Config::default();
+        parse_file_scoped(&dir, monitor::MONITOR_FILE, &mut cfg, monitor::parse);
+        assert!(config_degraded(), "读失败必须置降级标志");
+        assert!(
+            broken_config_files().contains(&monitor::MONITOR_FILE.to_string()),
+            "降级清单里要有出错的文件名，实际：{:?}",
+            broken_config_files()
+        );
+
+        clear_degraded();
+        assert!(!config_degraded(), "解除后应恢复正常保存");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn version_single_step_diff_ok() {
         let dir = std::env::temp_dir().join(format!("aaxsp_vok_{}", std::process::id()));
@@ -954,6 +1290,97 @@ mod tests {
             check_version_consistency(&dir).is_ok(),
             "单步同版本应放行"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归：非激活布局是旧格式（缺 `[meta] version`）时启动校验拒绝；
+    /// 「用默认配置覆盖全部」必须把它**一起**写成当前版本，否则每次启动重复弹窗
+    /// （2026-09-15 定位：`save_config` 只写 4 个文件，layout_v 永不被重写）。
+    /// 这里验证全量落盘内核 `bundle_all` 能把陈旧的非激活布局一并升级 → 校验通过。
+    #[test]
+    fn full_reset_upgrades_stale_inactive_layout() {
+        let dir = std::env::temp_dir().join(format!("aaxsp_all5_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // 现场复刻：4 个文件 v3，layout_v 为旧格式（无 version）
+        let _ = std::fs::write(dir.join(system::SYSTEM_FILE), "[system]\nversion = 3\n");
+        let _ = std::fs::write(dir.join(monitor::MONITOR_FILE), "[meta]\nversion = 3\n");
+        let _ = std::fs::write(dir.join(appearance::APPEARANCE_FILE), "[meta]\nversion = 3\n");
+        let _ = std::fs::write(dir.join(LAYOUT_H_FILE), "[meta]\nversion = 3\n");
+        let _ = std::fs::write(dir.join(LAYOUT_V_FILE), "[window]\nx = 0\n"); // 旧格式
+        assert!(
+            check_version_consistency(&dir).is_err(),
+            "旧格式非激活布局应触发拒绝（span=2）"
+        );
+
+        // 全量落盘（save_config_all 的核心）：写全 5 个文件
+        let cfg = Config::default();
+        for (name, content) in bundle_all(&cfg) {
+            assert!(write_file_atomic(&dir, &name, &content), "{name} 应写入成功");
+        }
+        assert!(
+            check_version_consistency(&dir).is_ok(),
+            "全量落盘后版本应一致（否则会反复弹窗）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 就地升级必须保证「升级前后 UI 样式与系统设置完全相同」。
+    /// 构造用户现场（4 文件 v3、layout_v 旧格式无 version），
+    /// 升级前后各解析一遍全部配置（含 layout_v 的 offsets），断言 Config 逐字段相等。
+    #[test]
+    fn in_place_upgrade_preserves_effective_config() {
+        let dir = std::env::temp_dir().join(format!("aaxsp_upgrade_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        // 4 个新格式文件（含自定义非默认值，确保比对真的有效）
+        let _ = std::fs::write(
+            dir.join(system::SYSTEM_FILE),
+            "[system]\nversion = 3\nx = 300\ny = 120\nzoom = 2\ninterval_ms = 1000\nlang = zh\ntopmost = 1\n",
+        );
+        let _ = std::fs::write(
+            dir.join(appearance::APPEARANCE_FILE),
+            "[meta]\nversion = 3\n\n[appearance]\nbg = #112233\nfont_size = 20.0\nshadow = 1\n",
+        );
+        let _ = std::fs::write(
+            dir.join(monitor::MONITOR_FILE),
+            "[meta]\nversion = 3\n\n[monitor]\nutil_decimal = 1\n\n[item.1]\nshow = 1\nname = 1\n",
+        );
+        let _ = std::fs::write(
+            dir.join(LAYOUT_H_FILE),
+            "[meta]\nversion = 3\n\n[layout]\norder = 1 2 3 7 4 5 6 8 9\n",
+        );
+        // layout_v：旧格式（无 [meta] version、无 [layout] 段）—— 用户现场
+        let _ = std::fs::write(
+            dir.join(LAYOUT_V_FILE),
+            "[window]\nx = 834\ny = -7\n\n[metrics]\noffset.5 = 0 0 12 0\n",
+        );
+
+        // 把全部配置（4 全局 + layout_v 视为激活布局）解析为一份 Config
+        let parse_all = |dir: &std::path::Path| {
+            let mut c = Config::default();
+            if let Some(t) = read_if(dir, system::SYSTEM_FILE) { system::parse(&mut c, &t); }
+            if let Some(t) = read_if(dir, appearance::APPEARANCE_FILE) { appearance::parse(&mut c, &t); }
+            if let Some(t) = read_if(dir, monitor::MONITOR_FILE) { monitor::parse(&mut c, &t); }
+            if let Some(t) = read_if(dir, LAYOUT_V_FILE) { layout::parse(RenderStyle::Vertical, &mut c, &t); }
+            c
+        };
+        let before = parse_all(&dir);
+
+        // 现状：版本不一致 → 启动会被拒绝（复现 bug）
+        assert!(check_version_consistency(&dir).is_err(), "旧格式 layout_v 应触发拒绝");
+
+        // 就地升级
+        let upgraded = upgrade_legacy_files_in_place(&dir);
+        assert!(upgraded >= 1, "至少应升级 layout_v");
+
+        // 升级后：版本一致，且 Config 逐字段不变（UI/系统设置不受影响）
+        assert!(check_version_consistency(&dir).is_ok(), "升级后版本应一致");
+        let after = parse_all(&dir);
+        assert_eq!(before, after, "就地升级不得改变任何有效配置");
+
+        // layout_v 的自定义偏移确实被保留
+        assert_eq!(after.metric_offsets[4], [0, 0, 12, 0], "旧布局 offsets 应无损保留");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
