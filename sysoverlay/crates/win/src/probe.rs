@@ -25,8 +25,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-/// 全局开关（由设置面板的「调试日志」项在运行时切换）。**默认开**（2026-09-14）。
-static DEBUG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// 全局开关（由设置面板的「调试日志」项在运行时切换）。
+/// **默认关**（审查 272：原初值 true 与"调试日志默认关"的语义相反；
+/// 启动时由 `main` 按 `cfg.debug_log` 显式开启）。
+static DEBUG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 设置面板调用：开/关调试日志。立即生效，无需重启。
 pub fn set_debug(on: bool) {
@@ -38,10 +40,11 @@ pub fn debug() -> bool {
     DEBUG.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// 是否启用。优先级（2026-09-14 起**默认开**，便于随时取数）：
+/// 是否启用。优先级（审查 272：默认**关**，由配置/环境显式开启）：
 ///
 /// 1. 环境变量 `AAXSYSPULSE_PROBE`：`0`/`false` 强制关、`1`/`true` 强制开；
-/// 2. 否则看设置面板「调试日志」开关（[`DEBUG`]，默认开）。
+/// 2. 否则看设置面板「调试日志」开关（[`DEBUG`]，默认关，
+///    `main` 启动时按 `cfg.debug_log` 覆盖）。
 pub fn enabled() -> bool {
     match env_probe_force() {
         Some(v) => v,
@@ -109,10 +112,14 @@ pub fn log_startup() {
         return;
     }
     let pid = std::process::id();
+    // 审查 597：打印两个开关的**实际**值 —— enabled() 为真可能只是因为
+    // 环境变量强制开，硬编码 "probe=1" 会误导现场判断。
     log(&format!(
-        "startup pid={} perf={} probe=1",
+        "startup pid={} env_probe_force={:?} debug={} perf_force={:?}",
         pid,
-        perf_flag()
+        env_probe_force(),
+        debug(),
+        crate::perf::env_perf_force()
     ));
 }
 
@@ -149,8 +156,5 @@ pub fn install_panic_hook() {
     }));
 }
 
-fn perf_flag() -> bool {
-    std::env::var("AAXSYSPULSE_PERF")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
+// 审查 272：`perf_flag` 已随 log_startup 改写为打印 `env_probe_force` /
+// `debug()` / `perf::env_perf_force()` 的实际值而删除 —— 单一解析在 perf 模块。

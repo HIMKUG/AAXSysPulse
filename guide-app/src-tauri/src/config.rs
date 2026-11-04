@@ -38,12 +38,10 @@ const _: () = assert!(METRIC_COUNT == aaxsyspulse_core::types::Metric::COUNT);
 pub const CONFIG_VERSION: u32 = aaxsyspulse_core::contract::CONFIG_VERSION;
 
 pub fn config_dir() -> PathBuf {
-    // 目录名 = 跨进程契约（审查项 7.1.2 / P1-22）：主程序 `config_io::appdata_dir`
-    // 读的是同一个目录，两边各写一份字面量时曾经一头 `AAXSysPulse` 一头 `AAXSysPulseC`。
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(aaxsyspulse_core::contract::APP_DATA_DIR_NAME)
-        .join("config")
+    // 目录拼接唯一真源 = 契约 `app_config_dir()`（首轮 010/011：主线程已把该函数
+    // 落进 `sysoverlay/crates/core/src/contract.rs`，返回 `%APPDATA%\AAXSysPulseC\config`）。
+    // 引导不再自行拼目录串 —— 主程序与引导任何一端改目录名都不会静默失联。
+    aaxsyspulse_core::contract::app_config_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
 pub fn ensure_config_dir() -> io::Result<PathBuf> {
@@ -70,27 +68,43 @@ fn parse_ini(content: &str) -> std::collections::HashMap<String, std::collection
             sections.entry(current_section.clone()).or_default();
         } else if let Some((key, value)) = line.split_once('=') {
             let key = key.trim().to_lowercase();
-            let value = value.trim().to_string();
+            let value = strip_inline_comment(value.trim()).to_string();
             sections.entry(current_section.clone()).or_default().insert(key, value);
         }
     }
     sections
 }
 
+/// 剥离行内注释（续篇 690）：`key = val # 注释` 曾把注释并进 value。
+/// 只剥离**前面带空白**的 `#`/`;` —— 颜色值 `#FF8800` 以 `#` 开头（前面无空白），不受影响。
+fn strip_inline_comment(v: &str) -> &str {
+    let bytes = v.as_bytes();
+    for i in 1..bytes.len() {
+        if (bytes[i] == b'#' || bytes[i] == b';') && bytes[i - 1].is_ascii_whitespace() {
+            return v[..i].trim_end();
+        }
+    }
+    v
+}
+
 fn parse_bool(s: &str) -> bool {
-    matches!(s.trim(), "1" | "true" | "yes" | "on")
+    // 续篇 691：与主程序 ini.rs 同口径先转小写 —— `True`/`YES` 曾被判 false，
+    // 两端读同一 cfg 结果不同。
+    matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
 }
 
-fn parse_u32(s: &str) -> u32 {
-    s.trim().parse().unwrap_or(0)
+// 续篇 247：解析失败回落**该字段的默认值**而不是 0 —— `interval_ms=0` 会被主
+// 程序吸附到 100ms 最快档、坐标写 0 会把悬浮窗踢到屏幕原点。
+fn parse_u32_or(s: &str, default: u32) -> u32 {
+    s.trim().parse().unwrap_or(default)
 }
 
-fn parse_i32(s: &str) -> i32 {
-    s.trim().parse().unwrap_or(0)
+fn parse_i32_or(s: &str, default: i32) -> i32 {
+    s.trim().parse().unwrap_or(default)
 }
 
-fn parse_f32(s: &str) -> f32 {
-    s.trim().parse().unwrap_or(0.0)
+fn parse_f32_or(s: &str, default: f32) -> f32 {
+    s.trim().parse().unwrap_or(default)
 }
 
 // ============ 监控项 ID ↔ 前端 key 映射（唯一真源）============
@@ -106,34 +120,19 @@ fn parse_f32(s: &str) -> f32 {
 //   index 7 → id 8 = disk_read
 //   index 8 → id 9 = disk_write
 
+// 续篇 689：id↔key 映射改由 core `Metric::ALL`/`key_name()` 派生，不再手写两份
+// —— 主程序在中间插入新指标时这里自动跟随，不会整列错位（编译期已有
+// METRIC_COUNT == Metric::COUNT 断言兜底）。
 pub fn metric_key_for_id(id: u32) -> Option<&'static str> {
-    match id {
-        1 => Some("cpu"),
-        2 => Some("mem"),
-        3 => Some("gpu"),
-        4 => Some("net"),
-        5 => Some("power"),
-        6 => Some("time"),
-        7 => Some("util"),
-        8 => Some("disk_read"),
-        9 => Some("disk_write"),
-        _ => None,
-    }
+    let idx = (id as usize).checked_sub(1)?;
+    aaxsyspulse_core::types::Metric::ALL.get(idx).map(|m| m.key_name())
 }
 
 pub fn metric_id_for_key(key: &str) -> Option<u32> {
-    match key {
-        "cpu" => Some(1),
-        "mem" => Some(2),
-        "gpu" => Some(3),
-        "net" => Some(4),
-        "power" => Some(5),
-        "time" => Some(6),
-        "util" => Some(7),
-        "disk_read" => Some(8),
-        "disk_write" => Some(9),
-        _ => None,
-    }
+    aaxsyspulse_core::types::Metric::ALL
+        .iter()
+        .position(|m| m.key_name() == key)
+        .map(|idx| idx as u32 + 1)
 }
 
 // ============ system.cfg ============
@@ -174,8 +173,10 @@ pub struct SystemConfig {
     pub gpu_3d_only: bool,
     pub net_low_freq: bool,
     pub lang: String,
-    pub admin_check_continue_count: u32,
-    pub driver_check_continue_count: u32,
+    // 续篇 248：与 core（u8 且 parse 处 .min(3)）统一类型与钳位 —— 引导侧 u32 曾把
+    // >3 的值原样写出，主程序读回钳成 3，"连点 3 次跳过"被提前触发。
+    pub admin_check_continue_count: u8,
+    pub driver_check_continue_count: u8,
     pub admin_check_last_date: u32,
     pub driver_check_last_date: u32,
 }
@@ -216,7 +217,9 @@ impl Default for SystemConfig {
             gpu_primary_only: false,
             gpu_3d_only: false,
             net_low_freq: false,
-            lang: "en".to_string(),
+            // 续篇 692：默认中文 —— index.html 是 zh-CN、全部引导文案中文，且 core
+            // `Config::default().lang == Lang::Zh`。默认 "en" 曾让首次安装后主程序以英文启动。
+            lang: "zh".to_string(),
             admin_check_continue_count: 0,
             driver_check_continue_count: 0,
             admin_check_last_date: 0,
@@ -250,38 +253,38 @@ impl SystemConfig {
 
         Ok(Self {
             version,
-            x: parse_i32(&get("x", "-1")),
-            y: parse_i32(&get("y", "-1")),
-            w: parse_i32(&get("w", "0")),
-            h: parse_i32(&get("h", "0")),
+            x: parse_i32_or(&get("x", "-1"), -1),
+            y: parse_i32_or(&get("y", "-1"), -1),
+            w: parse_i32_or(&get("w", "0"), 0),
+            h: parse_i32_or(&get("h", "0"), 0),
             locked: parse_bool(&get("locked", "false")),
             layout: get("layout", "horizontal"),
-            zoom: parse_u32(&get("zoom", "100")).clamp(75, 200),
+            zoom: parse_u32_or(&get("zoom", "100"), 100).clamp(75, 200),
             net_unit: get("net_unit", "mb"),
             net_mode: get("net_mode", "both"),
-            interval_ms: parse_u32(&get("interval_ms", "1000")),
+            interval_ms: parse_u32_or(&get("interval_ms", "1000"), 1000),
             refresh_auto: parse_bool(&get("refresh_auto", "true")),
             topmost: parse_bool(&get("topmost", "true")),
-            normal_opacity: parse_u32(&get("normal_opacity", "100")).clamp(0, 100),
-            anim_ms: parse_u32(&get("anim_ms", "300")).min(2000),
+            normal_opacity: parse_u32_or(&get("normal_opacity", "100"), 100).clamp(0, 100),
+            anim_ms: parse_u32_or(&get("anim_ms", "300"), 300).min(2000),
             autostart: parse_bool(&get("autostart", "false")),
             debug_log: parse_bool(&get("debug_log", "false")),
             render_mode: get("render_mode", "quality"),
             render_engine: get("render_engine", "0"),
-            appearance: parse_u32(&get("appearance", "0")),
-            settings_w: parse_i32(&get("settings_w", "800")).clamp(560, 1400),
-            settings_h: parse_i32(&get("settings_h", "640")).clamp(460, 1000),
+            appearance: parse_u32_or(&get("appearance", "0"), 0),
+            settings_w: parse_i32_or(&get("settings_w", "800"), 800).clamp(560, 1400),
+            settings_h: parse_i32_or(&get("settings_h", "640"), 640).clamp(460, 1000),
             click_through: parse_bool(&get("click_through", "false")),
-            snap_corner: parse_u32(&get("snap_corner", "0")),
+            snap_corner: parse_u32_or(&get("snap_corner", "0"), 0),
             fullscreen_auto_hide: parse_bool(&get("fullscreen_auto_hide", "true")),
             gpu_primary_only: parse_bool(&get("gpu_primary_only", "false")),
             gpu_3d_only: parse_bool(&get("gpu_3d_only", "false")),
             net_low_freq: parse_bool(&get("net_low_freq", "false")),
-            lang: get("lang", "en"),
-            admin_check_continue_count: parse_u32(&get("admin_check_continue_count", "0")),
-            driver_check_continue_count: parse_u32(&get("driver_check_continue_count", "0")),
-            admin_check_last_date: parse_u32(&get("admin_check_last_date", "0")),
-            driver_check_last_date: parse_u32(&get("driver_check_last_date", "0")),
+            lang: get("lang", "zh"),
+            admin_check_continue_count: parse_u32_or(&get("admin_check_continue_count", "0"), 0).min(3) as u8,
+            driver_check_continue_count: parse_u32_or(&get("driver_check_continue_count", "0"), 0).min(3) as u8,
+            admin_check_last_date: parse_u32_or(&get("admin_check_last_date", "0"), 0),
+            driver_check_last_date: parse_u32_or(&get("driver_check_last_date", "0"), 0),
         })
     }
 
@@ -359,8 +362,10 @@ driver_check_last_date = {driver_check_last_date}
             gpu_3d_only = self.gpu_3d_only,
             net_low_freq = self.net_low_freq,
             lang = self.lang,
-            admin_check_continue_count = self.admin_check_continue_count,
-            driver_check_continue_count = self.driver_check_continue_count,
+            // 续篇 248：序列化即钳位（防御式）—— 内存态被程序内误赋大值时，
+            // 落盘前先收敛到与 core 一致的 0..=3，跨进程读回不再跳变。
+            admin_check_continue_count = self.admin_check_continue_count.min(3),
+            driver_check_continue_count = self.driver_check_continue_count.min(3),
             admin_check_last_date = self.admin_check_last_date,
             driver_check_last_date = self.driver_check_last_date,
             ver = self.version,
@@ -386,13 +391,17 @@ driver_check_last_date = {driver_check_last_date}
         if let Some(gdi) = patch.get("gdi_mode").and_then(|v| v.as_bool()) {
             self.render_engine = if gdi { "0".to_string() } else { "1".to_string() };
         }
-        // orientation → layout（horizontal / vertical）
+        // orientation → layout（horizontal / vertical）。
+        // 续篇 693：加白名单 —— 非法值曾原样落盘，引导 UI 高亮竖版而主程序 `_ =>` 兜底横版。
         if let Some(o) = patch.get("orientation").and_then(|v| v.as_str()) {
-            self.layout = o.to_string();
+            if o == "horizontal" || o == "vertical" {
+                self.layout = o.to_string();
+            }
         }
-        // opacity → normal_opacity（主程序是 **0–100 整数**，不是 0–1 小数）
+        // opacity → normal_opacity（主程序是 **0–100 整数**，不是 0–1 小数）。
+        // 续篇 694：写入前钳 0..100 —— load 侧（:265）才钳曾让 JSON 大数回绕。
         if let Some(op) = patch.get("opacity").and_then(|v| v.as_u64()) {
-            self.normal_opacity = op as u32;
+            self.normal_opacity = op.min(100) as u32;
         }
         // position → x, y（窗口几何唯一归属 system.cfg）
         if let Some(pos) = patch.get("position").and_then(|v| v.as_object()) {
@@ -458,10 +467,11 @@ impl AppearanceConfig {
             version: sections.get("meta").and_then(|m| m.get("version")).and_then(|v| v.parse().ok()).unwrap_or(CONFIG_VERSION),
             bg: get("bg", "#000000"),
             fg: get("fg", "#FFFFFF"),
-            font_size: parse_f32(&get("font_size", "12.0")).clamp(8.0, 32.0),
-            font_weight: parse_u32(&get("font_weight", "2")),
-            metric_gap: parse_u32(&get("metric_gap", "16")),
-            label_value_gap: parse_u32(&get("label_value_gap", "4")),
+            font_size: parse_f32_or(&get("font_size", "12.0"), 12.0)
+                .clamp(aaxsyspulse_core::config::FONT_PX_MIN, aaxsyspulse_core::config::FONT_PX_MAX),
+            font_weight: parse_u32_or(&get("font_weight", "2"), 2),
+            metric_gap: parse_u32_or(&get("metric_gap", "16"), 16),
+            label_value_gap: parse_u32_or(&get("label_value_gap", "4"), 4),
             shadow: parse_bool(&get("shadow", "true")),
             outline: parse_bool(&get("outline", "false")),
         })
@@ -511,8 +521,10 @@ outline = {outline}
         // 主程序里 `bg` 是**悬浮窗背景色**，而前端 `colors.value` 是数值**文字色**——
         // 早期实现误把后者当 bg 写入，会把整块背景刷成数值颜色。
         // 数值色改由 monitor.cfg 的逐项 `color_v` 承载（见 MonitorConfig::patch_from_json）。
-        // font_name → font_size（全局字号）
-        if let Some(f) = patch.get("font_name").and_then(|v| v.as_u64()) {
+        // font_name → font_size（全局字号）。
+        // 续篇 696：改 as_f64 —— 主程序支持 0.5 步进字号（13.5），as_u64 曾把前端传的
+        // 小数静默截成整数。
+        if let Some(f) = patch.get("font_name").and_then(|v| v.as_f64()) {
             self.font_size = f as f32;
         }
         // font_weight → font_weight（主程序 0=细 / 1=中 / 2=粗，钳位 0..2）
@@ -619,7 +631,7 @@ impl MonitorConfig {
         cfg.power_enabled = parse_bool(&power.get("enabled").cloned().unwrap_or_else(|| "true".into()));
         cfg.power_query = parse_bool(&power.get("query").cloned().unwrap_or_else(|| "true".into()));
         cfg.power_display = power.get("display").cloned().unwrap_or_else(|| "cpupackage".into());
-        cfg.power_interval_ms = parse_u32(&power.get("interval_ms").cloned().unwrap_or_else(|| "3000".into()));
+        cfg.power_interval_ms = parse_u32_or(&power.get("interval_ms").cloned().unwrap_or_else(|| "3000".into()), 3000);
         cfg.exclude_virtual_nic = parse_bool(&power.get("exclude_virtual_nic").cloned().unwrap_or_else(|| "true".into()));
 
         for id in 1..=METRIC_COUNT as u32 {
@@ -631,8 +643,8 @@ impl MonitorConfig {
                 cfg.items[idx].id = id;
                 cfg.items[idx].show = parse_bool(&g("show", "true"));
                 cfg.items[idx].name = parse_bool(&g("name", "true"));
-                cfg.items[idx].short = parse_u32(&g("short", "0")).min(2);
-                cfg.items[idx].font = parse_f32(&g("font", "0"));
+                cfg.items[idx].short = parse_u32_or(&g("short", "0"), 0).min(2);
+                cfg.items[idx].font = parse_f32_or(&g("font", "0"), 0.0);
                 cfg.items[idx].color_l = g("color_l", "");
                 cfg.items[idx].color_v = g("color_v", "");
                 cfg.items[idx].auto = parse_bool(&g("auto", "false"));
@@ -706,6 +718,8 @@ exclude_virtual_nic = {exclude_virtual_nic}
         // 0) 显式 `per_item_colors: null` ⇒ 清空逐项配色覆盖，回落全局色。
         //    前端「统一设置」会把 perColors 置 null；若不清空，旧配置里的逐项色会
         //    一直生效，把预设写下的全局色整个遮住。
+        //    缺省语义（续篇 697）：**不传该键 = 不动逐项配色** —— 第 6 页的
+        //    items/order 等局部补丁依赖这一语义，不能改成"缺省即清空"。
         if matches!(patch.get("per_item_colors"), Some(serde_json::Value::Null)) {
             for item in self.items.iter_mut() {
                 item.color_l.clear();
@@ -984,9 +998,9 @@ order = {order}
                     full.push(id);
                 }
             }
-            if full.len() == METRIC_COUNT {
-                self.order = full;
-            }
+            // 续篇 698：上面已把缺失 id 按自然序补齐，full.len() 恒等于 METRIC_COUNT
+            // —— 旧守卫 `if full.len() == METRIC_COUNT` 是死代码。
+            self.order = full;
         }
     }
 }
@@ -1004,7 +1018,10 @@ order = {order}
 /// 附带好处：主程序的旧配置迁移判定是「`config.txt` 存在 **且任一 `.cfg` 缺失**」，
 /// 补齐 5 个文件同时避免了引导写好的设置被旧 `config.txt` 迁移覆盖。
 ///
-/// 只写**缺失**的文件，已存在的一律不动（不覆盖用户 / 主程序的数据）。
+/// 保证 5 个 `.cfg` 全部可用：缺失的用默认值补成 v3；**存在但读不出/解析失败**
+/// 的也重写默认值（续篇 249 —— 与 `lib.rs::guide_bootstrap` 的 config_corrupted
+/// 修复语义配套，旧实现"损坏但存在的一律不动"让损坏配置永远自愈不了）。
+/// 返回本次补写/重置的文件名。
 pub fn ensure_all_files() -> Result<Vec<String>, ConfigError> {
     ensure_config_dir()?;
     let dir = config_dir();
@@ -1013,18 +1030,30 @@ pub fn ensure_all_files() -> Result<Vec<String>, ConfigError> {
     if !dir.join("system.cfg").exists() {
         SystemConfig::default().save()?;
         created.push("system.cfg".to_string());
+    } else if SystemConfig::load().is_err() {
+        SystemConfig::default().save()?;
+        created.push("system.cfg".to_string());
     }
     if !dir.join("appearance.cfg").exists() {
+        AppearanceConfig::default().save()?;
+        created.push("appearance.cfg".to_string());
+    } else if AppearanceConfig::load().is_err() {
         AppearanceConfig::default().save()?;
         created.push("appearance.cfg".to_string());
     }
     if !dir.join("monitor.cfg").exists() {
         MonitorConfig::default().save()?;
         created.push("monitor.cfg".to_string());
+    } else if MonitorConfig::load().is_err() {
+        MonitorConfig::default().save()?;
+        created.push("monitor.cfg".to_string());
     }
     for vertical in [false, true] {
         let name = if vertical { "layout_v.cfg" } else { "layout_h.cfg" };
         if !dir.join(name).exists() {
+            LayoutConfig::default().save(vertical)?;
+            created.push(name.to_string());
+        } else if LayoutConfig::load(vertical).is_err() {
             LayoutConfig::default().save(vertical)?;
             created.push(name.to_string());
         }
@@ -1037,7 +1066,8 @@ pub fn ensure_all_files() -> Result<Vec<String>, ConfigError> {
 
 /// 唯一临时文件名：`.system.cfg.<pid>.<seq>.tmp`
 /// 固定名 `xxx.tmp` 会在两个写者并发时互相覆盖（A 的 tmp 被 B 改名走，A 的 rename 报错）。
-fn temp_path_for(path: &std::path::Path) -> PathBuf {
+/// 续篇 223：install.rs 的释放流程同样复用本函数（旧实现固定 `"<exe>.tmp"`）。
+pub(crate) fn unique_temp_path(path: &std::path::Path) -> PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
     let mut name = std::ffi::OsString::from(".");
@@ -1060,7 +1090,7 @@ pub(crate) fn atomic_write<E: From<io::Error>>(
     path: &std::path::Path,
     content: &[u8],
 ) -> Result<(), E> {
-    let temp_path = temp_path_for(path);
+    let temp_path = unique_temp_path(path);
     {
         let mut file = File::create(&temp_path)?;
         file.write_all(content)?;
@@ -1264,5 +1294,46 @@ mod cross_process_tests {
                 "{name} 的版本与契约常量不同步"
             );
         }
+    }
+
+    /// 续篇 248/699：连点计数口径 —— 引导侧曾用 u32、core 用 u8 且 `.min(3)`，
+    /// 写 255/65535 会被主程序钳成 3。两端统一 u8 + min(3) 后，非法大值在引导侧
+    /// 就被钳掉，这里断言解析端与写入端行为一致。
+    #[test]
+    fn admin_check_continue_count_clamps_like_core() {
+        // 写入端：内存态可被误赋 255，但**序列化即钳位**（serialize 里 .min(3)）——
+        // 落盘文本永远 <= 3，跨进程读回不再跳变。
+        let mut g = SystemConfig::default();
+        g.admin_check_continue_count = 255;
+        g.driver_check_continue_count = 3;
+        let text = g.ini_text();
+        assert!(text.contains("admin_check_continue_count = 3"), "序列化必须钳位:
+{text}");
+        assert!(text.contains("driver_check_continue_count = 3"));
+
+        // 解析端：手写超大值（绕过 u8 类型）经 core parse 也必须收敛到 3
+        let text = "[system]\nadmin_check_continue_count = 65535\ndriver_check_continue_count = 256\n";
+        let mut c = fresh_core_config();
+        core_cfg::system::parse(&mut c, &text);
+        assert_eq!(c.admin_check_continue_count, 3, "core 解析端未把 65535 钳到 3");
+        assert_eq!(c.driver_check_continue_count, 3, "core 解析端未把 256 钳到 3");
+    }
+
+    /// 续篇 255：前端 `useGuide.js::defaults()` 与引导后端默认值的交叉断言 ——
+    /// 曾漂移的三处：opacity（前端 80 vs 后端 100）、font_size（14 vs 12）、
+    /// 监控项（6 项 vs 9 项全开）。改任一端必须同步另一端。
+    #[test]
+    fn guide_frontend_defaults_match_backend() {
+        let sys = SystemConfig::default();
+        assert_eq!(sys.normal_opacity, 100, "前端 defaults().opacity 必须与本值一致（useGuide.js）");
+        let app = AppearanceConfig::default();
+        assert_eq!(app.font_size, 12.0, "前端 defaults().fontName 必须与本值一致（useGuide.js）");
+        let mon = MonitorConfig::default();
+        assert_eq!(
+            mon.items.iter().filter(|i| i.show).count(),
+            METRIC_COUNT,
+            "前端 defaults().selected 默认 9 项全开（useGuide.js）"
+        );
+        assert_eq!(sys.lang, "zh", "前端/引导默认中文（续篇 692）");
     }
 }

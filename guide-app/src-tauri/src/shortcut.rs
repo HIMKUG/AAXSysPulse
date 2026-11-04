@@ -10,15 +10,19 @@ use thiserror::Error;
 pub enum ShortcutError {
     #[error("Failed to get desktop folder")]
     NoDesktop,
+    // 续篇 667：开始菜单路径取的是 config_dir()（%APPDATA%）—— 曾复用 NoDesktop
+    //（文案 "Failed to get desktop folder"），排查会被误导。
+    #[error("无法获取配置目录（%APPDATA%）")]
+    NoConfigDir,
+    // 续篇 246：非 Windows 平台的"不支持"不再包成 ComError。
+    // （仅在 not(windows) 分支构造 —— Windows 构建下标注以免 dead_code 告警。）
+    #[cfg_attr(windows, allow(dead_code))]
+    #[error("当前平台不支持创建快捷方式")]
+    Unsupported,
     #[error("Failed to create COM object: {0}")]
     ComError(String),
     #[error("Failed to save shortcut: {0}")]
     SaveError(String),
-}
-
-#[cfg(windows)]
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// 创建一个指向主程序的 .lnk
@@ -40,6 +44,9 @@ fn make_lnk(link_path: &Path) -> Result<(), ShortcutError> {
 
     // 本线程已被他人以其他模式初始化时 CoInitializeEx 返回错误码——同样可继续使用；
     // 仅在自己成功初始化时才配对 CoUninitialize。
+    // 续篇 245：S_FALSE（HRESULT(1)）也是"成功"，按微软官方 COM 规则，凡成功的
+    // CoInitializeEx（含 S_FALSE）都必须配对一次 CoUninitialize —— windows crate
+    // 把 S_FALSE 折叠进 Ok(())，无法在此区分；保持"成功即配对"的官方正确口径。
     let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     let initialized = hr.is_ok();
 
@@ -50,10 +57,19 @@ fn make_lnk(link_path: &Path) -> Result<(), ShortcutError> {
         };
 
         // PCWSTR 只借不存，各 Vec<u16> 必须在对应调用返回前保持存活
+        // 续篇 246：.lnk 路径不再 to_string_lossy()（非 UTF-8 用户名会变 U+FFFD），
+        // 直接 OsStr::encode_wide；宽字符转换统一走契约 `wide_of`（首轮 006）。
         let exe_w: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
         let dir_w: Vec<u16> = workdir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-        let lnk_w = wide(&link_path.to_string_lossy());
-        let desc_w = wide(&format!("{} 桌面监控", aaxsyspulse_core::contract::APP_TECH_NAME));
+        let lnk_w: Vec<u16> = link_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let desc_w = aaxsyspulse_core::contract::wide_of(&format!(
+            "{} 桌面监控",
+            aaxsyspulse_core::contract::APP_TECH_NAME
+        ));
 
         unsafe {
             link.SetPath(PCWSTR::from_raw(exe_w.as_ptr()))
@@ -93,7 +109,7 @@ pub fn create_desktop_shortcut() -> Result<PathBuf, ShortcutError> {
 #[cfg(windows)]
 pub fn create_start_menu_shortcut() -> Result<PathBuf, ShortcutError> {
     let program_dir = dirs::config_dir()
-        .ok_or(ShortcutError::NoDesktop)?
+        .ok_or(ShortcutError::NoConfigDir)?
         .join(aaxsyspulse_core::contract::START_MENU_FOLDER);
     std::fs::create_dir_all(&program_dir).map_err(|e| ShortcutError::SaveError(e.to_string()))?;
 
@@ -105,10 +121,10 @@ pub fn create_start_menu_shortcut() -> Result<PathBuf, ShortcutError> {
 
 #[cfg(not(windows))]
 pub fn create_desktop_shortcut() -> Result<PathBuf, ShortcutError> {
-    Err(ShortcutError::ComError("Not supported on this platform".to_string()))
+    Err(ShortcutError::Unsupported)
 }
 
 #[cfg(not(windows))]
 pub fn create_start_menu_shortcut() -> Result<PathBuf, ShortcutError> {
-    Err(ShortcutError::ComError("Not supported on this platform".to_string()))
+    Err(ShortcutError::Unsupported)
 }

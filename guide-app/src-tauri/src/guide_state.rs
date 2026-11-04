@@ -15,6 +15,11 @@ pub enum StateError {
 }
 
 /// 状态文件目录：%APPDATA%\AAXSysPulseC\
+///
+/// 归属口径（首轮 011）：引导侧三类持久化目录各归其位，不再散落三种口径 ——
+/// · 引导自身状态（本文件）→ `dirs::data_dir()`（Roaming `%APPDATA%\AAXSysPulseC\`）
+/// · 与主程序共享的 5 个 .cfg → `config::config_dir()`（唯一真源 = 契约 `app_config_dir()`）
+/// · 引导日志 → `lib.rs::guide_log_dir()`（`dirs::data_local_dir()`，机器局部）
 pub fn state_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -43,6 +48,15 @@ pub struct GuideState {
 }
 
 impl GuideState {
+    /// 存档「读 → 改 → 写」的进程级互斥（续篇 669）：前端 scheduleBackup/flushBackup
+    /// 可并发发两次 guide_backup —— 各自 load→改→save 无锁时后写会覆盖先写
+    /// （丢页号/丢快照）。必须锁住整个序列，只锁 save() 防不住交错。
+    pub fn with_state_lock<R>(f: impl FnOnce() -> R) -> R {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    }
+
     pub fn load() -> Result<Self, StateError> {
         let path = Self::state_file_path();
         if !path.exists() {
@@ -66,10 +80,13 @@ impl GuideState {
     /// 文件不存在即视为已清空，返回 Ok。
     pub fn reset() -> Result<(), StateError> {
         let path = Self::state_file_path();
-        if path.exists() {
-            fs::remove_file(&path)?;
+        // 续篇 668：先 exists() 再 remove_file 是 TOCTOU —— 文件恰好消失时 Err 被
+        // 当成"清空失败"。直接删，把 NotFound 归一为成功。
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(StateError::from(e)),
         }
-        Ok(())
     }
 
     fn state_file_path() -> PathBuf {

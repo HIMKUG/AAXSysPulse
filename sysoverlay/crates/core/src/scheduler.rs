@@ -2,12 +2,15 @@
 //!
 //! # 核心变化
 //!
-//! v2 用 EMA 平滑吸收微振荡，死区迟滞防止抖动，Idle/Active 模式自适应提交节奏。
+//! v2 用 EMA 平滑吸收微振荡 + 分频调度控制提交节奏。死区迟滞 / Idle-Active
+//! 自适应状态机实现在 app/main.rs（使用 cadence 的 DELTA_*/ACTIVE_* 常量），
+//! 本 crate 只提供 EMA 与分频（审查 091：原注释让人误以为状态机在这里）。
 //! 不再依赖 v1 的成本反馈降档/升档机制（该机制在 v2 下与 EMA 冲突）。
 //!
 //! # 设计
 //!
-//! 1. **分频调度**：每个源独立记 `last_sample`，到期才采；
+//! 1. **分频调度**：每个源独立记 `last_sample`，到期才采
+//!    （间隔 = 木桶 base 与该源下限取 max，见 [`Scheduler::source_interval_ms`]）；
 //!    未到期源在 [`SamplePlan`] 里为 false，采样器直接沿用上一次的值。
 //! 2. **EMA 平滑**：`update_ema()` 用 `EMA_ALPHA = 0.3` 对原始值做指数移动平均，
 //!    吸收微振荡后再参与变化判定。
@@ -60,12 +63,13 @@ impl Source {
     }
 }
 
+/// 各源最小有效间隔；由 [`Source::min_effective_ms`] 派生（审查 092：唯一真源）。
 pub const MIN_EFFECTIVE_MS: [u32; SRC_COUNT] = [
-    TICK_MS as u32,
-    TICK_MS as u32,
-    2_000,
-    crate::cadence::REFRESH_FLOOR_MS as u32,
-    500,
+    Source::Cpu.min_effective_ms(),
+    Source::Mem.min_effective_ms(),
+    Source::Gpu.min_effective_ms(),
+    Source::Net.min_effective_ms(),
+    Source::Power.min_effective_ms(),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -105,6 +109,12 @@ impl SamplePlan {
 
 pub type EnabledMask = [bool; SRC_COUNT];
 
+/// 用户刷新间隔可调区间（ms）（审查 623：new/set_user 两份魔数收敛于此）。
+pub const USER_MS_MIN: u32 = 100;
+pub const USER_MS_MAX: u32 = 5_000;
+
+/// 全部源停用时的保底唤醒心跳。与 cadence::IDLE_MAX_MS（4.5s，提交门静止节流，
+/// 由 app/main.rs 使用）是两个不同机制（审查 094：已核实语义不同，不合并）。
 const IDLE_INTERVAL_MS: u32 = 1_000;
 
 #[derive(Debug)]
@@ -119,17 +129,12 @@ pub struct Scheduler {
     pub ema_mem: f32,
     pub ema_gpu: f32,
     pub ema_net: f32,
-    /// EMA 值上次提交时的快照（用于采样决策：EMA 无显著变化则跳过采样）
-    ema_cpu_committed: f32,
-    ema_mem_committed: f32,
-    ema_gpu_committed: f32,
-    ema_net_committed: f32,
 }
 
 impl Scheduler {
     pub fn new(user_interval_ms: u32, auto: bool) -> Self {
         Self {
-            user_interval_ms: user_interval_ms.clamp(100, 5_000),
+            user_interval_ms: user_interval_ms.clamp(USER_MS_MIN, USER_MS_MAX),
             auto,
             power_interval_ms: 3_000,
             last_sample_ms: [0; SRC_COUNT],
@@ -138,15 +143,11 @@ impl Scheduler {
             ema_mem: 0.0,
             ema_gpu: 0.0,
             ema_net: 0.0,
-            ema_cpu_committed: 0.0,
-            ema_mem_committed: 0.0,
-            ema_gpu_committed: 0.0,
-            ema_net_committed: 0.0,
         }
     }
 
     pub fn set_user(&mut self, user_interval_ms: u32, auto: bool) {
-        self.user_interval_ms = user_interval_ms.clamp(100, 5_000);
+        self.user_interval_ms = user_interval_ms.clamp(USER_MS_MIN, USER_MS_MAX);
         self.auto = auto;
     }
 
@@ -180,7 +181,11 @@ impl Scheduler {
     pub fn source_interval_ms(&self, src: Source, enabled: &EnabledMask) -> u32 {
         // Power 与刷新率解耦：固定用用户配置的独立间隔，不吃 base 木桶。
         if src == Source::Power {
-            return self.power_interval_ms;
+            // 审查 095：入口即钳位到声明区间（500..=60_000），不依赖调用方。
+            return self.power_interval_ms.clamp(
+                crate::config::POWER_INTERVAL_MS_MIN,
+                crate::config::POWER_INTERVAL_MS_MAX,
+            );
         }
         self.effective_interval_ms(enabled).max(MIN_EFFECTIVE_MS[src as usize])
     }
@@ -205,18 +210,11 @@ impl Scheduler {
         plan
     }
 
-    fn set_ema_committed(&mut self, src: Source, value: f32) {
-        match src {
-            Source::Cpu => self.ema_cpu_committed = value,
-            Source::Mem => self.ema_mem_committed = value,
-            Source::Gpu => self.ema_gpu_committed = value,
-            Source::Net => self.ema_net_committed = value,
-            // Power 不参与 EMA（纯分频采样，无变化检测）。
-            Source::Power => {}
-        }
-    }
-
     pub fn update_ema(&mut self, src: Source, raw: f32) {
+        // 审查 625：非有限值（NaN/Inf）不得进入 EMA，单帧坏值不能永久污染。
+        if !raw.is_finite() {
+            return;
+        }
         let ema = match src {
             Source::Cpu => &mut self.ema_cpu,
             Source::Mem => &mut self.ema_mem,
@@ -228,10 +226,10 @@ impl Scheduler {
         *ema = *ema + EMA_ALPHA * (raw - *ema);
     }
 
-    /// 提交 EMA 值到 committed 状态（在采样成功后调用）
+    /// 提交一次采样值到 EMA（在采样成功后调用）。
+    /// 审查 093：committed 快照只写不读，已删除；本方法保留为兼容入口。
     pub fn commit_ema(&mut self, src: Source, value: f32) {
         self.update_ema(src, value);
-        self.set_ema_committed(src, self.ema(src));
     }
 
     pub fn ema(&self, src: Source) -> f32 {

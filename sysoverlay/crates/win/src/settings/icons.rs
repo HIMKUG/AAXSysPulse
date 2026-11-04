@@ -104,18 +104,50 @@ const SOURCES: [&str; 14] = [
 
 static PATHS: OnceLock<[Vec<PathSeg>; 14]> = OnceLock::new();
 
+// 审查 547：三处长度 14 硬编码由编译期断言钉死（图标清单增删即编译失败）。
+const ICON_COUNT: usize = 14;
+const _: () = assert!(SOURCES.len() == ICON_COUNT);
+
 fn paths() -> &'static [Vec<PathSeg>; 14] {
     PATHS.get_or_init(|| std::array::from_fn(|i| parse(svg_path_data(SOURCES[i]))))
 }
 
-/// 取出 SVG 中 `d="…"` 的属性值（本项目图标均为单路径）。
+/// 取出 SVG 中 `d="…"` 的属性值。
+/// 审查 548：放宽 `d=` 属性解析 —— `d='…'` / `d = "…"` / 多 `<path>` 都支持
+/// （原先只认 `" d=\""`)。属性行首必须紧跟空白 —— 避免误匹配 `id=` 之类
+/// 以 d 结尾的属性名。
 fn svg_path_data(src: &str) -> &str {
-    let Some(pos) = src.find(" d=\"") else { return "" };
-    let start = pos + 4;
-    match src[start..].find('"') {
-        Some(end) => &src[start..start + end],
-        None => "",
+    let bytes = src.as_bytes();
+    let mut i = 0usize;
+    while i + 2 <= bytes.len() {
+        if bytes[i] == b'd'
+            && bytes[i + 1] == b'='
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+        {
+            let mut j = i + 2;
+            while j < bytes.len() && (bytes[j] as char).is_ascii_whitespace() {
+                j += 1;
+            }
+            let quote = match bytes.get(j) {
+                Some(b'"') => b'"',
+                Some(b'\'') => b'\'',
+                _ => {
+                    i += 2;
+                    continue;
+                }
+            };
+            j += 1;
+            let start = j;
+            while j < bytes.len() && bytes[j] != quote {
+                j += 1;
+            }
+            if j < bytes.len() && j > start {
+                return &src[start..j];
+            }
+        }
+        i += 1;
     }
+    ""
 }
 
 /// SVG 椭圆弧端点参数化 → 圆心参数化（W3C 规范 F.6.5），切分 ≤90° 段，
@@ -133,7 +165,9 @@ fn arc_to_cubics(
     x2: f32,
     y2: f32,
 ) {
-    if rx <= 0.0 || ry <= 0.0 {
+    if !rx.is_finite() || !ry.is_finite() || rx <= 0.0 || ry <= 0.0 {
+        // 审查 548/183：NaN 判不住 rx<=0 —— 非有限半径一律直线回退，
+        // 不再把 NaN 控制点推进几何。
         out.push(PathSeg::Line(x2, y2));
         return;
     }
@@ -264,7 +298,9 @@ fn parse(d: &str) -> Vec<PathSeg> {
         if *i == s {
             return None;
         }
-        d[s..*i].parse::<f32>().ok()
+        // 审查 548：非有限值（"1e999" → inf）过滤 —— Inf 坐标会流进
+        // PathSeg 生成非法几何。
+        d[s..*i].parse::<f32>().ok().filter(|v| v.is_finite())
     };
 
     // 读取弧标记（恰一个 '0'/'1' 字符）。SVG 允许标记与后续数字紧邻（如 "01.5"），
@@ -478,7 +514,9 @@ fn parse(d: &str) -> Vec<PathSeg> {
     out
 }
 
-/// 在 `rect` 内以 `color` 填充绘制图标（`rect` 建议为正方形）。
+/// 在 `rect` 内以 `color` 填充绘制图标。
+/// 审查 549：rect 钳为正方形（取短边、左上对齐）—— `fill_path` 的 sx/sy
+/// 独立缩放会把非正方形 rect 拉伸成非等比图标。
 pub fn draw(
     rt: &ID2D1HwndRenderTarget,
     gfx: &mut Gfx,
@@ -491,7 +529,9 @@ pub fn draw(
     if segs.is_empty() {
         return;
     }
-    gfx.fill_path(rt, idx, segs, VIEW, rect, color);
+    let side = rect.w().min(rect.h());
+    let sq = RectF::new(rect.l, rect.t, rect.l + side, rect.t + side);
+    gfx.fill_path(rt, idx, segs, VIEW, sq, color);
 }
 
 #[cfg(test)]
@@ -513,6 +553,10 @@ mod tests {
     fn all_icons_parse_non_empty() {
         for (i, segs) in paths().iter().enumerate() {
             assert!(!segs.is_empty(), "icon #{i} 解析为空（检查 icons_svg 与解析器）");
+            // 审查 550：孤立 Move 段（图形丢失）也"非空" —— 补锚点数下限。
+            let mut anchors = 0usize;
+            each_anchor(segs, |_, _| anchors += 1);
+            assert!(anchors >= 2, "icon #{i} 只有 {anchors} 个锚点（疑似孤立 Move/截断）");
         }
     }
 

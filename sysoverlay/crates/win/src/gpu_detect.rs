@@ -4,7 +4,8 @@
 //! - 只认三家：AMD 0x1002 / NVIDIA 0x10DE / Intel 0x8086；
 //!   虚拟屏（如 OrayIddDriver、Microsoft 基本渲染）VendorId 不在三家 → 无条件排除；
 //! - 核显忽略：在三家卡里取 `DedicatedVideoMemory` 最大者；要求 ≥4 GiB 才算独显
-//!   （AMD 核显通常 512MB~2GB，RX 9070 GRE 16GB）；
+//!   （**含恰好 4 GiB**，审查 072：边界语义已由具名常量 + 单测钉死；
+//!   AMD 核显通常 512MB~2GB，RX 9070 GRE 16GB）；
 //! - 没有满足条件的卡 → 返回 `None`，利用率回退 D3DKMT 通用路径。
 
 use crate::probe;
@@ -55,7 +56,12 @@ pub fn enum_adapters() -> Vec<GpuInfo> {
             }
         };
         let mut i: u32 = 0;
-        while let Ok(adapter) = factory.EnumAdapters1(i) {
+        // 审查 073：驱动异常时 EnumAdapters1 可能永不过期 —— 硬上限防死循环。
+        const MAX_ADAPTERS: u32 = 64;
+        while i < MAX_ADAPTERS {
+            let Ok(adapter) = factory.EnumAdapters1(i) else {
+                break;
+            };
             i += 1;
             let d = match adapter.GetDesc1() {
                 Ok(d) => d,
@@ -63,7 +69,16 @@ pub fn enum_adapters() -> Vec<GpuInfo> {
             };
             let name = {
                 let end = d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len());
-                String::from_utf16_lossy(&d.Description[..end])
+                // 审查 576：优先严格 UTF-16 解码，非法序列留探针而非静默 U+FFFD。
+                match String::from_utf16(&d.Description[..end]) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        if probe_on {
+                            probe::log("gpudetect adapter name has invalid UTF-16, lossy fallback");
+                        }
+                        String::from_utf16_lossy(&d.Description[..end])
+                    }
+                }
             };
             let info = GpuInfo {
                 vendor_id: d.VendorId,
@@ -104,4 +119,25 @@ pub fn pick_dgpu() -> Option<GpuInfo> {
         ));
     }
     Some(best)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 审查 072：4 GiB 阈值边界 —— 恰好 4 GiB 按 `>=` 判为独显（有意选择）。
+    #[test]
+    fn dgpu_threshold_is_exactly_4gib() {
+        assert_eq!(DEDICATED_MEM_DGPU, 4 * 1024 * 1024 * 1024);
+        let mk = |mem: usize| GpuInfo {
+            vendor_id: VENDOR_NVIDIA,
+            device_id: 0,
+            dedicated_mem: mem,
+            name: "t".into(),
+            luid_low: 0,
+            luid_high: 0,
+        };
+        assert!(mk(DEDICATED_MEM_DGPU).dedicated_mem >= DEDICATED_MEM_DGPU);
+        assert!(mk(DEDICATED_MEM_DGPU - 1).dedicated_mem < DEDICATED_MEM_DGPU);
+    }
 }

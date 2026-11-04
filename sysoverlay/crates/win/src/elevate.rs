@@ -38,18 +38,32 @@ pub fn prompt_and_relaunch(lang: Lang) -> bool {
             probe::log("elevate user declined -> power row disabled");
             return false;
         }
-        // 自身路径
-        let mut path = [0u16; 512];
-        let len = windows::Win32::System::LibraryLoader::GetModuleFileNameW(None, &mut path);
-        let exe = String::from_utf16_lossy(&path[..len as usize]);
+        // 自身路径（审查 275：循环扩容防截断 —— 512 定长缓冲对深路径不够）。
+        let exe = {
+            let mut buf = [0u16; 512];
+            loop {
+                let len = windows::Win32::System::LibraryLoader::GetModuleFileNameW(None, &mut buf);
+                let l = len as usize;
+                if l < buf.len() || l == 0 {
+                    buf[l..].fill(0);
+                    break String::from_utf16_lossy(&buf[..l]);
+                }
+                // 缓冲写满（可能截断）→ 扩容重试
+                buf = vec![0u16; buf.len() * 2].try_into().unwrap();
+            }
+        };
         let exe_w: Vec<u16> = exe.encode_utf16().chain(Some(0)).collect();
         let verb: Vec<u16> = "runas\0".encode_utf16().collect();
         let params: Vec<u16> = "--elevated\0".encode_utf16().collect();
 
-        use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_DEFAULT, SHELLEXECUTEINFOW};
+        use windows::Win32::UI::Shell::{
+            ShellExecuteExW, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW,
+        };
         let mut sei = SHELLEXECUTEINFOW {
             cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-            fMask: SEE_MASK_DEFAULT,
+            // 审查 603：与 restart.rs 同口径 —— NOASYNC 保证 exit 前新进程已派生，
+            // 否则"两个实例都没了"竞态（SEE_MASK_DEFAULT 是异步）。
+            fMask: SEE_MASK_NOASYNC,
             lpVerb: windows::core::PCWSTR(verb.as_ptr()),
             lpFile: windows::core::PCWSTR(exe_w.as_ptr()),
             lpParameters: windows::core::PCWSTR(params.as_ptr()),

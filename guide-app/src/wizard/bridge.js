@@ -31,8 +31,11 @@ async function ensureTauri() {
   return false
 }
 
-/** 后端桥是否可用 */
-export const isAvailable = () => !!tauriCore || !!window.__TAURI__?.core
+/** 后端桥是否可用（续篇 253：加 typeof window 守卫 —— 非 SSR 安全） */
+export const isAvailable = () => {
+  if (typeof window === 'undefined') return false
+  return !!tauriCore || !!window.__TAURI__?.core
+}
 
 /* 只有纯浏览器预览（vite dev）才允许"演示模式"。
    打包后若 Tauri API 因任何原因取不到，必须硬失败：
@@ -97,10 +100,17 @@ const SEALED_COMMANDS = new Set([
 let sealed = false
 let sealReason = ''
 
-/** 进入卸载态时调用：此后所有写类命令在桥层直接拒绝。幂等，不解除。 */
+/** 进入卸载态时调用：此后所有写类命令在桥层直接拒绝。幂等。 */
 export function sealWrites(reason = 'uninstall') {
   if (!sealed) sealReason = reason
   sealed = true
+}
+
+/** 受控解除（续篇 253）：卸载失败后必须允许重试 —— 旧实现"幂等却不可解除"，
+ *  卸载命令失败后用户既不能重试也不能回引导。 */
+export function unsealWrites() {
+  sealed = false
+  sealReason = ''
 }
 
 export const writesSealed = () => sealed
@@ -133,39 +143,82 @@ async function invoke(cmd, args = {}) {
     return demoInvoke(cmd, args)
   }
   console.debug(`[bridge] >>> ${cmd}`, args)
+  // 续篇 745：超时定时器句柄 —— 命令正常返回后必须 clearTimeout，
+  // 否则每次 invoke 都留一个最多 5s 的悬挂定时器。
+  let timeoutTimer = null
   try {
-    const limit = cmd in INVOKE_TIMEOUT_MS ? INVOKE_TIMEOUT_MS[cmd] : DEFAULT_INVOKE_TIMEOUT_MS
+    // 续篇 744：`cmd in INVOKE_TIMEOUT_MS` 会误命中 Object.prototype 上的名字
+    //（constructor/toString）—— 改 Object.hasOwn。
+    const limit = Object.hasOwn(INVOKE_TIMEOUT_MS, cmd)
+      ? INVOKE_TIMEOUT_MS[cmd]
+      : DEFAULT_INVOKE_TIMEOUT_MS
     const call = tauriCore.invoke(cmd, args)
     const data = limit > 0
       ? await Promise.race([
           call,
-          new Promise((_, rej) =>
-            setTimeout(() => rej(new Error(`invoke timeout after ${limit}ms: ${cmd}`)), limit)
-          )
+          new Promise((_, rej) => {
+            timeoutTimer = setTimeout(() => {
+              // 续篇 252：超时给独立 code —— 旧实现被包成 UNKNOWN。
+              rej(Object.assign(new Error(`invoke timeout after ${limit}ms: ${cmd}`), {
+                bridgeTimeout: true
+              }))
+            }, limit)
+          })
         ])
       : await call
     console.debug(`[bridge] <<< ${cmd} ok:`, data)
     return { ok: true, data: data ?? null }
   } catch (e) {
-    const raw = typeof e === 'string' ? e : (e?.message ?? String(e))
+    // 续篇 252：Tauri 对 struct 型 GuideError reject 的是**对象** —— 旧实现只处理
+    // string / e.message 再 JSON.parse，code/step/hint 全丢成 UNKNOWN。
     let code = 'UNKNOWN'
-    let message = raw
+    let message = ''
     let step = null
     let hint = null
-    try {
-      const parsed = JSON.parse(raw)
+    if (e && e.bridgeTimeout) {
+      code = 'INVOKE_TIMEOUT'
+      message = e.message
+    } else if (typeof e === 'string') {
+      message = e
+      const parsed = tryParseJson(e)
       if (parsed?.code) {
         code = parsed.code
-        message = parsed.message ?? raw
+        message = parsed.message ?? e
         step = parsed.step ?? null
         hint = parsed.hint ?? null
       }
-    } catch { /* 非 JSON，按字符串处理 */ }
+    } else if (e && typeof e === 'object') {
+      if (e.code) {
+        code = e.code
+        message = e.message ?? String(e)
+        step = e.step ?? null
+        hint = e.hint ?? null
+      } else {
+        message = e.message ?? String(e)
+      }
+    } else {
+      message = String(e)
+    }
     console.warn(`[bridge] !!! ${cmd} failed:`, code, message)
-    if (code === 'UNKNOWN' && /not found|Command/i.test(message)) {
-      reportBridgeError('命令未注册', `${cmd} → ${message}`)
+    if (code === 'UNKNOWN') {
+      if (/not found|Command/i.test(message)) {
+        reportBridgeError('命令未注册', `${cmd} → ${message}`)
+      } else if (/not permitted|forbidden|denied|capability/i.test(message)) {
+        // 续篇 746：capability 权限拒绝曾被归 UNKNOWN 且不上报 —— 诊断面板零记录。
+        reportBridgeError('权限被拒', `${cmd} → ${message}`)
+      }
     }
     return { ok: false, code, message, step, hint }
+  } finally {
+    if (timeoutTimer) clearTimeout(timeoutTimer)
+  }
+}
+
+function tryParseJson(raw) {
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return null
   }
 }
 
@@ -205,7 +258,22 @@ function demoInvoke(cmd, args) {
         ok: true,
         data: { path: '%LOCALAPPDATA%\\AAXSysPulse\\logs（演示目录）', lines: args?.lines ?? 400, content: '（演示模式没有真实日志）' }
       }
-    default: return { ok: true, data: null }
+    /* 续篇 254：演示模式只显式列出已模拟的写类命令 —— 不再用 catch-all
+       {ok:true} 掩盖漏实现。 */
+    case 'config_patch':
+    case 'guide_save_config':
+    case 'guide_backup':
+    case 'guide_reset_state':
+    case 'guide_finish':
+    case 'main_launch':
+    case 'main_reload_config':
+    case 'overlay_set_position':
+    case 'autostart_set':
+    case 'privilege_restart_as_admin':
+      return { ok: true, data: null }
+    default:
+      // 未列出的命令如实回失败：演示阶段暴露漏实现，而不是静默假成功。
+      return { ok: false, code: 'DEMO_NOT_IMPLEMENTED', message: `演示模式未实现命令：${cmd}` }
   }
 }
 
@@ -256,14 +324,20 @@ export const cmd = {
   backup: (page, path, snapshot) => invoke('guide_backup', { page, path, snapshot }),
   resetState: () => invoke('guide_reset_state'),
   quitAll: () => invoke('app_quit_all'),
-  finish: () => invoke('guide_finish', { createShortcut: true }),
+  // 续篇 253：createShortcut 改可选参数（默认 false）—— 旧实现硬编码 true，
+  // 忽略调用方且重复创建快捷方式（安装流程 85%/90% 已建过）。
+  finish: (createShortcut = false) => invoke('guide_finish', { createShortcut }),
   deleteSelf: () => invoke('guide_delete_self'),
 
   /* ---- 权限（第 2 页） ---- */
   privilegeCheck: () => invoke('privilege_check'),
   restartAsAdmin: () => invoke('privilege_restart_as_admin'),
 
-  /* ---- 安装（page 3）/ 卸载（第九部分） ---- */
+  /* ---- 安装（page 3）/ 卸载（第九部分） ----
+     续篇 747：keepConfig / createShortcut 是仅有的多词参数 —— 已核对 Tauri v2
+     默认把前端 camelCase 键映射到 Rust snake_case 形参（无 rename_all 时），
+     故保持 camelCase；其余命令均为单词形参无需转换。check-bridge.mjs 已把
+     「camelCase 键 ↔ snake_case 形参」纳入门禁静态比对。 */
   installRun: (mode = 'full') => invoke('install_run', { mode }),
   uninstallRun: (keepConfig) => invoke('uninstall_run', { keepConfig }),
 

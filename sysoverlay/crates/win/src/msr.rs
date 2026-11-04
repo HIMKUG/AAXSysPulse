@@ -45,8 +45,8 @@
 use crate::probe;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use aaxsyspulse_core::power::watts_from_energy_delta;
-// 辅助函数（query_service_binary_path / driver_file_exists）的签名与实现所需。
-// ring0() 内部的同名局部 use 会遮蔽此处导入，属正常显式声明。
+// 辅助函数（query_service_binary_path / driver_file_exists）使用模块级导入；
+// open_ring0() 内部另有局部 use（审查 584：原注释把函数名写成了 ring0()）。
 use windows::Win32::System::Services::{QueryServiceConfigW, QUERY_SERVICE_CONFIGW, SC_HANDLE};
 
 const MSR_AMD_UNIT: u32 = 0xC0010299;
@@ -130,9 +130,9 @@ unsafe fn open_ring0() -> Option<Ring0> {
         use windows::Win32::Storage::FileSystem::CreateFileW;
         use windows::Win32::System::Services::{
             // QueryServiceConfigW/QUERY_SERVICE_CONFIGW 在模块级导入（helper 用），
-            // 此处不再重复引入以免遮蔽触发 unused 警告。
+            // SC_HANDLE 同样由模块级导入提供（审查 584：不再局部重复引入）。
             ChangeServiceConfigW, CloseServiceHandle, CreateServiceW, OpenSCManagerW, OpenServiceW,
-            StartServiceW, ENUM_SERVICE_TYPE, SC_HANDLE,
+            StartServiceW, ENUM_SERVICE_TYPE,
             SC_MANAGER_ALL_ACCESS, SERVICE_ALL_ACCESS, SERVICE_DEMAND_START, SERVICE_ERROR,
             SERVICE_ERROR_NORMAL, SERVICE_KERNEL_DRIVER, SERVICE_NO_CHANGE, SERVICE_START_TYPE,
         };
@@ -283,10 +283,11 @@ unsafe fn open_ring0() -> Option<Ring0> {
                 }
             }
         };
-        // StartService 失败不再直接放弃：183（ERROR_ALREADY_EXISTS）通常表示设备名
-        // 已被另一个 WinRing0 实例占用（其他监控程序 / 遗留安装的旧服务仍在运行）——
-        // 此时设备本身可用。落到下方设备打开探测：能打开就照常读 MSR，
-        // 与 driver-installer 的 RES_OK_DEVICE 语义对齐。
+        // StartService 失败不再直接放弃：1056（ERROR_SERVICE_ALREADY_RUNNING，
+        // 审查 079：原注释误写 183/ERROR_ALREADY_EXISTS —— 那是 CreateService
+        // 的"已存在"码；StartService 的"已在运行"是 1056）通常表示服务已由
+        // 其他实例启动 —— 此时设备本身可用。落到下方设备打开探测：能打开就
+        // 照常读 MSR，与 driver-installer 的 RES_OK_DEVICE 语义对齐。
         if let Err(e) = StartServiceW(svc.0, None) {
             // 用 e.code() 而非 GetLastError()：后者是"最近一次 Win32 调用"的错误码，
             // 可能被 crate 内部后续调用污染，导致 183 判定失效。
@@ -355,8 +356,13 @@ fn ring0() -> Option<MutexGuard<'static, Option<Ring0>>> {
     let mut g = lock_ring0();
     if g.is_none() || RING0_STALE.load(std::sync::atomic::Ordering::Relaxed) {
         let new = unsafe { open_ring0() };
+        let ok = new.is_some();
         *g = new;
-        RING0_STALE.store(false, std::sync::atomic::Ordering::Relaxed);
+        // 审查 585：仅打开成功才清唤醒自愈标记 —— 失败时 g 已是 None、下轮
+        // 仍会重试，但不吞掉 RING0_STALE 的语义。
+        if ok {
+            RING0_STALE.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     Some(g)
 }
@@ -382,16 +388,33 @@ fn query_service_binary_path(svc: SC_HANDLE) -> Option<String> {
             return None;
         }
         let mut len = 0usize;
-        while *pw.0.add(len) != 0 {
+        // 审查 081：按缓冲容量上限扫描 —— 无 NUL 结尾的路径不再越界读。
+        while len < buf.len() * 8 / 2 && *pw.0.add(len) != 0 {
             len += 1;
         }
         Some(String::from_utf16_lossy(std::slice::from_raw_parts(pw.0, len)))
     }
 }
 
-/// 服务的 BinaryPath（可能带 `\??\` 内核前缀）指向的文件是否真实存在。
+/// 服务的 BinaryPath（可能带内核前缀）指向的文件是否真实存在。
+///
+/// 审查 082：内核路径前缀还原 —— `\??\` 直接剥掉；`\SystemRoot\` 映射到
+/// Windows 目录（`%SystemRoot%`，通常 `C:\Windows`）。否则服务明明有效却被
+/// 误判"文件不存在"，触发不必要的 ChangeServiceConfig 修复路径。
 fn driver_file_exists(binary_path: &str) -> bool {
     let p = binary_path.strip_prefix(r"\??\").unwrap_or(binary_path);
+    if let Some(rest) = p.strip_prefix(r"\SystemRoot\") {
+        let mut pb = std::path::PathBuf::from(
+            std::env::var_os("SystemRoot")
+                .unwrap_or_else(|| std::path::PathBuf::from("C:\\Windows").into_os_string()),
+        );
+        for part in rest.split('\\') {
+            if !part.is_empty() {
+                pb.push(part);
+            }
+        }
+        return pb.exists();
+    }
     std::path::Path::new(p).exists()
 }
 
@@ -410,12 +433,13 @@ pub fn teardown() {
     // 关设备句柄（若已初始化）：take() 取得所有权，Ring0 的 Drop 自动 CloseHandle。
     // 用 try_lock 而不是 lock（审查项 2.2.3）：功耗线程可能正卡在 `DeviceIoControl`
     // 上并持有该锁，阻塞等待会把采样线程挂回同一个死点上。取不到锁时只跳过
-    // 显式关闭 —— 那次阻塞调用返回后 `Ring0` 的 Drop 仍会 CloseHandle。
+    // 显式关闭 —— 审查 586：该次调用返回后守卫析构会关句柄，但 Ring0 仍留在
+    // 静态槽位且 TORN 使其不会被替换，这一个句柄将存活到进程退出（已接受并注明）。
     match RING0.try_lock() {
         Ok(mut g) => {
             let _ = g.take();
         }
-        Err(_) => probe::log("msr teardown: 功耗线程仍持有设备锁，句柄将在其调用返回后关闭"),
+        Err(_) => probe::log("msr teardown: 功耗线程仍持设备锁；其返回后守卫关闭句柄，但槽位中的 Ring0 将存活到进程退出（已接受）"),
     }
     // 停止内核驱动服务
     unsafe {
@@ -551,9 +575,18 @@ impl MsrPower {
         let r = g.as_ref()?;
         let amd = cpuid_info().amd;
         let pkg_idx = if amd { MSR_AMD_PKG_ENERGY } else { MSR_INTEL_PKG_ENERGY };
-        let pkg = read_msr(r, pkg_idx)?;
+        // 审查 588：PKG 读失败沿用 last_watts —— `?` 直接短路会绕过
+        // "异常时回退到上一次有效读数"的承诺，让功耗行无谓掉成 `--`。
+        let pkg = match read_msr(r, pkg_idx) {
+            Some(v) => v,
+            None => return self.last_watts,
+        };
         let dram = if self.dram_ok {
-            read_msr(r, MSR_INTEL_DRAM_ENERGY).unwrap_or(0)
+            // 审查 080：DRAM 读失败沿用上帧原始值 —— 写 0 会让下一帧
+            // wrapping_sub 得到巨大伪回绕量、整帧被拒。
+            read_msr(r, MSR_INTEL_DRAM_ENERGY)
+                .or_else(|| self.prev.map(|(_, _, pd)| pd))
+                .unwrap_or(0)
         } else {
             0
         };
@@ -618,6 +651,13 @@ impl MsrPower {
 
         // 无效帧：沿用上次有效值（基线已推进，下一帧重新计算）。
         self.invalid = self.invalid.saturating_add(1);
+        // 审查 587：连续异常计数接上阈值决策 —— 达到阈值走不受门控的
+        // degrade 流（此前该字段只被日志文本读取，名实不符）。
+        if self.invalid == 30 {
+            probe::degrade(
+                "degrade: MSR 功耗连续 30 帧异常（回绕/倒退/超窗）—— 读数将持续沿用旧值",
+            );
+        }
         probe::log(&format!(
             "msr reject dt={dt_ms} pkg_delta={pkg_delta} dram_delta={dram_delta} invalid={} hold={:?}",
             self.invalid, self.last_watts
@@ -632,6 +672,12 @@ impl MsrPower {
         let r = g.as_ref()?;
         let u = read_msr(r, unit_idx)?;
         let n = (u >> 8) & 0x1F;
+        // 审查 589：能量单位指数校验 —— 驱动返回垃圾（如 n=0 ⇒ 1J/计数）
+        // 会把功耗算爆；物理上 RAPL 单位指数在 0x0D~0x10 附近，钳到 1..=20。
+        if n == 0 || n > 20 {
+            probe::log(&format!("msr unit exponent out of range n={n} -> init aborted"));
+            return None;
+        }
         self.unit_j = 1.0 / (1u64 << n) as f32;
         // DRAM 域：仅 Intel 探测（AMD 没有可公开读取的 DRAM 能量域）。
         if !c.amd {
@@ -726,7 +772,9 @@ impl MsrPowerAsync {
         }
         if self.in_flight {
             // 上一轮派出去的任务还没回来：不重复派单。若回包已在队列里，说明
-            // 那次阻塞调用最终返回了 —— 收下迟到结果、复位状态，下一帧重新计时。
+            // 那次阻塞调用最终返回了 —— 只复位状态、丢弃这次迟到的结果
+            // （其时间窗已过期，不能充当本帧值；下一帧重新派单计时。
+            // 审查 083：原注释"收下迟到结果"与实现不符，据实更正）。
             match self.reply_rx.as_ref().map(|rx| rx.try_recv()) {
                 Some(Ok(_)) => self.in_flight = false,
                 Some(Err(TryRecvError::Disconnected)) => {

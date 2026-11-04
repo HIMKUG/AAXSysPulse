@@ -16,13 +16,18 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# 首轮 266 / 续篇 804：build.rs 里的主程序 exe 名与驱动资源名改从契约取 ——
+# 硬编码是 MAIN_EXE_NAME / DRIVER_FILE_NAME 的第二、三份副本，改契约名即构建期漏检。
+# （同 workspace 的 path 依赖，不引入新外部 crate。）
+aaxsyspulse-core = { path = "../../sysoverlay/crates/core" }
 
 [dependencies]
 # 跨进程契约唯一真源（审查项 P1-22）：exe / 服务 / 任务名、消息号、窗口类名、
 # CONFIG_VERSION 都从这里取。core 零依赖 ⇒ 不会把 windows 0.58 拉进本次编译。
 aaxsyspulse-core = { path = "../../sysoverlay/crates/core" }
 tauri = { version = "2", features = [] }
-tauri-plugin-opener = "2"
+# 续篇 659 / 778：tauri_plugin_opener 前端零调用 —— 依赖与 capabilities 里的
+# opener:default 一并移除，收敛 csp:null 下的能力面。
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 notify = "8"
@@ -37,6 +42,10 @@ tokio = { version = "1", features = ["time", "rt"] }
 chrono = "0.4"
 
 [target.'cfg(windows)'.dependencies]
+# 续篇 790：windows 0.61 与 app/win crate 的 0.58 并存（Cargo.lock 同时锁两份）——
+# Tauri v2 的 wry/webview2 依赖链要求 0.61 API 面，而主程序 win crate 的 D2D/DWrite
+# COM 接口签名基于 0.58，两者互不兼容，暂无法统一到单一版本；升版属依赖替换，
+# 不在本轮修复范围。
 windows = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Security",

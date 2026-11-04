@@ -32,23 +32,35 @@ pub fn init() {
     set_memory_priority();
     // 启动期触碰过一次就不再用的页（初始化代码/表/字体后备）在 30s 后立即
     // 交还系统，不等自然回落；此刻若用户正在交互，热页软故障即回，无感。
-    std::thread::Builder::new()
+    match std::thread::Builder::new()
         .name("mem-tune-startup".into())
         .spawn(|| {
             std::thread::sleep(std::time::Duration::from_millis(30_000));
             trim("startup settled");
-        })
-        .ok();
+        }) {
+        Ok(_) => {}
+        // 审查 273：spawn 失败不再被 `.ok()` 无声吞掉。
+        Err(e) => crate::probe::log(&format!("mem_tune: startup trim thread spawn failed: {e}")),
+    }
 }
 
 /// 主动清空一次工作集（60s 节流）。返回是否真正执行；`reason` 仅用于探针日志。
 pub fn trim(reason: &str) -> bool {
     let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
-    // check-then-store 无锁竞态：最坏情形两个线程连修两次，第二次近乎空操作，无害。
-    if now.saturating_sub(LAST_TRIM_MS.load(Ordering::Relaxed)) < TRIM_MIN_INTERVAL_MS {
+    let last = LAST_TRIM_MS.load(Ordering::Relaxed);
+    // 审查 605：last==0 表示从未修剪 —— 系统开机不足 60s 时 now-0<60_000
+    // 恒真，会把启动 30s 的一次性 trim 永久挡掉。
+    if last != 0 && now.saturating_sub(last) < TRIM_MIN_INTERVAL_MS {
         return false;
     }
-    LAST_TRIM_MS.store(now, Ordering::Relaxed);
+    // 审查 273：CAS 抢占节流窗口 —— 原先 check-then-store 无锁竞态，
+    // 两个线程可连修两次。
+    if LAST_TRIM_MS
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return false;
+    }
     let before = working_set_mb();
     unsafe {
         use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};

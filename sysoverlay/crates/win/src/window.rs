@@ -16,7 +16,7 @@ use crate::Config;
 use crate::Snapshot;
 use aaxsyspulse_core::sampler::SamplerDiag;
 use arc_swap::ArcSwap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -157,11 +157,12 @@ const OVERLAY_STATE_FILE: &str = "overlay_hidden.dat";
 
 fn overlay_state_dir() -> std::path::PathBuf {
     // 安装目录名是契约常量：引导卸载时删的正是这个目录（3.1.14 / P1-22）。
-    std::env::var("LOCALAPPDATA")
-        .map(|p| {
-            std::path::PathBuf::from(p).join(aaxsyspulse_core::contract::INSTALL_DIR_NAME)
-        })
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+    // 审查 354：var_os + PathBuf —— `var()` 要求 UTF-8，非 UTF-8 的
+    // LOCALAPPDATA 会回落 "."，把标记写进工作目录。
+    std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(aaxsyspulse_core::contract::INSTALL_DIR_NAME)
 }
 
 fn overlay_state_path() -> std::path::PathBuf {
@@ -177,8 +178,11 @@ fn mark_overlay_hidden(hidden: bool) {
             let _ = std::fs::create_dir_all(parent);
         }
         let _ = std::fs::write(&path, b"1");
-    } else {
-        let _ = std::fs::remove_file(&path);
+    } else if let Err(e) = std::fs::remove_file(&path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            // 审查 355：删除失败留 probe —— 残留标记会让下次启动误判隐藏。
+            crate::probe::log(&format!("overlay: clear hidden marker failed: {e}"));
+        }
     }
 }
 
@@ -203,8 +207,11 @@ struct ThreadState {
     hovered: bool,
     /// 缓存的窗口像素尺寸（P1-10）：尺寸变化（WM_SIZE/WM_DISPLAYCHANGE）时更新，
     /// 渲染每帧读缓存而非跨进程 `GetWindowRect`。0 表示尚未缓存。
-    win_w: i32,
-    win_h: i32,
+    /// 审查 145：**AtomicI32** —— UI 线程（WM_SIZE/WM_DISPLAYCHANGE）写、
+    /// 渲染线程（`get_window_size`）裸读是真实数据竞争（UB），原子化消除；
+    /// Relaxed 足够（尺寸变化会伴随渲染纪元/重绘信号，读旧值一帧无害）。
+    win_w: AtomicI32,
+    win_h: AtomicI32,
 }
 
 impl ThreadState {
@@ -218,8 +225,8 @@ impl ThreadState {
             size_dirty: false,
             resize_mode: false,
             hovered: false,
-            win_w: 0,
-            win_h: 0,
+            win_w: AtomicI32::new(0),
+            win_h: AtomicI32::new(0),
         }
     }
 }
@@ -360,6 +367,8 @@ pub fn publish_schedule_cfg(cfg: &Config) {
     // GPU 查询范围（主适配器/3D 引擎 only）随配置即时生效
     crate::proc_gpu::set_gpu_scope(cfg.gpu_primary_only, cfg.gpu_3d_only);
     // 数值类字段变化 ⇒ 请求一次强制屏障提交（审查项 2.2.5 / P1-16）。
+    // 审查 356：gpu_primary_only / gpu_3d_only 也属数值语义字段（GPU 查询
+    // 范围），纳入结构使改动触发强制屏障提交。
     note_numeric_change(&NumericFields {
         interval_ms: cfg.interval_ms,
         refresh_auto: cfg.refresh_auto,
@@ -367,6 +376,8 @@ pub fn publish_schedule_cfg(cfg: &Config) {
         power_interval_ms: cfg.power_interval_ms,
         disk_on,
         net_low: cfg.net_low_freq,
+        gpu_primary_only: cfg.gpu_primary_only,
+        gpu_3d_only: cfg.gpu_3d_only,
     });
     // 唤醒采样线程（含全关停车状态）
     let mut gen = CFG_GEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -396,6 +407,9 @@ struct NumericFields {
     power_interval_ms: u32,
     disk_on: bool,
     net_low: bool,
+    /// GPU 查询范围（审查 356：改动走强制屏障提交）。
+    gpu_primary_only: bool,
+    gpu_3d_only: bool,
 }
 
 /// 首次发布只建立基线，不触发强制提交（启动阶段本来就要出第一帧）。
@@ -644,6 +658,25 @@ unsafe extern "system" fn wndproc(
     _wparam: windows::Win32::Foundation::WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // 审查 146：任一分支 panic 跨 FFI 边界即 abort 整个进程 —— 外层包
+    // catch_unwind（与 settings_wndproc 同型），panic 帧按失败处理返回 0，
+    // 崩溃现场已由 probe panic hook 落盘。
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wndproc_inner(hwnd, msg, _wparam, lparam)
+    }));
+    outcome.unwrap_or_else(|_| {
+        crate::probe::log(&format!("window: PANIC in wndproc msg={msg:#x} (caught)"));
+        crate::gdi::force_full_refresh();
+        LRESULT(0)
+    })
+}
+
+unsafe fn wndproc_inner(
+    hwnd: HWND,
+    msg: u32,
+    _wparam: windows::Win32::Foundation::WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match msg {
         // 明确拒绝激活：不抢前台应用焦点。
         WM_MOUSEACTIVATE => LRESULT(3), // MA_NOACTIVATE = 3
@@ -807,11 +840,15 @@ unsafe extern "system" fn wndproc(
                 if _wparam.0 != 2 {
                     state.size_dirty = true;
                 }
-                // 缓存窗口尺寸，省去每帧 GetWindowRect（P1-10）
+                // 缓存窗口尺寸，省去每帧 GetWindowRect（P1-10；审查 145：原子写）
                 let mut r = RECT::default();
                 if GetWindowRect(hwnd, &mut r).as_bool() {
-                    state.win_w = (r.right - r.left).max(1);
-                    state.win_h = (r.bottom - r.top).max(1);
+                    state
+                        .win_w
+                        .store((r.right - r.left).max(1), Ordering::Relaxed);
+                    state
+                        .win_h
+                        .store((r.bottom - r.top).max(1), Ordering::Relaxed);
                 }
                 let _ = InvalidateRect(hwnd, None, true);
             }
@@ -1023,15 +1060,23 @@ unsafe extern "system" fn wndproc(
             // 开着一个模态 MessageBox / 取色对话框（本项目大量使用），消息迟迟不被
             // 处理，则必现。改为 `Arc::into_raw` 把这一份强引用**移交**给接收端，
             // 接收端必须以 `Arc::from_raw` 接管（见 settings::on_wm_sampler_diag）。
+            // 审查 148：PostMessageW 失败时用 `Arc::from_raw` 回收强引用 ——
+            // `let _` 吞掉失败会让这份 Arc 永久泄漏。
             let ptr = Arc::into_raw(shared_diag());
             // 发送给 settings 窗口（由 lparam 传入目标 HWND）
             let target = HWND(lparam.0 as *mut _);
-            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                 target,
                 WM_SAMPLER_DIAG,
                 WPARAM(0),
                 LPARAM(ptr as isize),
-            );
+            )
+            .is_err()
+            {
+                // 接收端拿不到消息 → 所有权收回，避免泄漏。
+                drop(Arc::from_raw(ptr));
+                crate::probe::log("window: WM_SAMPLER_DIAG post failed -> Arc reclaimed");
+            }
             LRESULT(0)
         }
 
@@ -1041,8 +1086,8 @@ unsafe extern "system" fn wndproc(
             crate::gdi::invalidate_dib_cache();
             // 显示器变化可能改变窗口尺寸/位置 → 使尺寸缓存失效，下次渲染重新取（P1-10）
             if let Some(state) = get_state_ptr(hwnd).as_mut() {
-                state.win_w = 0;
-                state.win_h = 0;
+                state.win_w.store(0, Ordering::Relaxed);
+                state.win_h.store(0, Ordering::Relaxed);
             }
             if IsWindowVisible(hwnd).as_bool() {
                 if let Some(state) = get_state_ptr(hwnd).as_ref() {
@@ -1101,7 +1146,9 @@ unsafe extern "system" fn wndproc(
         WM_WTSSESSION_CHANGE => {
             const WTS_SESSION_LOCK: u32 = 0x7;
             const WTS_SESSION_UNLOCK: u32 = 0x8;
-            match lparam.0 as u32 {
+            // 审查 365：LOCK/UNLOCK 状态在 **wParam**，lParam 是会话 ID ——
+            // 原先用 lParam 匹配恒不命中，锁屏检测基本失效。
+            match _wparam.0 as u32 {
                 WTS_SESSION_LOCK => {
                     SESSION_LOCKED.store(true, std::sync::atomic::Ordering::SeqCst);
                     crate::probe::log("session locked -> sampler paused");
@@ -1204,7 +1251,10 @@ pub fn modify_config(hwnd: HWND, f: impl FnOnce(&mut Config)) {
 /// 快速重启的 `exit(0)` 会带走后台写线程，`save_config_async` 在重启路径上不可用。
 fn save_current_config(hwnd: HWND) {
     if let Some(state) = unsafe { get_state_ptr(hwnd).as_ref() } {
-        crate::config_io::save_config(&state.cfg);
+        // 审查 367：落盘失败留痕 —— 快速重启前同步落盘丢配置最难排查。
+        if !crate::config_io::save_config(&state.cfg) {
+            crate::probe::log("window: save_current_config FAILED（快速重启前落盘失败）");
+        }
     }
 }
 
@@ -1270,19 +1320,22 @@ pub(crate) fn get_window_size(hwnd: HWND) -> (i32, i32) {
     let p = unsafe { get_state_ptr(hwnd) };
     if !p.is_null() {
         let s = unsafe { &*p };
-        if s.win_w > 0 && s.win_h > 0 {
-            return (s.win_w, s.win_h);
+        let w = s.win_w.load(Ordering::Relaxed);
+        let h = s.win_h.load(Ordering::Relaxed);
+        if w > 0 && h > 0 {
+            return (w, h);
         }
     }
     let mut rect = RECT::default();
     if unsafe { GetWindowRect(hwnd, &mut rect) }.as_bool() {
-        let w = (rect.right - rect.left).unsigned_abs() as i32;
-        let h = (rect.bottom - rect.top).unsigned_abs() as i32;
+        // 审查 368：i32::MIN 回绕 —— saturating_abs 保证差值非负。
+        let w = (rect.right.saturating_sub(rect.left)).unsigned_abs() as i32;
+        let h = (rect.bottom.saturating_sub(rect.top)).unsigned_abs() as i32;
         if w > 0 && h > 0 {
             if !p.is_null() {
                 unsafe {
-                    (*p).win_w = w;
-                    (*p).win_h = h;
+                    (*p).win_w.store(w, Ordering::Relaxed);
+                    (*p).win_h.store(h, Ordering::Relaxed);
                 }
             }
             return (w, h);
@@ -1444,22 +1497,64 @@ pub fn snap_overlay_to_corner(hwnd: HWND, corner: u8) {
         if !GetWindowRect(hwnd, &mut r).as_bool() {
             return;
         }
-        let (sw, sh) = get_screen_size();
+        // 审查 373：贴角按**目标显示器**取整屏矩形（MonitorFromPoint），不再
+        // 只用主屏 —— 多显示器下贴副屏角落会被拉回主屏。审查 374：显式列出
+        // 0..=3，非法值回落左下并留痕（原先 `_ =>` 把任何 >3 的垃圾都当左下）。
+        let (sw, sh) = {
+            let center = POINT {
+                x: (r.left + r.right) / 2,
+                y: (r.top + r.bottom) / 2,
+            };
+            screen_size_of(center)
+        };
         let w = r.right - r.left;
         let h = r.bottom - r.top;
         let (x, y) = match corner {
             0 => (sw - w - MARGIN, MARGIN),                 // 右上
             1 => (sw - w - MARGIN, sh - h - MARGIN),        // 右下
             2 => (MARGIN, MARGIN),                          // 左上
-            _ => (MARGIN, sh - h - MARGIN),                 // 左下
+            3 => (MARGIN, sh - h - MARGIN),                 // 左下
+            other => {
+                crate::probe::log(&format!("snap_overlay_to_corner: invalid corner {other} -> bottom-left"));
+                (MARGIN, sh - h - MARGIN)
+            }
         };
-        let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        let sp = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        // 审查 380：归位落盘 —— 原先只改内存，每次启动重复执行、磁盘仍冲突。
+        if sp.is_ok() {
+            modify_config(hwnd, |c| c.snap_corner = corner);
+        }
+    }
+}
+
+/// 指定点所在显示器的整屏尺寸（审查 373：snap 用，替代主屏 GetDC(None)）。
+fn screen_size_of(pt: POINT) -> (i32, i32) {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    };
+    unsafe {
+        let hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(hmon, &mut mi).as_bool() {
+            let rc = mi.rcMonitor;
+            (rc.right - rc.left, rc.bottom - rc.top)
+        } else {
+            get_screen_size()
+        }
     }
 }
 
 fn get_screen_size() -> (i32, i32) {
     unsafe {
+        // 审查 375：GetDC(None) 失败不再继续（空 HDC 的 GetDeviceCaps 返回 0 并传播）。
         let hdc = GetDC(None);
+        if hdc.is_invalid() {
+            crate::probe::log("window: get_screen_size GetDC failed -> (0,0)");
+            return (0, 0);
+        }
         let w = GetDeviceCaps(hdc, HORZRES);
         let h = GetDeviceCaps(hdc, VERTRES);
         ReleaseDC(None, hdc);
@@ -1516,7 +1611,9 @@ fn clamp_window_into_view(hwnd: HWND) -> Option<RECT> {
     let (x, y) = clamp_to_visible(rect.left, rect.top, w, h);
     if x != rect.left || y != rect.top {
         unsafe {
-            let _ = SetWindowPos(
+            // 审查 376：钳制失败返回 None —— 原先把钳制坐标写回 rect 让调用方
+            // 落盘，配置与实际位置从此不符。
+            if SetWindowPos(
                 hwnd,
                 None,
                 x,
@@ -1524,7 +1621,12 @@ fn clamp_window_into_view(hwnd: HWND) -> Option<RECT> {
                 0,
                 0,
                 SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
-            );
+            )
+            .is_err()
+            {
+                crate::probe::log("window: clamp SetWindowPos failed -> keep old rect");
+                return None;
+            }
         }
         rect.left = x;
         rect.top = y;
@@ -1666,7 +1768,12 @@ impl OverlayWindow {
             use windows::Win32::System::RemoteDesktop::{
                 WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
             };
-            let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
+            // 审查 150：判返回值 —— 注册失败则锁屏检测整条链路失效。
+            if let Err(e) = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) {
+                crate::probe::log(&format!(
+                    "window: WTSRegisterSessionNotification failed ({e}) —— 锁屏暂停采样不可用"
+                ));
+            }
         }
 
         // UIPI 放行引导程序发来的两个跨进程消息。
@@ -1679,7 +1786,9 @@ impl OverlayWindow {
             use windows::Win32::UI::WindowsAndMessaging::{
                 ChangeWindowMessageFilterEx, MSGFLT_ALLOW,
             };
-            for msg in [WM_RELOAD_CONFIG, WM_QUICK_RESTART] {
+            // 审查 379：UIPI 白名单补 WM_OPEN_SETTINGS —— 双击托盘/第二实例
+            // 打开设置同样要跨完整性投递（缺它时被静默丢弃，「双击打开设置无效」）。
+            for msg in [WM_RELOAD_CONFIG, WM_QUICK_RESTART, WM_OPEN_SETTINGS] {
                 // 这条 API 的返回值**必须判**（批次 5 项 ⑥ 的 A 层同族）：放行失败时
                 // 引导侧的 `PostMessageW` **仍返回成功**（UIPI 是静默丢弃），于是
                 // 「引导改了设置、悬浮窗毫无反应」在两端的日志里都显示成功。
@@ -1722,10 +1831,12 @@ impl OverlayWindow {
         // 由 WM_PAINT 分支在 state 就绪后重试。
         let _ = unsafe { InvalidateRect(hwnd, None, false) };
 
-        // 启动全屏检测定时器（1s 间隔）。
+        // 启动全屏检测定时器（1s 间隔；审查 381：判返回值）。
         unsafe {
             use windows::Win32::UI::WindowsAndMessaging::SetTimer;
-            let _ = SetTimer(hwnd, FULLSCREEN_TIMER_ID as _, 1000, None);
+            if SetTimer(hwnd, FULLSCREEN_TIMER_ID as _, 1000, None) == 0 {
+                crate::probe::log("window: fullscreen timer SetTimer failed");
+            }
         }
 
         Ok(Self { hwnd, state })
@@ -1846,8 +1957,15 @@ fn find_overlay_hwnd() -> Option<HWND> {
             // LPARAM(i64) → 原始指针：`LPARAM.0` 本身是 `isize`，只需一步 `as u64`
             let raw = lparam.0 as u64;
             let result = &*(raw as *const Mutex<Option<HWND>>);
+            // 审查 385：GetClassNameW 返回值判截断 —— 缓冲 256 不够时
+            // `len != class_name.len()` 直接漏匹配（超长类名场景）。
             let mut buf = [0u16; 256];
             let len = GetClassNameW(hwnd, &mut buf);
+            let truncated = len as usize >= buf.len();
+            if truncated {
+                crate::probe::log("find_overlay_hwnd: class name truncated (256 cap)");
+                return BOOL(1);
+            }
             // 契约常量而非字面量（审查项 7.1.2 / P1-22）。名字保证 ASCII
             // （core::contract 的 `names_are_ascii_for_lossless_wide_literals`），
             // 故 UTF-16 码元数 == UTF-8 字节数，可直接先比长度。
@@ -1867,9 +1985,22 @@ fn find_overlay_hwnd() -> Option<HWND> {
             BOOL(1)
         }
 
-        let _ = EnumWindows(Some(enum_proc), LPARAM(result_ptr as isize));
+        // 审查 387：EnumWindows 返回值判失败；poison 恢复与 gdi.rs 口径一致。
+        // 审查 386（部分采纳）：同名类/残留窗口风险 —— 本函数同时服务于
+        // **第二实例跨进程**查找（找到的是*别的*进程的窗口），按 PID 过滤会
+        // 直接打断"双击打开设置"链路，故不在枚举侧过滤；进程内调用方一律走
+        // OVERLAY_HWND 快路径（上方），类名匹配仅作兜底。残留窗口风险由
+        // `IsWindow` + 消息投递无副作用兜住（投递到僵尸窗口只会静默失败）。
+        let my_pid = std::process::id();
+        let _ = my_pid;
+        let enum_ok = EnumWindows(Some(enum_proc), LPARAM(result_ptr as isize)).as_bool();
+        if !enum_ok {
+            crate::probe::log("find_overlay_hwnd: EnumWindows failed");
+        }
         // 回调已执行完，reconstruct Box 并取结果
         let result = Box::from_raw(result_ptr as *mut Mutex<Option<HWND>>);
-        result.lock().ok().and_then(|g| *g)
+        let found = result.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        drop(result);
+        found
     }
 }

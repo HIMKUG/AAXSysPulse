@@ -1,4 +1,5 @@
 # Build artifacts
+target/
 *.exe
 *.pdb
 *.obj
@@ -8,6 +9,8 @@
 *.res
 
 # Third-party driver binary (embedded into driver-installer at build time; not committed)
+# 审查 809：构建期硬依赖（guide build.rs 资源校验）—— CI 缺该文件时
+# 校验已降级为 warning（guide-app/src-tauri/build.rs），不再 panic。
 WinRing0x64.sys
 
 # driver-installer build intermediates
@@ -22,6 +25,9 @@ sysoverlay/driver-installer/obj/
 
 # 基线截图必须入库（S0 回归对比锚点），豁免上面的全局图片忽略
 !sysoverlay/docs/baseline/*.png
+# 审查 810：app 的托盘/窗口图标是 build.rs 构建期硬依赖（rc.exe 输入），
+# 必须入库 —— 豁免 *.ico 全局忽略。
+!sysoverlay/crates/win/assets/*.ico
 
 # Configuration and cache
 .AppData/
@@ -46,6 +52,5 @@ sysoverlay/driver-installer/bin/
 
 # 审查隔离区的二进制/死文件
 docs/reviews/_quarantine-*/
-
-# TRAE IDE 配置（非源码）
-.trae/
+# 审查 279/906：统一归档目录（历史产物/备份/截图迁入），不入库
+archive/

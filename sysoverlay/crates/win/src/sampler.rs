@@ -36,8 +36,10 @@ pub struct SystemSampler {
     /// Diagnostic ring buffer (64 entries, no heap, survives crashes).
     pub diag: SamplerDiag,
 
-    /// Exponential back-off state per sampler（含 Power，共 5 个）.
-    backoff: [Backoff; 5],
+    /// Exponential back-off state per sampler（含 Power，共 5 个）。
+    /// 审查 592：容量由 `SamplerId::ALL.len()` 派生 —— 新增采样器变体时
+    /// 这里自动跟随，`id as usize` 不再有越界风险。
+    backoff: [Backoff; SamplerId::ALL.len()],
 
     /// Sequence number for the next snapshot.
     seq: u64,
@@ -67,7 +69,7 @@ impl SystemSampler {
             util_meter: Meter::new(MeterConfig::default()),
             last_util_ms: None,
             diag: SamplerDiag::new(),
-            backoff: [Backoff::default(); 5],
+            backoff: [Backoff::default(); SamplerId::ALL.len()],
             seq: 0,
             last_net_ms: 0,
             disk: None,
@@ -95,9 +97,8 @@ impl SystemSampler {
         // Power 行关：关闭 MSR 设备句柄并停止内核驱动服务（真正的服务级停止）。
         // 重开本会话不热恢复（teardown 一次性）→ 采样返回 None → 行显示 `--`；
         // 设置页在关闭瞬间已弹原生提示框告知「重启应用恢复」。
-        if prev[4] && !cur[4] {
+        if prev[SamplerId::Power as usize] && !cur[SamplerId::Power as usize] {
             crate::msr::teardown();
-            crate::power_system::store_cpu_watts(None);
             self.backoff[SamplerId::Power as usize].reset();
             self.diag.push(aaxsyspulse_core::sampler::DiagEntry {
                 sampler: SamplerId::Power,
@@ -106,7 +107,7 @@ impl SystemSampler {
                 seq: self.seq as u32,
             });
             // GPU 行也关着 → 厂商库已无使用者（它只为功耗行的瓦数而继续留存），一并卸载。
-            if !cur[2] {
+            if !cur[SamplerId::Gpu as usize] {
                 crate::gpu_vendor::teardown();
                 self.syspower.set_gpu_watts(None);
             }
@@ -115,8 +116,8 @@ impl SystemSampler {
         // —— 功耗行仍需要 GPU 实测瓦数（整机功耗 = CPU + GPU + …），
         //    "不显示占用率"不等于"不测显卡功耗"。
         // 重开：D3DKMT 查询无状态、拓扑缓存自动重建；厂商库被卸载后本会话不热恢复（走 D3DKMT 兜底）。
-        if prev[2] && !cur[2] {
-            if !cur[4] {
+        if prev[SamplerId::Gpu as usize] && !cur[SamplerId::Gpu as usize] {
+            if !cur[SamplerId::Power as usize] {
                 crate::gpu_vendor::teardown();
                 // 厂商瓦数随后端卸载而失效：清掉陈旧读数，避免整机功耗冻结在旧值上。
                 self.syspower.set_gpu_watts(None);
@@ -197,26 +198,31 @@ impl SystemSampler {
             if plan.gpu {
                 // vendor 有值：写入快照并缓存，短路 D3DKMT 调用
                 if let Some(u) = v_util {
-                    gpu_vendor::set_cached_util(u);
-                    // NaN 防护：f32::clamp 对 NaN 返回 NaN（厂商库异常时会漏进快照，
-                    // 渲染成 "NaN%"）。
-                    snap.gpu = if u.is_finite() {
-                        Metric::Value(u.clamp(0.0, 100.0))
+                    // 审查 088：先滤非有限值再进缓存 —— NaN 的位型恰是
+                    // cached_util() 的哨兵值，非有限值不得进入共享缓存；
+                    // NaN 防护：clamp 对 NaN 返回 NaN（渲染成 "NaN%"）。
+                    if u.is_finite() {
+                        gpu_vendor::set_cached_util(u);
+                        snap.gpu = Metric::Value(u.clamp(0.0, 100.0));
                     } else {
-                        Metric::Unavailable
-                    };
+                        snap.gpu = Metric::Unavailable;
+                    }
                     crate::perf::note_section("sample_gpu", t);
                     self.push_diag(SamplerId::Gpu, SampleOutcome::Ok, 0, now_ms);
                 } else {
-                    // vendor 不可用：从缓存恢复；若缓存也无则用 D3DKMT
+                    // vendor 不可用：先跑 D3DKMT；仅当 D3DKMT 也无值时才回退缓存
+                    // （审查 593：缓存是上一轮旧值且 vendor 失败时不失效，
+                    // 直接覆盖会把 GPU 利用率冻结在旧值上）。
                     let gpu_out = self.gpu.sample(prev, now_ms, &mut snap);
                     crate::perf::note_section("sample_gpu", t);
-                    if let Some(u) = gpu_vendor::cached_util() {
-                        snap.gpu = if u.is_finite() {
-                            Metric::Value(u.clamp(0.0, 100.0))
-                        } else {
-                            Metric::Unavailable
-                        };
+                    if !matches!(snap.gpu, Metric::Value(_)) {
+                        if let Some(u) = gpu_vendor::cached_util() {
+                            snap.gpu = if u.is_finite() {
+                                Metric::Value(u.clamp(0.0, 100.0))
+                            } else {
+                                Metric::Unavailable
+                            };
+                        }
                     }
                     self.push_diag(SamplerId::Gpu, gpu_out, 0, now_ms);
                 }
@@ -232,8 +238,8 @@ impl SystemSampler {
         // Network：低频档（v3 性能档，默认开）独立 2s 分频；
         // 速率 = Δbytes/Δms（真实间隔），拉长间隔只降粒度不失真。
         // 内部已改为「拓扑缓存 + GetIfEntry2 增量查询」，每周期仅查缓存的活跃 NIC
-        // （本机实测 5 个，含 Hyper-V 虚拟交换机，<0.5ms），仅首次/全部掉线/10s 安全间隔
-        // 才跑一次 GetIfTable2（~28ms）。
+        // （本机实测 5 个，含 Hyper-V 虚拟交换机，<0.5ms），仅首次/全部掉线/60s 兜底间隔
+        // 才跑一次 GetIfTable2（~28ms）（审查 067：原注释误写 10s）。
         let net_due = !crate::window::schedule_net_low()
             || now_ms.saturating_sub(self.last_net_ms) >= NET_LOW_FREQ_MS;
         if plan.net && net_due && self.backoff[SamplerId::Net as usize].is_backing_off(now_ms) {
@@ -268,12 +274,15 @@ impl SystemSampler {
                 }
                 None => {
                     snap.power = Metric::Unavailable;
-                    self.push_diag(SamplerId::Power, SampleOutcome::Skipped, 0, now_ms);
+                    // 审查 089：None = 采样失败，记 Transient —— 退避只对
+                    // is_failure() 生效，记 Skipped 会让 Power 永不退避、
+                    // 每轮都重走昂贵的 MSR 打开流程。
+                    self.push_diag(SamplerId::Power, SampleOutcome::Transient, 0, now_ms);
                 }
             }
             crate::perf::note_section("sample_power", t);
-            // 发布 CPU 实测功率（供进程榜做功耗分摊，跨线程原子共享）
-            crate::power_system::store_cpu_watts(self.syspower.cpu_watts());
+            // 审查 590/594：CPU 实测功率的跨线程发布链（store_cpu_watts 等）
+            // 全仓零读取方，已删除；失败帧也不再对外发布任何陈旧读数。
         } else if !power_enabled {
             // 查询被禁用（行开关关 / 性能页 power_query 关 / teardown 后重开）：
             // 显式置 Unavailable，覆盖 prev 带来的旧值 → 功耗行显示 `--` 而非冻结的旧瓦数。
@@ -288,11 +297,11 @@ impl SystemSampler {
             }
             if let Some(ref mut d) = self.disk {
                 let (read, write) = d.sample(now_ms);
-                // ready 只在**确实拿到有效读数**时为 true：PDH 首轮只建立基线，
-                // 旧实现无条件置 true → 前 2s 显示 "0 B/s" 而不是未就绪。
+                // 审查 087：分侧保留 Metric —— 单侧读不到显示 `--`，
+                // 不再把"读不到"伪装成 0 B/s（ready 仍表示任一侧有值）。
                 snap.disk.ready = read.value().is_some() || write.value().is_some();
-                snap.disk.read_bps = read.value().unwrap_or(0.0);
-                snap.disk.write_bps = write.value().unwrap_or(0.0);
+                snap.disk.read_bps = read;
+                snap.disk.write_bps = write;
             }
         } else {
             // 磁盘监控关闭：销毁 PDH 查询，下次开启时重建。

@@ -28,10 +28,8 @@ pub fn add(hwnd: HWND) -> bool {
             hIcon: icon,
             ..Default::default()
         };
-        let tip: Vec<u16> = TRAY_TIP.encode_utf16().chain(std::iter::once(0)).collect();
-        for (i, c) in tip.iter().take(nid.szTip.len()).enumerate() {
-            nid.szTip[i] = *c;
-        }
+        // 审查 162：复用 [`write_w`] —— 手写循环在超长截断后可能无 NUL 结尾。
+        write_w(&mut nid.szTip, TRAY_TIP);
         Shell_NotifyIconW(NIM_ADD, &nid).as_bool()
     }
 }
@@ -62,7 +60,11 @@ pub fn balloon(hwnd: HWND, title: &str, body: &str) -> bool {
 const BALLOON_TIMEOUT_MS: u32 = 10_000;
 
 /// 把 UTF-16 写入定长数组：自动补结尾 NUL，超长截断（绝不越界 panic）。
+/// 审查 163：空 `dst` 直接返回（原先 `dst[0] = 0` 会 panic）。
 fn write_w(dst: &mut [u16], s: &str) {
+    if dst.is_empty() {
+        return;
+    }
     let wide: Vec<u16> = s.encode_utf16().collect();
     let n = wide.len().min(dst.len().saturating_sub(1));
     dst[..n].copy_from_slice(&wide[..n]);
@@ -78,6 +80,9 @@ pub fn remove(hwnd: HWND) {
             uID: 1,
             ..Default::default()
         };
-        let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+        // 审查 609：注销失败留痕 —— 残留托盘图标"幽灵图标"无日志最难排查。
+        if !Shell_NotifyIconW(NIM_DELETE, &nid).as_bool() {
+            crate::probe::log("tray: NIM_DELETE failed（图标残留）");
+        }
     }
 }

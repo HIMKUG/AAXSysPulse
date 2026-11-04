@@ -4,7 +4,8 @@
 //! - `system.cfg`      全局/系统级（含 `[system]` 几何 + `layout` 锚点决定横竖）
 //! - `appearance.cfg`  颜色/字号/间距/阴影描边（含 `[meta]`）
 //! - `monitor.cfg`     监控项开关/顺序/配色/功耗（含 `[meta]`）
-//! - `layout_h.cfg`    横版布局专属（窗口几何 + 逐指标 4 分量偏移，含 `[meta]`）
+//! - `layout_h.cfg`    横版布局专属（逐指标 4 分量偏移 + order，含 `[meta]`；
+//!                     窗口几何唯一归属 system.cfg，审查 284）
 //! - `layout_v.cfg`    竖版布局专属（含 `[meta]`）
 //!
 //! 旧版单文件 `%APPDATA%\AAXSysPulseC\config.txt`(v2) 启动时若发现且 5 个新文件
@@ -29,6 +30,8 @@ use aaxsyspulse_core::config::system;
 use aaxsyspulse_core::config::Config;
 use aaxsyspulse_core::types::RenderStyle;
 
+use crate::probe;
+
 /// 配置加载错误。
 ///
 /// 调用方（`app` 入口）应据此向用户弹窗，而不是静默按某个版本解析。
@@ -42,8 +45,8 @@ pub enum ConfigError {
     VersionSpanTooLarge { min: u32, max: u32 },
 }
 
-/// 配置子目录名（位于 `%APPDATA%\AAXSysPulseC\` 下）。
-const CONFIG_SUBDIR: &str = "config";
+// 审查 010：配置子目录拼接已收敛到契约（contract::app_config_dir），
+// 本文件不再持有 "config" 子目录名副本。
 
 /// 迁移一次性执行标记文件名：由 `CONFIG_VERSION` 推导（审查项 7.1.3 / P1-22），
 /// 升版不会留下一个还在写 v3 标记的硬编码。
@@ -58,7 +61,9 @@ fn appdata_dir() -> Option<std::path::PathBuf> {
 }
 
 fn config_dir() -> Option<std::path::PathBuf> {
-    appdata_dir().map(|d| d.join(CONFIG_SUBDIR))
+    // 审查 010：目录拼接唯一真源在契约（%APPDATA%\AAXSysPulseC\config），
+    // 不在本文件手拼。
+    aaxsyspulse_core::contract::app_config_dir()
 }
 
 fn migration_marker_path() -> Option<std::path::PathBuf> {
@@ -164,10 +169,11 @@ pub fn broken_config_files() -> Vec<String> {
 
 fn mark_degraded(name: &str) {
     CONFIG_DEGRADED.store(true, Ordering::SeqCst);
-    if let Ok(mut v) = BROKEN_FILES.lock() {
-        if !v.iter().any(|n| n == name) {
-            v.push(name.to_string());
-        }
+    // 审查 405：与 broken_config_files() 的口径一致 —— 中毒锁恢复后继续用，
+    // 降级生效但清单为空的不一致不再出现。
+    let mut v = BROKEN_FILES.lock().unwrap_or_else(|e| e.into_inner());
+    if !v.iter().any(|n| n == name) {
+        v.push(name.to_string());
     }
 }
 
@@ -179,18 +185,24 @@ fn quarantine_unreadable(dir: &std::path::Path, name: &str, reason: &str) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let dst = dir.join(format!("{}.broken.{}", name, ts));
-    // 时间戳到秒：同名重复时复制失败即说明证据已在，不再重试。
-    match std::fs::copy(&src, &dst) {
-        Ok(_) => eprintln!(
-            "[config_io] ⚠️ {} 存在但读取失败（{}）。原件保留，已另存证据 {}；\
-             本次按默认值继续，并**禁用配置保存**以免默认值覆盖你的设置。",
+    // 审查 406：同秒重复失败不得覆盖已有证据副本（std::fs::copy 默认覆盖同名目标）。
+    if dst.exists() {
+        // 走不受调试门控的 degrade 流（审查 049：GUI 子系统看不到 eprintln!）。
+        probe::degrade(&format!(
+            "config_io: {} 存在但读取失败（{}）；证据副本 {} 已存在，不覆盖；本次按默认值继续并禁用配置保存",
             name, reason, dst.display()
-        ),
-        Err(e) => eprintln!(
-            "[config_io] ⚠️ {} 存在但读取失败（{}），留证副本也没写成（{}）；\
-             本次按默认值继续，并**禁用配置保存**以免默认值覆盖你的设置。",
-            name, reason, e
-        ),
+        ));
+    } else {
+        match std::fs::copy(&src, &dst) {
+            Ok(_) => probe::degrade(&format!(
+                "config_io: {} 存在但读取失败（{}）。原件保留，已另存证据 {}；本次按默认值继续，并禁用配置保存以免默认值覆盖设置",
+                name, reason, dst.display()
+            )),
+            Err(e) => probe::degrade(&format!(
+                "config_io: {} 存在但读取失败（{}），留证副本也没写成（{}）；本次按默认值继续并禁用配置保存",
+                name, reason, e
+            )),
+        }
     }
     mark_degraded(name);
 }
@@ -209,6 +221,23 @@ fn parse_file_scoped(
     }
 }
 
+/// 唯一临时文件名（审查 051）：固定 `<name>.tmp` 在进程被杀后会永久残留，
+/// 且并发写者互相覆盖；pid 后缀让每个进程拥有独立临时名。
+fn temp_name(name: &str) -> String {
+    format!("{}.{}.tmp", name, std::process::id())
+}
+
+/// 启动时清理旧版固定名临时文件的残留（审查 051）。
+/// 只处理本应用五个已知配置名的 `<name>.tmp`，不触碰目录里的其他文件。
+fn cleanup_legacy_tmp(dir: &std::path::Path) {
+    for name in ALL_FILES {
+        let p = dir.join(format!("{}.tmp", name));
+        if p.exists() {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
 /// 原子写单个文件：临时文件 + `MoveFileExW` 同卷替换。
 fn write_file_atomic(dir: &std::path::Path, name: &str, content: &str) -> bool {
     if std::fs::create_dir_all(dir).is_err() {
@@ -216,7 +245,7 @@ fn write_file_atomic(dir: &std::path::Path, name: &str, content: &str) -> bool {
         return false;
     }
     let target = dir.join(name);
-    let temp = dir.join(format!("{}.tmp", name));
+    let temp = dir.join(temp_name(name));
 
     // 先写临时文件并 fsync：避免断电时 MoveFileExW 替换成功但数据未落盘。
     let write_ok = std::fs::File::create(&temp).and_then(|mut f| {
@@ -240,8 +269,10 @@ fn write_file_atomic(dir: &std::path::Path, name: &str, content: &str) -> bool {
             MOVEFILE_REPLACE_EXISTING,
         );
         if result.is_err() {
-            let err = windows::Win32::Foundation::GetLastError();
-            eprintln!("[config_io] MoveFileExW 失败: {} ({})", name, err.0);
+            // 审查 050：打印 windows crate 返回的错误码 —— 中间再调
+            // GetLastError() 的结果可能已被后续调用污染。
+            let hr = result.unwrap_err().code().0 as u32;
+            eprintln!("[config_io] MoveFileExW 失败: {} (0x{hr:08X})", name);
             let _ = std::fs::remove_file(&temp);
             return false;
         }
@@ -264,9 +295,12 @@ fn write_bundle(dir: &std::path::Path, files: &[(String, String)]) -> bool {
 /// 把文件包写入临时文件（不 rename），返回临时文件路径列表。
 /// 用于迁移事务：先写出 .tmp，全部成功后才 rename。
 fn write_bundle_to_tmp(dir: &std::path::Path, files: &[(String, String)]) -> Vec<std::path::PathBuf> {
+    // 审查 407：迁移事务与 `write_bundle` 同一把锁串行化 —— 否则迁移与
+    // 保存并发会交错写同名 .tmp。
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut tmp_paths = Vec::new();
     for (name, content) in files {
-        let temp = dir.join(format!("{}.tmp", name));
+        let temp = dir.join(temp_name(name));
         if let Ok(mut f) = std::fs::File::create(&temp) {
             use std::io::Write;
             if f.write_all(content.as_bytes()).is_ok() && f.sync_all().is_ok() {
@@ -275,7 +309,8 @@ fn write_bundle_to_tmp(dir: &std::path::Path, files: &[(String, String)]) -> Vec
             }
         }
         eprintln!("[config_io] 写临时文件失败: {}", name);
-        // 清理已创建的临时文件
+        // 审查 408：当前这个写失败的 temp 可能已被 create 出来（半截内容），一并清理。
+        let _ = std::fs::remove_file(&temp);
         for p in &tmp_paths {
             let _ = std::fs::remove_file(p);
         }
@@ -285,10 +320,15 @@ fn write_bundle_to_tmp(dir: &std::path::Path, files: &[(String, String)]) -> Vec
 }
 
 /// 把一组 `.tmp` 路径 rename 到目标（用 MoveFileExW 原子替换）。
-/// 失败时返回 (成功数, 失败名)。
-fn rename_tmp_to_final(dir: &std::path::Path, files: &[(String, String)]) -> Result<(), (usize, String)> {
+/// 失败时返回 `(已成功改名的文件列表, 失败名)`（审查 409：前半已成功数
+/// 不再被丢弃，供调用方回滚）。
+fn rename_tmp_to_final(
+    dir: &std::path::Path,
+    files: &[(String, String)],
+) -> Result<(), (Vec<String>, String)> {
+    let mut done: Vec<String> = Vec::new();
     for (name, _) in files {
-        let tmp = dir.join(format!("{}.tmp", name));
+        let tmp = dir.join(temp_name(name));
         let target = dir.join(name);
         unsafe {
             use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
@@ -301,28 +341,33 @@ fn rename_tmp_to_final(dir: &std::path::Path, files: &[(String, String)]) -> Res
             )
             .is_err()
             {
-                let err = windows::Win32::Foundation::GetLastError();
-                eprintln!("[config_io] MoveFileExW rename 失败: {} ({})", name, err.0);
-                return Err((0, name.clone()));
+                let hr = windows::Win32::Foundation::GetLastError().0;
+                eprintln!("[config_io] MoveFileExW rename 失败: {} (0x{hr:08X})", name);
+                return Err((done, name.clone()));
             }
         }
+        done.push(name.clone());
     }
     Ok(())
 }
 
-/// 读单个配置文件的 `[meta] version`（不存在或解析失败返回 `None`）。
-/// system.cfg 特殊：version 写在 `[system]` 段而非 `[meta]`。
+/// 读单个配置文件的 version（不存在或解析失败返回 `None`）。
+/// 新格式统一写 `[meta]`，历史文件写在 `[system]`（审查 032/054：两处都读，
+/// 与 core::config::system::parse 的兼容口径一致）。
+///
+/// 审查 054：文件**存在但读不出来**时返回当前版本号（不再当作"缺 version → v1"
+/// 触发破坏性版本弹窗）——真实损坏已由 quarantine/降级闸门处理。
 fn read_file_version(dir: &std::path::Path, name: &str) -> Option<u32> {
-    let text = read_if(dir, name)?;
-    let ini = Ini::parse(&text);
-    // system.cfg 版本在 [system] 段，其余文件在 [meta] 段
-    let (section, key) = if name == system::SYSTEM_FILE {
-        ("system", "version")
-    } else {
-        ("meta", "version")
-    };
-    ini.get(section, key)
-        .and_then(|v| v.parse::<u32>().ok())
+    match read_probe(dir, name) {
+        Err(_) => Some(aaxsyspulse_core::config::CONFIG_VERSION),
+        Ok(None) => None,
+        Ok(Some(text)) => {
+            let ini = Ini::parse(&text);
+            ini.get("meta", "version")
+                .or_else(|| ini.get("system", "version"))
+                .and_then(|v| v.parse::<u32>().ok())
+        }
+    }
 }
 
 /// 检查 5 个配置文件的 version 一致性（启动时调用）。
@@ -351,10 +396,9 @@ fn check_version_consistency(dir: &std::path::Path) -> Result<(), ConfigError> {
     let min_v = *versions.iter().min().unwrap_or(&3);
 
     if max_v - min_v > 1 {
-        eprintln!(
-            "[config_io] ⚠️ 配置文件版本跨度过大（min={}, max={}），拒绝启动以免静默丢失配置",
-            min_v, max_v
-        );
+        probe::degrade(&format!(
+            "config_io: 配置文件版本跨度过大（min={min_v}, max={max_v}），拒绝启动以免静默丢失配置"
+        ));
         return Err(ConfigError::VersionSpanTooLarge { min: min_v, max: max_v });
     }
 
@@ -413,7 +457,12 @@ fn upgrade_one(
     let new_text = serialize(&cfg);
 
     let src = dir.join(name);
-    let _ = std::fs::copy(&src, dir.join(format!("{}.bak", name))); // 升级前备份
+    // 审查 052：备份失败即中止升级 —— 原先 `let _ =` 会在备份丢失的情况下
+    // 覆盖原文件，与导入路径的严格备份口径不一致。
+    if let Err(e) = std::fs::copy(&src, dir.join(format!("{}.bak", name))) {
+        eprintln!("[config_io] {} 升级前备份失败（{e}），中止升级并保留原文件", name);
+        return false;
+    }
     if write_file_atomic(dir, name, &new_text) {
         eprintln!("[config_io] {} 已就地升级到 v{}（各字段值保持不变）", name, cur);
         true
@@ -556,9 +605,16 @@ fn run_migration_if_needed() {
         return;
     }
 
-    // 5. 原子 rename 全部 .tmp → 正式文件
-    if let Err((_, bad_name)) = rename_tmp_to_final(&dir, &files) {
-        eprintln!("[config_io] 文件 rename 失败（{}），迁移中止", bad_name);
+    // 5. 原子 rename 全部 .tmp → 正式文件。
+    // 审查 053：部分成功时回滚已改名者（rename 回 .tmp），与
+    // "失败保持原状、下次启动重试"的注释一致。
+    if let Err((renamed, bad_name)) = rename_tmp_to_final(&dir, &files) {
+        eprintln!("[config_io] 文件 rename 失败（{}），迁移中止并回滚", bad_name);
+        for name in &renamed {
+            let target = dir.join(name);
+            let tmp = dir.join(temp_name(name));
+            let _ = std::fs::rename(&target, &tmp);
+        }
         // 清理 .tmp
         for p in &tmp_paths {
             let _ = std::fs::remove_file(p);
@@ -566,9 +622,13 @@ fn run_migration_if_needed() {
         return;
     }
 
-    // 6. 旧文件备份
+    // 6. 旧文件备份（审查 410：rename 失败即中止 —— 旧文件留在原处下次重试；
+    // 此前无条件写一次性标记会让迁移永不重试、旧文件永久滞留）
     let bak = app.join("config.txt.bak");
-    let _ = std::fs::rename(&old, &bak);
+    if std::fs::rename(&old, &bak).is_err() {
+        eprintln!("[config_io] 旧配置备份 rename 失败，迁移中止（下次启动重试）");
+        return;
+    }
 
     // 7. 写一次性标记
     if let Some(p) = migration_marker_path() {
@@ -593,6 +653,9 @@ pub fn load_config() -> Result<Config, ConfigError> {
         Some(d) => d,
         None => return Ok(Config::default()),
     };
+
+    // 审查 051：清理旧版固定名临时文件残留
+    cleanup_legacy_tmp(&dir);
 
     // ── 就地升级：把版本落后 / 缺失 version 的文件先升级到当前版本 ──
     // 升级只推进格式与版本号，各字段值不变（见 upgrade_one 文档），
@@ -627,7 +690,8 @@ pub fn load_config() -> Result<Config, ConfigError> {
 /// 否则内存里的默认值会把用户其余设置覆盖掉。
 pub fn save_config(cfg: &Config) -> bool {
     if config_degraded() {
-        eprintln!("[config_io] 配置处于降级加载态，本次拒绝落盘（详见 .broken.<ts> 备份）");
+        // 审查 049：GUI 子系统看不到 eprintln!，用户可见警告走 degrade 流。
+        probe::degrade("config_io: 配置处于降级加载态，本次拒绝落盘（详见 .broken.<ts> 备份）");
         return false;
     }
     match config_dir() {
@@ -720,51 +784,54 @@ fn writer_notify() -> &'static std::sync::OnceLock<mpsc::Sender<()>> {
 }
 
 fn start_writer_thread() {
-    // 只启动一次
-    if writer_notify().get().is_some() {
-        return;
-    }
+    // 审查 055：检查-启动-发布三步收进 get_or_init —— 并发首次保存只会起
+    // 一个写线程（原"先 get 再 spawn 再 set"非原子，可能各起一个）。
+    WRITER_NOTIFY.get_or_init(|| {
+        let (notify_tx, rx) = mpsc::channel();
+        let pending_c = writer_pending().clone();
+        let shutdown_c = writer_shutdown().clone();
 
-    let (notify_tx, rx) = mpsc::channel();
-    let pending_c = writer_pending().clone();
-    let shutdown_c = writer_shutdown().clone();
-
-    let spawned = std::thread::Builder::new()
-        .name("config-writer".into())
-        .spawn(move || {
-            while rx.recv().is_ok() {
-                if shutdown_c.load(Ordering::SeqCst) {
-                    break;
+        let spawned = std::thread::Builder::new()
+            .name("config-writer".into())
+            .spawn(move || {
+                while rx.recv().is_ok() {
+                    if shutdown_c.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let bundle = {
+                        let mut lock = pending_c.lock().unwrap_or_else(|e| e.into_inner());
+                        lock.take()
+                    };
+                    if let Some(bundle) = bundle {
+                        if let Some(d) = config_dir() {
+                            write_bundle(&d, &bundle.files);
+                        }
+                    }
+                    if shutdown_c.load(Ordering::SeqCst) {
+                        break;
+                    }
                 }
-                let bundle = {
-                    let mut lock = pending_c.lock().unwrap_or_else(|e| e.into_inner());
-                    lock.take()
-                };
-                if let Some(bundle) = bundle {
+                // 退出前把最后一次 pending 落盘
+                if let Some(bundle) = pending_c.lock().unwrap_or_else(|e| e.into_inner()).take() {
                     if let Some(d) = config_dir() {
                         write_bundle(&d, &bundle.files);
                     }
                 }
-                if shutdown_c.load(Ordering::SeqCst) {
-                    break;
-                }
-            }
-            // 退出前把最后一次 pending 落盘
-            if let Some(bundle) = pending_c.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                if let Some(d) = config_dir() {
-                    write_bundle(&d, &bundle.files);
-                }
-            }
-        })
-        .is_ok();
+            })
+            .is_ok();
 
-    if !spawned {
-        // 不再 panic：旧实现的 `.expect()` 运行在 UI 线程（apply_config），
-        // panic 会经 wndproc 的 extern "system" 边界直接 abort 整个进程。
-        eprintln!("[config_io] config-writer thread spawn failed");
-        return;
-    }
-    let _ = writer_notify().set(notify_tx);
+        if !spawned {
+            // 不再 panic：旧实现的 `.expect()` 运行在 UI 线程（apply_config），
+            // panic 会经 wndproc 的 extern "system" 边界直接 abort 整个进程。
+            // 返回一个**已断开**通道的发送端：send 必失败 → 调用方得到
+            // "未入队"（false），而不是误以为保存成功。
+            eprintln!("[config_io] config-writer thread spawn failed");
+            let (tx, dead_rx) = mpsc::channel();
+            drop(dead_rx);
+            return tx;
+        }
+        notify_tx
+    });
 }
 
 /// 异步落盘（UI 线程调用）：
@@ -774,7 +841,7 @@ fn start_writer_thread() {
 /// ⚠️ 进程退出路径（关窗/隐藏 flush）请用 [`save_config`] 同步落盘保数据。
 pub fn save_config_async(cfg: &Config) -> bool {
     if config_degraded() {
-        eprintln!("[config_io] 配置处于降级加载态，异步保存已跳过（避免默认值覆盖设置）");
+        probe::degrade("config_io: 配置处于降级加载态，异步保存已跳过（避免默认值覆盖设置）");
         return false;
     }
     // 第一次调用时启动写线程
@@ -812,8 +879,12 @@ pub fn switch_layout_in_place(cfg: &mut Config, old: RenderStyle, new: RenderSty
         return;
     }
     if let Some(d) = config_dir() {
-        // 1) 先把当前（旧）布局数据落盘
-        let _ = write_file_atomic(&d, layout::file_for(old), &layout::serialize(old, cfg));
+        // 1) 先把当前（旧）布局数据落盘。审查 411：失败即中止切换 ——
+        // 写失败仍继续会静默丢失旧布局的几何/偏移。
+        if !write_file_atomic(&d, layout::file_for(old), &layout::serialize(old, cfg)) {
+            probe::degrade("config_io: 旧布局保存失败，取消布局切换（旧布局数据未丢）");
+            return;
+        }
         // 2) 载入新布局文件（不存在则保留当前几何，待首次保存时补齐）
         if let Some(text) = read_if(&d, layout::file_for(new)) {
             layout::parse(new, cfg, &text);
@@ -822,9 +893,10 @@ pub fn switch_layout_in_place(cfg: &mut Config, old: RenderStyle, new: RenderSty
     cfg.render_style = new;
 }
 
-/// 导出为 `.mcfg` 分享/备份文本（含脱敏）。失败返回 `None`。
-pub fn export_config(cfg: &Config) -> Option<String> {
-    Some(mcfg::export_config(cfg))
+/// 导出为 `.mcfg` 分享/备份文本（含脱敏）。
+/// 审查 412：导出无失败路径，恒返回 `String`（原先的 `Option` 无意义）。
+pub fn export_config(cfg: &Config) -> String {
+    mcfg::export_config(cfg)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -851,14 +923,12 @@ fn validate_import_files(
             continue;
         }
 
-        // version 检查（仅 monitor/appearance/layout 有 [meta]，system 在 [system]）
-        let version = if name == system::SYSTEM_FILE {
-            let ini = Ini::parse(&content);
-            ini.get("system", "version")
-                .and_then(|v| v.parse::<u32>().ok())
-        } else {
+        // version 检查（审查 032 后续：system.cfg 的 version 已统一写 [meta]，
+        // 兼容读取 [meta] 与历史 [system] 两个位置）
+        let version = {
             let ini = Ini::parse(&content);
             ini.get("meta", "version")
+                .or_else(|| ini.get("system", "version"))
                 .and_then(|v| v.parse::<u32>().ok())
         };
 
@@ -945,6 +1015,15 @@ fn prompt_import_confirm() -> bool {
 ///
 /// 当前即用原生 `MessageBoxW` 弹窗（P3 已证明 GUI 弹窗能力可用），
 /// 不依赖尚未接入的设置页 —— 故这里直接做 I/O，而不是占位。
+#[cfg(test)]
+fn prompt_max_compat() -> bool {
+    // 审查 056：补测试 mock —— 此前只有其余三个弹窗有 #[cfg(test)] 变体，
+    // :1402 用例会弹真实 MessageBox 阻塞 CI。
+    false
+}
+
+/// 真实 `MessageBoxW` 弹窗（最大化兼容二次确认）。
+#[cfg(not(test))]
 fn prompt_max_compat() -> bool {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -1067,7 +1146,8 @@ pub fn import_config(text: &str) -> bool {
     };
     let _ = std::fs::create_dir_all(&dir);
 
-    // 4. 所有目标文件 rename → .bak（仅保留最新一份；回滚失败时再改 .bak.failed.<ts> 保留）
+    // 4. 所有目标文件 rename → .bak（固定名，仅保留最新一份；
+    // 审查 413：原注释"带时间戳"与实现不符，据实更正）
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1091,7 +1171,12 @@ pub fn import_config(text: &str) -> bool {
             if std::fs::rename(&target, &bak).is_ok() {
                 bak_entries.push((name.clone(), bak));
             } else {
-                eprintln!("[config_io] 备份 {} 失败，导入中止（当前配置未改动）", name);
+                eprintln!("[config_io] 备份 {} 失败，导入中止", name);
+                // 审查 414：恢复已改名 .bak 的正式文件 —— 否则"当前配置未改动"
+                // 的承诺不成立（前几个文件已被改名、内容不在原位）。
+                for (orig, bakp) in &bak_entries {
+                    let _ = std::fs::rename(bakp, dir.join(orig));
+                }
                 return false;
             }
         } else {
@@ -1133,11 +1218,12 @@ pub fn import_config(text: &str) -> bool {
                 "[config_io] 未能回滚的备份保留在 {}（.bak.failed.<ts>），请手动恢复",
                 dir.display()
             );
-            // 保留未能回滚的备份：改名 .bak.failed.<ts>，避免被下次导入清除
+            // 保留未能回滚的备份：改名 .bak.failed.<ms>（审查 415：毫秒级
+            // 时间戳，同秒多次回滚失败不再互相覆盖），避免被下次导入清除
             let fail_ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(ts);
+                .map(|d| d.as_millis())
+                .unwrap_or(ts as u128);
             for (orig_name, bak) in &bak_entries {
                 if bak.exists() {
                     let failed = dir.join(format!("{}.bak.failed.{}", orig_name, fail_ts));
@@ -1198,8 +1284,10 @@ pub fn prompt_config_degraded(broken: &[String]) {
 }
 
 /// 返回配置文件路径（用于 UI 展示/诊断），无则返回 `None`。
-pub fn get_config_path() -> Option<String> {
-    config_dir().map(|d| d.join(system::SYSTEM_FILE).to_string_lossy().into_owned())
+/// 审查 416：返回 `PathBuf` —— `to_string_lossy` 会把非 UTF-8 用户名路径
+/// 显示成 U+FFFD。
+pub fn get_config_path() -> Option<std::path::PathBuf> {
+    config_dir().map(|d| d.join(system::SYSTEM_FILE))
 }
 
 #[cfg(test)]
@@ -1211,11 +1299,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("aaxsp_vspan_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         // system.cfg = v3（[system] 段）；其余缺 version → 视为 v1
-        let _ = std::fs::write(dir.join(system::SYSTEM_FILE), "[system]\nversion = 3\n");
-        let _ = std::fs::write(dir.join(monitor::MONITOR_FILE), "[monitor]\nshow_cpu = 1\n");
-        let _ = std::fs::write(dir.join(appearance::APPEARANCE_FILE), "[appearance]\n");
-        let _ = std::fs::write(dir.join(LAYOUT_H_FILE), "[window]\n");
-        let _ = std::fs::write(dir.join(LAYOUT_V_FILE), "[window]\n");
+        // （审查 417：fixture 写入失败必须炸出，不能让断言变成误导性红）
+        std::fs::write(dir.join(system::SYSTEM_FILE), "[system]\nversion = 3\n").expect("fixture");
+        std::fs::write(dir.join(monitor::MONITOR_FILE), "[monitor]\nshow_cpu = 1\n").expect("fixture");
+        std::fs::write(dir.join(appearance::APPEARANCE_FILE), "[appearance]\n").expect("fixture");
+        std::fs::write(dir.join(LAYOUT_H_FILE), "[window]\n").expect("fixture");
+        std::fs::write(dir.join(LAYOUT_V_FILE), "[window]\n").expect("fixture");
 
         let res = check_version_consistency(&dir);
         assert!(
@@ -1280,15 +1369,29 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("aaxsp_vok_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         // 全部 v3
-        let _ = std::fs::write(dir.join(system::SYSTEM_FILE), "[system]\nversion = 3\n");
-        let _ = std::fs::write(dir.join(monitor::MONITOR_FILE), "[meta]\nversion = 3\n");
-        let _ = std::fs::write(dir.join(appearance::APPEARANCE_FILE), "[meta]\nversion = 3\n");
-        let _ = std::fs::write(dir.join(LAYOUT_H_FILE), "[meta]\nversion = 3\n");
-        let _ = std::fs::write(dir.join(LAYOUT_V_FILE), "[meta]\nversion = 3\n");
+        std::fs::write(dir.join(system::SYSTEM_FILE), "[system]\nversion = 3\n").expect("fixture");
+        std::fs::write(dir.join(monitor::MONITOR_FILE), "[meta]\nversion = 3\n").expect("fixture");
+        std::fs::write(dir.join(appearance::APPEARANCE_FILE), "[meta]\nversion = 3\n").expect("fixture");
+        std::fs::write(dir.join(LAYOUT_H_FILE), "[meta]\nversion = 3\n").expect("fixture");
+        std::fs::write(dir.join(LAYOUT_V_FILE), "[meta]\nversion = 3\n").expect("fixture");
 
         assert!(
             check_version_consistency(&dir).is_ok(),
             "单步同版本应放行"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 审查 418：补 v2/v3 混合用例 —— 名为"单步差异"，必须真的覆盖 span=1
+        let dir = std::env::temp_dir().join(format!("aaxsp_vok2_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join(system::SYSTEM_FILE), "[system]\nversion = 3\n").expect("fixture");
+        std::fs::write(dir.join(monitor::MONITOR_FILE), "[meta]\nversion = 2\n").expect("fixture");
+        std::fs::write(dir.join(appearance::APPEARANCE_FILE), "[meta]\nversion = 3\n").expect("fixture");
+        std::fs::write(dir.join(LAYOUT_H_FILE), "[meta]\nversion = 2\n").expect("fixture");
+        std::fs::write(dir.join(LAYOUT_V_FILE), "[meta]\nversion = 3\n").expect("fixture");
+        assert!(
+            check_version_consistency(&dir).is_ok(),
+            "v2/v3 混合（span=1）应按兼容方式放行"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1385,11 +1488,11 @@ mod tests {
     }
 
     // ── confirm_import 短路测试 ────────────────────────────────────────────────
-    // 注：`prompt_import_confirm` / `prompt_max_compat` 在测试环境下为 `false` / `false`
-    // （非测试代码的默认实现），因此两个测试需临时替换这两个函数。
-    // 这里用 `#[swift_bindgen]` 不可用时的标准 Rust 做法：构造一个最小 mcfg 文本，
-    // 让 `mcfg::parse_mcfg` 能解析出 `version_too_high = true` 的文件，
-    // 然后验证 `confirm_import` 在两种拒绝场景下的短路行为。
+    // `prompt_import_confirm` / `prompt_max_compat` 在测试环境下恒返回 false
+    // （审查 419：删除原注释里不存在的 `#[swift_bindgen]` 说法）。
+    // 这里构造一个最小 mcfg 文本，让 `mcfg::parse_mcfg` 能解析出
+    // `version_too_high = true` 的文件，然后验证 `confirm_import`
+    // 在两种拒绝场景下的短路行为。
 
     #[test]
     fn confirm_import_rejects_first() {

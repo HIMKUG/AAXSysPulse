@@ -20,8 +20,13 @@ static SHARED: OnceLock<ArcSwap<Trends>> = OnceLock::new();
 
 /// 提交闸门放行时调用：追加 CPU/内存/网络四个点（**不是每轮采样**，见模块文档第 1 条）。
 ///
-/// 网络以 **KB/s**（>>10）存储：值域 ~10^6，f32 24 位尾数可无损表示；
-/// 直接存 bps（~10^9）会掉精度。
+/// 网络以 **KiB/s**（>>10）存储：值域 ~10^6，f32 24 位尾数可无损表示；
+/// 直接存 bps（~10^9）会掉精度。（审查 277：>>10 是 KiB 而非"KB/s 无损"，
+/// 0~1023 B/s 的值会归 0 —— 模块文档据实更正；显示端若需 KB/s 再换算。）
+///
+/// 审查 613：CPU 不可用（`Unavailable`）时**跳过该点**，不再 push(0.0)
+/// 把"读不到"伪装成有效 0% 曲线点（与 `Metric::Unavailable` 语义对齐）。
+/// 内存恒可用；网络恒有计数（0 是合法值）。
 pub fn push(snap: &Snapshot) {
     let t = SHARED.get_or_init(|| ArcSwap::from_pointee(Trends::new()));
     let mut cur = t.load_full(); // Arc<Trends>
@@ -29,7 +34,9 @@ pub fn push(snap: &Snapshot) {
         let c = Arc::make_mut(&mut cur);
         c.seq = snap.seq;
         c.at_ms = snap.timestamp_ms;
-        c.cpu.push(snap.cpu.value().unwrap_or(0.0));
+        if let Some(v) = snap.cpu.value() {
+            c.cpu.push(v);
+        }
         c.mem.push(snap.memory.load_pct);
         c.net_rx.push((snap.net.rx_bps >> 10) as f32);
         c.net_tx.push((snap.net.tx_bps >> 10) as f32);

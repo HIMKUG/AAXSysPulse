@@ -27,7 +27,8 @@ pub const LAYOUT_V_FILE: &str = "layout_v.cfg";
 pub fn file_for(style: RenderStyle) -> &'static str {
     match style {
         RenderStyle::Vertical => LAYOUT_V_FILE,
-        _ => LAYOUT_H_FILE,
+        // 显式穷尽（审查 041）：新增变体时这里必须做出选择。
+        RenderStyle::Strip | RenderStyle::Classic => LAYOUT_H_FILE,
     }
 }
 
@@ -50,7 +51,12 @@ pub fn serialize(_style: RenderStyle, cfg: &Config) -> String {
 
     // 监控项显示顺序（1-based ID 列表，与 [metrics] 同属布局专属）
     w.section("layout");
-    let order_ids: Vec<String> = cfg.metric_order.iter().map(|&i| (i + 1).to_string()).collect();
+    // 审查 043：u8 + 1 在 i==255 时 debug 下溢出 panic，先升位再相加。
+    let order_ids: Vec<String> = cfg
+        .metric_order
+        .iter()
+        .map(|&i| (i as u32 + 1).to_string())
+        .collect();
     w.kv("order", order_ids.join(" "));
 
     w.into_string()
@@ -72,18 +78,20 @@ pub fn parse(_style: RenderStyle, cfg: &mut Config, text: &str) {
             let idx = (id - 1) as usize;
             let key = format!("offset.{}", id);
             if let Some(v) = sec.get(&key) {
-                let mut arr = [0i32; 4];
-                let mut got = 0;
-                for slot in arr.iter_mut() {
-                    if let Some(tok) = v.split_whitespace().nth(got) {
-                        if let Ok(n) = tok.parse::<i32>() {
-                            *slot = n.clamp(OFFSET_MIN, OFFSET_MAX);
-                            got += 1;
-                        }
-                    }
-                }
-                if got == 4 {
-                    cfg.metric_offsets[idx] = arr;
+                // 审查 042：坏 token 不再让 nth(got) 反复读同一个位置，
+                // 语义与原实现一致 —— 不足 4 个合法分量时整段丢弃。
+                let toks: Vec<i32> = v
+                    .split_whitespace()
+                    .take(4)
+                    .filter_map(|t| t.parse::<i32>().ok())
+                    .collect();
+                if toks.len() == 4 {
+                    cfg.metric_offsets[idx] = [
+                        toks[0].clamp(OFFSET_MIN, OFFSET_MAX),
+                        toks[1].clamp(OFFSET_MIN, OFFSET_MAX),
+                        toks[2].clamp(OFFSET_MIN, OFFSET_MAX),
+                        toks[3].clamp(OFFSET_MIN, OFFSET_MAX),
+                    ];
                 }
             }
         }

@@ -44,7 +44,8 @@ fn enabled() -> bool {
 }
 
 /// `AAXSYSPULSE_PERF` 独立强制开关（进程内只读一次）。未设置 → `None`（交总开关决定）。
-fn env_perf_force() -> Option<bool> {
+/// `pub(crate)`：probe 的启动摘要复用同一解析（审查 272）。
+pub(crate) fn env_perf_force() -> Option<bool> {
     static E: OnceLock<Option<bool>> = OnceLock::new();
     *E.get_or_init(|| {
         let v = std::env::var("AAXSYSPULSE_PERF").ok()?;
@@ -107,7 +108,11 @@ pub fn end_render(start: u64) {
             Err(v) => cur = v,
         }
     }
-    write_line(&format!("frame_render ms={} us={}\n", wall_ms() % 1_000_000, us));
+    // 审查 271：只记慢帧（>2ms）或抽样帧（每 32 帧 1 条）—— 原先每帧无条件
+    // 落盘一行，PROBE 开启时日志被逐帧行刷满。
+    if us > 2_000 || FRAMES.load(Ordering::Relaxed) % 32 == 0 {
+        write_line(&format!("frame_render ms={} us={}\n", wall_ms() % 1_000_000, us));
+    }
     maybe_report();
 }
 
@@ -150,6 +155,9 @@ fn maybe_report() {
     let skipped = SKIPPED.swap(0, Ordering::Relaxed);
     let total = TOTAL_US.swap(0, Ordering::Relaxed);
     let max = MAX_US.swap(0, Ordering::Relaxed);
+    // 审查 599：输出聚合行后清掉"有数据"标记 —— HAS_DATA 置位后从不复位，
+    // 空闲期仍每 5s 打一行全零聚合。
+    HAS_DATA.store(false, Ordering::Relaxed);
     let avg = total.checked_div(frames).unwrap_or(0);
     // 恢复计划 0.4：聚合行带 p50/p99 与跳帧率——分布比均值诚实。
     // ⚠️ 2026-09-14 修：此前只 sort **不清空**，样本是全程累计的 → 聚合行的
@@ -228,15 +236,19 @@ pub fn msg_end(start: u64, hwnd: usize, msg: u32) {
     }
     let us = elapsed_us(start);
     // 轨迹（最慢者优先保留，便于崩溃前定位）
+    // 审查 600：一次有序插入 / 替换最慢项，替代"每条消息都整表排序"的
+    // O(n log n)（排序原本落在消息热路径上）。
     if let Ok(mut trail) = MSG_TRAIL.lock() {
         if trail.len() < TRAIL_MAX {
-            trail.push((us, hwnd, msg));
-            trail.sort_by_key(|&(u, _, _)| std::cmp::Reverse(u));
+            let pos = trail.partition_point(|&(u, _, _)| u >= us);
+            trail.insert(pos, (us, hwnd, msg));
         } else if let Some(last) = trail.last_mut() {
             if us > last.0 {
                 *last = (us, hwnd, msg);
+                let n = trail.len();
+                let pos = trail[..n - 1].partition_point(|&(u, _, _)| u >= us);
+                trail[pos..].rotate_left(n - 1 - pos);
             }
-            trail.sort_by_key(|&(u, _, _)| std::cmp::Reverse(u));
         }
     }
     MSG_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -258,7 +270,9 @@ pub fn msg_end(start: u64, hwnd: usize, msg: u32) {
             }
         }
     }
-    if MSG_COUNT.fetch_add(0, Ordering::Relaxed) > 0 {
+    // 审查 271：普通 load —— 原先 `fetch_add(0)` 让每条消息都做一次无谓的
+    // RMW 并全部进 maybe_report_msgs 的窗口判断。
+    if MSG_COUNT.load(Ordering::Relaxed) > 0 {
         // 每 5s 聚合一次（复用渲染的 maybe_report 窗口）
         maybe_report_msgs();
     }
@@ -364,17 +378,22 @@ pub fn note_cycle(cost_ms: u32, sleep_ms: u64) {
     }
 }
 
-/// 提交探针：每次提交落盘一行（无条件，无阈值）。
+/// 提交探针：抽样落盘（审查 271：原实现每次提交落盘一行，100ms 快档下
+/// 每 5s 可达 50 行 —— 抽样 1/16，节奏异常仍能从聚合行看出）。
 pub fn note_barrier_commit(seq: u64, max_delta: f32, mode_active: u32) {
     if !enabled() {
         return;
     }
-    write_line(&format!(
-        "commit seq={} max_delta={:.1} active={}\n",
-        seq,
-        max_delta,
-        mode_active,
-    ));
+    static COMMIT_N: AtomicU64 = AtomicU64::new(0);
+    let n = COMMIT_N.fetch_add(1, Ordering::Relaxed);
+    if n % 16 == 0 {
+        write_line(&format!(
+            "commit seq={} max_delta={:.1} active={}\n",
+            seq,
+            max_delta,
+            mode_active,
+        ));
+    }
 }
 
 // ── QPC 封装 ─────────────────────────────────────────────
@@ -382,8 +401,17 @@ pub fn note_barrier_commit(seq: u64, max_delta: f32, mode_active: u32) {
 fn qpc() -> u64 {
     unsafe {
         let mut c: i64 = 0;
-        let _ = windows::Win32::System::Performance::QueryPerformanceCounter(&mut c);
-        c as u64
+        if windows::Win32::System::Performance::QueryPerformanceCounter(&mut c).is_ok() {
+            c as u64
+        } else {
+            // QPC 不可用：退回 SystemTime 毫秒 —— 与 freq() 的 1000 兜底同源。
+            // 审查 271：原先 qpc 返回真实 QPC 计数而 freq 兜底 1000，
+            // 耗时会被放大 QPC 频率/1000 倍。
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        }
     }
 }
 
@@ -394,7 +422,7 @@ fn freq() -> u64 {
         if windows::Win32::System::Performance::QueryPerformanceFrequency(&mut f).is_ok() && f > 0 {
             f as u64
         } else {
-            1_000 // 兜底：假装 1 count = 1 ms
+            1_000 // 兜底：与 qpc() 的 SystemTime 毫秒退路同源（审查 271）
         }
     })
 }

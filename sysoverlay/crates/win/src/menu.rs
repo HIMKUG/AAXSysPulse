@@ -10,9 +10,14 @@ pub const IDM_SETTINGS: u16 = 1;
 pub const IDM_QUIT: u16 = 2;
 pub const IDM_RESTART: u16 = 3;
 
-unsafe fn append(menu: HMENU, id: u16, label: &str) {
+unsafe fn append(menu: HMENU, id: u16, label: &str) -> bool {
     let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
-    let _ = AppendMenuW(menu, MF_STRING, id as usize, windows::core::PCWSTR(wide.as_ptr()));
+    // 审查 164：判返回值 —— 静默缺项的菜单最难排查。
+    let ok = AppendMenuW(menu, MF_STRING, id as usize, windows::core::PCWSTR(wide.as_ptr())).is_ok();
+    if !ok {
+        crate::probe::log(&format!("menu: AppendMenuW failed id={id}"));
+    }
+    ok
 }
 
 /// 在光标处弹出托盘菜单，返回选中的命令 ID。
@@ -34,8 +39,13 @@ pub fn show_tray_menu(hwnd: HWND) -> Option<u16> {
 
         // 不调用 SetForegroundWindow：用 TPM_NOACTIVATE 让菜单跟随托盘图标，
         // 不抢前台应用焦点。
+        // 审查 610：GetCursorPos 失败回退到屏幕中心 —— 原先菜单弹到 (0,0)。
         let mut pt = windows::Win32::Foundation::POINT::default();
-        let _ = GetCursorPos(&mut pt);
+        if GetCursorPos(&mut pt).is_err() {
+            crate::probe::log("menu: GetCursorPos failed -> fall back to screen center");
+            pt.x = crate::dpi::screen_w() / 2;
+            pt.y = crate::dpi::screen_h() / 2;
+        }
         let cmd = TrackPopupMenu(
             menu,
             TPM_LEFTALIGN | TPM_RETURNCMD

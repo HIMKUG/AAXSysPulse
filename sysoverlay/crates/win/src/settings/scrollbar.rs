@@ -131,7 +131,10 @@ pub fn geom(dpi: u32, _win_w: i32, win_h: i32, content_h: i32) -> Option<SbGeom>
     let max_scroll = (content_h - win_h) as f32;
 
     // 拇指高 = 轨道高 × 视口占比，下限 MIN_THUMB，上限不超过轨道本身。
-    let raw = track_h * win_h as f32 / content_h as f32;
+    // 审查 192：极端内容高（win_h=0 / content_h 极大）时 track_h 压到 1、
+    // travel=0 —— ratio 恒 0、滚动卡死；给 track_h 下限保住可用性。
+    let track_h = track_h.max(s(dpi, SCROLLBAR_MIN_THUMB) as f32);
+    let raw = track_h * win_h.max(1) as f32 / content_h as f32;
     let thumb_h = raw
         .max(s(dpi, SCROLLBAR_MIN_THUMB) as f32)
         .min(track_h);
@@ -162,8 +165,9 @@ pub enum SbHit {
 /// 这样拇指之外的轨道也能点击跳转，且细条也不会「点不中」。
 pub fn hit_test(g: &SbGeom, win_w: i32, pt: POINT, offset: f32) -> Option<SbHit> {
     // x：从窗口右缘向左覆盖整条命中带（含可见条外侧的隐形扩展区）。
+    // 审查 191：半开区间 —— 与 `pt_in`/拇指闭区间口径统一，右缘 1px 不再越界命中。
     let left = hit_left(g, win_w);
-    if (pt.x as f32) < left || (pt.x as f32) > win_w as f32 {
+    if (pt.x as f32) < left || (pt.x as f32) >= win_w as f32 {
         return None;
     }
     // y：整条轨道（含内缩之外的一点点容错，避免贴边时点不中）。

@@ -24,6 +24,9 @@ pub struct FluentTokens {
 }
 
 /// 浅色 / 深色各自的一组 token。
+/// 审查 180：**颜色** token 以 D2D ColorF 存储；非颜色 token 为
+/// f32/u16/&str/[f32;4]（字段清单见下）—— 原注释"所有 token 均以 ColorF
+/// 存储"与结构不符。
 #[derive(Clone, Copy, Debug)]
 pub struct FluentPalette {
     // ── 颜色 ──────────────────────────────────────────────
@@ -79,9 +82,9 @@ pub struct FluentPalette {
     pub spacing_vertical_m: f32,      // 12.0（= 现有 ROW_GAP）
     pub spacing_vertical_l: f32,      // 16.0
 
-    // ── 动效 ──────────────────────────────────────────────
-    pub duration_faster: f32,         // 50ms（WAM 等效）
-    pub duration_normal: f32,          // 167ms（WAM 等效）
+    // ── 动效（审查 179：注释改秒 —— 字段以秒计，0.1s=100ms、0.2s=200ms）──
+    pub duration_faster: f32,         // 0.1s（=100ms）
+    pub duration_normal: f32,          // 0.2s（=200ms）
     pub curve_easy_ease: [f32; 4],    // Fluent 标准曲线
     pub curve_decelerate_mid: [f32; 4],
 }
@@ -92,11 +95,8 @@ pub struct FluentPalette {
 const fn c(r: u8, g: u8, b: u8) -> ColorF {
     ColorF::rgba(r, g, b, 1.0)
 }
-
-/// Fluent 颜色解析（带透明度）：r/g/b 0-255，a 0.0-1.0。
-const fn ca(r: u8, g: u8, b: u8, a: f32) -> ColorF {
-    ColorF::rgba(r, g, b, a)
-}
+// 审查 552：`ca`（带 alpha 变体）定义后全文件零调用 —— 删除，
+// 需要半透明时直接用 `ColorF::rgba(..., a)`。
 
 // ── FluentPalette 浅色版 ─────────────────────────────────────
 
@@ -307,6 +307,50 @@ mod tests {
                    FLUENT.dark.color_neutral_background1);
         assert_ne!(FLUENT.light.color_brand_background,
                    FLUENT.dark.color_brand_background);
+    }
+
+    /// 审查 555：遍历**全部**颜色 token 比对浅深差异 —— 原先只测 2 个，
+    /// 其余 ~26 个（如 fg_inverted、stroke1）误填同值无锁。
+    ///
+    /// 例外（有意同值，勿"修"）：`brand_pressed` —— 深浅两套的按下态都收敛到
+    /// 同一深海军蓝 #0c3b5e（Quel'Thalas 原始转录；dark 的 hover=light 的 normal
+    /// 是同一映射风格）。若未来引入真值不同的 dark pressed，先改这里。
+    #[test]
+    fn every_color_token_differs_between_light_and_dark() {
+        let l = FLUENT.light;
+        let d = FLUENT.dark;
+        let pairs = [
+            ("bg1", l.color_neutral_background1, d.color_neutral_background1),
+            ("bg1_hover", l.color_neutral_background1_hover, d.color_neutral_background1_hover),
+            ("bg1_pressed", l.color_neutral_background1_pressed, d.color_neutral_background1_pressed),
+            ("bg3", l.color_neutral_background3, d.color_neutral_background3),
+            ("bg6", l.color_neutral_background6, d.color_neutral_background6),
+            ("bg_disabled", l.color_neutral_background_disabled, d.color_neutral_background_disabled),
+            ("brand_bg", l.color_brand_background, d.color_brand_background),
+            ("brand_hover", l.color_brand_background_hover, d.color_brand_background_hover),
+            ("compound", l.color_compound_brand_background, d.color_compound_brand_background),
+            ("compound_hover", l.color_compound_brand_background_hover, d.color_compound_brand_background_hover),
+            ("compound_pressed", l.color_compound_brand_background_pressed, d.color_compound_brand_background_pressed),
+            ("fg1", l.color_neutral_foreground1, d.color_neutral_foreground1),
+            ("fg2", l.color_neutral_foreground2, d.color_neutral_foreground2),
+            ("fg3", l.color_neutral_foreground3, d.color_neutral_foreground3),
+            ("fg3_hover", l.color_neutral_foreground3_hover, d.color_neutral_foreground3_hover),
+            ("fg3_pressed", l.color_neutral_foreground3_pressed, d.color_neutral_foreground3_pressed),
+            ("fg_disabled", l.color_neutral_foreground_disabled, d.color_neutral_foreground_disabled),
+            ("fg_inverted", l.color_neutral_foreground_inverted, d.color_neutral_foreground_inverted),
+            ("stroke_acc", l.color_neutral_stroke_accessible, d.color_neutral_stroke_accessible),
+            ("stroke_acc_hover", l.color_neutral_stroke_accessible_hover, d.color_neutral_stroke_accessible_hover),
+            ("stroke_acc_pressed", l.color_neutral_stroke_accessible_pressed, d.color_neutral_stroke_accessible_pressed),
+            ("stroke1", l.color_neutral_stroke1, d.color_neutral_stroke1),
+            ("stroke1_hover", l.color_neutral_stroke1_hover, d.color_neutral_stroke1_hover),
+            ("stroke1_pressed", l.color_neutral_stroke1_pressed, d.color_neutral_stroke1_pressed),
+            ("stroke_disabled", l.color_neutral_stroke_disabled, d.color_neutral_stroke_disabled),
+            ("stroke2", l.color_neutral_stroke2, d.color_neutral_stroke2),
+            ("subtle_hover", l.color_subtle_background_hover, d.color_subtle_background_hover),
+        ];
+        for (name, lv, dv) in pairs {
+            assert_ne!(lv, dv, "颜色 token {name} 浅深同值（映射无意义/抄写遗漏）");
+        }
     }
 
     #[test]

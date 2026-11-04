@@ -26,6 +26,9 @@ pub fn ram_stick_count() -> usize {
         if got == 0 {
             return 0;
         }
+        // 审查 595：按实际写入量截断 —— got < size 时尾部零字节会被
+        // 当成 SMBIOS 结构解析出幻影条目。
+        buf.truncate(got as usize);
         // RawSMBIOSData: UsedCallingMethod(1) MajorVer(1) MinorVer(1) DmiRevision(1) Length(4) 数据
         if buf.len() < 8 {
             return 0;
@@ -95,10 +98,11 @@ pub fn physical_disk_count() -> usize {
                 None,
             );
             if let Ok(hd) = h {
+                // 审查 596：INVALID_HANDLE_VALUE 不得传给 CloseHandle。
                 if !hd.is_invalid() {
                     n += 1;
+                    let _ = windows::Win32::Foundation::CloseHandle(hd);
                 }
-                let _ = windows::Win32::Foundation::CloseHandle(hd);
             }
         }
     }

@@ -25,7 +25,6 @@ use crate::probe;
 use aaxsyspulse_core::sampler::{SampleOutcome, Sampler, SamplerId};
 use aaxsyspulse_core::snapshot::{Metric, Snapshot};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::OnceLock;
 use windows::Win32::Foundation::LUID;
 use windows::Wdk::Graphics::Direct3D::{
     D3DKMTEnumAdapters2, D3DKMTQueryStatistics, D3DKMT_ADAPTERINFO, D3DKMT_ENUMADAPTERS2,
@@ -93,6 +92,10 @@ impl GpuSampler {
 /// 这个原子标记跨线程通知，不碰实例本身。
 pub fn invalidate_topology() {
     TOPO_INVALID.store(true, AtomicOrdering::SeqCst);
+    // 审查 573：同时失效主适配器 LUID 缓存。
+    if let Ok(mut g) = PRIMARY_LUID.lock() {
+        *g = None;
+    }
 }
 
 impl Default for GpuSampler {
@@ -125,13 +128,16 @@ fn enum_topology(probe_on: bool) -> Option<Vec<(LUID, u32)>> {
             return None;
         }
 
-        let mut infos: Vec<D3DKMT_ADAPTERINFO> = Vec::with_capacity(n.NumAdapters as usize);
-        infos.resize_with(n.NumAdapters as usize, D3DKMT_ADAPTERINFO::default);
+        // 审查 070：驱动返回垃圾计数时钳到合理上限，防 OOM。
+        let n_adapters = (n.NumAdapters as usize).min(64);
+        let mut infos: Vec<D3DKMT_ADAPTERINFO> = Vec::with_capacity(n_adapters);
+        infos.resize_with(n_adapters, D3DKMT_ADAPTERINFO::default);
         n.pAdapters = infos.as_mut_ptr();
         let st2 = D3DKMTEnumAdapters2(&mut n);
         if st2.is_err() {
             if probe_on {
-                probe::log(&format!("gpu enum#2 failed nt=0x{:x}", st.0 as u32));
+                // 审查 068：打印第二次调用的返回码 st2，而非第一次的 st。
+                probe::log(&format!("gpu enum#2 failed nt=0x{:x}", st2.0 as u32));
             }
             return None;
         }
@@ -149,6 +155,9 @@ fn enum_topology(probe_on: bool) -> Option<Vec<(LUID, u32)>> {
             } else {
                 0
             };
+            // 审查 574：节点数钳到合理上限 —— 驱动返回垃圾值时不再
+            // 逐节点发起海量内核查询。
+            let node_count = node_count.min(64);
             if probe_on {
                 probe::log(&format!(
                     "gpu adapter {ai} luid=0x{:08x}_0x{:08x} nodes={node_count}",
@@ -169,13 +178,17 @@ fn enum_topology(probe_on: bool) -> Option<Vec<(LUID, u32)>> {
 
 /// 主适配器 LUID（高 32 位 | 低 32 位），首个采样解析一次并缓存——
 /// `gpu_detect::pick_dgpu()` 每次调用都做完整 DXGI 枚举，不能每周期跑。
-static PRIMARY_LUID: OnceLock<Option<u64>> = OnceLock::new();
+/// 审查 573：改用可失效的 Mutex 缓存 —— `invalidate_topology()` 同时清掉它，
+/// 换主显卡后按新拓扑重新挑选（OnceLock 无法重置）。
+static PRIMARY_LUID: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
 
 fn primary_luid() -> Option<u64> {
-    *PRIMARY_LUID.get_or_init(|| {
-        crate::gpu_detect::pick_dgpu()
-            .map(|g| ((g.luid_high as u64) << 32) | g.luid_low as u64)
-    })
+    let mut g = PRIMARY_LUID.lock().unwrap_or_else(|e| e.into_inner());
+    if g.is_none() {
+        *g = crate::gpu_detect::pick_dgpu()
+            .map(|d| ((d.luid_high as u64) << 32) | d.luid_low as u64);
+    }
+    *g
 }
 
 /// 按缓存拓扑查引擎 RunningTime（不再枚举适配器，D1）。
@@ -229,7 +242,9 @@ fn collect_running_times(
                     // 100ns 累计运行时间
                     qn.QueryResult.NodeInformation.GlobalInformation.RunningTime
                 } else {
-                    0
+                    // 审查 575：查询失败不得压 0 —— 0 会污染逐节点基线，
+                    // 下一帧真实值 delta 巨大、被钳成 100% 假尖峰。整帧作废。
+                    return None;
                 }
             };
             if probe_on {
@@ -264,7 +279,11 @@ impl Sampler for GpuSampler {
             match enum_topology(probe_on) {
                 Some(t) => self.topology = t,
                 None => {
-                    // 枚举失败：可能没有 WDDM 2.0 统计支持（部分虚拟机/老驱动）
+                    // 枚举失败：可能没有 WDDM 2.0 统计支持（部分虚拟机/老驱动）。
+                    // 审查 572：诚实降级 —— 置 available=false，此后每周期直接
+                    // Skipped，不再每帧重跑 40~180ms 的昂贵枚举（注释宣称的
+                    // "首次硬失败后置 false" 此前从未兑现）。
+                    self.available = false;
                     out.gpu = Metric::Unavailable;
                     return SampleOutcome::Transient;
                 }
@@ -303,11 +322,15 @@ impl Sampler for GpuSampler {
             }
         }
 
+        // 审查 069：用独立的"首轮"标记判断 —— 原先在 `self.prev = Some(..)`
+        // 之后判 `self.prev.is_some()` 恒真，times 为空/长度不匹配/dt 过短
+        // 的失败帧全被伪装成 0%。
+        let was_first_round = self.prev.is_none();
         self.prev = Some((now_ms, times));
 
         if let Some(p) = pct {
             out.gpu = Metric::Value(p);
-        } else if self.prev.is_some() {
+        } else if was_first_round {
             // 首轮：只有基线，先给 0 避免 UI 一直 `--`
             out.gpu = Metric::Value(0.0);
         }

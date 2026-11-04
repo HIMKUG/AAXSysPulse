@@ -12,26 +12,14 @@
 use crate::msr::MsrPowerAsync;
 use crate::probe;
 use crate::sysinfo;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 const EST_RAM_W_PER_STICK: f32 = 5.0;
 const EST_MAINBOARD_W: f32 = 44.0;
 const EST_DISK_W: f32 = 6.0;
 
-/// 最近一轮 **CPU 实测**功率（瓦 ×100 存原子，跨线程共享，供进程功耗分摊）。
-static CPU_WATTS_CENTI: AtomicU32 = AtomicU32::new(0);
-
-/// 采样线程每轮保存 CPU 实测功率（供进程榜分摊，0 = 无读数）。
-pub fn store_cpu_watts(w: Option<f32>) {
-    let v = w.map(|x| (x * 100.0).clamp(0.0, u16::MAX as f32) as u32).unwrap_or(0);
-    CPU_WATTS_CENTI.store(v, Ordering::Relaxed);
-}
-
-/// 进程榜读取当前 CPU 实测功率（瓦）。返回 `None` 表示无读数（不分摊）。
-pub fn cpu_watts_global() -> Option<f32> {
-    let v = CPU_WATTS_CENTI.load(Ordering::Relaxed);
-    if v == 0 { None } else { Some(v as f32 / 100.0) }
-}
+// 审查 590：CPU 实测功率的跨线程发布链（CPU_WATTS_CENTI / store_cpu_watts /
+// cpu_watts_global）全仓零读取方（进程榜功能不存在），已整条删除；
+// 进程内分摊如未来恢复，从 SystemPower::cpu_watts() 重新接线。
 
 pub struct SystemPower {
     msr: MsrPowerAsync,
@@ -78,7 +66,8 @@ impl SystemPower {
 
     /// 更新最近一轮 GPU 功耗（厂商模块读数，None = 不可用记 0）。
     pub fn set_gpu_watts(&mut self, w: Option<f32>) {
-        self.gpu_watts = w;
+        // 审查 591：非有限值过滤 —— NaN/Inf 并入 total 会污染整机功耗。
+        self.gpu_watts = w.filter(|x| x.is_finite());
     }
 
     /// 最近一轮 CPU 实测功率（进程分摊用；首帧前为 None）。
@@ -114,7 +103,9 @@ impl SystemPower {
         let missing = self.gpu_watts.is_none();
         if missing != self.gpu_watts_missing {
             self.gpu_watts_missing = missing;
-            probe::log(if missing {
+            // 审查 085：状态翻转走不受调试门控的 degrade 流 —— 关掉调试日志
+            // 后"整机功耗偏低"仍应可诊断。
+            probe::degrade(if missing {
                 "syspower gpu watts unavailable → 显卡项按 0 并入（整机功耗偏低，查 gpu_vendor 读数）"
             } else {
                 "syspower gpu watts available → 显卡项已纳入整机功耗"
@@ -125,6 +116,12 @@ impl SystemPower {
             + self.ram_est_w
             + EST_MAINBOARD_W
             + self.disks as f32 * EST_DISK_W;
+        // 审查 086：非有限 total（某项 NaN/Inf 污染）不外泄 —— 返回 None
+        // 让 Power 行关闭，而不是把 Inf/NaN 发给渲染层。
+        if !total.is_finite() {
+            probe::degrade("syspower total is not finite -> power row off");
+            return None;
+        }
         if probe::enabled() {
             probe::log(&format!(
                 "syspower cpu={cpu:.1} gpu={gpu:.1} ram_est={} disks={} total={total:.1}W",

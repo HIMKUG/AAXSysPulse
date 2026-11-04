@@ -15,10 +15,10 @@ use crate::color::Rgb;
 /// 把 `Rgb` 写成 `#RRGGBB`（大写）。
 pub fn fmt_color(c: Rgb) -> String {
     let h = c.to_hex();
-    format!("#{}{}{}", 
-        std::str::from_utf8(&h[0..2]).unwrap_or("00"),
-        std::str::from_utf8(&h[2..4]).unwrap_or("00"),
-        std::str::from_utf8(&h[4..6]).unwrap_or("00"))
+    // 审查 030：整段一次性转换。to_hex 产出的必为 6 字节 ASCII，
+    // 极端错误下统一兜底为纯黑，不再拆三段各写 "00" 掩盖问题。
+    let hex = std::str::from_utf8(&h).unwrap_or("000000");
+    format!("#{hex}")
 }
 
 /// 解析 `#RRGGBB` / `RRGGBB`（空白或缺失返回 `None`）。
@@ -31,11 +31,25 @@ pub fn parse_color(s: &str) -> Option<Rgb> {
 }
 
 /// 宽容布尔解析：接受 `1/0/true/false/yes/no/on/off`，失败时回退 `default`。
+///
+/// 审查 031：这是全仓唯一一份布尔解析（config.rs 转发至此），且不再
+/// 为每次比较分配小写字符串。
 pub fn parse_bool(s: &str, default: bool) -> bool {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => true,
-        "0" | "false" | "no" | "off" => false,
-        _ => default,
+    let t = s.trim();
+    if t.eq_ignore_ascii_case("1")
+        || t.eq_ignore_ascii_case("true")
+        || t.eq_ignore_ascii_case("yes")
+        || t.eq_ignore_ascii_case("on")
+    {
+        true
+    } else if t.eq_ignore_ascii_case("0")
+        || t.eq_ignore_ascii_case("false")
+        || t.eq_ignore_ascii_case("no")
+        || t.eq_ignore_ascii_case("off")
+    {
+        false
+    } else {
+        default
     }
 }
 
@@ -52,6 +66,20 @@ pub fn parse_i32(s: &str, default: i32) -> i32 {
 /// 已解析的 INI 文档：`section(小写) -> (key(小写) -> value)`。
 pub struct Ini {
     sections: HashMap<String, HashMap<String, String>>,
+}
+
+/// 剥掉 value 的行内注释（审查 029）。
+///
+/// 只有 `#`/`;` 前面是空白才视为注释起点（从下标 1 起扫，
+/// `bg = #RRGGBB` 这类以 `#` 开头的颜色值因此不受影响）。
+fn strip_inline_comment(v: &str) -> &str {
+    let bytes = v.as_bytes();
+    for i in 1..bytes.len() {
+        if (bytes[i] == b'#' || bytes[i] == b';') && bytes[i - 1].is_ascii_whitespace() {
+            return v[..i].trim_end();
+        }
+    }
+    v
 }
 
 impl Ini {
@@ -88,6 +116,8 @@ impl Ini {
             } else {
                 continue;
             };
+            // 审查 029：剥行内注释，`key = val # 注释` 的注释部分不再混进 value。
+            let v = strip_inline_comment(&v).to_string();
             if !k.is_empty() {
                 cur_map.insert(k, v);
             }
@@ -190,5 +220,14 @@ mod tests {
     fn ini_ignores_garbage() {
         let ini = Ini::parse("\n# hi\nnot-a-key\n[sec]\nbad line no equals\nkey = val\n");
         assert_eq!(ini.get("sec", "key"), Some("val"));
+    }
+
+    /// 行内注释被剥离，但以 `#` 开头的颜色值原样保留（审查 029 回归锁）。
+    #[test]
+    fn inline_comments_are_stripped_but_colors_survive() {
+        let ini = Ini::parse("[sec]\nkey = val # comment\nbg = #1B1614\nzoom = 100 ; hi\n");
+        assert_eq!(ini.get("sec", "key"), Some("val"));
+        assert_eq!(ini.get("sec", "bg"), Some("#1B1614"));
+        assert_eq!(ini.get("sec", "zoom"), Some("100"));
     }
 }

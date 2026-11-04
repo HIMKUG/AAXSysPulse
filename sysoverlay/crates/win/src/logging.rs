@@ -60,6 +60,9 @@ const SESSION_CAP_BYTES: u64 = 8 * 1024 * 1024;
 static SESSION_BYTES: AtomicU64 = AtomicU64::new(0);
 /// 超限标记：置位后本会话所有写入直接丢弃。
 static CAP_HIT: AtomicBool = AtomicBool::new(false);
+/// 文件打开失败标记（审查 270）：置位后跳过落盘，不再每行重跑
+/// `create_dir_all` + `prune_dir`。
+static OPEN_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// 追加一段日志文本（单行或多行）到指定流。
 ///
@@ -67,12 +70,15 @@ static CAP_HIT: AtomicBool = AtomicBool::new(false);
 /// 一次 `write_all`（perf 的 5s 聚合批量落盘设计因此得以保留）。
 /// 打开文件失败时静默放弃——日志是尽力而为，绝不影响主流程。
 pub fn write(stream: Stream, text: &str) {
-    if CAP_HIT.load(Ordering::Relaxed) {
+    if CAP_HIT.load(Ordering::Relaxed) || OPEN_FAILED.load(Ordering::Relaxed) {
         return;
     }
-    // +32：行前缀/时间戳余量。并发窗口内的少量超写可接受——保险丝只需
-    // 保证「有界」，不做精确字节会计。
-    let prev = SESSION_BYTES.fetch_add(text.len() as u64 + 32, Ordering::Relaxed);
+    // 审查 270：体积会计按「字节数 + 行数×前缀余量」计 —— `prefixed()` 每行
+    // 另加约 32 字节前缀，perf 批量段可达上万行，原先固定 +32 低估数个量级；
+    // 全程 saturating 防溢出。
+    let lines = text.split('\n').count().max(1) as u64;
+    let cost = (text.len() as u64).saturating_add(lines.saturating_mul(48));
+    let prev = SESSION_BYTES.fetch_add(cost, Ordering::Relaxed);
     if prev >= SESSION_CAP_BYTES {
         // 首个越界者写一次性标记行（直通 write_inner 绕过自身检查），随后封笔。
         if !CAP_HIT.swap(true, Ordering::Relaxed) {
@@ -97,7 +103,14 @@ fn write_inner(stream: Stream, text: &str) {
 
     let mut guard = FILE.lock().unwrap_or_else(|p| p.into_inner());
     if guard.is_none() {
+        if OPEN_FAILED.load(Ordering::Relaxed) {
+            return;
+        }
         let Some(dir) = std::env::var_os("LOCALAPPDATA") else {
+            // 审查 270：环境缺失也留痕。degrade 流本身走本模块（此时还打不开），
+            // 只能退回一次性 eprintln 并置标志短路后续写。
+            OPEN_FAILED.store(true, Ordering::Relaxed);
+            eprintln!("[logging] LOCALAPPDATA missing — logging disabled for this session");
             return;
         };
         let dir = std::path::PathBuf::from(dir).join(aaxsyspulse_core::contract::APP_DATA_DIR_NAME);
@@ -112,8 +125,12 @@ fn write_inner(stream: Stream, text: &str) {
             .open(dir.join(&name))
         {
             Ok(f) => *guard = Some(f),
-            // 打不开（目录被占/权限问题）就静默放弃，后续也不断重试同一个坏路径。
-            Err(_) => return,
+            // 审查 270：打不开（目录被占/权限问题）置失败标志短路 ——
+            // 不再每行重跑 create_dir_all + prune_dir。
+            Err(_) => {
+                OPEN_FAILED.store(true, Ordering::Relaxed);
+                return;
+            }
         }
     }
     use std::io::Write;
@@ -156,7 +173,10 @@ fn local_systemtime() -> windows::Win32::Foundation::SYSTEMTIME {
 /// 末尾统一保证一个换行；调用方传 `"a\nb\n"` 或 `"a\nb"` 结果一致。
 fn prefixed(prefix: &str, text: &str) -> String {
     let body = text.strip_suffix('\n').unwrap_or(text);
-    let mut out = String::with_capacity(text.len() + prefix.len() * 4);
+    // 审查 601：按实际行数预估容量 —— perf 批量段可达上万行，
+    // 固定 ×4 预估会反复 realloc。
+    let n_lines = body.split('\n').count();
+    let mut out = String::with_capacity(text.len() + prefix.len() * n_lines);
     for line in body.split('\n') {
         out.push_str(prefix);
         out.push_str(line);
@@ -190,6 +210,10 @@ fn prune_plan(entries: &[(String, u64, u64)], now_secs: u64, current: &str) -> V
     let mut kept: Vec<&(String, u64, u64)> = Vec::new();
     for e in entries {
         if e.0 == current {
+            kept.push(e);
+        } else if e.1 == 0 {
+            // 审查 602：mtime 未知（modified() 失败兜底为 0）—— 保留而非
+            // 被当成 14 天前的旧文件直接删。
             kept.push(e);
         } else if e.1 < cutoff {
             doomed.push(e.0.clone());

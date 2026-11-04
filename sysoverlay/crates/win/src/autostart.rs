@@ -15,7 +15,7 @@
 //! `state()` 用于把系统**真实**状态读回来核对（仅在配置里记一个 bool 是不够的）。
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegGetValueW, RegOpenKeyExW,
     RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE,
@@ -44,21 +44,32 @@ pub enum State {
 
 /// 本次进程是否由自启拉起（`--autostart`）。
 pub fn launched_at_logon() -> bool {
-    std::env::args().any(|a| a == AUTOSTART_FLAG)
+    // 审查 614：args_os —— 参数含非 UTF-8 字节时 `args()` 直接 panic。
+    std::env::args_os()
+        .any(|a| a == std::ffi::OsStr::new(AUTOSTART_FLAG))
 }
 
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// 当前进程的 exe 完整路径。
+/// 当前进程的 exe 完整路径（审查 274：循环扩容防截断）。
 fn exe_path() -> Option<String> {
     let mut buf = [0u16; 512];
-    let len = unsafe { windows::Win32::System::LibraryLoader::GetModuleFileNameW(None, &mut buf) };
-    if len == 0 {
-        return None;
+    loop {
+        let len =
+            unsafe { windows::Win32::System::LibraryLoader::GetModuleFileNameW(None, &mut buf) };
+        let l = len as usize;
+        if l == 0 {
+            return None;
+        }
+        if l < buf.len() {
+            return Some(String::from_utf16_lossy(&buf[..l]));
+        }
+        // 写满（可能截断）→ 扩容重试
+        let bigger = vec![0u16; buf.len() * 2];
+        buf = bigger.try_into().unwrap();
     }
-    Some(String::from_utf16_lossy(&buf[..len as usize]))
 }
 
 /// `Run` 项的数据：exe 完整路径（带引号，防路径含空格）+ 自启标记参数。
@@ -82,9 +93,11 @@ fn value_exists() -> bool {
         if open.is_err() {
             return false;
         }
-        let mut data = [0u16; 512];
+        // 审查 615：Run 值超长时 512 缓冲会返回 ERROR_MORE_DATA ——
+        // 原先被当成"不存在"；改为：不够则按返回 size 扩容重读。
+        let mut data: Vec<u16> = vec![0u16; 512];
         let mut size = (data.len() * 2) as u32;
-        let ret = RegGetValueW(
+        let mut ret = RegGetValueW(
             hkey,
             PCWSTR::null(),
             PCWSTR(value_name.as_ptr()),
@@ -93,6 +106,19 @@ fn value_exists() -> bool {
             Some(data.as_mut_ptr() as *mut _),
             Some(&mut size),
         );
+        if ret == ERROR_MORE_DATA {
+            data = vec![0u16; (size as usize).div_ceil(2) + 1];
+            size = (data.len() * 2) as u32;
+            ret = RegGetValueW(
+                hkey,
+                PCWSTR::null(),
+                PCWSTR(value_name.as_ptr()),
+                RRF_RT_REG_SZ,
+                None,
+                Some(data.as_mut_ptr() as *mut _),
+                Some(&mut size),
+            );
+        }
         let _ = RegCloseKey(hkey);
         ret == ERROR_SUCCESS
     }
@@ -239,7 +265,17 @@ pub const ARG_TASK_REMOVE: &str = "--auto-task-remove";
 
 /// `schtasks.exe` 绝对路径（不依赖 PATH）。
 fn schtasks_path() -> String {
-    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    // 审查 616：SystemRoot 缺失时用 GetWindowsDirectoryW 而非硬编码 C:\Windows
+    // （非 C 盘系统盘上 schtasks 会静默失效）。
+    let mut buf = [0u16; 260];
+    let len = unsafe { windows::Win32::System::SystemInformation::GetWindowsDirectoryW(Some(&mut buf)) };
+    let root = if len == 0 {
+        std::env::var_os("SystemRoot")
+            .map(|v| v.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "C:\\Windows".to_string())
+    } else {
+        String::from_utf16_lossy(&buf[..len as usize])
+    };
     format!("{root}\\System32\\schtasks.exe")
 }
 
@@ -371,8 +407,11 @@ fn disable() -> bool {
     } else {
         true
     };
-    let run_gone = delete() && clear_approved_flag();
-    task_gone && run_gone
+    // 审查 618：delete 与 clear_approved_flag 各自执行 —— `&&` 短路会让
+    // delete 失败时禁用标记不被清，下次开启仍被系统挡。
+    let run_gone = delete();
+    let approved_gone = clear_approved_flag();
+    task_gone && run_gone && approved_gone
 }
 
 /// 同步自启状态（**幂等，启动时调用**）。
@@ -423,9 +462,18 @@ pub fn apply_user(enabled: bool) -> bool {
 pub fn apply_user_async(hwnd: windows::Win32::Foundation::HWND, enabled: bool) {
     // HWND 不是 Send（裸指针不保证线程安全）→ 跨线程只传地址，线程内重建。
     // 与 main.rs 采样线程传 hwnd 的做法一致。
+    // 审查 619：单飞去重 —— 快速连点开关会并发跑多个 apply_user
+    // （各自弹 UAC / 改注册表互相覆盖）；进行中再次请求则记日志后忽略
+    // （开关的最终态由下一次点击重新触发，不会丢）。
+    static IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if IN_FLIGHT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        crate::probe::log("autostart: apply_user_async ignored (previous request in flight)");
+        return;
+    }
     let hwnd_addr = hwnd.0 as usize;
     std::thread::spawn(move || {
         let ok = apply_user(enabled);
+        IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
         crate::probe::log(&format!(
             "autostart: async apply_user({enabled}) ok={ok} mode={:?} os_state={:?}",
             mode(),

@@ -40,21 +40,22 @@ jobs:
         uses: actions/cache@v4
         with:
           path: target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          # 审查 813：只锁**根** Cargo.lock —— sysoverlay/backup/noprobe-src/ 里
+          # 的旧锁文件会让缓存键被备份内容打爆。
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      # ⚠️ 必须在【仓库根】跑：workspace 清单是根 Cargo.toml，
-      # sysoverlay/Cargo.toml 只是 app crate 的成员清单。
-      - name: cargo check (workspace, all targets)
-        run: cargo check --workspace --all-targets
-
-      # 不加 `-D warnings`：clippy 口径里有刻意保留的 warn 级项（见根 Cargo.toml
-      # [workspace.lints.clippy] 与各 crate 根的 cfg_attr），升级为 deny 是待决策项。
-      - name: cargo clippy (workspace, all targets)
-        run: cargo clippy --workspace --all-targets
-
-      - name: cargo test (workspace)
-        run: cargo test --workspace
+      # ⚠️ 必须在【仓库根】跑：workspace 清单是根 Cargo.toml
+      # （sysoverlay/Cargo.toml 已废弃 —— 审查 814：它是 3 行注释的空文件）。
+      # 审查 815：check / clippy / test 三步各会触发一次 guide build.rs 的
+      # 内层 release 构建 —— 合并为单步串行执行，主程序只编译一次。
+      - name: cargo check + clippy + test (workspace, all targets)
+        run: |
+          cargo check --workspace --all-targets
+          # 不加 `-D warnings`：clippy 口径里有刻意保留的 warn 级项（见根 Cargo.toml
+          # [workspace.lints.clippy] 与各 crate 根的 cfg_attr），升级为 deny 是待决策项。
+          cargo clippy --workspace --all-targets
+          cargo test --workspace
 
       # check-bridge.mjs 是 npm run build 的前置门禁：后端 generate_handler![]
       # 与前端 invoke('cmd') 字面量对不上就直接失败（审查项 P1-12）。

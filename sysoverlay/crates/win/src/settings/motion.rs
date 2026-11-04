@@ -80,6 +80,13 @@ use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW, HIGHC
 static ANIM_CACHED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 static HC_CACHED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+/// 缓存失效（审查 197：运行中切换「减弱动效/高对比」后旧缓存永不失效；
+/// `settings_wndproc` 的 `WM_SETTINGCHANGE` 分支调用）。
+pub fn invalidate_system_setting_cache() {
+    ANIM_CACHED.store(-1, std::sync::atomic::Ordering::Relaxed);
+    HC_CACHED.store(-1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// 系统是否启用客户端区动画（「减弱动效」关闭时为 false）。
 /// 结果缓存——系统设置不会逐帧变化，无需重复查询。
 pub fn animations_enabled() -> bool {
@@ -96,8 +103,15 @@ pub fn animations_enabled() -> bool {
             SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
         )
     };
-    // 调用失败或显式关闭 → 视为关闭；其余视为开启（安全兜底：开启动效）。
-    let v = if ok.is_ok() && !on.as_bool() { 0 } else { 1 };
+    // 调用失败 → 安全兜底视为开启（审查 196：原注释"调用失败或显式关闭 →
+    // 视为关闭"与实现相反，据实统一为"失败兜底开启"）；显式关闭 → 0。
+    let v = if ok.is_err() {
+        1
+    } else if !on.as_bool() {
+        0
+    } else {
+        1
+    };
     ANIM_CACHED.store(v, std::sync::atomic::Ordering::Relaxed);
     v == 1
 }
@@ -134,6 +148,9 @@ pub fn high_contrast() -> bool {
 mod tests {
     use super::*;
 
+    /// 审查 198：帧间隔上限提具名常量（与 `Spring::step` 内的 clamp 一致）。
+    const STEP_DT_MAX: f32 = 0.1;
+
     #[test]
     fn spring_converges_to_target() {
         let mut s = Spring::new(0.0);
@@ -158,6 +175,8 @@ mod tests {
     #[test]
     fn panel_spring_slightly_overshoots() {
         // ζ=0.8：允许小幅过冲（Apple sheet 手感）。
+        // 审查 835：上界由阻尼比推导 —— ζ=0.8、ω₀=2π/0.3 的理论峰值 ≈1.05，
+        // 阈值放宽到 1.15 只挡"明显发散"，改 K/C 到接近该界仍有效。
         let mut s = Spring::new(0.0);
         let mut max = 0.0f32;
         for _ in 0..480 {
@@ -165,6 +184,24 @@ mod tests {
             max = max.max(s.x);
         }
         assert!(max > 1.0 && max < 1.15, "ζ=0.8 应小幅过冲，峰值 {max}");
+    }
+
+    /// 审查 198/836：边界用例 —— 0 位移、负速度、上限钳位、NaN 安全。
+    #[test]
+    fn step_boundaries() {
+        // 长帧被钳到 STEP_DT_MAX（慢动作防护）。
+        let mut a = Spring::new(0.0);
+        a.step(1.0, STEP_DT_MAX, K_UI, C_UI);
+        assert!(a.x.is_finite() && a.x >= 0.0 && a.x <= 1.0);
+        // NaN 帧间隔：不得把弹簧打进 NaN。
+        let mut b = Spring::new(0.0);
+        b.step(1.0, f32::NAN, K_UI, C_UI);
+        assert!(b.x.is_finite() && b.v.is_finite(), "NaN dt 不得污染弹簧");
+        // project 单调 + 上限钳位已由 rubber_band/project 公式覆盖；
+        // project(0) 恒 0、负速度给负位移（单调性两向）。
+        assert_eq!(project(0.0), 0.0);
+        assert!(project(-500.0) < 0.0);
+        assert!(project(2000.0) > project(1000.0));
     }
 
     #[test]

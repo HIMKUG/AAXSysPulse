@@ -5,6 +5,6 @@
   "windows": ["guide"],
   "permissions": [
     "core:default",
-    "opener:default"
+    "core:event:default"
   ]
 }

@@ -16,6 +16,8 @@ members = [
 version = "0.7.1"
 edition = "2021"
 license = "MIT"
+# 审查 782/827：MSRV 落实（README.md 口头声明 1.96 无约束力）。
+rust-version = "1.96"
 
 # ── 全仓共享 lint 策略（批次 6·①②）───────────────────────────────
 # 定位：**声明式口径，不阻塞构建**。这里只集中放「经逐条判定后决定长期放过」
@@ -30,11 +32,14 @@ license = "MIT"
 too_many_arguments = "allow"
 
 [profile.release]
-# 体积优先，但 panic 必须保持 unwind：gdi.rs 的 D2D 自愈依赖 catch_unwind
-# （panic=abort 会使其失效 → D2D panic 时进程直接崩溃，用户无法自救）。
+# 体积优先，但 panic 必须保持 unwind：gdi/msr/render_thread/app（main 采样循环）
+# **四处**都依赖 catch_unwind 自愈（审查 783：原注释只点名 gdi.rs）。
+# panic=abort 会使其全部失效 → panic 时进程直接崩溃，用户无法自救。
 opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "unwind"
+# 审查 784：strip=true 剥符号 —— release 产物**无符号**，崩溃时 minidump
+# 只能给出地址不能给出符号名（有 minidump 排障需求时改为 false 或 debug=1）。
 strip = true
 overflow-checks = false

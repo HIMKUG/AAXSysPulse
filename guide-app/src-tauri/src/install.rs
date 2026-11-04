@@ -27,46 +27,63 @@ pub enum InstallError {
     Locked(String),
 }
 
-/// 内容指纹（FNV-1a 64 位）。
+/// 目标文件是否与给定字节**逐字节等价**（先比大小，再分块流式比对）。
 ///
-/// 为什么不用大小做"已是最新"的判据（审查项 3.1.6 / P2-12）：链接器产物大小
-/// 相同而内容不同是常态（改字符串常量、版本号长度不变），半写失败的截断文件
-/// 也可能凑出同样大小。没有现成哈希依赖，FNV-1a 一轮 40 MB 在百毫秒级，
-/// 且只在"大小已经相同"这条少见的分支上才对既有文件计算，代价可控。
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    h
-}
-
-/// 目标文件是否与给定字节**逐字节等价**（先比大小，再比指纹）。
+/// 首轮 220：旧实现只比大小 + FNV-1a 指纹 —— 哈希碰撞（概率极低但非零）会把
+/// "同尺寸的新版本"误判成最新并跳过更新；且续篇 670：bytes 本身已在内存里，
+/// 再整块 `fs::read` 翻倍安装器内存峰值。改为 64KB 分块流式逐字节比对：
+/// 零碰撞、内存峰值不增。
 fn same_content(path: &Path, bytes: &[u8]) -> bool {
+    use std::io::Read;
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };
     if meta.len() != bytes.len() as u64 {
         return false;
     }
-    let Ok(existing) = fs::read(path) else {
+    let Ok(mut f) = fs::File::open(path) else {
         return false;
     };
-    fnv1a64(&existing) == fnv1a64(bytes)
+    let mut chunk = [0u8; 64 * 1024];
+    let mut consumed = 0usize;
+    loop {
+        let n = match f.read(&mut chunk) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        if n == 0 {
+            break;
+        }
+        if bytes.get(consumed..consumed + n) != Some(&chunk[..n]) {
+            return false;
+        }
+        consumed += n;
+    }
+    consumed == bytes.len()
 }
 
-/// 一次性写入 + 原子替换：先写 .tmp 再 rename 就位，最后校验大小。
+/// Win32 错误码（首轮 222：不用裸魔数 `5 | 32`）。非 Windows 平台 raw_os_error
+/// 不会命中这两个值。
+const ERROR_ACCESS_DENIED: i32 = 5;
+const ERROR_SHARING_VIOLATION: i32 = 32;
+
+/// 一次性写入 + 原子替换：先写 .tmp（fsync）再 rename 就位，最后**逐字节**校验。
 ///
 /// 任一环节失败都**不留 .tmp**（否则下次安装会看到一份"看着像最新版"的孤儿文件），
 /// 并把失败如实抛给调用方（`run_install` 会记为中止失败）。
 fn atomic_replace(temp: &Path, target: &Path, bytes: &[u8]) -> Result<(), InstallError> {
-    fs::write(temp, bytes)?;
+    {
+        use std::io::Write;
+        // 首轮 221：fs::write 不 fsync —— rename 后掉电可能留下指向未落盘内容的文件。
+        let mut f = fs::File::create(temp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
     if let Err(e) = fs::rename(temp, target) {
         let _ = fs::remove_file(temp);
-        // 32 = ERROR_SHARING_VIOLATION / 5 = ERROR_ACCESS_DENIED：目标正在运行。
+        // ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION：目标正在运行。
         let code = e.raw_os_error().unwrap_or(0);
-        if matches!(code, 5 | 32) {
+        if code == ERROR_ACCESS_DENIED || code == ERROR_SHARING_VIOLATION {
             return Err(InstallError::Locked(format!(
                 "{}（退出正在运行的主程序后重试）",
                 target.display()
@@ -74,11 +91,17 @@ fn atomic_replace(temp: &Path, target: &Path, bytes: &[u8]) -> Result<(), Instal
         }
         return Err(InstallError::Io(e));
     }
-    if let Err(e) = verify_file(target, bytes.len() as u64) {
+    if !same_content(target, bytes) {
         // rename 已成功 ⇒ temp 已不存在，此刻的半成品就是 target：删掉它，
         // 免得安装中止后「已安装检测」把一份截断文件当成可用主程序报出来。
-        let _ = fs::remove_file(target);
-        return Err(e);
+        // 续篇 671：清理失败也不能吞 —— 截断残留会被 installed_detected 判为已装。
+        if let Err(e) = fs::remove_file(target) {
+            return Err(InstallError::Io(std::io::Error::other(format!(
+                "校验失败且清理半成品失败（{}）：{e}",
+                target.display()
+            ))));
+        }
+        return Err(InstallError::FileCorrupted);
     }
     Ok(())
 }
@@ -95,7 +118,8 @@ pub fn release_main_program(app: &AppHandle) -> Result<PathBuf, InstallError> {
         return Ok(target);
     }
 
-    atomic_replace(&install_dir.join(format!("{}.tmp", c::MAIN_EXE_NAME)), &target, &bytes)?;
+    // 续篇 223：临时名复用 config::unique_temp_path（pid+seq 唯一），不再固定 "<exe>.tmp"。
+    atomic_replace(&crate::config::unique_temp_path(&target), &target, &bytes)?;
     log_install("释放主程序", "成功", None);
     Ok(target)
 }
@@ -111,7 +135,7 @@ pub fn release_driver_to_install(app: &AppHandle) -> Result<PathBuf, InstallErro
         return Ok(target);
     }
 
-    atomic_replace(&install_dir.join(format!("{}.tmp", c::DRIVER_FILE_NAME)), &target, &bytes)?;
+    atomic_replace(&crate::config::unique_temp_path(&target), &target, &bytes)?;
     log_install("释放驱动文件", "成功", None);
     Ok(target)
 }
@@ -123,15 +147,21 @@ pub fn get_install_dir() -> Result<PathBuf, InstallError> {
         .ok_or(InstallError::NoLocalAppData)
 }
 
+/// 日志目录唯一出处（续篇 672）：`%LOCALAPPDATA%\AAXSysPulse\logs`。
+/// 此前 "logs" 在 ensure_install_dir / log_install / lib.rs::guide_log_dir 各拼一份。
+pub fn logs_dir() -> Result<PathBuf, InstallError> {
+    Ok(get_install_dir()?.join("logs"))
+}
+
 /// 确保安装目录存在，返回安装目录路径
 pub fn ensure_install_dir() -> Result<PathBuf, InstallError> {
     let dir = get_install_dir()?;
     if !dir.exists() {
         fs::create_dir_all(&dir)?;
     }
-    let logs_dir = dir.join("logs");
-    if !logs_dir.exists() {
-        fs::create_dir_all(&logs_dir)?;
+    let logs = logs_dir()?;
+    if !logs.exists() {
+        fs::create_dir_all(&logs)?;
     }
     Ok(dir)
 }
@@ -141,58 +171,60 @@ pub fn get_main_program_path() -> Result<PathBuf, InstallError> {
     Ok(get_install_dir()?.join(c::MAIN_EXE_NAME))
 }
 
-/// 写入后校验文件完整性
-fn verify_file(path: &Path, expected_size: u64) -> Result<(), InstallError> {
-    let metadata = std::fs::metadata(path)?;
-    if metadata.len() != expected_size {
-        return Err(InstallError::FileCorrupted);
-    }
-    Ok(())
-}
-
 /// 获取系统驱动目标路径
 pub fn get_system_driver_path() -> PathBuf {
     Path::new(c::DRIVER_DIR).join(c::DRIVER_FILE_NAME)
 }
 
+/// 卸载注册的布尔开关（首轮 226：裸值提为具名常量并核对规格）。
+/// 规格：NoModify=1 关掉「更改」按钮；NoRepair=0 保留「修复」入口
+/// （修复 = 重跑引导安装，行为成立），与产品语义一致。
+const UNINSTALL_NO_MODIFY: u32 = 1;
+const UNINSTALL_NO_REPAIR: u32 = 0;
+
 /// 写入卸载注册（第七部分）：
 /// HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\AAXSysPulse
 /// RegCreateKeyExW + RegSetValueExW；值按文档规格。
-pub fn write_uninstall_registry(_app: &AppHandle) -> Result<(), InstallError> {
+pub fn write_uninstall_registry() -> Result<(), InstallError> {
     #[cfg(windows)]
     {
         use std::iter::once;
+        use std::os::windows::ffi::OsStrExt;
         use windows::core::PCWSTR;
         use windows::Win32::System::Registry::{
             RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
             KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
         };
 
-        fn w(s: &str) -> Vec<u16> {
-            s.encode_utf16().chain(once(0)).collect()
-        }
+        // 宽字符转换统一走契约 `wide_of`（首轮 006 / 续篇 673：删掉本函数内
+        // 又一份私有 w() 副本）。
         // UTF-16 缓冲区须在对应 API 调用期间存活，PCWSTR 仅存指针
         fn wbytes(v: &[u16]) -> &[u8] {
             unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2) }
         }
 
-        let install_dir = get_install_dir()?.to_string_lossy().to_string();
-        let sub_key = w(c::UNINSTALL_SUBKEY);
+        let install_dir = get_install_dir()?;
+        // 续篇 674：InstallLocation 用 OsStr::encode_wide 直写 REG_SZ ——
+        // to_string_lossy() 会把非 UTF-8 用户名变 U+FFFD 写进注册表。
+        let install_dir_w: Vec<u16> = install_dir
+            .as_os_str()
+            .encode_wide()
+            .chain(once(0))
+            .collect();
+        // 首轮 193：run_install 只释放 MAIN_EXE_NAME 与驱动文件 —— 卸载入口必须
+        // 指向真实存在的引导 exe，并用 Path::join 拼接（不再手拼 "dir\\Guide.exe"）。
+        let guide_exe = install_dir.join(c::GUIDE_EXE_NAME);
+        let uninstall_value = format!("\"{}\" --uninstall", guide_exe.display());
+        let display_icon_value = format!("\"{}\"", install_dir.join(c::MAIN_EXE_NAME).display());
+        let sub_key = c::wide_of(c::UNINSTALL_SUBKEY);
 
-        // Publisher：文档写作占位「你的名字」，取 Cargo.toml authors 的 AAXSysPulse（见最终汇报）
-        let str_values: Vec<(&str, String)> = vec![
-            ("DisplayName", c::APP_TECH_NAME.to_string()),
-            ("DisplayVersion", crate::MAIN_PROGRAM_VERSION.to_string()),
-            ("Publisher", c::APP_TECH_NAME.to_string()),
-            ("InstallLocation", install_dir.clone()),
-            (
-                "UninstallString",
-                format!("\"{}\\{}\" --uninstall", install_dir, c::GUIDE_EXE_NAME),
-            ),
-            (
-                "DisplayIcon",
-                format!("\"{}\\{}\"", install_dir, c::MAIN_EXE_NAME),
-            ),
+        let str_values: Vec<(&str, Vec<u16>)> = vec![
+            ("DisplayName", c::wide_of(c::APP_TECH_NAME)),
+            ("DisplayVersion", c::wide_of(crate::MAIN_PROGRAM_VERSION)),
+            ("Publisher", c::wide_of(c::APP_TECH_NAME)),
+            ("InstallLocation", install_dir_w),
+            ("UninstallString", c::wide_of(&uninstall_value)),
+            ("DisplayIcon", c::wide_of(&display_icon_value)),
         ];
 
         unsafe {
@@ -209,32 +241,35 @@ pub fn write_uninstall_registry(_app: &AppHandle) -> Result<(), InstallError> {
                 None,
             )
             .ok()
-            .map_err(|e| std::io::Error::from_raw_os_error(e.code().0))?;
+            // 首轮 225：e.code().0 是 HRESULT，塞给 from_raw_os_error（期待 Win32 码）
+            // 会得到错误码错位 —— 统一转字符串 Err。
+            .map_err(|e| std::io::Error::other(format!("RegCreateKeyExW 失败：{e}")))?;
 
             let mut first_err = None;
             for (name, value) in &str_values {
-                let n = w(name);
-                let v = w(value);
+                let n = c::wide_of(name);
                 if let Err(e) =
-                    RegSetValueExW(hkey, PCWSTR(n.as_ptr()), None, REG_SZ, Some(wbytes(&v))).ok()
+                    RegSetValueExW(hkey, PCWSTR(n.as_ptr()), None, REG_SZ, Some(wbytes(value)))
+                        .ok()
+                        .map_err(|e| std::io::Error::other(format!("RegSetValueExW({name}) 失败：{e}")))
                 {
                     first_err.get_or_insert(e);
                 }
             }
-            for (name, value) in [("NoModify", 1u32), ("NoRepair", 0u32)] {
-                let n = w(name);
+            for (name, value) in [("NoModify", UNINSTALL_NO_MODIFY), ("NoRepair", UNINSTALL_NO_REPAIR)] {
+                let n = c::wide_of(name);
                 let data = value.to_le_bytes();
                 if let Err(e) =
-                    RegSetValueExW(hkey, PCWSTR(n.as_ptr()), None, REG_DWORD, Some(&data)).ok()
+                    RegSetValueExW(hkey, PCWSTR(n.as_ptr()), None, REG_DWORD, Some(&data))
+                        .ok()
+                        .map_err(|e| std::io::Error::other(format!("RegSetValueExW({name}) 失败：{e}")))
                 {
                     first_err.get_or_insert(e);
                 }
             }
             let _ = RegCloseKey(hkey);
             if let Some(e) = first_err {
-                return Err(InstallError::Io(std::io::Error::from_raw_os_error(
-                    e.code().0,
-                )));
+                return Err(InstallError::Io(e));
             }
         }
     }
@@ -260,12 +295,13 @@ pub fn log_install(step: &str, result: &str, error: Option<&str>) {
         "失败" => { STEP_FAIL.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
         _ => {}
     }
-    let _ = (|| -> std::io::Result<()> {
+    if let Err(e) = (|| -> std::io::Result<()> {
         use std::io::Write;
-        let log_dir = dirs::data_local_dir()
-            .ok_or_else(|| std::io::Error::other("no local app data"))?
-            .join(c::INSTALL_DIR_NAME)
-            .join("logs");
+        // 续篇 672：日志目录唯一出处 = logs_dir()，不再各自 join("logs")。
+        let log_dir = match logs_dir() {
+            Ok(d) => d,
+            Err(e) => return Err(std::io::Error::other(e.to_string())),
+        };
         fs::create_dir_all(&log_dir)?;
         let detail = match error {
             Some(e) => format!("{result}（{e}）"),
@@ -277,7 +313,11 @@ pub fn log_install(step: &str, result: &str, error: Option<&str>) {
         let line = format!("[{ts}] {} | {}\n", redact(step), redact(&detail));
         let mut f = fs::OpenOptions::new().create(true).append(true).open(&path)?;
         f.write_all(line.as_bytes())
-    })();
+    })() {
+        // 首轮 227：写盘失败全部被吞 —— 至少往 stderr 打一条（GUI 子系统下用户
+        // 看不见，但调试运行/CI 可见）。绝不能再调 log_install 造成递归。
+        eprintln!("[install.log] 写入失败：{e}");
+    }
 }
 
 /// 本会话步骤计数（7.3.4 总结行依据）。由 [`log_install`] 按 `result` 归类别，
@@ -336,10 +376,14 @@ fn rotate_install_log(path: &Path) {
 /// 只处理"能确定归因"的那一段前缀，不改写其余文本 —— 排障时路径本身是有用的，
 /// 需要去掉的只是**用户名**。
 fn redact(s: &str) -> String {
-    match std::env::var("USERPROFILE") {
-        Ok(profile) if !profile.is_empty() => redact_with(s, &profile),
-        _ => s.to_string(),
-    }
+    // 续篇 675：脱敏完全依赖 USERPROFILE —— 取不到时原样返回，
+    // "写盘前统一替换"承诺落空。回退 dirs::home_dir()。
+    let profile = std::env::var("USERPROFILE")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .or_else(|| dirs::home_dir().map(|p| p.to_string_lossy().to_string()))
+        .unwrap_or_default();
+    redact_with(s, &profile)
 }
 
 /// 纯字符串部分，便于单测（不读环境变量）。
@@ -366,6 +410,8 @@ fn redact_with(s: &str, profile: &str) -> String {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct InstallProgress {
+    /// 单调递增序号（首轮 229）：前端据此拒绝迟到/重发事件回退进度
+    pub seq: u32,
     pub pct: u32,
     pub text: String,
 }
@@ -381,19 +427,19 @@ pub struct InstallProgress {
 // 就是"这一步还活着"的可观察证据。线程由 [`Heartbeat`] 的 `Drop` 收尾（安装 panic
 // 也一样停 —— `[profile.release] panic = "unwind"`，栈展开必定执行 Drop）。
 static HEARTBEAT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// 当前步骤锚点：`(pct, 基准文本, 进入时刻)`，心跳线程每 tick 读它。
-static STEP_ANCHOR: std::sync::Mutex<Option<(u32, String, std::time::Instant)>> =
+/// 当前步骤锚点：`(seq, pct, 基准文本, 进入时刻)`，心跳线程每 tick 读它。
+static STEP_ANCHOR: std::sync::Mutex<Option<(u32, u32, String, std::time::Instant)>> =
     std::sync::Mutex::new(None);
 
 /// 心跳线程的会话句柄：Drop 即停（不可复制，保证同一时刻只有一个在跑）。
 struct Heartbeat;
 
 impl Heartbeat {
-    /// 启动心跳。已有心跳在跑 ⇒ 返回 `None`（**不**抢占：两层嵌套安装说明调用方出错，
-    /// 让先启动的那个继续负责收尾，比互相覆盖锚点安全）。
+    /// 启动心跳。已有心跳在跑 ⇒ 返回 `None`（不抢占：让先启动的那个继续负责收尾）。
     fn start(app: &AppHandle) -> Option<Self> {
         if HEARTBEAT_ON.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            HEARTBEAT_ON.store(false, std::sync::atomic::Ordering::Relaxed);
+            // 首轮 228：命中后**直接返回** —— 旧实现 `store(false)` 反而把正在跑的
+            // 心跳关掉了，与注释"不抢占"正好相反。
             return None;
         }
         let app = app.clone();
@@ -402,7 +448,7 @@ impl Heartbeat {
             .spawn(move || {
                 while HEARTBEAT_ON.load(std::sync::atomic::Ordering::Relaxed) {
                     std::thread::sleep(std::time::Duration::from_millis(500));
-                    let Some((pct, text, started)) = Self::anchor() else {
+                    let Some((seq, pct, text, started)) = Self::anchor() else {
                         continue;
                     };
                     // 100% 是终止步：不再追发，免得"安装完成"之后又冒出一行"已用 N 秒"。
@@ -413,7 +459,7 @@ impl Heartbeat {
                     emit_traced(
                         &app,
                         "install-progress",
-                        InstallProgress { pct, text: format!("{text}（已用 {secs} 秒）") },
+                        InstallProgress { seq, pct, text: format!("{text}（已用 {secs} 秒）") },
                     );
                 }
             });
@@ -424,7 +470,7 @@ impl Heartbeat {
         Some(Self)
     }
 
-    fn anchor() -> Option<(u32, String, std::time::Instant)> {
+    fn anchor() -> Option<(u32, u32, String, std::time::Instant)> {
         // 中毒也要读：中毒只可能来自上一次写锚点时的 panic，心跳不该成为二次故障源。
         STEP_ANCHOR
             .lock()
@@ -464,28 +510,36 @@ pub fn emit_traced(app: &AppHandle, event: &str, payload: impl Serialize + Clone
             }
         };
         if first {
+            // 续篇 676：emit 失败不是安装步骤 —— 不能记"失败"（会被 STEP_FAIL
+            // 计数，安装成功却总结"失败 1"）。用中性 result 走同一日志出口但不计步数。
             log_install(
-                "事件推送",
-                "失败",
-                Some(&format!("{event}: {e}（该事件后续失败不再重复记录）")),
+                &format!("事件推送 {event}"),
+                "不可达",
+                Some(&format!("{e}（该事件后续失败不再重复记录）")),
             );
         }
     }
 }
 
+/// 进度事件单调序号（首轮 229）：心跳线程重发与迟到 emit 曾让 100% 之后仍可能
+/// 收到旧 pct 造成进度回退 —— payload 带 seq，前端只接受更大值。
+static PROGRESS_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 fn emit_progress(app: &AppHandle, pct: u32, text: &str) {
+    let seq = PROGRESS_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     {
         let mut g = STEP_ANCHOR.lock().unwrap_or_else(|e| e.into_inner());
-        *g = Some((pct, text.to_string(), std::time::Instant::now()));
+        *g = Some((seq, pct, text.to_string(), std::time::Instant::now()));
     }
-    emit_traced(app, "install-progress", InstallProgress { pct, text: text.to_string() });
+    emit_traced(app, "install-progress", InstallProgress { seq, pct, text: text.to_string() });
 }
 
-/// 跳过类步骤统一记账：失败记录日志并继续推进
+/// 跳过类步骤统一记账（首轮 230）：Err 一律记**失败** —— 旧实现把 Err 也记成
+/// "跳过"，总结行"失败 0"谎报成功。失败只记账并继续推进，不中断安装。
 fn skip_step<T>(step: &str, r: Result<T, impl std::fmt::Display>) {
     match r {
         Ok(_) => log_install(step, "成功", None),
-        Err(e) => log_install(step, "跳过", Some(&e.to_string())),
+        Err(e) => log_install(step, "失败", Some(&e.to_string())),
     }
 }
 
@@ -494,7 +548,7 @@ fn skip_step_bool(step: &str, r: Result<bool, impl std::fmt::Display>) {
     match r {
         Ok(true) => log_install(step, "成功", None),
         Ok(false) => log_install(step, "跳过", Some("服务不存在")),
-        Err(e) => log_install(step, "跳过", Some(&e.to_string())),
+        Err(e) => log_install(step, "失败", Some(&e.to_string())),
     }
 }
 
@@ -512,12 +566,15 @@ pub enum InstallMode {
 }
 
 impl InstallMode {
-    /// 前端桥传字符串：'full' | 'driver-only' | 'repair'，未识别按 Full
-    pub fn from_arg(s: &str) -> Self {
+    /// 前端桥传字符串：'full' | 'driver-only' | 'repair'。
+    /// 续篇 677：未识别值不再静默回落 Full（拼错 driver_only 曾触发完整重装）——
+    /// 返回 Err 由命令层白名单校验。
+    pub fn from_arg(s: &str) -> Result<Self, String> {
         match s {
-            "driver-only" => Self::DriverOnly,
-            "repair" => Self::Repair,
-            _ => Self::Full,
+            "full" => Ok(Self::Full),
+            "driver-only" => Ok(Self::DriverOnly),
+            "repair" => Ok(Self::Repair),
+            other => Err(format!("未知安装模式：{other}")),
         }
     }
 
@@ -549,7 +606,19 @@ pub fn run_install(app: &AppHandle, mode: InstallMode) -> Result<InstallOutcome,
         mode.as_str(),
     );
     // 心跳守卫：随本函数作用域存活，任何 return / panic 路径都会 Drop 停线程。
-    let _heartbeat = Heartbeat::start(app);
+    // 续篇 678：start 返回 None（已有心跳 / spawn 失败）曾直接被忽略 —— 安装继续
+    // 但进度条静止且零留痕；这里记一条不可达日志（不计步数）。
+    let _heartbeat: Option<Heartbeat> = match Heartbeat::start(app) {
+        Some(h) => Some(h),
+        None => {
+            log_install(
+                "安装进度心跳",
+                "不可达",
+                Some("心跳线程未启动（已有心跳或 spawn 失败），进度条可能静止"),
+            );
+            None
+        }
+    };
 
     if head {
         // 5% 创建安装目录（中止）
@@ -583,11 +652,12 @@ pub fn run_install(app: &AppHandle, mode: InstallMode) -> Result<InstallOutcome,
     emit_progress(app, 45, "删除旧服务");
     skip_step_bool("删除旧服务", crate::driver::delete_old_service());
 
-    // 55% 释放驱动到系统目录（跳过）
+    // 55% 释放驱动到系统目录（续篇 232：资源读取失败单独记**失败**并带资源名，
+    // 不再包成 io::Error 后交给 skip_step 记"跳过"——Resource 变体的文案自带名字）
     emit_progress(app, 55, "释放驱动到系统目录");
-    skip_step("释放驱动到系统目录", (|| -> Result<(), crate::driver::DriverError> {
-        let data = get_driver_bytes(app).map_err(|e| std::io::Error::other(e.to_string()))?;
-        crate::driver::release_driver_sys(&data)
+    skip_step("释放驱动到系统目录", (|| -> Result<(), String> {
+        let data = get_driver_bytes(app).map_err(|e| e.to_string())?;
+        crate::driver::release_driver_sys(&data).map_err(|e| e.to_string())
     })());
 
     // 65% 注册系统服务（跳过）
@@ -610,22 +680,48 @@ pub fn run_install(app: &AppHandle, mode: InstallMode) -> Result<InstallOutcome,
         // 95% 写入卸载注册（跳过）——修复安装不动注册
         if registry {
             emit_progress(app, 95, "写入卸载注册");
-            skip_step("写入卸载注册", write_uninstall_registry(app));
+            skip_step("写入卸载注册", write_uninstall_registry());
         }
     }
 
     // 100% 完成
     emit_progress(app, 100, "安装完成");
-    end_install_session("安装结束", started.elapsed().as_secs_f64());
+    // 首轮 231：结束标签与 begin 的"驱动重试/修复安装开始"配对，不再一律写"安装结束"
+    end_install_session(
+        match mode {
+            InstallMode::Full => "安装结束",
+            InstallMode::Repair => "修复安装结束",
+            InstallMode::DriverOnly => "驱动重试结束",
+        },
+        started.elapsed().as_secs_f64(),
+    );
 
-    // 驱动是否可用以实际服务状态为准（第八部分「检测」而非凭标记）
-    let driver_ok = crate::driver::get_driver_status()
-        .map(|s| s.installed && s.running)
-        .unwrap_or(false);
+    // 驱动是否可用以实际服务状态为准（第八部分「检测」而非凭标记）。
+    // 续篇 679：探测 Err 曾被 unwrap_or(false) 静默当"驱动不可用"，触发误导性
+    // 的重试/跳过弹窗 —— 失败单独留痕。
+    let driver_ok = match crate::driver::get_driver_status() {
+        Ok(s) => s.installed && s.running,
+        Err(e) => {
+            log_install("驱动状态检测", "失败", Some(&e.to_string()));
+            false
+        }
+    };
     Ok(InstallOutcome { driver_ok })
 }
 
 // ============ 第九部分：卸载 ============
+
+/// 卸载单步状态（续篇 680：裸 `&'static str` 拼错（"OK"）能编译通过且前端原样
+/// 显示 —— 改枚举 + serde rename，JSON 里仍是 `ok`/`skip`/`fail` 字符串）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum StepStatus {
+    #[serde(rename = "ok")]
+    Ok,
+    #[serde(rename = "skip")]
+    Skip,
+    #[serde(rename = "fail")]
+    Fail,
+}
 
 /// 卸载单步结果。`status`：`ok` 做完 ｜ `skip` 无需做/本就不存在 ｜ `fail` 想做但没做成。
 ///
@@ -634,7 +730,7 @@ pub fn run_install(app: &AppHandle, mode: InstallMode) -> Result<InstallOutcome,
 #[derive(Debug, Clone, Serialize)]
 pub struct StepResult {
     pub step: String,
-    pub status: &'static str,
+    pub status: StepStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -649,11 +745,11 @@ impl UninstallReport {
         Self { steps: Vec::new() }
     }
 
-    fn record(&mut self, step: &str, status: &'static str, detail: Option<String>) {
+    fn record(&mut self, step: &str, status: StepStatus, detail: Option<String>) {
         let label = match status {
-            "ok" => "成功",
-            "skip" => "跳过",
-            _ => "失败",
+            StepStatus::Ok => "成功",
+            StepStatus::Skip => "跳过",
+            StepStatus::Fail => "失败",
         };
         log_install(step, label, detail.as_deref());
         self.steps.push(StepResult {
@@ -664,27 +760,27 @@ impl UninstallReport {
     }
 
     fn ok(&mut self, step: &str) {
-        self.record(step, "ok", None);
+        self.record(step, StepStatus::Ok, None);
     }
 
     fn ok_with(&mut self, step: &str, detail: impl std::fmt::Display) {
-        self.record(step, "ok", Some(detail.to_string()));
+        self.record(step, StepStatus::Ok, Some(detail.to_string()));
     }
 
     fn skip(&mut self, step: &str, why: impl std::fmt::Display) {
-        self.record(step, "skip", Some(why.to_string()));
+        self.record(step, StepStatus::Skip, Some(why.to_string()));
     }
 
     fn fail(&mut self, step: &str, why: impl std::fmt::Display) {
-        self.record(step, "fail", Some(why.to_string()));
+        self.record(step, StepStatus::Fail, Some(why.to_string()));
     }
 }
 
 /// 删除计划任务：`Ok(true)`=已删除、`Ok(false)`=本来就没有、`Err`=想删但没删成。
 ///
-/// **先 `/Query` 再 `/Delete`**：`schtasks` 在"任务不存在"与"删不掉（拒绝访问）"
-/// 两种情况下都返回非 0 退出码，只凭退出码无法区分 —— 而这两者必须分别记
-/// **跳过**与**失败**（P0-9 的"无条件记完成"就是这么谎报的）。
+/// **先 `/Query` 再 `/Delete`**。续篇 233：`/Query` 的任何非 0 退出码曾被一律当
+/// "任务不存在"（拒绝访问也被当成跳过，与注释矛盾）—— 现按输出内容区分：
+/// 只有命中"找不到文件"语义的输出才视为不存在，其余按失败上报。
 /// 用绝对路径而不裸写 `schtasks`：不依赖 PATH（主程序 `autostart.rs:229` 同做法）。
 #[cfg(windows)]
 fn delete_scheduled_task(name: &str) -> Result<bool, String> {
@@ -695,7 +791,22 @@ fn delete_scheduled_task(name: &str) -> Result<bool, String> {
         .output()
         .map_err(|e| format!("schtasks 不可用：{e}"))?;
     if !query.status.success() {
-        return Ok(false);
+        // schtasks 不区分错误码（"任务不存在"与"拒绝访问"都是非 0），
+        // 只能按输出文本识别"不存在"语义（中英文各覆盖一种常见形态）。
+        let out = format!(
+            "{}{}",
+            String::from_utf8_lossy(&query.stdout),
+            String::from_utf8_lossy(&query.stderr)
+        )
+        .to_ascii_lowercase();
+        if out.contains("find the file") || out.contains("找不到") {
+            return Ok(false);
+        }
+        return Err(format!(
+            "无法确认任务是否存在（退出码 {:?}）：{}",
+            query.status.code(),
+            out.trim()
+        ));
     }
     let del = std::process::Command::new(&exe)
         .args(["/Delete", "/TN", name, "/F"])
@@ -745,13 +856,43 @@ pub fn run_uninstall(keep_config: bool) -> Vec<StepResult> {
         Err(e) => r.fail("删除服务", e),
     }
 
-    // 3) 删除驱动残留目录（系统目录若已空则一并移除；安装目录里的 .sys 随目录删除）
+    // 3) 删除驱动残留目录。续篇 234：只 `remove_dir` 对非空目录必然失败且残留的
+    //    .sys 无人清理 —— 先逐个删文件/子目录，再尝试删目录本身。
     match get_system_driver_path().parent() {
-        Some(dir) => match fs::remove_dir(dir) {
-            Ok(()) => r.ok("删除驱动目录"),
-            Err(_) if !dir.exists() => r.skip("删除驱动目录", "目录不存在"),
-            Err(e) => r.fail("删除驱动目录", format!("{}：{}", dir.display(), e)),
-        },
+        Some(dir) => {
+            if !dir.exists() {
+                r.skip("删除驱动目录", "目录不存在");
+            } else {
+                let mut left: Vec<String> = Vec::new();
+                match fs::read_dir(dir) {
+                    Ok(entries) => {
+                        for entry in entries {
+                            let Ok(e) = entry else {
+                                left.push(format!("{}（枚举失败）", dir.display()));
+                                continue;
+                            };
+                            let p = e.path();
+                            let outcome =
+                                if p.is_dir() { fs::remove_dir_all(&p) } else { fs::remove_file(&p) };
+                            if outcome.is_err() && p.exists() {
+                                left.push(format!("{}（残留）", p.display()));
+                            }
+                        }
+                    }
+                    Err(e) => left.push(format!("{}（目录不可枚举：{e}）", dir.display())),
+                }
+                match fs::remove_dir(dir) {
+                    Ok(()) => {
+                        if left.is_empty() {
+                            r.ok("删除驱动目录");
+                        } else {
+                            r.fail("删除驱动目录", format!("目录已删但部分内容残留：{}", left.join("；")));
+                        }
+                    }
+                    Err(e) => r.fail("删除驱动目录", format!("{}：{}", dir.display(), e)),
+                }
+            }
+        }
         None => r.skip("删除驱动目录", "驱动路径无父目录"),
     }
 
@@ -797,7 +938,7 @@ pub fn run_uninstall(keep_config: bool) -> Vec<StepResult> {
             HKEY_CURRENT_USER, KEY_SET_VALUE,
         };
         let mut h = HKEY::default();
-        let run_key = w(c::RUN_KEY);
+        let run_key = c::wide_of(c::RUN_KEY);
         if unsafe {
             RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(run_key.as_ptr()), None, KEY_SET_VALUE, &mut h)
                 .ok()
@@ -807,7 +948,7 @@ pub fn run_uninstall(keep_config: bool) -> Vec<StepResult> {
             let mut removed: Vec<&str> = Vec::new();
             let mut errs: Vec<String> = Vec::new();
             for name in [c::RUN_VALUE_GUIDE, c::RUN_VALUE_MAIN] {
-                let wide = w(name);
+                let wide = c::wide_of(name);
                 let code = unsafe { RegDeleteValueW(h, PCWSTR(wide.as_ptr())) };
                 if code.is_ok() {
                     removed.push(name);
@@ -826,7 +967,9 @@ pub fn run_uninstall(keep_config: bool) -> Vec<StepResult> {
                 r.skip("删除 Run 键", "未设置开机自启");
             }
         } else {
-            r.skip("删除 Run 键", "Run 键不可打开");
+            // 续篇 681：权限不足打不开 Run 键 ≠ "无需处理" —— 记失败，
+            // 清单里如实显示自启残留，而不是谎报跳过。
+            r.fail("删除 Run 键", "Run 键不可打开（权限不足？），自启项可能残留");
         }
     }
     #[cfg(not(windows))]
@@ -845,7 +988,15 @@ pub fn run_uninstall(keep_config: bool) -> Vec<StepResult> {
         let mut removed = 0usize;
         let mut left: Vec<String> = Vec::new();
         for p in targets {
-            let outcome = if p.is_dir() { fs::remove_dir_all(&p) } else { fs::remove_file(&p) };
+            let outcome = if p.is_dir() {
+                // 续篇 682：开始菜单文件夹里可能有用户/其他软件的快捷方式 ——
+                // 只删我们自己的 .lnk，再尝试删空目录（非空会失败并如实记录）。
+                let lnk = p.join(c::SHORTCUT_FILE_NAME);
+                let _ = fs::remove_file(&lnk);
+                fs::remove_dir(&p)
+            } else {
+                fs::remove_file(&p)
+            };
             match outcome {
                 Ok(()) => removed += 1,
                 Err(_) if !p.exists() => {}
@@ -869,8 +1020,13 @@ pub fn run_uninstall(keep_config: bool) -> Vec<StepResult> {
         Ok(dir) => {
             let mut left: Vec<String> = Vec::new();
             if keep_config {
+                // 续篇 234：entries.flatten() 曾吞掉逐条读取错误 —— 逐条记录原因。
                 if let Ok(entries) = fs::read_dir(&dir) {
-                    for e in entries.flatten() {
+                    for entry in entries {
+                        let Ok(e) = entry else {
+                            left.push(format!("{}（枚举失败）", dir.display()));
+                            continue;
+                        };
                         let p = e.path();
                         if p.file_name().map(|n| n == "config").unwrap_or(false) {
                             continue;
@@ -905,7 +1061,7 @@ pub fn run_uninstall(keep_config: bool) -> Vec<StepResult> {
         use windows::core::PCWSTR;
         use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
         use windows::Win32::System::Registry::{RegDeleteTreeW, HKEY_CURRENT_USER};
-        let sub = w(c::UNINSTALL_SUBKEY);
+        let sub = c::wide_of(c::UNINSTALL_SUBKEY);
         let code = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(sub.as_ptr())) };
         if code.is_ok() {
             r.ok("删除卸载注册");
@@ -924,11 +1080,8 @@ pub fn run_uninstall(keep_config: bool) -> Vec<StepResult> {
     r.steps
 }
 
-/// str → 以 NUL 结尾的 UTF-16 缓冲区（Win32 宽字符串）
-#[cfg(windows)]
-fn w(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
+// 首轮 006：本文件原有的一份私有 `w()` 已删除 —— 宽字符转换统一走契约
+// `aaxsyspulse_core::contract::wide_of()`（调用点已就地替换）。
 
 #[cfg(test)]
 mod redact_tests {

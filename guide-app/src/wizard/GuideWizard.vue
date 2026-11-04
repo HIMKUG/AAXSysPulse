@@ -8,7 +8,7 @@ import {
   next, prev, saveConfig, quitGuide, deleteGuideFiles, finishGuide,
   restartAsAdmin, resumeGuide, restartGuide,
   clearState, retryInstall, quitDuringInstall,
-  ensureInstallWatch,
+  ensureInstallWatch, disposeInstallWatch,
   retryDriverInstall, skipDriverInstall,
   chooseReinstall, chooseRepair, chooseReguide,
   askUninstall, runUninstall, cancelUninstall, finishUninstall,
@@ -61,14 +61,23 @@ function handleNext() {
    只用键盘也要能翻完 14 页：Alt+→ = 「继续」，Alt+← = 「上一步」，
    与页脚两个按钮完全等价（走同一组函数，因此第 13 页未选自启时的
    校验提示也一致）。三条护栏：
-   1. 有 sheet 打开时不翻页 —— 面板是模态的，翻页会把面板丢在背后；
-   2. 安装页推进中不翻页 —— 此时页脚本就无按钮，`next()` 还会打断安装；
+   1. 有 sheet 打开时不翻页 —— 面板是模态的，翻页会把面板丢在背后
+      （续篇 734：Teleport defer 挂载/卸载帧内 querySelector 滞后 ——
+      改为统一 open 状态计数，不再探测 DOM）；
+   2. 安装页推进中/失败态不翻页 —— 推进中页脚本就无按钮，`next()` 会打断安装；
+      失败态也禁止（续篇 259：Alt+→ 曾绕过重试直接翻页）；
    3. 只接裸 Alt+方向键，带 Ctrl/Meta/Shift 的组合留给浏览器与输入法。 */
+const anySheetOpen = computed(() =>
+  showResume.value || showInstallQuit.value || state.install.driverPrompt ||
+  showInstalled.value || state.uninstall.confirm || state.uninstall.done ||
+  closeStep.value > 0 || quitted.value || showDeleteSheet.value || showLogs.value
+)
 function onWizardKeydown(e) {
   if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return
   if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return
-  if (document.querySelector('.sheet-scrim')) return
-  if (state.page === 3 && state.install.status !== 'error') return
+  if (anySheetOpen.value) return
+  // 续篇 259：error 态也不允许键盘翻页绕过重试（done 态由 install-done 自动推进）
+  if (state.page === 3 && state.install.status !== 'done') return
   e.preventDefault()
   if (e.key === 'ArrowRight') handleNext()
   else if (canPrev.value) prev()
@@ -86,7 +95,12 @@ ensureInstallWatch()
 let offClose = null
 onMounted(async () => {
   window.addEventListener('keydown', onWizardKeydown)
-  offClose = await onCloseRequested(() => askClose())
+  const un = await onCloseRequested(() => askClose())
+  if (wizardUnmounted) {
+    un && un()   // 卸载早于 await 完成：立刻注销，不泄漏
+    return
+  }
+  offClose = un
   const resume = await bootstrap()
   if (state.boot.uninstallMode) {
     // --uninstall 启动：直接进入卸载确认
@@ -103,9 +117,15 @@ function onInstalledChoice(fn) {
   showInstalled.value = false
   fn()
 }
+// 续篇 736：卸载可能早于 onCloseRequested 的 await 完成 —— 立即占位，
+// 竞态时注销刚拿到手的 unlisten（幂等）。
+let wizardUnmounted = false
 onUnmounted(() => {
+  wizardUnmounted = true
   window.removeEventListener('keydown', onWizardKeydown)
   offClose && offClose()
+  // 续篇 735：三个常驻安装监听一并注销，重建后旧监听不再持有旧 state
+  disposeInstallWatch()
 })
 
 async function onResumeYes() {
@@ -150,7 +170,11 @@ async function onSilentQuit() {
   await quitGuide() // 内部 flushConfig + flushBackup + 退出进程
   quitted.value = true
 }
-async function onSave() { await saveConfig(); closeStep.value = 2 }
+// 续篇 737：保存结果不再忽略 —— 写盘失败不推进"已保存"的退出确认
+async function onSave() {
+  const ok = await saveConfig()
+  if (ok) closeStep.value = 2
+}
 async function onDontSave() {
   await clearState()       // 不保存：直接清空断点续引导记忆
   closeStep.value = 2
@@ -194,10 +218,15 @@ async function openLogs() {
 
 /* ---------------- 权限动作 ---------------- */
 const onPrivilege = () => restartAsAdmin()
+
+/* 续篇 259：DEV 守卫（演示退出面板只进开发包） */
+const isDev = import.meta.env.DEV
 </script>
 
 <template>
-  <div class="guide-window">
+  <!-- 续篇 764：.translucent 此前是全仓唯一死规则 —— 第 12 页拖动桌面悬浮窗时
+       提高窗口透明度（"看得到桌面悬浮窗"）真正接线生效。 -->
+  <div class="guide-window" :class="{ translucent: state.page === 12 }">
     <!-- 顶部拖动区 + 日志入口 + 关闭按钮 -->
     <div class="titlebar">
       <button class="win-diag" @click="openLogs">
@@ -220,8 +249,10 @@ const onPrivilege = () => restartAsAdmin()
 
     <!-- 底部导航 -->
     <footer class="footer">
-      <div class="dots">
-        <span v-for="i in totalSteps" :key="i" :class="dotClass(i - 1)"></span>
+      <!-- 续篇 738：进度点是无文本 span —— 容器携带"当前步"语义，点本身
+           aria-hidden（读屏不再逐个播报空元素） -->
+      <div class="dots" role="group" :aria-label="`第 ${stepIndex + 1} 步，共 ${totalSteps} 步`">
+        <span v-for="i in totalSteps" :key="i" :class="dotClass(i - 1)" aria-hidden="true"></span>
       </div>
 
       <div class="nav-btns">
@@ -362,9 +393,10 @@ const onPrivilege = () => restartAsAdmin()
       </template>
     </WizardSheet>
 
-    <!-- 演示用：退出后的占位（正式程序这里直接退出进程） -->
-    <WizardSheet :open="quitted" size="s" :closable="false" :scrim-close="false"
-      title="引导程序已退出（演示）">
+    <!-- 演示用：退出后的占位（正式程序这里直接退出进程）。
+         续篇 259：加 DEV 守卫 —— 生产包不留"（演示）"字样的死面板。 -->
+    <WizardSheet v-if="isDev" :open="quitted" size="s" :closable="false" :scrim-close="false"
+      title="引导程序已退出（开发预览）">
       <template #footer>
         <button class="btn btn-primary" @click="reopen">重新打开引导</button>
       </template>

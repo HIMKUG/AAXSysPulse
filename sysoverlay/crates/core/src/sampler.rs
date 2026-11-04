@@ -35,13 +35,20 @@ pub enum SampleOutcome {
 
 impl SampleOutcome {
     /// 是否算作失败（用于决定是否计入退避）。
+    /// 穷尽 match（审查 099）：新增变体时此处编译失败，逼你显式归类。
     pub fn is_failure(self) -> bool {
-        matches!(self, SampleOutcome::Transient | SampleOutcome::Fatal)
+        match self {
+            SampleOutcome::Transient | SampleOutcome::Fatal => true,
+            SampleOutcome::Ok | SampleOutcome::Skipped => false,
+        }
     }
 
     /// 是否需要重建采样器。
     pub fn is_fatal(self) -> bool {
-        matches!(self, SampleOutcome::Fatal)
+        match self {
+            SampleOutcome::Fatal => true,
+            SampleOutcome::Ok | SampleOutcome::Transient | SampleOutcome::Skipped => false,
+        }
     }
 }
 
@@ -78,11 +85,13 @@ impl SamplerId {
     ];
 }
 
-/// 诊断环容量。64 项 ≈ 覆盖最近一分钟（1s 间隔 × 5 采样器）。
+/// 诊断环容量。64 项 ≈ 覆盖最近约 13 秒（1s 间隔 × 5 采样器，审查 626：原注释
+/// 误写"一分钟"）。崩溃转储与 `--diag` 输出以这个窗口为准。
 pub const DIAG_CAP: usize = 64;
 
 /// 单条诊断记录。8 字节，全部定长，无指针、无堆。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
 pub struct DiagEntry {
     /// 哪个采样器。
     pub sampler: SamplerId,
@@ -106,18 +115,19 @@ pub struct SamplerDiag {
     written: u64,
 }
 
+/// 空槽位填充值（seq=0/outcome=Skipped 视为"未使用"）。
+const EMPTY_ENTRY: DiagEntry = DiagEntry {
+    sampler: SamplerId::Cpu,
+    outcome: SampleOutcome::Skipped,
+    code: 0,
+    seq: 0,
+};
+
 impl SamplerDiag {
     /// 空缓冲。
     pub const fn new() -> Self {
-        // 用第一条记录作为填充值；seq=0/outcome=Skipped 视为"未使用"。
-        const EMPTY: DiagEntry = DiagEntry {
-            sampler: SamplerId::Cpu,
-            outcome: SampleOutcome::Skipped,
-            code: 0,
-            seq: 0,
-        };
         Self {
-            entries: [EMPTY; DIAG_CAP],
+            entries: [EMPTY_ENTRY; DIAG_CAP],
             head: 0,
             written: 0,
         }
@@ -173,13 +183,21 @@ impl SamplerDiag {
 
     /// 统计某个采样器最近的失败次数（用于 UI 决定是否标灰）。
     pub fn recent_failures(&self, id: SamplerId) -> u32 {
-        self.iter()
+        let count = self
+            .iter()
             .filter(|e| e.sampler == id && e.outcome.is_failure())
-            .count() as u32
+            .count();
+        // 审查 101：环形窗口容量 DIAG_CAP=64，计数远小于 u32::MAX；
+        // 容量若被调大到溢出，这里显式饱和而不是 `as u32` 静默截断。
+        u32::try_from(count).unwrap_or(u32::MAX)
     }
 
-    /// 清空。
+    /// 清空（审查 627：同时覆写条目本身 —— 诊断会随 MiniDump 带出，
+    /// 只复位游标会让"已清空"的旧记录仍留在崩溃转储里）。
     pub fn clear(&mut self) {
+        for e in self.entries.iter_mut() {
+            *e = EMPTY_ENTRY;
+        }
         self.head = 0;
         self.written = 0;
     }
@@ -290,7 +308,8 @@ pub trait Sampler: Send {
     /// `prev` is the previous complete snapshot (if available) and can be
     /// used to compute deltas (e.g. CPU time differences).
     ///
-    /// `now_ms` is the current timestamp in milliseconds since Unix epoch.
+    /// `now_ms` 是当前采样时钟的单调毫秒（GetTickCount64 同源，开机以来；
+    /// 审查 628：原注释误写 "milliseconds since Unix epoch"，两字段并非同一时间源）。
     ///
     /// Returns [`SampleOutcome`] indicating success or the class of failure.
     fn sample(
@@ -438,15 +457,28 @@ mod tests {
 
     #[test]
     fn diag_entry_is_compact() {
-        // 8 字节：id(1) + outcome(1) + code(2) + seq(4)
-        assert!(
-            core::mem::size_of::<DiagEntry>() <= 8,
-            "诊断项必须紧凑，实测 {} 字节",
+        // 8 字节：id(1) + outcome(1) + code(2) + seq(4)；repr(C) 下必须恰好 8。
+        assert_eq!(
+            core::mem::size_of::<DiagEntry>(),
+            8,
+            "诊断项必须恰好 8 字节（repr(C)），实测 {}",
             core::mem::size_of::<DiagEntry>()
         );
         assert!(
             core::mem::size_of::<SamplerDiag>() <= DIAG_CAP * 8 + 16,
             "整个诊断缓冲必须无堆、有界"
         );
+    }
+
+    /// 审查 627 回归锁：clear 必须覆写条目，MiniDump 里不留旧记录。
+    #[test]
+    fn diag_clear_wipes_entries() {
+        let mut d = SamplerDiag::new();
+        d.push(entry(SamplerId::Cpu, SampleOutcome::Fatal, 42));
+        d.clear();
+        for e in d.iter() {
+            assert_eq!(e.seq, 0, "clear 后不得残留旧 seq");
+            assert_eq!(e.outcome, SampleOutcome::Skipped);
+        }
     }
 }

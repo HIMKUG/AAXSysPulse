@@ -23,7 +23,8 @@ let opener = null // 打开面板时的焦点，关闭后还原
 
 const FOCUSABLE =
   'button:not([disabled]), input:not([disabled]), select:not([disabled]), ' +
-  'textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])'
+  'textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"]), ' +
+  '[contenteditable="true"], [role="button"], summary'
 
 function focusables() {
   const root = scrimEl.value
@@ -83,11 +84,17 @@ watch(
       if (inside) opener.focus?.()
       opener = null
     }
-  }
+  },
+  // 续篇 740：immediate —— 面板以 open=true 初始挂载时，Esc/Tab 陷阱与
+  // 初始聚焦此前全部失效。
+  { immediate: true }
 )
 
 onBeforeUnmount(() => {
   if (typeof document !== 'undefined') document.removeEventListener('keydown', onKeydown, true)
+  // 续篇 741：open 状态下直接卸载也还原焦点（与 watch(false) 分支对称）
+  if (props.open && opener && typeof opener.focus === 'function') opener.focus()
+  opener = null
 })
 </script>
 
@@ -104,7 +111,7 @@ onBeforeUnmount(() => {
           :class="`sheet--${size}`"
           role="dialog"
           aria-modal="true"
-          :aria-label="title"
+          :aria-label="title || '对话框'"
         >
           <div class="sheet-head">
             <span class="sheet-title">{{ title }}</span>
@@ -114,7 +121,9 @@ onBeforeUnmount(() => {
               </svg>
             </button>
           </div>
-          <div class="sheet-body">
+          <!-- 续篇 743：滚动区补 tabindex/role —— 键盘用户能聚焦后用方向键滚动
+               （逐项面板 / 日志此前不可键盘滚动） -->
+          <div class="sheet-body" tabindex="0" role="region" aria-label="面板内容">
             <slot />
           </div>
           <div v-if="$slots.footer" class="sheet-foot">

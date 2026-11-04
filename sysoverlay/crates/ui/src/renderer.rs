@@ -24,7 +24,7 @@
 //! 指纹必须覆盖本渲染器**全部**会改变像素的输入（含全局 alpha ——
 //! 透明度/悬停变化必须触发重绘）。
 
-use crate::font::{measure_scaled_f, render_str_scaled_f};
+use crate::font::{measure_scaled_f, render_str_scaled_f, FONT_HEIGHT, FONT_SPACING, FONT_WIDTH};
 use crate::offscreen::SoftwareSurface;
 use crate::palette::Style;
 use crate::Rgba;
@@ -92,7 +92,7 @@ pub trait Renderer {
                 }
             }
             if !full_clear {
-                let pad = if c.outline { 2 } else if c.shadow { 1 } else { 0 };
+                let pad = sig_pad(c.shadow, c.outline);
                 out.clear_rect(c.bbox_x, c.y - pad, c.w + 2 * pad, c.h + 2 * pad);
             }
             draw_row_text(out, c.text.as_str(), c.x, c.y, c.scale, c.color, c.shade, c.shadow, c.outline);
@@ -136,8 +136,9 @@ fn fnv_f32(acc: &mut u64, v: f32) {
 /// 槽位宽度（字符数）——按各类数值的**最大**模板串宽取值：
 /// 百分比 `100%`=4；GB 占用 `999.9GB`=7；网速 `888.8M/s`=8；功耗 `8888W`=5。
 pub const SLOT_PCT: u32 = 4;
-/// 带一位小数的百分比 `99.9%`=5（综合占用 Util 专用，见 [`fmt_pct1`]）。
-pub const SLOT_PCT1: u32 = 5;
+/// 带一位小数的百分比 `100.0%`=6（综合占用 Util 专用，见 [`fmt_pct1`]；
+/// 审查 124：满量程 100.0% 是 6 字符，槽位必须装得下，原 5 会截断）。
+pub const SLOT_PCT1: u32 = 6;
 pub const SLOT_GB: u32 = 7;
 pub const SLOT_RATE: u32 = 8;
 pub const SLOT_POWER: u32 = 5;
@@ -145,6 +146,8 @@ pub const SLOT_POWER: u32 = 5;
 pub const PAD_X: i32 = 8;
 /// 上下内边距（像素）。
 pub const PAD_Y: i32 = 6;
+/// 磁盘行数值槽位（`XXX.XGB/s` 最长 9 字符；审查 487：两个分支与测试共用一份）。
+pub const DISK_SLOT: u32 = 9;
 
 /// 一个指标单元的**最终显示数据**（构建后即不可变，供绘制/测宽/哈希共用）。
 pub struct MetricRow {
@@ -227,10 +230,6 @@ impl RowList {
     fn as_slice(&self) -> &[MetricRow] {
         &self.items[..self.count]
     }
-    #[allow(dead_code)]
-    fn is_empty(&self) -> bool {
-        self.count == 0
-    }
 }
 
 /// 一个文字 cell 的**完整绘制指令 + 内容指纹**（供脏矩形上屏复用）。
@@ -263,6 +262,18 @@ pub struct CellSig {
     pub scale: f32,
 }
 
+/// 阴影/描边的外扩像素数（cell_sig 与 paint 共用，审查 479；
+/// `pub`：win 侧脏区上界计算（gdi.rs:143）复用同一份定义）。
+pub fn sig_pad(shadow: bool, outline: bool) -> i32 {
+    if outline {
+        2
+    } else if shadow {
+        1
+    } else {
+        0
+    }
+}
+
 /// 构造一个文字 cell 的绘制指令 + 内容指纹。
 ///
 /// 包围盒按阴影/描边外扩（outline=±1、shadow=+1），保证 `draw_row_text`
@@ -284,7 +295,7 @@ fn cell_sig(
     slot_w: i32,
 ) -> CellSig {
     let text_w = measure_scaled_f(text.as_str(), scale);
-    let pad = if outline { 2 } else if shadow { 1 } else { 0 };
+    let pad = sig_pad(shadow, outline);
     // 槽位 > 0 = 右对齐数值 cell（标签 cell 传 0）。
     // 右对齐锚点 = x + text_w（布局按位图度量把右缘对齐到该点）；
     // 包围盒向左覆盖整个预留槽位（max(text_w, slot_w)），以容纳 D2D 真字形
@@ -298,39 +309,47 @@ fn cell_sig(
     };
     let w = reserved + 2 * pad;
     let h = (h_rows * scale).ceil() as i32;
-    let mut acc = FNV_OFFSET;
-    for b in text.as_str().as_bytes() {
-        fnv_mix(&mut acc, &[*b]);
-    }
-    fnv_u32(&mut acc, color.to_colorref());
-    fnv_u8(&mut acc, color.a);
-    fnv_u32(&mut acc, shade.to_colorref());
-    fnv_u8(&mut acc, shade.a);
-    fnv_u8(&mut acc, shadow as u8);
-    fnv_u8(&mut acc, outline as u8);
-    fnv_f32(&mut acc, scale);
-    CellSig {
+    let mut sig = CellSig {
         x,
         y,
         w,
         h: h + 2 * pad,
         bbox_x,
         right_align,
-        hash: acc,
+        hash: 0,
         text: *text,
         color,
         shade,
         shadow,
         outline,
         scale,
+    };
+    let mut acc = FNV_OFFSET;
+    fnv_cell(&mut acc, &sig);
+    sig.hash = acc;
+    sig
+}
+
+/// 单个 cell 的内容指纹混合（cell_sig 与 hash_cells 共用，审查 482：
+/// 两处原本各自重算且字段集合不一致，现在收敛为同一份实现）。
+fn fnv_cell(acc: &mut u64, c: &CellSig) {
+    for b in c.text.as_str().as_bytes() {
+        fnv_mix(acc, &[*b]);
     }
+    fnv_u32(acc, c.color.to_colorref());
+    fnv_u8(acc, c.color.a);
+    fnv_u32(acc, c.shade.to_colorref());
+    fnv_u8(acc, c.shade.a);
+    fnv_u8(acc, c.shadow as u8);
+    fnv_u8(acc, c.outline as u8);
+    fnv_f32(acc, c.scale);
 }
 
 /// 把 snapshot 指标归一化成 (数值, 是否陈旧, 是否可用)。
+/// 审查 630：`Metric::Stale` 已删除，陈旧标记恒 false（保留元组形状以稳定调用方）。
 fn metric_parts(m: &SnapMetric<f32>) -> (f32, bool, bool) {
     match m {
         SnapMetric::Value(v) => (*v, false, true),
-        SnapMetric::Stale { value, .. } => (*value, true, true),
         SnapMetric::Unavailable => (0.0, false, false),
     }
 }
@@ -346,18 +365,12 @@ fn shade_color(fg: Rgb) -> Rgba {
 }
 
 /// core::Metric 在 [`Config::metric_colors`] / [`Config::metric_font_sizes`] 里的下标。
+/// 由 `Metric::ALL` 派生（审查 122/486）：新增指标不再需要手写 match。
 fn metric_index(m: MetricEnum) -> usize {
-    match m {
-        MetricEnum::Cpu => 0,
-        MetricEnum::Mem => 1,
-        MetricEnum::Gpu => 2,
-        MetricEnum::Net => 3,
-        MetricEnum::Power => 4,
-        MetricEnum::Time => 5,
-        MetricEnum::Util => 6,
-        MetricEnum::DiskRead => 7,
-        MetricEnum::DiskWrite => 8,
-    }
+    MetricEnum::ALL
+        .iter()
+        .position(|x| *x == m)
+        .unwrap_or(0)
 }
 
 /// 名称/数值配色：指标专属色优先，否则回退到 fallback。
@@ -365,7 +378,10 @@ fn metric_index(m: MetricEnum) -> usize {
 /// CPU/GPU/内存百分比的 fallback 即占用率强调色
 /// （`style.accent(pct)`：<60% 绿 / 60~85% 橙 / ≥85% 红）。
 fn slot_color(cfg: &Config, m: MetricEnum, label: bool, fallback: Rgba) -> Rgba {
-    let mc = &cfg.metric_colors[metric_index(m)];
+    // 审查 483：统一 .get 防长度不齐 panic（正常恒命中，守卫只为防御）。
+    let Some(mc) = cfg.metric_colors.get(metric_index(m)) else {
+        return fallback;
+    };
     if !label && mc.value_auto {
         return fallback;
     }
@@ -378,7 +394,10 @@ fn slot_color(cfg: &Config, m: MetricEnum, label: bool, fallback: Rgba) -> Rgba 
 
 /// 指标专属字号（像素）：逐指标覆盖优先，否则全局。
 fn font_size_for(cfg: &Config, m: MetricEnum) -> f32 {
-    cfg.metric_font_sizes[metric_index(m)].unwrap_or(cfg.font_size)
+    cfg.metric_font_sizes
+        .get(metric_index(m))
+        .and_then(|s| *s)
+        .unwrap_or(cfg.font_size)
 }
 
 // ── 字重（细/中/粗） ─────────────────────────────────────
@@ -414,7 +433,8 @@ fn weight_faded(c: Rgba, factor: f32) -> Rgba {
 /// 压字、脏区也盖不住墨迹边缘。
 fn visible_rows(cfg: &Config) -> f32 {
     if cfg.render_engine == aaxsyspulse_core::types::RenderEngine::D2d {
-        16.0
+        // 审查 484：引用字体常量而非裸 16.0。
+        FONT_HEIGHT as f32
     } else {
         crate::font::GLYPH_VISIBLE_ROWS_F
     }
@@ -428,7 +448,9 @@ fn font_scale_of(size: f32) -> f32 {
 /// 汇总按 cfg 的所有指标单元。**显示顺序 = `cfg.metric_order`**（设置页可拖动排序）；
 /// 关闭的项（含时钟行）不产出行。单次构建（C1/C2）。
 fn build_rows(snap: &Snapshot, cfg: &Config) -> RowList {
-    let style = Style::derive(Rgb::default(), cfg.fg);
+    // 审查 119：背景色必须参与调色板派生（此前写死 Rgb::default()，
+    // cfg.bg 完全不生效 —— 换背景色时 border/track 等派生色不变）。
+    let style = Style::derive(cfg.bg, cfg.fg);
     let mut rows = RowList::new();
     let mut seen = [false; MetricEnum::COUNT];
     for &m_idx in cfg.metric_order.iter() {
@@ -494,15 +516,33 @@ fn fmt_bps(b: &mut StrBuf, bps: f64) {
     }
 }
 
-/// 格式化定点小数的 f64（无格式化依赖，纯整数位拼接）。
+/// 格式化定点小数的 f64（审查 120：手写逐位拼接，与"零格式化依赖"注释一致，
+/// 不再走 `format!` 堆分配；审查 485：先整体四舍五入再拆整数/小数，
+/// `1.999`（1 位）→ `"2.0"` 而非截断成 `"1.9"`）。
 fn push_f64_fixed(b: &mut StrBuf, v: f64, decimals: usize) {
-    let whole = v as u64;
-    b.push_u64(whole);
+    let decimals = decimals.min(9); // 与 units::pow10 容量一致
+    let pow = 10_u64.pow(decimals as u32);
+    let scaled = if v.is_finite() {
+        ((v * pow as f64).round() as i64).max(0) as u64
+    } else {
+        0
+    };
+    b.push_u64(scaled / pow);
     if decimals > 0 {
         b.push_str(".");
-        let frac = ((v - whole as f64) * 10_f64.powi(decimals as i32)) as u64;
-        let frac_str = format!("{:0>width$}", frac, width = decimals);
-        b.push_str(&frac_str);
+        let mut frac = scaled % pow;
+        let mut digits = [0u8; 9];
+        let mut n = 0;
+        while n < decimals {
+            digits[n] = b'0' + (frac % 10) as u8;
+            frac /= 10;
+            n += 1;
+        }
+        while n > 0 {
+            n -= 1;
+            let byte = [digits[n]];
+            b.push_str(core::str::from_utf8(&byte).unwrap_or("0"));
+        }
     }
 }
 
@@ -525,7 +565,7 @@ fn build_row(m: MetricEnum, snap: &Snapshot, cfg: &Config, style: Style) -> Opti
             } else {
                 style.accent(v)
             };
-            let label = metric_label(cfg, 0, "CPU", "C");
+            let label = metric_label(cfg, MetricEnum::Cpu, "CPU", "C");
             Some(new_row(
                 MetricEnum::Cpu,
                 label,
@@ -554,7 +594,7 @@ fn build_row(m: MetricEnum, snap: &Snapshot, cfg: &Config, style: Style) -> Opti
             } else {
                 style.accent(snap.memory.load_pct)
             };
-            let label = metric_label(cfg, 1, "Mem", "M");
+            let label = metric_label(cfg, MetricEnum::Mem, "Mem", "M");
             Some(new_row(
                 MetricEnum::Mem,
                 label,
@@ -581,7 +621,7 @@ fn build_row(m: MetricEnum, snap: &Snapshot, cfg: &Config, style: Style) -> Opti
             } else {
                 style.accent(v)
             };
-            let label = metric_label(cfg, 2, "GPU", "G");
+            let label = metric_label(cfg, MetricEnum::Gpu, "GPU", "G");
             Some(new_row(
                 MetricEnum::Gpu,
                 label,
@@ -633,7 +673,7 @@ fn build_row(m: MetricEnum, snap: &Snapshot, cfg: &Config, style: Style) -> Opti
                     slot = SLOT_RATE * 2 + 3;
                 }
             };
-            let label = metric_label(cfg, 3, label_long, "N");
+            let label = metric_label(cfg, MetricEnum::Net, label_long, "N");
             Some(new_row(
                 MetricEnum::Net,
                 label,
@@ -661,7 +701,7 @@ fn build_row(m: MetricEnum, snap: &Snapshot, cfg: &Config, style: Style) -> Opti
             } else {
                 style.ui.value
             };
-            let label = metric_label(cfg, 4, "Power", "P");
+            let label = metric_label(cfg, MetricEnum::Power, "Power", "P");
             Some(new_row(
                 MetricEnum::Power,
                 label,
@@ -679,7 +719,7 @@ fn build_row(m: MetricEnum, snap: &Snapshot, cfg: &Config, style: Style) -> Opti
             // 时钟标签用 "Time"：DIN 位图字体仅覆盖 ASCII（含 D2D 引擎的
             // 字体回退行为差异），中文标签交给设置页 i18n（DWrite）。
             let (b, slot) = time_value(cfg);
-            let label = metric_label(cfg, 5, "Time", "T");
+            let label = metric_label(cfg, MetricEnum::Time, "Time", "T");
             Some(new_row(
                 MetricEnum::Time,
                 label,
@@ -720,7 +760,7 @@ fn build_row(m: MetricEnum, snap: &Snapshot, cfg: &Config, style: Style) -> Opti
             } else {
                 style.accent(v)
             };
-            let label = metric_label(cfg, 6, "Util", "U");
+            let label = metric_label(cfg, MetricEnum::Util, "Util", "U");
             Some(new_row(
                 MetricEnum::Util,
                 label,
@@ -739,17 +779,16 @@ fn build_row(m: MetricEnum, snap: &Snapshot, cfg: &Config, style: Style) -> Opti
             // ⚠️ 数据未就绪（PDH 首轮基线未建立 / 采样器不可用）时**仍然占位**：
             // 旧实现这里 `return None` 会把整行撤掉，用户看到的是「开了磁盘读项，
             // 悬浮窗里连格子都没有」（2026-09-17 报障）。与 CPU/Mem/Util 同语义：
-            // 行不消失，只是数值显示 `--`。
-            const DISK_SLOT: u32 = 9; // max "XXX.XGB/s" = 9 chars
+            // 行不消失，只是数值显示 `--`。审查 087：单侧无数据显示 `--` 而非 0。
             let mut b = StrBuf::new();
-            let color = if snap.disk.ready {
-                fmt_bps(&mut b, snap.disk.read_bps);
+            let color = if let Some(v) = snap.disk.read_bps.value() {
+                fmt_bps(&mut b, v);
                 style.ui.value
             } else {
                 b.push_str("--");
                 style.accent(100.0)
             };
-            let label = metric_label(cfg, 7, "RDisk", "R");
+            let label = metric_label(cfg, MetricEnum::DiskRead, "RDisk", "R");
             Some(new_row(
                 MetricEnum::DiskRead,
                 label,
@@ -766,16 +805,15 @@ fn build_row(m: MetricEnum, snap: &Snapshot, cfg: &Config, style: Style) -> Opti
                 return None;
             }
             // 未就绪仍占位显示 `--`，理由同 DiskRead。
-            const DISK_SLOT: u32 = 9;
             let mut b = StrBuf::new();
-            let color = if snap.disk.ready {
-                fmt_bps(&mut b, snap.disk.write_bps);
+            let color = if let Some(v) = snap.disk.write_bps.value() {
+                fmt_bps(&mut b, v);
                 style.ui.value
             } else {
                 b.push_str("--");
                 style.accent(100.0)
             };
-            let label = metric_label(cfg, 8, "WDisk", "W");
+            let label = metric_label(cfg, MetricEnum::DiskWrite, "WDisk", "W");
             Some(new_row(
                 MetricEnum::DiskWrite,
                 label,
@@ -793,7 +831,9 @@ fn build_row(m: MetricEnum, snap: &Snapshot, cfg: &Config, style: Style) -> Opti
 ///  - if `metric_show_labels[mi]` is false → empty string (label hidden)
 ///  - else per-item `metric_name_modes[mi]` wins; Follow falls back to global `short_names`
 ///  - short form (e.g. "C", "M") when resolved short, else full form (e.g. "CPU", "Mem")
-fn metric_label(cfg: &Config, mi: usize, full: &'static str, short: &'static str) -> &'static str {
+fn metric_label(cfg: &Config, m: MetricEnum, full: &'static str, short: &'static str) -> &'static str {
+    // 审查 486：调用方传 Metric 枚举，不再手写下标 0..8。
+    let mi = metric_index(m);
     if !cfg.metric_show_labels.get(mi).copied().unwrap_or(true) {
         ""
     } else if cfg
@@ -823,7 +863,10 @@ fn new_row(
     let scale = font_scale_of(size);
     let label_w = measure_scaled_f(label, scale);
     let value_w = measure_scaled_f(value.as_str(), scale);
-    let slot_w = measure_scaled_f("0", scale) * slot as i32;
+    // 审查 488：槽位宽按 measure 公式算 slot 个字符的宽（含字符间距累加），
+    // 单字符宽 × slot 会系统性低估 (slot-1)*scale 像素。
+    let slot_w = ((slot as f32 * (FONT_WIDTH + FONT_SPACING) as f32 - FONT_SPACING as f32) * scale)
+        .ceil() as i32;
     // 字重（细/中/粗）：对名称/数值色做 alpha 弱化（预乘），粗 = 原样。
     let wf = font_weight_factor(cfg.font_weight);
     // 名称隐藏时：标签宽度归零、间距归零（数值紧贴左侧起始位置）。
@@ -920,21 +963,16 @@ fn hash_cells(cells: &[CellSig], cfg: &Config, w: i32, h: i32, alpha: u8) -> u64
         fnv_u32(&mut acc, *off as u32);
     }
     for c in cells {
-        for b in c.text.as_str().as_bytes() {
-            fnv_mix(&mut acc, &[*b]);
-        }
+        fnv_cell(&mut acc, c);
         fnv_mix(&mut acc, &[0xFE]);
-        fnv_u32(&mut acc, c.color.to_colorref());
-        fnv_u8(&mut acc, c.color.a);
-        fnv_u32(&mut acc, c.shade.to_colorref());
-        fnv_u8(&mut acc, c.shade.a);
-        fnv_u8(&mut acc, c.shadow as u8);
-        fnv_u8(&mut acc, c.outline as u8);
-        fnv_f32(&mut acc, c.scale);
         fnv_u32(&mut acc, c.x as u32);
         fnv_u32(&mut acc, c.y as u32);
         fnv_u32(&mut acc, c.w as u32);
         fnv_u32(&mut acc, c.h as u32);
+        // 审查 123：包围盒左缘与右对齐标记也进指纹 —— 右对齐修正/布局
+        // 漂移导致"几何变而内容不变"时不再漏重绘。
+        fnv_u32(&mut acc, c.bbox_x as u32);
+        fnv_u8(&mut acc, c.right_align as u8);
     }
     acc
 }

@@ -159,7 +159,7 @@ cd guide-app && npm run build   # = check-bridge 断言 + vite build
 | 操作 | 效果 |
 |------|------|
 | **左键拖动** | 移动卡片位置，位置会自动记忆 |
-| **右键点击** | 打开功能菜单（置顶、极简、悬停、大小、形状、颜色等） |
+| **右键点击** | 打开功能菜单（置顶、极简、悬停、大小、颜色等；审查 282：形状已移除） |
 
 ### 配置文件
 
@@ -170,7 +170,7 @@ cd guide-app && npm run build   # = check-bridge 断言 + vite build
 | 文件 | 内容 | 定义处 |
 |------|------|--------|
 | `system.cfg` | 刷新间隔、开机自启、GDI 兼容、日志等 | `core::config::system` |
-| `appearance.cfg` | 背景/前景色、字号字重、透明度、形状 | `core::config::appearance` |
+| `appearance.cfg` | 背景/前景色、字号字重、阴影描边（审查 282：透明度在 system.cfg、形状键已废弃） | `core::config::appearance` |
 | `monitor.cfg` | 监控项开关、顺序、逐项颜色与字号 | `core::config::monitor` |
 | `layout_h.cfg` | 横版布局的位置与尺寸记忆 | `core::config::layout` |
 | `layout_v.cfg` | 竖版布局的位置与尺寸记忆 | `core::config::layout` |
@@ -192,7 +192,7 @@ cd guide-app && npm run build   # = check-bridge 断言 + vite build
 - **刷新间隔** - 100 / 200 / 1000 / 2000 / 5000 ms 五档（`core::config::INTERVAL_MS_ALLOWED`）
 - **大小档位** - 75% / 100% / 125% / 150% / 200%
 - **网速单位** - KB/s / MB/s / GB/s 切换
-- **形状选择** - 圆角 / 直角 / 纯内容（无背景）
+- **卡片圆角** - 固定圆角（审查 282：独立的形状选择已随卡片式移除）
 - **颜色定制** - 背景色 + 文字色（支持 HEX 输入）
 
 ### 技术亮点

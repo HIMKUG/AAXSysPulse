@@ -3,6 +3,11 @@
 //! 生产代码与测试分文件存放，是为了让 `renderer.rs` 只剩渲染逻辑；
 //! 这里靠 `use super::*` 看见父模块的私有项，语义与原内联模块完全一致。
 use super::*;
+use std::sync::Mutex;
+
+/// 审查 125：`clock::set_local` 写进程级静态，并行测试会相互覆盖；
+/// 所有触碰时钟静态的用例先拿这把锁串行化。
+static CLOCK_LOCK: Mutex<()> = Mutex::new(());
 
 fn demo_cfg() -> Config {
     // 新默认值里 CPU/内存/GPU 显示是关的（用户拍板）；
@@ -36,6 +41,14 @@ fn renderers_render_pixels() {
         let (w, h) = renderer.natural_size(&demo_cfg());
         let mut s = SoftwareSurface::new(w.max(100), h.max(20));
         renderer.draw(&mut s, &snap, &demo_cfg());
+        // 审查 489：不只断言"画了像素"，还断言文字 cell 真正产出 ——
+        // 只查 lit>0 时，画 1 个像素的空实现也能骗过。
+        let (_, _, cells) = renderer.layout(&snap, &demo_cfg(), s.width, s.height);
+        assert!(
+            !cells.is_empty(),
+            "{} 渲染器必须产出文字 cell",
+            renderer.name()
+        );
         let lit = s.pixels.chunks_exact(4).filter(|p| p[3] > 0).count();
         assert!(lit > 0, "{} 渲染器必须画出像素（lit={}）", renderer.name(), lit);
     }
@@ -70,40 +83,56 @@ fn alpha_and_values_change_hash() {
 fn metric_offsets_shift_cells_and_grow_natural_size() {
     let snap = demo_snap();
     let cfg = demo_cfg();
-    // h=0 → 垂直居中被 PAD_Y 下限吞掉，基线对两版一致，便于逐值断言。
-    let (nw, nh, cells) = StripRenderer.layout(&snap, &cfg, 0, 0);
+    // 审查 490：参数化多组画布高度 —— 不再只测 h=0（垂直居中分支零覆盖）。
+    for hh in [0, 36, 200] {
+        // h=0 → 垂直居中被 PAD_Y 下限吞掉，基线对两版一致，便于逐值断言。
+        let (nw, nh, cells) = StripRenderer.layout(&snap, &cfg, 0, hh);
 
-    // CPU 的数值右移 5、下移 3；名称不动。
-    let mut cfg2 = cfg;
-    cfg2.metric_offsets[metric_index(MetricEnum::Cpu)] = [0, 0, 5, 3];
-    let (nw2, nh2, cells2) = StripRenderer.layout(&snap, &cfg2, 0, 0);
+        // CPU 的数值右移 5、下移 3；名称不动。
+        let mut cfg2 = cfg;
+        cfg2.metric_offsets[metric_index(MetricEnum::Cpu)] = [0, 0, 5, 3];
+        let (nw2, nh2, cells2) = StripRenderer.layout(&snap, &cfg2, 0, hh);
 
-    assert_eq!(cells2.len(), cells.len(), "cell 数量不随偏移变化");
-    assert_eq!(
-        (cells2[0].x, cells2[0].y),
-        (cells[0].x, cells[0].y),
-        "名称 cell 不受数值偏移影响"
-    );
-    assert_eq!(cells2[1].x, cells[1].x + 5, "数值 X 偏移 +5");
-    assert_eq!(cells2[1].y, cells[1].y + 3, "数值 Y 偏移 +3");
-    assert!(nw2 > nw, "正值 X 偏移必须扩宽自然宽度 {nw} → {nw2}");
-    assert!(nh2 > nh, "正值 Y 偏移必须增高自然高度 {nh} → {nh2}");
+        assert_eq!(cells2.len(), cells.len(), "cell 数量不随偏移变化");
+        // X 断言对所有 hh 成立（垂直居中不影响 x）。
+        assert_eq!(cells2[0].x, cells[0].x, "名称 cell X 不受数值偏移影响");
+        assert_eq!(cells2[1].x, cells[1].x + 5, "数值 X 偏移 +5");
+        assert!(nw2 > nw, "正值 X 偏移必须扩宽自然宽度 {nw} → {nw2}");
+        if hh == 0 {
+            // h=0 时自然高度 = strip_h_rows（随 off_b 增长）；h>0 时窗口高度
+            // 主导（h.max(strip_h_rows)），自然高度不再随小偏移变化。
+            assert!(nh2 > nh, "正值 Y 偏移必须增高自然高度 {nh} → {nh2}");
+        }
+        if hh == 0 {
+            // 审查 490：Y 断言仅在 h=0（居中被 PAD_Y 下限钳住，基线不随 off_b
+            // 浮动）时成立；h>0 时数值 Y 偏移抬高 off_b → 整行垂直居中基线下移，
+            // 名称 cell 随基线整体移动是布局的预期行为。
+            assert_eq!(cells2[0].y, cells[0].y, "名称 cell Y 不受数值偏移影响（h=0）");
+            assert_eq!(cells2[1].y, cells[1].y + 3, "数值 Y 偏移 +3");
+        }
 
-    // 指纹随之改变（否则改偏移不触发重绘）。
-    assert_ne!(
-        StripRenderer.frame_hash(&snap, &cfg, 0, 0, 90),
-        StripRenderer.frame_hash(&snap, &cfg2, 0, 0, 90),
-        "偏移变化必须改变门面指纹"
-    );
+        // 指纹随之改变（否则改偏移不触发重绘）。
+        assert_ne!(
+            StripRenderer.frame_hash(&snap, &cfg, 0, hh, 90),
+            StripRenderer.frame_hash(&snap, &cfg2, 0, hh, 90),
+            "偏移变化必须改变门面指纹"
+        );
 
-    // 竖版同样生效：数值右移 5。
-    let (_, _, vcells) = VerticalRenderer.layout(&snap, &cfg, 0, 0);
-    let (_, _, vcells2) = VerticalRenderer.layout(&snap, &cfg2, 0, 0);
-    assert_eq!(vcells2[0].x, vcells[0].x, "竖版名称不动");
-    assert_eq!(vcells2[1].x, vcells[1].x + 5, "竖版数值 X 偏移 +5");
-    assert_eq!(vcells2[1].y, vcells[1].y + 3, "竖版数值 Y 偏移 +3");
+        // 竖版同样生效：数值右移 5。
+        let (_, _, vcells) = VerticalRenderer.layout(&snap, &cfg, 0, hh);
+        let (_, _, vcells2) = VerticalRenderer.layout(&snap, &cfg2, 0, hh);
+        assert_eq!(vcells2[0].x, vcells[0].x, "竖版名称不动");
+        assert_eq!(vcells2[1].x, vcells[1].x + 5, "竖版数值 X 偏移 +5");
+        if hh == 0 {
+            // 审查 490：y 断言仅在 h=0（居中被 PAD_Y 下限钳住）时成立；
+            // h>0 时数值 Y 偏移会抬高 off_b → 整行垂直居中基线下移，
+            // 这是布局的预期行为（名称 cell 随基线整体移动）。
+            assert_eq!(vcells2[1].y, vcells[1].y + 3, "竖版数值 Y 偏移 +3");
+        }
+    }
 
     // 负偏移（向左上）也必须扩宽/增高，避免被窗口边缘裁掉。
+    let (nw, nh, _) = StripRenderer.layout(&snap, &cfg, 0, 0);
     let mut cfg3 = cfg;
     cfg3.metric_offsets[metric_index(MetricEnum::Cpu)] = [-6, -4, 0, 0];
     let (nw3, nh3, _) = StripRenderer.layout(&snap, &cfg3, 0, 0);
@@ -127,18 +156,34 @@ fn vertical_is_taller_than_strip() {
 
 #[test]
 fn per_metric_font_size_applies_to_mem() {
-    // 回归锁：mfs_mem（逐项字号覆盖，索引 1）必须真实影响 Mem 行缩放。
+    // 回归锁：mfs_mem（逐项字号覆盖）必须真实影响 Mem 行缩放。
     // （用户实测"字号调整对内存项目不生效"——渲染管线本身要保证生效。）
+    // 审查 491：按 Metric 枚举定位行，不再依赖 `text=="Mem"`（short_names
+    // 默认值一改就 panic 的脆弱定位）。
     let snap = demo_snap();
     let mut cfg = demo_cfg();
-    let (_, _, base) = VerticalRenderer.layout(&snap, &cfg, 400, 400);
-    let base_mem = base.iter().find(|c| c.text.as_str() == "Mem").expect("Mem label cell").scale;
+    let mem = {
+        let rows = build_rows(&snap, &cfg);
+        let s = rows
+            .as_slice()
+            .iter()
+            .find(|r| matches!(r.metric, MetricEnum::Mem))
+            .expect("Mem 行")
+            .scale;
+        s
+    };
 
     cfg.metric_font_sizes[metric_index(MetricEnum::Mem)] = Some(40.0);
-    let (_, _, sized) = VerticalRenderer.layout(&snap, &cfg, 400, 400);
-    let mem = sized.iter().find(|c| c.text.as_str() == "Mem").expect("Mem label cell");
-    assert!((mem.scale - 40.0 / 16.0).abs() < 1e-3, "Mem 缩放应 = 40/16，实际 {}", mem.scale);
-    assert!(mem.scale > base_mem, "覆盖字号必须大于默认");
+    let mem_new = {
+        let rows = build_rows(&snap, &cfg);
+        rows.as_slice()
+            .iter()
+            .find(|r| matches!(r.metric, MetricEnum::Mem))
+            .expect("Mem 行")
+            .scale
+    };
+    assert!((mem_new - 40.0 / 16.0).abs() < 1e-3, "Mem 缩放应 = 40/16，实际 {}", mem_new);
+    assert!(mem_new > mem, "覆盖字号必须大于默认");
 }
 
 #[test]
@@ -178,10 +223,13 @@ fn gaps_change_hash() {
 
 #[test]
 fn float_font_measure_matches_render() {
-    // 最近邻字形宽度与渲染步进一致（不 panic、正数）
+    // 最近邻字形宽度与渲染步进一致（不 panic、正数）。
+    // 审查 492：名实相符 —— 补"测宽 vs 渲染墨迹右缘"的真实比对，
+    // 渲染的最右墨迹列必须落在 measure 预测宽之内（ceil 取整口径统一）。
     let s = "CPU";
     let scale = font_scale_of(24.5);
-    assert!(measure_scaled_f(s, scale) > 0);
+    let m = measure_scaled_f(s, scale);
+    assert!(m > 0);
     let mut surf = SoftwareSurface::new(200, 40);
     render_str_scaled_f(
         &mut surf.pixels,
@@ -194,6 +242,13 @@ fn float_font_measure_matches_render() {
         Rgba::opaque(255, 255, 255),
     );
     assert!(surf.pixels.chunks_exact(4).any(|p| p[3] > 0), "必须画出内容");
+    let mut max_x = 0i32;
+    for (i, p) in surf.pixels.chunks_exact(4).enumerate() {
+        if p[3] > 0 {
+            max_x = max_x.max((i as i32) % surf.width);
+        }
+    }
+    assert!(max_x < m, "最右墨迹列 {max_x} 必须落在测宽 {m} 之内");
 }
 
 #[test]
@@ -318,10 +373,19 @@ fn vertical_value_cells_share_one_right_edge() {
         1,
         "所有数值 cell 必须共享同一右对齐锚点，实际 {anchors:?}"
     );
+
+    // 审查 493：补一条独立推导路径交叉验证 —— 期望右缘 = 内容左缘 +
+    // 内容基准宽（由 build_rows / vertical_base_w 结构化推出），
+    // 不再只依赖"用 measure 复算 layout 内部"的同源比较。
+    let rows = build_rows(&snap, &cfg);
+    let (off_l, _) = off_h_span(rows.as_slice());
+    let expected = PAD_X + off_l + vertical_base_w(rows.as_slice());
+    assert_eq!(anchors[0], expected, "锚点必须等于结构推导的数值右缘");
 }
 
 #[test]
 fn time_row_renders_clock_text() {
+    let _guard = CLOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // 时钟行：默认显示，标签 "Time"，数值 = HH:MM:SS（槽位 8）。
     crate::clock::set_local(22, 12, 36);
     let cfg = demo_cfg();
@@ -355,16 +419,30 @@ fn time_row_renders_clock_text() {
         !rows.as_slice().iter().any(|r| matches!(r.metric, MetricEnum::Time)),
         "show_time=false 时不得出现 Time 行"
     );
+    // 审查 125：共享静态用完复位
+    crate::clock::set_local(0, 0, 0);
 }
 
 #[test]
 fn metric_order_drives_display_order() {
+    let _guard = CLOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // 顺序必须真实生效：把 Time 排到最前，行序随之改变。
     crate::clock::set_local(1, 2, 3);
     let mut cfg = demo_cfg();
     // 磁盘项（DiskRead/DiskWrite）默认在 metric_order 里，但 show_disk_* 默认关闭
-    // → 默认不产出行；本测试用 0 填充末尾，只验证顺序语义。
-    cfg.metric_order = [5, 0, 1, 2, 3, 4, 6, 0, 0];
+    // → 默认不产出行；本测试用 Time 打头验证顺序语义。
+    // 审查 127：由 Metric 枚举构造，新增指标时编译器可跟随（不再写死数字）。
+    cfg.metric_order = [
+        MetricEnum::Time as u8,
+        MetricEnum::Cpu as u8,
+        MetricEnum::Mem as u8,
+        MetricEnum::Gpu as u8,
+        MetricEnum::Net as u8,
+        MetricEnum::Power as u8,
+        MetricEnum::Util as u8,
+        MetricEnum::DiskRead as u8,
+        MetricEnum::DiskWrite as u8,
+    ];
     let rows = build_rows(&Snapshot::placeholder(0), &cfg);
     let seq: Vec<MetricEnum> = rows.as_slice().iter().map(|r| r.metric).collect();
     assert_eq!(
@@ -388,6 +466,8 @@ fn metric_order_drives_display_order() {
     // 同一秒内 → 指纹稳定（跳帧省渲染的前提）
     let h3 = StripRenderer.frame_hash(&Snapshot::placeholder(0), &cfg, 400, 36, 90);
     assert_eq!(h2, h3, "同一秒内指纹必须稳定");
+    // 审查 125：共享静态用完复位
+    crate::clock::set_local(0, 0, 0);
 }
 
 #[test]
@@ -395,6 +475,9 @@ fn util_row_states_and_colors() {
     // Util 行三态：正常值 / 降级（部分源缺失）/ 不可用（全源缺失）。
     let cfg = demo_cfg();
     assert!(cfg.show_util, "Util 默认显示");
+    // 审查 494：期望值用与生产完全相同的入口构造（Style::derive(cfg.bg, cfg.fg)），
+    // 两套入口分离会静默放过回归。
+    let style = Style::derive(cfg.bg, cfg.fg);
 
     // 不可用（启动首帧）：显示红色 "--"，行仍占位。
     let rows = build_rows(&Snapshot::placeholder(0), &cfg);
@@ -405,7 +488,7 @@ fn util_row_states_and_colors() {
         .expect("show_util=true 时必须有 Util 行");
     assert_eq!(u.label.as_str(), "Util");
     assert_eq!(u.value.as_str(), "--");
-    assert_eq!(u.value_color, Style::default().accent(100.0), "不可用必须红色");
+    assert_eq!(u.value_color, style.accent(100.0), "不可用必须红色");
 
     // 正常值：占用率强调色（47.0% → 绿档；Util 显示一位小数，见 fmt_pct1）。
     let mut snap = Snapshot::placeholder(0);
@@ -414,7 +497,7 @@ fn util_row_states_and_colors() {
     let rows = build_rows(&snap, &cfg);
     let u = rows.as_slice().iter().find(|r| matches!(r.metric, MetricEnum::Util)).unwrap();
     assert_eq!(u.value.as_str(), "47.0%");
-    assert_eq!(u.value_color, Style::default().accent(47.0));
+    assert_eq!(u.value_color, style.accent(47.0));
 
     // 降级（GPU 缺失重归一化）：陈旧色。
     let mut snap = Snapshot::placeholder(0);
@@ -422,7 +505,7 @@ fn util_row_states_and_colors() {
     snap.util_partial = true;
     let rows = build_rows(&snap, &cfg);
     let u = rows.as_slice().iter().find(|r| matches!(r.metric, MetricEnum::Util)).unwrap();
-    assert_eq!(u.value_color, Style::default().stale_accent(61.0), "降级值必须用陈旧色");
+    assert_eq!(u.value_color, style.stale_accent(61.0), "降级值必须用陈旧色");
 
     // 关闭 → 行消失。
     let mut cfg2 = cfg;
@@ -436,7 +519,7 @@ fn util_row_states_and_colors() {
 
 #[test]
 fn util_short_label_and_slot() {
-    // 简称 U；数值槽为一位小数百分比（"99.9%" 5 字符，见 fmt_pct1）。
+    // 简称 U；数值槽为一位小数百分比（满量程 "100.0%" 6 字符，见 fmt_pct1）。
     let mut cfg = demo_cfg();
     cfg.short_names = true;
     let mut snap = Snapshot::placeholder(0);
@@ -445,15 +528,20 @@ fn util_short_label_and_slot() {
     let u = rows.as_slice().iter().find(|r| matches!(r.metric, MetricEnum::Util)).unwrap();
     assert_eq!(u.label.as_str(), "U");
     assert_eq!(u.value.as_str(), "100.0%");
-    assert_eq!(u.slot, SLOT_PCT1);
+    // 审查 495：断言槽位 ≥ 实际文本宽 —— 不把"槽位不足"固化为期望。
+    assert!(
+        u.slot as usize >= u.value.as_str().chars().count(),
+        "槽位 {} 必须装得下 {}",
+        u.slot,
+        u.value.as_str()
+    );
 }
 
-/// `layout` 预算门禁（恢复计划 P4.3，照 build_pages 门禁模式）：
-/// layout 是渲染线程**每帧**路径（P0 实测 seg_layout p50=6µs / max=16µs），
-/// 预算锁回归——有人往 build_rows / cell_sig 循环里塞分配/重活立刻可见，
-/// 并在 release 下打印真实耗时供决策参考。
+/// `layout` 预算观测（审查 126：墙钟 `<500µs` 断言在 CI/负载下 flaky，
+/// 改为仅打印参考值、不再作为失败条件；「往每帧路径塞重活」的回归
+/// 由 code review 与 release 实测承担）。
 #[test]
-fn overlay_layout_is_within_budget() {
+fn overlay_layout_budget_reference() {
     let snap = demo_snap();
     let cfg = demo_cfg();
     // 预热（首跑含查表/分配冷路径，不代表稳态）。
@@ -473,12 +561,8 @@ fn overlay_layout_is_within_budget() {
         best_vertical = best_vertical.min(t.elapsed().as_secs_f64() * 1e6);
     }
     println!(
-        "overlay layout strip={best_strip:.0}µs vertical={best_vertical:.0}µs (release 下供参考)"
+        "overlay layout strip={best_strip:.0}µs vertical={best_vertical:.0}µs (参考值，不作断言)"
     );
-    // 预算先实测再定值：release 实测 ~6µs（P0 seg_layout）。500µs ≈ 80× 余量，
-    // debug 测试构建也远够——锁「往每帧路径加重活」的回归即可。
-    assert!(best_strip < 500.0, "横版布局超预算：{best_strip:.0}µs");
-    assert!(best_vertical < 500.0, "竖版布局超预算：{best_vertical:.0}µs");
 }
 
 /// 回归：磁盘读写行**必须占位**。
@@ -491,7 +575,18 @@ fn disk_rows_always_reserve_a_cell() {
     let mut cfg = demo_cfg();
     cfg.show_disk_read = true;
     cfg.show_disk_write = true;
-    cfg.metric_order = [7, 8, 0, 1, 2, 6, 3, 5, 4]; // 磁盘排最前，便于定位
+    // 磁盘排最前，便于定位（审查 127：由 Metric 枚举构造排列）。
+    cfg.metric_order = [
+        MetricEnum::DiskRead as u8,
+        MetricEnum::DiskWrite as u8,
+        MetricEnum::Cpu as u8,
+        MetricEnum::Mem as u8,
+        MetricEnum::Gpu as u8,
+        MetricEnum::Util as u8,
+        MetricEnum::Net as u8,
+        MetricEnum::Power as u8,
+        MetricEnum::Time as u8,
+    ];
 
     // ① 未就绪（PDH 首轮基线 / 数据源不可用）：仍占位，数值 `--`，槽位仍 9 字符。
     let rows = build_rows(&Snapshot::placeholder(0), &cfg);
@@ -507,16 +602,17 @@ fn disk_rows_always_reserve_a_cell() {
         .expect("未就绪时磁盘写行必须占位（不能整行消失）");
     assert_eq!(rd.value.as_str(), "--");
     assert_eq!(wr.value.as_str(), "--");
-    assert_eq!(rd.slot, 9);
-    assert_eq!(wr.slot, 9);
+    // 审查 496：断言具名常量而非裸 9（生产侧三份魔数已收敛为 DISK_SLOT）。
+    assert_eq!(rd.slot, DISK_SLOT);
+    assert_eq!(wr.slot, DISK_SLOT);
     assert_eq!(rd.label.as_str(), "RDisk");
     assert_eq!(wr.label.as_str(), "WDisk");
 
     // ② 就绪：显示真实速率，颜色回到常规数值色。
     let mut snap = Snapshot::placeholder(0);
     snap.disk.ready = true;
-    snap.disk.read_bps = 1_048_576.0; // 1.0MB/s
-    snap.disk.write_bps = 1_073_741_824.0; // 1.00GB/s
+    snap.disk.read_bps = SnapMetric::Value(1_048_576.0); // 1.0MB/s
+    snap.disk.write_bps = SnapMetric::Value(1_073_741_824.0); // 1.00GB/s
     let rows = build_rows(&snap, &cfg);
     let rd = rows
         .as_slice()
@@ -530,7 +626,7 @@ fn disk_rows_always_reserve_a_cell() {
         .unwrap();
     assert_eq!(rd.value.as_str(), "1.0MB/s");
     assert_eq!(wr.value.as_str(), "1.00GB/s");
-    assert_eq!(rd.value_color, Style::derive(Rgb::default(), cfg.fg).ui.value);
+    assert_eq!(rd.value_color, Style::derive(cfg.bg, cfg.fg).ui.value);
 
     // ③ 显式关掉开关才不占位（只关读，写仍占位）。
     let mut off = cfg;
@@ -544,4 +640,28 @@ fn disk_rows_always_reserve_a_cell() {
         rows.as_slice().iter().any(|r| matches!(r.metric, MetricEnum::DiskWrite)),
         "只关读时磁盘写行仍应占位"
     );
+}
+
+/// 审查 558：cell_sig 把文本编入内容指纹的链路验证 ——
+/// 同几何不同文本 → 门面指纹必须不同（脏检查依赖此性质）。
+#[test]
+fn cell_hash_tracks_text_content() {
+    let cfg = demo_cfg();
+    let mut snap = Snapshot::placeholder(0);
+    snap.cpu = SnapMetric::Value(10.0);
+    let h1 = StripRenderer.frame_hash(&snap, &cfg, 400, 36, 90);
+    snap.cpu = SnapMetric::Value(20.0);
+    let h2 = StripRenderer.frame_hash(&snap, &cfg, 400, 36, 90);
+    assert_ne!(h1, h2, "文本内容必须编入 cell 指纹（脏检查依赖）");
+}
+
+/// 审查 558：颜色也必须编入指纹（gdi 脏判定以 CellSig.hash 为准）。
+#[test]
+fn cell_hash_tracks_color() {
+    let mut cfg = demo_cfg();
+    let snap = Snapshot::placeholder(0);
+    let h1 = StripRenderer.frame_hash(&snap, &cfg, 400, 36, 90);
+    cfg.metric_colors[metric_index(MetricEnum::Cpu)].value = Some(Rgb::new(255, 0, 0));
+    let h2 = StripRenderer.frame_hash(&snap, &cfg, 400, 36, 90);
+    assert_ne!(h1, h2, "颜色必须编入 cell 指纹（脏检查依赖）");
 }

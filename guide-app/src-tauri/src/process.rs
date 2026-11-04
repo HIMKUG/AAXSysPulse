@@ -14,8 +14,9 @@ static GUIDE_MUTEX_HANDLE: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 /// 刻意用会话局部命名空间（不带 `Global\`）：`Global\` 需要
 /// `SeCreateGlobalPrivilege`，标准用户下 `CreateMutexW` 直接 `ACCESS_DENIED`，
 /// 会让"是否已有实例"的判定彻底失真。引导不需要跨会话单实例。
+/// 审查 005：已收进契约唯一真源（`contract::GUIDE_MUTEX_NAME`），此处不再留副本。
 #[cfg(windows)]
-const GUIDE_MUTEX_NAME: &str = "Local\\AAXSysPulseGuide_SingleInstance";
+const GUIDE_MUTEX_NAME: &str = aaxsyspulse_core::contract::GUIDE_MUTEX_NAME;
 
 /// 主程序悬浮窗窗口类名：契约常量（审查项 7.1.2 / P1-22），与 `notify.rs` 同源。
 #[cfg(windows)]
@@ -39,10 +40,8 @@ pub fn acquire_guide_single_instance() -> bool {
         return true; // 本进程已持有，重复调用不应自我否决
     }
 
-    let name_wide: Vec<u16> = GUIDE_MUTEX_NAME
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    // 续篇 662：宽字符转换统一走契约 `wide_of`（另见 :101/:223 的同类重复）
+    let name_wide: Vec<u16> = aaxsyspulse_core::contract::wide_of(GUIDE_MUTEX_NAME);
 
     unsafe {
         match CreateMutexW(None, false, PCWSTR::from_raw(name_wide.as_ptr())) {
@@ -59,9 +58,10 @@ pub fn acquire_guide_single_instance() -> bool {
                 }
             }
             Err(e) => {
-                // 创建失败（极端环境）不应阻塞安装流程，但要留下痕迹。
+                // 首轮 250：创建失败曾 warn 后放行 —— 两个实例会并发改服务/写同一
+                // INI。如实返回 false（宁可退出，也不裸奔并发写）。
                 tracing::warn!("CreateMutexW for guide single-instance failed: {}", e);
-                true
+                false
             }
         }
     }
@@ -77,9 +77,13 @@ pub fn release_guide_single_instance() {
     let raw = GUIDE_MUTEX_HANDLE.swap(0, Ordering::AcqRel);
     if raw != 0 {
         unsafe {
-            let _ = windows::Win32::Foundation::CloseHandle(
+            // 续篇 663：CloseHandle 失败曾被吞 —— 提权重启的新实例仍可能撞锁，
+            // 至少告警一次留排查线索。
+            if let Err(e) = windows::Win32::Foundation::CloseHandle(
                 windows::Win32::Foundation::HANDLE(raw as *mut core::ffi::c_void),
-            );
+            ) {
+                tracing::warn!("release_guide_single_instance: CloseHandle failed: {e}");
+            }
         }
     }
 }
@@ -98,10 +102,8 @@ pub fn main_process_pid() -> Option<u32> {
     use windows::core::PCWSTR;
     use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId};
 
-    let class_wide: Vec<u16> = MAIN_WINDOW_CLASS
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    // 续篇 662：宽字符转换统一走契约 `wide_of`
+    let class_wide: Vec<u16> = aaxsyspulse_core::contract::wide_of(MAIN_WINDOW_CLASS);
     let hwnd = unsafe { FindWindowW(PCWSTR::from_raw(class_wide.as_ptr()), PCWSTR::null()) }.ok()?;
     let mut pid = 0u32;
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid as *mut u32)) };
@@ -115,6 +117,50 @@ pub fn main_process_pid() -> Option<u32> {
 #[cfg(not(windows))]
 pub fn main_process_pid() -> Option<u32> {
     None
+}
+
+/// 校验窗口是否属于主程序进程（首轮 012 / 013 的归属校验 helper）。
+///
+/// 只按类名 FindWindowW 取第一个 HWND，同名类/残留窗口会收错消息、量错位置。
+/// 这里用 `GetWindowThreadProcessId` + `QueryFullProcessImageNameW` 反查窗口
+/// 归属进程的映像名，必须等于契约里的主程序 exe 名才算数。
+#[cfg(windows)]
+pub fn hwnd_belongs_to_main_process(hwnd: windows::Win32::Foundation::HWND) -> bool {
+    use windows::core::PWSTR;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid as *mut u32)) };
+    if pid == 0 {
+        return false;
+    }
+    let Ok(handle) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
+        return false;
+    };
+    let mut buf = [0u16; 512];
+    let mut len = buf.len() as u32;
+    let ok = unsafe {
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+    }
+    .is_ok();
+    unsafe {
+        let _ = windows::Win32::Foundation::CloseHandle(handle);
+    }
+    if !ok {
+        return false;
+    }
+    let image = String::from_utf16_lossy(&buf[..len as usize]).to_ascii_lowercase();
+    let expected = aaxsyspulse_core::contract::MAIN_EXE_NAME.to_ascii_lowercase();
+    image.ends_with(&format!("\\{expected}"))
 }
 
 /// 主程序资源占用真值：`(生命周期 CPU 平均占用百分比, 工作集字节数)`。
@@ -162,28 +208,29 @@ pub fn main_process_usage() -> Option<(f64, u64)> {
     let mem_bytes = if mem_ok { counters.WorkingSetSize as u64 } else { 0 };
 
     if !times_ok {
-        return if mem_bytes > 0 { Some((0.0, mem_bytes)) } else { None };
+        // 首轮 250：GetProcessTimes 失败曾伪造 0.0% CPU —— 与本函数"不再伪造"
+        // 的口径矛盾。返回 None 让前端显示"未取到"。
+        return None;
     }
 
     let to_u64 = |ft: &FILETIME| {
         ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64)
     };
-    let busy = to_u64(&kernel) + to_u64(&user);
+    // 续篇 664：普通加法在 FILETIME 极端值下 debug 会溢出 panic —— saturating。
+    let busy = to_u64(&kernel).saturating_add(to_u64(&user));
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64 / 100 + FILETIME_UNIX_EPOCH_DIFF)
-        .unwrap_or_else(|_| to_u64(&creation) + 1);
+        // 续篇 665：SystemTime 不可用（时钟早于 1970）时回落到进程创建时刻 ——
+        // 两侧本就是同一 FILETIME 口径（主分支 = UNIX 纪元换算 + EPOCH_DIFF），
+        // 单位一致无需再补差值，仅保证 alive >= 1。
+        .unwrap_or_else(|_| to_u64(&creation).saturating_add(1));
     let alive = now.saturating_sub(to_u64(&creation)).max(1);
-    let cpu_avg_percent = (busy as f64 / alive as f64) * 100.0;
+    // 续篇 666：多核进程生命周期均值可超 100% —— 钳到 100，完成页不再显示 >100%。
+    let ratio = (busy as f64 / alive as f64) * 100.0;
+    let cpu_avg_percent = if ratio.is_finite() { ratio.min(100.0) } else { 0.0 };
 
-    Some((
-        if cpu_avg_percent.is_finite() {
-            (cpu_avg_percent * 10.0).round() / 10.0
-        } else {
-            0.0
-        },
-        mem_bytes,
-    ))
+    Some(((cpu_avg_percent * 10.0).round() / 10.0, mem_bytes))
 }
 
 #[cfg(not(windows))]
@@ -220,10 +267,8 @@ pub fn request_main_close() -> bool {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_CLOSE};
 
-    let class_wide: Vec<u16> = MAIN_WINDOW_CLASS
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    // 续篇 662：宽字符转换统一走契约 `wide_of`
+    let class_wide: Vec<u16> = aaxsyspulse_core::contract::wide_of(MAIN_WINDOW_CLASS);
     let hwnd = match unsafe { FindWindowW(PCWSTR::from_raw(class_wide.as_ptr()), PCWSTR::null()) } {
         Ok(h) => h,
         Err(_) => return false,
@@ -276,8 +321,14 @@ pub fn start_main_process(app: Option<&tauri::AppHandle>) -> Result<(), String> 
         return Err(format!("主程序不存在: {}", exe_path.display()));
     }
 
+    // 首轮 250：`parent().unwrap_or(&exe_path)` 会把 exe **文件**当工作目录 ——
+    // 取不到父目录就如实报错。
+    let workdir = exe_path
+        .parent()
+        .ok_or_else(|| format!("主程序路径无父目录：{}", exe_path.display()))?;
+
     Command::new(&exe_path)
-        .current_dir(exe_path.parent().unwrap_or(&exe_path))
+        .current_dir(workdir)
         .spawn()
         .map_err(|e| format!("Failed to start main process: {}", e))?;
 

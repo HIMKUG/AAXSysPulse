@@ -72,6 +72,15 @@ use cfg_ref::{CfgRef, Value};
 /// 监控项容量（柔性框架）：恒随 `Metric::COUNT` 扩展，设置页逐指标数组一律用它。
 const N_METRICS: usize = aaxsyspulse_core::types::Metric::COUNT;
 
+/// 设置页页数（审查 303：`Vec::with_capacity` / `pages` 数组 / `sidebar_at` /
+/// 侧边栏绘制四处写死 6/7 收敛于此）。
+/// 审查 348：与图标清单（侧边栏"唯一真值来源"）编译期钉死一致。
+const PAGE_COUNT: usize = 7;
+const _: () = assert!(
+    PAGE_COUNT == icons::IconKind::ALL.len(),
+    "侧边栏导航项数（IconKind::ALL）与设置页页数不一致"
+);
+
 use layout::{
     build_pages, content_origin, content_viewport, page_caption, s, CARD_PAD, CARD_RADIUS,
     CAPTION_GAP, CAPTION_H, FOOTNOTE_H,
@@ -99,7 +108,7 @@ const WM_NCHITTEST: u32 = 0x0084;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_LBUTTONUP: u32 = 0x0202;
-const WM_MOUSELEAVE: u32 = 0x02A2;
+const WM_MOUSELEAVE: u32 = 0x02A3; // 审查 301：0x02A2 是 WM_NCMOUSELEAVE；TrackMouseEvent 发的是 0x02A3
 const WM_CAPTURECHANGED: u32 = 0x0215;
 const WM_KEYDOWN: u32 = 0x0100;
 const WM_CHAR: u32 = 0x0102;
@@ -135,6 +144,12 @@ const DESTROY_TIMER: usize = 15;
 /// DESTROY_TIMER 的延时（毫秒）。
 const DESTROY_DELAY_MS: u32 = 6500;
 const STEPPER_REPEAT_MS: u32 = 60;
+/// 步进器长按首延迟（审查 334：原 350ms 裸魔数）。
+const STEPPER_FIRST_DELAY_MS: u32 = 350;
+/// 动画主时钟帧间隔（审查 333：三处 16ms 裸魔数收敛于此）。
+const ANIM_FRAME_MS: u32 = 16;
+/// 输入框字符上限（审查 341：原 16 裸魔数）。
+const INPUT_MAX_CHARS: usize = 16;
 
 // ── GDI extern（window.rs 的声明是私有的，此处独立声明） ─
 #[link(name = "user32")]
@@ -177,7 +192,7 @@ struct SettingsCtx {
     theme: Theme,
     dpi: u32,
     hand: HCURSOR,
-    pages: [Page; 7],
+    pages: [Page; PAGE_COUNT],
     /// 当前分页。
     page: usize,
     /// 翻页动画（None = 无动画进行中）。
@@ -328,12 +343,15 @@ impl SettingsCtx {
 
     /// 标记单个控件需要重绘。
     fn invalidate_widget(&mut self, idx: usize) {
-        if let Some(ref mut v) = self.dirty {
-            if !v.contains(&idx) {
-                v.push(idx);
+        match &mut self.dirty {
+            Some(v) => {
+                if !v.contains(&idx) {
+                    v.push(idx);
+                }
             }
-        } else {
-            self.dirty = Some(vec![idx]);
+            // 审查 302：None = 全量重绘 —— 降级成单控件集合会静默丢掉全量语义，
+            // 未重绘的控件残留旧像素。
+            None => {}
         }
     }
 
@@ -356,7 +374,7 @@ impl SettingsCtx {
                 .map(|d| d.order)
                 .unwrap_or(cfg.metric_order);
             build_pages(&mut self.pages, &cfg, lang, dpi, client_w, &expand, &order);
-            let mut grids = Vec::with_capacity(6);
+            let mut grids = Vec::with_capacity(PAGE_COUNT);
             for page in &self.pages {
                 let mut grid =
                     state::SpatialGrid::new(client_w, page.h.max(s(dpi, 200)), s(dpi, 30));
@@ -387,17 +405,22 @@ impl SettingsCtx {
     }
 }
 
+/// 三处逐字重复的弹簧参数选择收敛于此（审查 304）。
+fn sheet_params() -> (f32, f32) {
+    if motion::animations_enabled() {
+        (motion::K_SHEET, motion::C_SHEET)
+    } else {
+        (motion::K_REDUCED, motion::C_REDUCED)
+    }
+}
+
 /// 翻页动画进度（H3）：弹簧驱动，返回 (水平偏移px, 不透明度0..1)。
 /// 可中断：切页时不重置弹簧，仅由 `dispatch(SetPage)` 在「非动画中」时置初值。
 fn anim_params(ctx: &mut SettingsCtx, dt: f32) -> (f32, f32) {
     if ctx.page_anim.is_none() {
         return (0.0, 1.0);
     }
-    let (k, damp) = if motion::animations_enabled() {
-        (motion::K_SHEET, motion::C_SHEET)
-    } else {
-        (motion::K_REDUCED, motion::C_REDUCED)
-    };
+    let (k, damp) = sheet_params();
     let settled_s = ctx.page_slide.step(0.0, dt, k, damp);
     let settled_f = ctx.page_fade.step(1.0, dt, k, damp);
     if settled_s && settled_f {
@@ -409,11 +432,7 @@ fn anim_params(ctx: &mut SettingsCtx, dt: f32) -> (f32, f32) {
 /// 推进「布局类」弹簧：折叠卡展开度 + 侧边栏选中胶囊。
 /// 返回 true = 仍在动（调用方需每帧重排，并在帧末请求下一帧）。
 fn step_layout_anims(ctx: &mut SettingsCtx, dt: f32) -> bool {
-    let (k, damp) = if motion::animations_enabled() {
-        (motion::K_SHEET, motion::C_SHEET)
-    } else {
-        (motion::K_REDUCED, motion::C_REDUCED)
-    };
+    let (k, damp) = sheet_params();
     let mut moving = false;
     for (i, sp) in ctx.metric_expand_t.iter_mut().enumerate() {
         let target = if ctx.metric_expanded[i] { 1.0 } else { 0.0 };
@@ -431,11 +450,7 @@ fn step_layout_anims(ctx: &mut SettingsCtx, dt: f32) -> bool {
 /// 拖动换位时把被挤开的邻卡弹到旧位置，这里每帧把它滑回新槽位。
 /// 返回 true = 仍有卡在滑动（需续帧重绘）。
 fn step_card_slide(ctx: &mut SettingsCtx, dt: f32) -> bool {
-    let (k, damp) = if motion::animations_enabled() {
-        (motion::K_SHEET, motion::C_SHEET)
-    } else {
-        (motion::K_REDUCED, motion::C_REDUCED)
-    };
+    let (k, damp) = sheet_params();
     let mut moving = false;
     for sp in ctx.card_slide.iter_mut() {
         if !sp.step(0.0, dt, k, damp) {
@@ -495,14 +510,16 @@ fn create_dialog(overlay: HWND) {
     unsafe {
         let Ok(hinst) = GetModuleHandleW(None) else { return };
 
-        static REGISTERED: std::sync::Once = std::sync::Once::new();
+        static REGISTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         // 类名由契约常量运行期转宽字符（审查项 7.1.2 / P1-22），本函数内两个
         // 使用点（注册 + 建窗）共用同一份缓冲，`class_w` 必须活过 CreateWindowExW。
         let class_w = aaxsyspulse_core::contract::wide_of(
             aaxsyspulse_core::contract::SETTINGS_WINDOW_CLASS,
         );
         let class_pcw = windows::core::PCWSTR(class_w.as_ptr());
-        REGISTERED.call_once(|| {
+        // 审查 305：注册失败不再被 call_once 永久缓存 —— 失败时不置位、
+        // 直接放弃建窗（重试还有机会成功）。
+        if !REGISTERED.load(Ordering::SeqCst) {
             let wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
                 lpfnWndProc: Some(settings_wndproc),
@@ -511,8 +528,13 @@ fn create_dialog(overlay: HWND) {
                 hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH::default(),
                 ..Default::default()
             };
-            let _ = RegisterClassExW(&wc);
-        });
+            if RegisterClassExW(&wc) != 0 {
+                REGISTERED.store(true, Ordering::SeqCst);
+            } else {
+                crate::probe::log("settings RegisterClassExW failed");
+                return;
+            }
+        }
 
         // 主题按配置外观解析：跟随系统 / 强制浅色 / 强制深色。
         let theme = window::get_config_of(overlay)
@@ -555,10 +577,14 @@ fn create_dialog(overlay: HWND) {
         );
         let Ok(hwnd) = hwnd else { return };
         // 双保险：初始样式去掉了 WS_THICKFRAME，此处运行时再剥一次，防止任何路径绕过。
-        // WS_POPUP=0x80000000, WS_MINIMIZEBOX=0x00020000, WS_THICKFRAME=0x00040000。
-        let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, 0x80020000_isize);
+        // 审查 307：用具名常量运算，不再手写 0x80020000。
+        let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_POPUP.0 | WS_MINIMIZEBOX.0) as isize);
         let Some(gfx) = Gfx::new(hwnd) else {
             crate::probe::log("settings Gfx::new failed (no D2D?)");
+            // 审查 306：CreateWindowExW 已成功、GWLP_UD 未设 —— 不销毁就是
+            // 一个永远不可绘制的孤儿窗口（句柄泄漏 + 单例标志脏）。
+            let _ = DestroyWindow(hwnd);
+            SETTINGS_HWND.store(-1, Ordering::SeqCst);
             return;
         };
 
@@ -630,19 +656,21 @@ fn create_dialog(overlay: HWND) {
 
 /// Win11：DWM 圆角 + 跟随主题的标题栏。
 unsafe fn apply_window_chrome(hwnd: HWND, dark: bool) {
-    let pref: i32 = 2;
+    // 审查 309：具名常量 + size_of，不再裸魔数 2/4。
+    use windows::Win32::Graphics::Dwm::DWMWCP_ROUND;
+    let pref: i32 = DWMWCP_ROUND.0;
     let _ = DwmSetWindowAttribute(
         hwnd,
         DWMWA_WINDOW_CORNER_PREFERENCE,
         &pref as *const i32 as *const _,
-        4,
+        std::mem::size_of::<i32>() as u32,
     );
     let dark_i: i32 = dark as i32;
     let _ = DwmSetWindowAttribute(
         hwnd,
         DWMWA_USE_IMMERSIVE_DARK_MODE,
         &dark_i as *const i32 as *const _,
-        4,
+        std::mem::size_of::<i32>() as u32,
     );
 }
 
@@ -677,16 +705,28 @@ fn find_hwnd(_ctx: &SettingsCtx) -> HWND {
 
 // ── 命中测试 ─────────────────────────────────────────────
 
-/// 控件命中（当前页）：空间网格 O(1)。`pt` 必须是**内容坐标**。
+/// 控件命中（当前页）：空间网格 O(1)；网格缺失时回退线性命中（审查 310）。
+/// `pt` 必须是**内容坐标**。
 fn widget_at(ctx: &SettingsCtx, pt: ContentPt) -> Option<usize> {
-    let grid = ctx.spatial_grids.get(ctx.page)?;
-    let candidates = grid.query(pt.0);
-    let hit = candidates.iter().copied().find(|&i| {
-        let w = &ctx.pages[ctx.page].widgets[i];
-        pt_in(&w.rect, pt.0)
-    });
+    let page = ctx.pages.get(ctx.page)?;
+    // 审查 311：网格返回的下标经 .get 校验 —— rebuild 后网格与控件树
+    // 可能短暂不同步，裸索引会 panic。
+    let hit_in = |cands: &[usize]| -> Option<usize> {
+        cands
+            .iter()
+            .copied()
+            .find(|&i| page.widgets.get(i).is_some_and(|w| pt_in(&w.rect, pt.0)))
+    };
+    let Some(grid) = ctx.spatial_grids.get(ctx.page) else {
+        // 审查 310：cfg 不可用等导致未建网格时回退线性命中，命中整体失效
+        // 静默无痕最难排查 —— 留日志并降级。
+        crate::probe::log("settings widget_at: no spatial grid -> linear fallback");
+        return (0..page.widgets.len())
+            .find(|&i| pt_in(&page.widgets[i].rect, pt.0));
+    };
+    let hit = hit_in(grid.query(pt.0));
     if let Some(idx) = hit {
-        let w = &ctx.pages[ctx.page].widgets[idx];
+        let w = &page.widgets[idx];
         crate::probe::log(&format!(
             "widget_at hit pt=({},{}) -> idx={} id={}",
             pt.0.x, pt.0.y, idx, w.id
@@ -703,13 +743,13 @@ fn sidebar_at(dpi: u32, pt: ClientPt) -> Option<usize> {
         return None;
     }
     let top = s(dpi, 8 + 30 + 12);
-    let step = s(dpi, SB_ITEM_H + SB_ITEM_GAP);
+    let step = s(dpi, SB_ITEM_H + SB_ITEM_GAP).max(1); // 审查 312：dpi 异常为 0 时除零防护
     let rel = pt.0.y - top;
     if rel < 0 {
         return None;
     }
     let i = rel / step;
-    if i >= 7 {
+    if i >= PAGE_COUNT as i32 {
         return None;
     }
     // 落于项间距（gap）内视为未命中
@@ -721,7 +761,11 @@ fn sidebar_at(dpi: u32, pt: ClientPt) -> Option<usize> {
 
 /// 鼠标是否在内容区（用于滚轮与滚动条拖拽的归属判定）。
 fn in_content(dpi: u32, client_w: i32, pt: ClientPt) -> bool {
-    pt.0.x >= s(dpi, SIDEBAR_W) && pt.0.x < client_w
+    // 审查 313：补 y 下界 —— 标题栏区域不属于内容区（此前只判 x，
+    // 鼠标在标题栏但 x 落在内容区范围时滚轮仍会滚动内容）。
+    pt.0.y >= crate::dpi::scale_logical(crate::titlebar::TB_H, dpi)
+        && pt.0.x >= s(dpi, SIDEBAR_W)
+        && pt.0.x < client_w
 }
 
 // ── 监控项卡片拖拽排序 ───────────────────────────────────
@@ -805,8 +849,15 @@ fn card_drag_move(ctx: &mut SettingsCtx, cpt: ContentPt) {
         shift_card(ctx, page_idx, npos_now, y_off_new);
         // 邻卡现在落在 order 的 `pos` 处（被拖动卡在 `npos_now`）；
         // 弹簧初值 = 旧顶 − 新顶，使其从旧位置滑入新槽（目标恒 0）。
+        // 审查 314：neighbor_metric 来自损坏的 metric_order 时可能 ≥ N_METRICS
+        // —— .get_mut 拒绝越界，不再 panic。
         let neighbor_new_top = ctx.pages[page_idx].cards[pos].rect.top;
-        ctx.card_slide[neighbor_metric].set((neighbor_old_top - neighbor_new_top) as f32);
+        match ctx.card_slide.get_mut(neighbor_metric) {
+            Some(sp) => sp.set((neighbor_old_top - neighbor_new_top) as f32),
+            None => crate::probe::log(&format!(
+                "card_drag: neighbor metric {neighbor_metric} out of range"
+            )),
+        }
     } else {
         // 未换位：增量平移（免 rebuild，跟手最顺滑）。
         let delta = new_y_off - y_off_old;
@@ -873,35 +924,34 @@ fn step_drag_release(ctx: &mut SettingsCtx, dt: f32) -> bool {
 
 // ── 单向数据流：Action 分派（唯一写入口） ────────────────
 
+/// 监控项开关全集（审查 315：is_metric_toggle / metrics_all_off_after /
+/// N_METRICS 三处共用同一份列表，新增开关只改这里）。
+fn metric_toggles() -> [CfgRef; 9] {
+    [
+        CfgRef::ShowCpu,
+        CfgRef::ShowMem,
+        CfgRef::ShowGpu,
+        CfgRef::ShowNet,
+        CfgRef::ShowUtil,
+        CfgRef::ShowTime,
+        CfgRef::PowerEnabled,
+        CfgRef::ShowDiskRead,
+        CfgRef::ShowDiskWrite,
+    ]
+}
+
 /// v3：Time 与 CPU/Mem/GPU/Net/Power/Util/DiskRead/DiskWrite 平权，同属监控项（共 9 项）。
 fn is_metric_toggle(r: CfgRef) -> bool {
-    matches!(
-        r,
-        CfgRef::ShowCpu
-            | CfgRef::ShowMem
-            | CfgRef::ShowGpu
-            | CfgRef::ShowNet
-            | CfgRef::ShowUtil
-            | CfgRef::ShowTime
-            | CfgRef::PowerEnabled
-            | CfgRef::ShowDiskRead
-            | CfgRef::ShowDiskWrite
-    )
+    metric_toggles().contains(&r)
 }
 
 /// 拒绝「关闭全部监控项」：任意时刻可见项数 ≥ 1（含 Time 与 Util）。
 fn metrics_all_off_after(cfg: &aaxsyspulse_core::config::Config, turning_off: CfgRef) -> bool {
     let v = |r: CfgRef| matches!(r.get(cfg), Value::Bool(true));
     let would_off = |r: CfgRef| r == turning_off;
-    (!v(CfgRef::ShowCpu) || would_off(CfgRef::ShowCpu))
-        && (!v(CfgRef::ShowMem) || would_off(CfgRef::ShowMem))
-        && (!v(CfgRef::ShowGpu) || would_off(CfgRef::ShowGpu))
-        && (!v(CfgRef::ShowNet) || would_off(CfgRef::ShowNet))
-        && (!v(CfgRef::ShowUtil) || would_off(CfgRef::ShowUtil))
-        && (!v(CfgRef::ShowTime) || would_off(CfgRef::ShowTime))
-        && (!v(CfgRef::PowerEnabled) || would_off(CfgRef::PowerEnabled))
-        && (!v(CfgRef::ShowDiskRead) || would_off(CfgRef::ShowDiskRead))
-        && (!v(CfgRef::ShowDiskWrite) || would_off(CfgRef::ShowDiskWrite))
+    metric_toggles()
+        .iter()
+        .all(|&r| !v(r) || would_off(r))
 }
 
 /// v3：行关闭触发驱动/厂商库卸载时，弹原生提示框告知「重启应用恢复」。
@@ -942,10 +992,14 @@ fn dispatch(ctx: &mut SettingsCtx, action: Action) {
                 }
                 ctx.page_anim = Some(PageAnim);
                 // 过渡弹簧数量对齐新页控件数。
-                let n = ctx.pages[p].widgets.len();
-                ctx.transitions.clear();
-                for wi in 0..n {
-                    ctx.transitions.insert((p, wi as i32), Transition::default());
+                // 审查 316：只清本页键 —— 按 (页,id) 持久化的约定下，
+                // 清掉所有页会让别的页动画状态凭空丢失。
+                ctx.transitions.retain(|(pg, _), _| *pg != p);
+                for w in &ctx.pages[p].widgets {
+                    // 审查 317：预插入键用控件 id（读取侧 paint_page 用
+                    // (页, w.id) 查表）—— 原先用下标插、用 id 读，两套键
+                    // 不互通，预插入条目永不命中。
+                    ctx.transitions.entry((p, w.id)).or_default();
                 }
                 // 翻页动画由 paint_d2d 帧末启动的 ANIM_TIMER(16ms) 驱动。
                 ctx.interaction = Interaction::Idle;
@@ -954,9 +1008,13 @@ fn dispatch(ctx: &mut SettingsCtx, action: Action) {
         Action::Toggle(r) => {
             // 业务规则：至少一项指标可见
             if is_metric_toggle(r) {
-                let reject = ctx.cfg().map(|c| metrics_all_off_after(&c, r)).unwrap_or(false);
+                // 审查 318：cfg 读失败时按"拒绝"兜底 —— 放行会关闭最后一项。
+                let reject = ctx
+                    .cfg()
+                    .map(|c| metrics_all_off_after(&c, r))
+                    .unwrap_or(true);
                 if reject {
-                    crate::probe::log("dispatch: reject turning off last metric");
+                    crate::probe::log("dispatch: reject turning off last metric (or cfg unavailable)");
                     return;
                 }
             }
@@ -1048,7 +1106,8 @@ fn dispatch(ctx: &mut SettingsCtx, action: Action) {
                     _ => false,
                 }
             });
-            if r == CfgRef::Lang {
+            // 审查 320：与 Toggle 分支同口径 —— 未应用（值未变）不重建。
+            if applied && r == CfgRef::Lang {
                 if let Some(cfg) = ctx.cfg() {
                     crate::i18n::set_global_lang(cfg.lang);
                 }
@@ -1168,6 +1227,19 @@ fn set_status(ctx: &mut SettingsCtx, text: &str) {
     ctx.status = Some((text.to_string(), Instant::now()));
     unsafe { start_timer(find_hwnd(ctx), STATUS_TIMER, 2500) };
     invalidate_settings();
+}
+
+/// 审查 200：防抖窗到点补写 —— 由 ANIM_TIMER 帧循环驱动（paint_d2d 每帧
+/// 调用；`is_due` 只在 pending 且超窗时为真，正常路径零成本）。
+fn flush_due_save(ctx: &mut SettingsCtx) {
+    if !ctx.save.is_due(ctx.now_ms()) {
+        return;
+    }
+    if let Some(cfg) = ctx.cfg() {
+        if config_io::save_config_async(&cfg) {
+            ctx.save.on_saved(ctx.now_ms());
+        }
+    }
 }
 
 /// 打开日志文件所在目录（报告 C-01：路径降级为动作）。
@@ -1325,7 +1397,13 @@ fn begin_edit(ctx: &mut SettingsCtx, idx: usize) {
             Value::Num(x) => x as f32,
             _ => 0.0,
         };
-        let f = if slider.dp == 0 { v.round() as i64 } else { (v * 10.0).round() as i64 / 10 };
+        let f = if slider.dp == 0 {
+            v.round() as i64
+        } else {
+            // 审查 321：按 dp 生成量化粒度（dp>=2 仍按 1 位小数是错的）。
+            let pow = 10f64.powi(slider.dp as i32);
+            ((v as f64 * pow).round() / pow) as i64
+        };
         (format!("{f}"), v as f64)
     } else {
         (String::new(), 0.0)
@@ -1344,7 +1422,9 @@ fn begin_edit(ctx: &mut SettingsCtx, idx: usize) {
 fn commit_edit(ctx: &mut SettingsCtx) {
     let Some(e) = ctx.edit.take() else { return };
     ctx.interaction = Interaction::Idle;
-    let text: String = e.buf.iter().map(|&c| char::from_u32(c as u32).unwrap_or('\u{FFFD}')).collect();
+    // 审查 322：用 from_utf16_lossy —— 逐 char::from_u32 会把代理对
+    // 拆成两个 U+FFFD（与 widget.rs 的第二份同型实现统一）。
+    let text = String::from_utf16_lossy(&e.buf);
     let page = &ctx.pages[ctx.page];
     let Some(w) = page.widgets.get(e.idx) else { return };
     let Some(slider) = w.kind.as_any().downcast_ref::<widget::SliderWidget>() else { return };
@@ -1411,7 +1491,8 @@ fn open_color_picker(ctx: &mut SettingsCtx, color_cfg: CfgRef, auto_cfg: Option<
 }
 
 fn on_click_plain(ctx: &mut SettingsCtx, idx: usize, pt: ContentPt) {
-    let w = &ctx.pages[ctx.page].widgets[idx];
+    // 审查 323：与 activate_focused 同口径 —— 翻页/rebuild 后下标可能越界。
+    let Some(w) = ctx.pages[ctx.page].widgets.get(idx) else { return };
     let Some(cfg) = ctx.cfg() else {
         // cfg 拿不到也要给视觉反馈，不静默吞掉
         crate::probe::log("on_click_plain: cfg unavailable");
@@ -1665,11 +1746,18 @@ fn on_title_btn(ctx: &mut SettingsCtx, btn: TitleBtn) {
 // ── 定时器辅助 ───────────────────────────────────────────
 
 unsafe fn start_timer(hwnd: HWND, id: usize, ms: u32) {
-    let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(hwnd, id, ms, None);
+    // 审查 325：SetTimer 失败静默会让动画/状态清除永不触发 —— 留痕。
+    let r = windows::Win32::UI::WindowsAndMessaging::SetTimer(hwnd, id, ms, None);
+    if r == 0 {
+        crate::probe::log(&format!("settings: SetTimer({id}) failed"));
+    }
 }
 
 unsafe fn kill_timer(hwnd: HWND, id: usize) {
-    let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(hwnd, id);
+    // 审查 325：KillTimer 失败留痕。
+    if windows::Win32::UI::WindowsAndMessaging::KillTimer(hwnd, id).is_err() {
+        crate::probe::log_lazy(|| format!("settings: KillTimer({id}) failed"));
+    }
 }
 
 // ── 窗口过程 ─────────────────────────────────────────────
@@ -1680,6 +1768,8 @@ unsafe fn kill_timer(hwnd: HWND, id: usize) {
 
 unsafe fn on_wm_paint(hwnd: HWND, _msg: u32, _wparam: WPARAM, _lparam: LPARAM) -> LRESULT {
             // 不走 BeginPaint，必须显式 ValidateRect，否则 WM_PAINT 无限循环。
+            // 审查 326：paint_d2d 成功路径在其内部 :2842 自行 ValidateRect ——
+            // 此处只在它失败（含模态跳过）时兜底验证，契约见该函数注释。
             if !paint_d2d(hwnd) {
             let _ = ValidateRect(hwnd, None);
             }
@@ -1735,10 +1825,14 @@ unsafe fn on_wm_size(hwnd: HWND, _msg: u32, _wparam: WPARAM, lparam: LPARAM) -> 
         }
 
 unsafe fn on_wm_exitsizemove(hwnd: HWND, _msg: u32, _wparam: WPARAM, _lparam: LPARAM) -> LRESULT {
-            // 拖动结束：把最终客户区尺寸落盘（物理像素）。
+            // 拖动结束：把最终客户区尺寸落盘（审查 328：settings_size 语义是
+            // **逻辑 px**（config.rs:229），必须先除掉 DPI 再落盘 —— 原实现把
+            // 物理像素写进去，重启后 s(dpi,…) 二次放大）。
             if let Some(ctx) = ctx_of(hwnd) {
             let (w, h) = ctx.client_size;
-            window::modify_config(ctx.overlay, |c| c.settings_size = (w, h));
+            let d = ctx.dpi.max(1);
+            let inv = |v: i32| ((v as f64) * 96.0 / d as f64).round() as i32;
+            window::modify_config(ctx.overlay, |c| c.settings_size = (inv(w), inv(h)));
             if let Some(c) = ctx.cfg() {
             // 拖设置窗结束的高频落盘走异步（P2），不卡 UI 线程。
             let _ = config_io::save_config_async(&c);
@@ -1801,7 +1895,9 @@ unsafe fn on_wm_nchittest(hwnd: HWND, _msg: u32, _wparam: WPARAM, lparam: LPARAM
             };
             let _ = ScreenToClient(hwnd, &mut sc);
             let pt = ClientPt(sc);
-            let d = crate::dpi::get_system_dpi();
+            // 审查 330：与其余分支(:1842/:1855 等)统一取 ctx.dpi ——
+            // get_system_dpi() 在 ctx 已建时是第二口径。
+            let d = ctx_of(hwnd).map(|c| c.dpi).unwrap_or_else(crate::dpi::get_system_dpi);
             let mut r = RECT::default();
             let _ = GetClientRect(hwnd, &mut r);
             let cw = r.right - r.left;
@@ -1871,13 +1967,12 @@ unsafe fn on_wm_mousemove(hwnd: HWND, _msg: u32, _wparam: WPARAM, lparam: LPARAM
             ctx.sb_hover = false;
             let _ = InvalidateRect(hwnd, None, false);
             }
-            // 拖动中：按当前 x 绝对落值（不再累积、不再看 origin）
+            // 拖动中：按当前 x 绝对落值（不再累积、不再看 origin）。
             if let Interaction::Dragging { widget: idx, .. } = &ctx.interaction {
             let idx = *idx;
-            if let Some(s) = ctx.pages[ctx.page].widgets[idx]
-            .kind
-            .as_any()
-            .downcast_ref::<widget::SliderWidget>()
+            // 审查 331：翻页/rebuild 后控件数可能变化 —— .get 拒绝越界。
+            if let Some(s) = ctx.pages[ctx.page].widgets.get(idx)
+            .and_then(|w| w.kind.as_any().downcast_ref::<widget::SliderWidget>())
             {
             let r = ctx.pages[ctx.page].widgets[idx].rect;
             let tr = widget::track_rect(&r, ctx.dpi);
@@ -1967,6 +2062,10 @@ unsafe fn on_wm_mouseleave(hwnd: HWND, _msg: u32, _wparam: WPARAM, _lparam: LPAR
             kill_timer(hwnd, STEPPER_TIMER);
             if let Interaction::Hover { widget } = &ctx.interaction {
             ctx.invalidate_widget(*widget);
+            }
+            // 审查 332：无捕获路径（Pressing/Editing/Dragging）离窗不走
+            // WM_CAPTURECHANGED —— 这里统一复位，残留态会让下一次按下误判。
+            if !matches!(ctx.interaction, Interaction::Idle) {
             ctx.interaction = Interaction::Idle;
             }
             let _ = InvalidateRect(hwnd, None, false);
@@ -2041,7 +2140,7 @@ unsafe fn on_wm_lbuttondown(hwnd: HWND, _msg: u32, _wparam: WPARAM, lparam: LPAR
             scrollbar_drag_scroll(ctx, pt.0.y);
             let _ = InvalidateRect(hwnd, None, false);
             // 拖拽需要连续重绘：驱动 16ms 主时钟（帧末 animating 会续表）
-            start_timer(hwnd, ANIM_TIMER, 16);
+            start_timer(hwnd, ANIM_TIMER, ANIM_FRAME_MS);
             return LRESULT(0);
             }
             }
@@ -2081,10 +2180,10 @@ unsafe fn on_wm_lbuttondown(hwnd: HWND, _msg: u32, _wparam: WPARAM, lparam: LPAR
             ctx.invalidate_widget(idx);
             let _ = InvalidateRect(hwnd, None, false);
             // 重绘饥饿补丁：拖拽态驱动 16ms 主时钟（见滚动条分支注释）。
-            start_timer(hwnd, ANIM_TIMER, 16);
+            start_timer(hwnd, ANIM_TIMER, ANIM_FRAME_MS);
             return LRESULT(0);
             }
-            // 步进器：按下即 ±1 并进入长按连发（350ms 首延迟 → 60ms/步）；
+            // 步进器：按下即 ±1 并进入长按连发（首延迟 → STEPPER_REPEAT_MS/步）；
             // 抬起 / 失去捕获 / 离开窗口即停。UP 路径对持握中的步进器不再重复触发。
             let step_dir = {
             let w = &ctx.pages[ctx.page].widgets[idx];
@@ -2099,7 +2198,7 @@ unsafe fn on_wm_lbuttondown(hwnd: HWND, _msg: u32, _wparam: WPARAM, lparam: LPAR
             ctx.stepper_hold = Some((idx, step_dir));
             ctx.interaction = Interaction::Pressing { widget: idx };
             let _ = SetCapture(hwnd);
-            start_timer(hwnd, STEPPER_TIMER, 350);
+            start_timer(hwnd, STEPPER_TIMER, STEPPER_FIRST_DELAY_MS);
             ctx.invalidate_widget(idx);
             let _ = InvalidateRect(hwnd, None, false);
             return LRESULT(0);
@@ -2127,9 +2226,8 @@ unsafe fn on_wm_lbuttondown(hwnd: HWND, _msg: u32, _wparam: WPARAM, lparam: LPAR
             .card_drag
             .as_ref()
             .map(|d| d.order)
-            .unwrap_or_else(|| {
-            ctx.cfg().map(|c| c.metric_order).unwrap_or([0, 1, 2, 6, 3, 5, 4, 7, 8])
-            });
+            // 审查 335：不再手写第二份默认 metric_order。
+            .unwrap_or_else(|| aaxsyspulse_core::config::Config::default().metric_order);
             let pos = order.iter().position(|&m| m as usize == mi).unwrap_or(0);
             let card_top = ctx.pages[ctx.page]
             .cards
@@ -2146,7 +2244,7 @@ unsafe fn on_wm_lbuttondown(hwnd: HWND, _msg: u32, _wparam: WPARAM, lparam: LPAR
             moved: false,
             });
             // 重绘饥饿补丁：拖拽态驱动 16ms 主时钟（见滚动条分支注释）。
-            start_timer(hwnd, ANIM_TIMER, 16);
+            start_timer(hwnd, ANIM_TIMER, ANIM_FRAME_MS);
             }
             // H2：按下即进入 Pressing（视觉反馈），抬起且仍命中才触发动作。
             ctx.interaction = Interaction::Pressing { widget: idx };
@@ -2302,6 +2400,11 @@ unsafe fn on_wm_timer(hwnd: HWND, _msg: u32, wparam: WPARAM, _lparam: LPARAM) ->
             let need = ctx.edit.as_mut().map(|e| { e.caret = !e.caret; true }).unwrap_or(false);
             if !need {
             kill_timer(hwnd, EDIT_TIMER);
+            // 审查 336：edit 已 None 时同步复位交互态 —— 残留 Editing 会让
+            // 后续键盘/点击路径误判（光标闪烁计时已停，编辑态却不结束）。
+            if ctx.is_editing() {
+            ctx.interaction = Interaction::Idle;
+            }
             }
             if ctx.is_editing() {
             if let Some(idx) = ctx.active_widget() {
@@ -2311,11 +2414,18 @@ unsafe fn on_wm_timer(hwnd: HWND, _msg: u32, wparam: WPARAM, _lparam: LPARAM) ->
             }
             let _ = InvalidateRect(hwnd, None, false);
             } else if wparam.0 == STATUS_TIMER {
-            // 状态提示到期清除。
+            // 状态提示到期清除（审查 337：以 Instant 时间戳为准 —— set_status
+            // 可能被反复调用重启计时器，无条件清除会让新提示提前消失）。
             if let Some(ctx) = ctx_of(hwnd) {
+            let expired = ctx
+            .status
+            .as_ref()
+            .map_or(true, |(_, t)| t.elapsed() >= std::time::Duration::from_millis(2400));
+            if expired {
             ctx.status = None;
-            }
             kill_timer(hwnd, STATUS_TIMER);
+            }
+            }
             let _ = InvalidateRect(hwnd, None, false);
             } else if wparam.0 == STEPPER_TIMER {
             // 步进器长按连发：仍在按住同一控件则步进并续期，否则停止。
@@ -2384,10 +2494,14 @@ unsafe fn on_wm_keydown(hwnd: HWND, _msg: u32, wparam: WPARAM, _lparam: LPARAM) 
             }
             0x25 | 0x27
             // ← / →：滑杆 ±步进、步进器 ±1、分段左右切换。
+            // 审查 338：编辑态下 ←/→ 暂不移动光标 —— EditState 只有 bool
+            // caret（无位置字段），如需移动先给 EditState 补 caret index。
             if !ctx.is_editing() => {
             on_hkey(ctx, vk == 0x27);
             let _ = InvalidateRect(hwnd, None, false);
             }
+            // 审查 339：Enter(0x0D) 在 WM_CHAR 分支提交（编辑态）；↑/↓ 键
+            // 当前无绑定语义，保持空臂。
             _ => {}
             }
             }
@@ -2400,7 +2514,10 @@ unsafe fn on_wm_char(hwnd: HWND, _msg: u32, wparam: WPARAM, _lparam: LPARAM) -> 
             if let Some(e) = ctx.edit.as_mut() {
             let c = (wparam.0 & 0xFFFF) as u16;
             // 首次键入直接替换整串旧值（select_all，人类直觉）
-            let is_input = (b'0' as u16..=b'9' as u16).contains(&c) || c == b'.' as u16;
+            let is_input = (b'0' as u16..=b'9' as u16).contains(&c)
+            || c == b'.' as u16
+            // 审查 340：偏移步进器范围 -64..64，负号必须可输入。
+            || c == b'-' as u16;
             if c == '\r' as u16 || c == '\n' as u16 {
             commit_edit(ctx);
             kill_timer(hwnd, EDIT_TIMER);
@@ -2417,8 +2534,13 @@ unsafe fn on_wm_char(hwnd: HWND, _msg: u32, wparam: WPARAM, _lparam: LPARAM) -> 
             e.buf.clear();
             e.select_all = false;
             }
-            if e.buf.len() < 16 {
+            if e.buf.len() < INPUT_MAX_CHARS {
             e.buf.push(c);
+            } else {
+            // 审查 341：超长给留痕，不再静默丢字符。
+            crate::probe::log(&format!(
+            "settings: input truncated at {INPUT_MAX_CHARS} chars"
+            ));
             }
             e.caret = true;
             }
@@ -2470,7 +2592,14 @@ unsafe fn on_wm_diag_click(hwnd: HWND, _msg: u32, _wparam: WPARAM, _lparam: LPAR
                 // 接管 overlay 侧 `Arc::into_raw` 移交的所有权（见 window::wndproc 的
                 // WM_GET_SAMPLER_DIAG）。必须 from_raw，否则每个消息漏一份 Arc 强引用。
                 if lparam.0 != 0 {
-                    let arc = std::sync::Arc::from_raw(lparam.0 as *const SamplerDiag);
+                    // 审查 343：同一裸指针二次投递会被 from_raw 两次 → double free。
+                    // 与当前持有的指针比较，重复投递直接忽略（over-lay 侧重发时）。
+                    let ptr = lparam.0 as *const SamplerDiag;
+                    if ctx.diag == Some(ptr) {
+                        crate::probe::log("settings: duplicate WM_SAMPLER_DIAG ignored");
+                        return LRESULT(0);
+                    }
+                    let arc = std::sync::Arc::from_raw(ptr);
                     ctx.diag = Some(std::sync::Arc::as_ptr(&arc));
                     ctx.diag_arc = Some(arc);
                 } else {
@@ -2488,7 +2617,19 @@ unsafe fn on_wm_setcursor(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) 
             || ctx.tb.hover.is_some()
             || ctx.is_editing()
             {
-            SetCursor(ctx.hand);
+            // 审查 344：hand 加载失败为 null 时 SetCursor(null) 会隐藏光标
+            // —— 回退箭头。
+            let hand = if ctx.hand.is_invalid() {
+            LoadCursorW(None, IDC_HAND).unwrap_or_default()
+            } else {
+            ctx.hand
+            };
+            let cur = if hand.is_invalid() {
+            LoadCursorW(None, windows::Win32::UI::WindowsAndMessaging::IDC_ARROW).unwrap_or_default()
+            } else {
+            hand
+            };
+            SetCursor(cur);
             return LRESULT(1);
             }
             }
@@ -2496,6 +2637,9 @@ unsafe fn on_wm_setcursor(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) 
         }
 
 unsafe fn on_wm_settingchange(hwnd: HWND, _msg: u32, _wparam: WPARAM, _lparam: LPARAM) -> LRESULT {
+            // 审查 197：系统设置（减弱动效/高对比）变化 → 失效 motion 缓存，
+            // 运行中切换即时生效。
+            crate::settings::motion::invalidate_system_setting_cache();
             if let Some(ctx) = ctx_of(hwnd) {
             // 跟随系统时跟随 OS 变化；强制浅/深色时保持用户选择。
             let app = ctx.cfg().map(|c| c.appearance).unwrap_or_default();
@@ -2589,6 +2733,9 @@ fn small_px(dpi: u32) -> f32 {
 }
 
 fn c(_t: &Theme, v: u32) -> ColorF {
+    // 审查 345：与 widget.rs:403 同型 —— 形参未用，删形参需动所有调用点，
+    // 先注明（Theme 参数保留为将来深浅色差异留位）。
+    let _ = _t;
     ColorF::from_colorref(v, 1.0)
 }
 
@@ -2641,6 +2788,9 @@ fn paint_d2d(hwnd: HWND) -> bool {
     }
     ctx.layout_anim_active = moving;
 
+    // 审查 200：防抖窗到点补写（pending 且超窗时才真正落盘）。
+    flush_due_save(ctx);
+
     // 换位滑动弹簧：拖动排序时邻卡从旧位置滑入新槽位（非线性动画）。
     let slide_moving = step_card_slide(ctx, dt);
 
@@ -2655,7 +2805,8 @@ fn paint_d2d(hwnd: HWND) -> bool {
     //
     // ⚠️ 当前**无输入源**会写入非零 scroll_vel：滚轮已改为「一格 = 一拍」的
     // 离散步进（见 on_wm_mousewheel），拖拽路径也会主动清零。即本分支是
-    // 休眠状态，保留是为了将来接入触控板惯性手势。若要重新启用，必须先修掉
+    // 不可达的休眠代码（审查 346：据实标注），保留是为了将来接入触控板
+    // 惯性手势。若要重新启用，必须先修掉
     // 「每帧从当前位置重新投射 → 目标一路前移到底」的问题（动量落点应在
     // 手势结束时**一次性**算定，而不是每帧重算）。
     if ctx.scroll_vel.abs() > 1.0 {
@@ -2690,7 +2841,8 @@ fn paint_d2d(hwnd: HWND) -> bool {
     let cfg = ctx.cfg();
     let tb = &ctx.tb;
     let nav_hover = ctx.nav_hover;
-    let metric_expanded = &ctx.metric_expanded;
+    // 审查 350：metric_expanded 已随 paint_page 的 `_metric_expanded` 形参一并移除
+    // （展开态经 rebuild_pages 落进行结构，绘制不再读它）。
     // 卡片拖拽排序预览：被拖卡（当前 order 中的位置）最后绘制（浮于其余卡之上）。
     let drag_pos = ctx
         .card_drag
@@ -2740,12 +2892,11 @@ fn paint_d2d(hwnd: HWND) -> bool {
             &interaction,
             edit.as_ref(),
             cfg.as_ref(),
-            pc.diag,
+            // 审查 349：诊断数据经 PaintCtx 共享（paint_page 不再单独收 _diag）
             ox as f32,
             oy as f32,
             body_px(dpi),
             caption_px(dpi),
-            metric_expanded,
             drag_pos,
             transitions,
             card_slide,
@@ -2919,13 +3070,15 @@ fn caption_px(dpi: u32) -> f32 {
     layout::caption_px(dpi)
 }
 
-/// 侧边栏标题字号（I1：20pt）。
+/// 侧边栏标题字号（I1）。
+/// 审查 347：统一到 DIP（/96）口径 —— 原 20pt 的 /72 换算与 body_px /
+/// caption_px 两套基准并存（20pt@96dpi ≈ 26px，取整为 26px）。
 fn display_px(dpi: u32) -> f32 {
-    20.0 * dpi as f32 / 72.0
+    26.0 * dpi as f32 / 96.0
 }
 
-/// 侧边栏（D3）：底色 + 标题 + 导航项（数量随 [`icons::IconKind::ALL`]，当前 7 项，
-/// 顺序 = 页面下标；图标 + 文案 + 胶囊选中/悬停）。
+/// 侧边栏（D3）：底色 + 标题 + 导航项（数量随 [`icons::IconKind::ALL`] =
+/// [`PAGE_COUNT`]，顺序 = 页面下标；图标 + 文案 + 胶囊选中/悬停）。
 /// 固定在左侧，不随内容滚动；几何必须与命中测试 `sidebar_at` 保持一致。
 fn paint_sidebar(
     pc: &PaintCtx,
@@ -3058,17 +3211,15 @@ fn paint_scrollbar(
 fn paint_page(
     pc: &PaintCtx,
     gfx: &mut Gfx,
-    pages: &[Page; 7],
+    pages: &[Page; PAGE_COUNT],
     page_idx: usize,
     interaction: &Interaction,
     edit: Option<&EditState>,
     cfg: Option<&aaxsyspulse_core::config::Config>,
-    _diag: Option<*const SamplerDiag>,
     ox: f32,
     oy: f32,
     body: f32,
     caption: f32,
-    _metric_expanded: &[bool; N_METRICS],
     drag_pos: Option<usize>,
     transitions: &mut std::collections::HashMap<(usize, i32), Transition>,
     card_slide: &[motion::Spring; N_METRICS],
@@ -3085,7 +3236,9 @@ fn paint_page(
     let mut active = false;
     let page = &pages[page_idx];
     // `card.rect` / `widget.rect` 均为**内容坐标**；绘制统一加内容区原点 (ox, oy)。
-    // 红线 R7：漏加会让内容与侧边栏/标题重叠。折叠卡（G1-G3）将消费 _metric_expanded。
+    // 红线 R7：漏加会让内容与侧边栏/标题重叠。
+    // 审查 349/350：`_diag` 与 `_metric_expanded` 两个从未消费的形参已删除
+    // （诊断数据实际取自 pc.diag；展开态经 rebuild_pages 落进行结构）。
 
     // 页标题 + 副标题（报告 §11 每页 h5 + p；随内容滚动）。
     // 内容坐标：ox 已含侧栏偏移，这里只加内容左边距。
@@ -3188,10 +3341,13 @@ fn paint_page(
             // 分组分隔线（有标题的分组卡：行与行之间的灰色细线）。
             // 位置按**墨迹等距**算，不是按行盒等距 —— 见 `divider_rise`。
             if row.divider {
-                let above = &card.rows[ri - 1];
+                // 审查 351：divider 依赖"首行恒无分隔线"的隐含约束 —— 补显式
+                // guard，布局改动引入首行 divider 时不再 panic。
+                if let Some(above) = card.rows.get(ri.wrapping_sub(1)).filter(|_| ri > 0) {
                 let above_hint = above.hint_text.is_some() || above.hint2.is_some();
                 let ly = row_top - layout::divider_rise(dpi, above_hint);
                 gfx.line(rt, text_l, ly, text_r, ly, c(t, t.secondary).with_alpha(0.35), 1.0);
+                }
             }
             if !row.label.is_empty() {
                 let first_widget_left = row

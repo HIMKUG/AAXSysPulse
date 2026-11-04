@@ -4,10 +4,10 @@
       <h1 class="t-hero r1">欢迎使用<br />AAXSysPulse</h1>
 
       <p class="t-body r2" style="margin-top: var(--sp-4); color: var(--text-secondary); font-style: italic">
-        30 秒完成配置，之后随开机自动运行
+        几步完成配置，之后随开机自动运行
       </p>
 
-      <p class="t-mini r3" style="margin-top: 120px">
+      <p class="t-mini r3" style="margin-top: var(--sp-16)">
         本工具不收集任何数据，配置仅保存在本地
       </p>
     </div>

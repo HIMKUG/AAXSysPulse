@@ -27,9 +27,11 @@ impl SoftwareSurface {
     ///
     /// All pixels are initialized to transparent black (0,0,0,0).
     pub fn new(width: i32, height: i32) -> Self {
-        let size = (width * height * 4) as usize;
+        // 审查 107/108：与 resize 同口径 —— 负尺寸钳 0，i64 乘法防溢出。
+        let need = (width.max(0) as i64) * (height.max(0) as i64) * 4;
+        let need = need.clamp(0, i32::MAX as i64) as usize;
         Self {
-            pixels: vec![0u8; size],
+            pixels: vec![0u8; need],
             width,
             height,
         }
@@ -40,7 +42,9 @@ impl SoftwareSurface {
     /// 悬浮窗每帧都要一块同尺寸的画布；逐帧 `vec![0u8; 187_200]` 的
     /// 分配 + 清零是纯浪费（P2）。尺寸真的变了才重新分配。
     pub fn resize(&mut self, width: i32, height: i32) {
-        let need = (width.max(0) * height.max(0) * 4) as usize;
+        // 审查 108：i32 乘法在大 DPI/大窗口下会溢出，改 i64 并钳制。
+        let need = (width.max(0) as i64) * (height.max(0) as i64) * 4;
+        let need = need.clamp(0, i32::MAX as i64) as usize;
         if self.width != width || self.height != height || self.pixels.len() != need {
             self.pixels = vec![0u8; need];
             self.width = width;
@@ -69,15 +73,34 @@ impl SoftwareSurface {
         let dst_r = self.pixels[idx + 2] as f32;
         let dst_a = self.pixels[idx + 3] as f32;
 
-        let out_r = color.r as f32 + dst_r * factor;
-        let out_g = color.g as f32 + dst_g * factor;
-        let out_b = color.b as f32 + dst_b * factor;
+        // 审查 499：out_r/g/b 必须与 out_a 一样钳到 255 —— 预乘色叠加
+        // 理论上有界，但防御性钳位防 `as u8` 回绕（与 alpha 侧对称）。
+        let out_r = (color.r as f32 + dst_r * factor).min(255.0);
+        let out_g = (color.g as f32 + dst_g * factor).min(255.0);
+        let out_b = (color.b as f32 + dst_b * factor).min(255.0);
         let out_a = (color.a as f32 + dst_a * factor).min(255.0);
 
-        self.pixels[idx] = out_b as u8;     // B
+        self.pixels[idx] = out_b as u8; // B
         self.pixels[idx + 1] = out_g as u8; // G
         self.pixels[idx + 2] = out_r as u8; // R
         self.pixels[idx + 3] = out_a as u8; // A
+    }
+
+    /// 把一个像素**直接置 0**（全透明，审查 109）。
+    ///
+    /// 不能用 `blend_pixel(…, transparent)` 实现清像素：over 合成下
+    /// `src_a = 0 ⇒ out = dst`，是恒等操作，圆角根本清不掉。
+    fn clear_pixel(&mut self, x: i32, y: i32) {
+        if x < 0 || y < 0 || x >= self.width || y >= self.height {
+            return;
+        }
+        let idx = ((y * self.width + x) * 4) as usize;
+        if idx + 3 < self.pixels.len() {
+            self.pixels[idx] = 0;
+            self.pixels[idx + 1] = 0;
+            self.pixels[idx + 2] = 0;
+            self.pixels[idx + 3] = 0;
+        }
     }
 
     /// Clears the surface to "transparent".
@@ -150,49 +173,45 @@ impl SoftwareSurface {
     /// Clears (sets to transparent) the four corner regions of a rounded rectangle.
     ///
     /// 填充矩形后再调用本函数，清除四个角的四分之一圆像素，实现圆角效果。
+    /// 审查 109：逐像素**直接置 0**（clear_pixel），不能用 over 合成"清"
+    /// —— src_a=0 时合成是恒等操作，圆角永远清不掉。
     fn clear_corners(&mut self, r: Rect, radius: i32, _color: Rgba) {
         if radius <= 0 {
             return;
         }
         let radius = radius.min(r.w / 2).min(r.h / 2);
-        let transparent = Rgba::transparent();
-        let r_right = r.x + r.w;
-        let r_bottom = r.y + r.h;
+        let r_right = r.x.saturating_add(r.w);
+        let r_bottom = r.y.saturating_add(r.h);
 
         // 左上角：圆心 (r.x, r.y)，清除圆内像素
         for dy in 0..radius {
             let dx_max = ((radius * radius - dy * dy) as f64).sqrt() as i32;
             for dx in 0..=dx_max {
-                self.blend_pixel(r.x + dx, r.y + dy, transparent);
+                self.clear_pixel(r.x + dx, r.y + dy);
             }
         }
         // 右上角：圆心 (r.x + r.w, r.y)
         for dy in 0..radius {
             let dx_max = ((radius * radius - dy * dy) as f64).sqrt() as i32;
             for dx in 0..=dx_max {
-                self.blend_pixel(r_right - dx, r.y + dy, transparent);
+                self.clear_pixel(r_right - dx, r.y + dy);
             }
         }
         // 左下角：圆心 (r.x, r.y + r.h)
         for dy in 0..radius {
             let dx_max = ((radius * radius - dy * dy) as f64).sqrt() as i32;
             for dx in 0..=dx_max {
-                self.blend_pixel(r.x + dx, r_bottom - dy, transparent);
+                self.clear_pixel(r.x + dx, r_bottom - dy);
             }
         }
         // 右下角：圆心 (r.x + r.w, r.y + r.h)
         for dy in 0..radius {
             let dx_max = ((radius * radius - dy * dy) as f64).sqrt() as i32;
             for dx in 0..=dx_max {
-                self.blend_pixel(r_right - dx, r_bottom - dy, transparent);
+                self.clear_pixel(r_right - dx, r_bottom - dy);
             }
         }
     }
-}
-
-/// Checks if a point is inside a rectangle.
-fn _point_in_rect(x: i32, y: i32, r: &Rect) -> bool {
-    x >= r.x && x < r.right() && y >= r.y && y < r.bottom()
 }
 
 /// Checks if a point is inside a circle centered at (cx, cy) with given radius.
@@ -257,7 +276,13 @@ impl RenderTarget for SoftwareSurface {
     /// 注意：像素是**预乘**的，只改 alpha 会让残留的 RGB 在合成时溢出，
     /// 所以 RGB 必须同步按同一系数缩放（这正是 v2 §1.2 `blend_onto` 要表达的语义）。
     fn scale_alpha(&mut self, factor: f32) {
-        let f = factor.clamp(0.0, 1.0);
+        // 审查 501：clamp 对 NaN 返回 NaN，`as u8` 得 0 会把整帧抹成透明；
+        // 非有限因子视为无效，整帧保持不变（no-op 而非破坏）。
+        let f = if factor.is_finite() {
+            factor.clamp(0.0, 1.0)
+        } else {
+            return;
+        };
         for p in self.pixels.chunks_exact_mut(4) {
             p[0] = (p[0] as f32 * f) as u8;
             p[1] = (p[1] as f32 * f) as u8;
@@ -273,7 +298,7 @@ impl RenderTarget for SoftwareSurface {
         }
 
         // 半径过大时（常见于小高度进度条），先填满再做四角裁圆。
-        if radius * 2 >= r.h {
+        if radius.saturating_mul(2) >= r.h {
             self.fill_rect(r, color);
             if radius <= 0 {
                 return;
@@ -284,9 +309,14 @@ impl RenderTarget for SoftwareSurface {
         }
 
         // 标准圆角路径：逐像素判定。
+        // 审查 502：先裁剪到画布 —— 负/超大 r 不再遍历画布外的巨大范围。
         let radius = radius.min(r.w / 2).min(r.h / 2);
-        for y in r.y..r.bottom() {
-            for x in r.x..r.right() {
+        let clip = r.clip_to_surface(self.width, self.height);
+        if clip.w <= 0 || clip.h <= 0 {
+            return;
+        }
+        for y in clip.y..clip.bottom() {
+            for x in clip.x..clip.right() {
                 if point_in_round_rect(x, y, &r, radius) {
                     self.blend_pixel(x, y, color);
                 }
@@ -391,9 +421,17 @@ impl RenderTarget for SoftwareSurface {
                 if cov == 0 {
                     continue;
                 }
-                // 覆盖率 → alpha，再按非预乘颜色构造预乘色
+                // 审查 110：color 是预乘 Rgba，不能走 Rgba::new 二次预乘（变暗）。
+                // 正确语义 = 按覆盖率同步缩放预乘 RGB 与 alpha。
+                let t = cov as f32 / 255.0;
                 let a = ((color.a as u32 * cov as u32) / 255) as u8;
-                self.blend_pixel(at.x + x, at.y + y, Rgba::new(color.r, color.g, color.b, a));
+                let c = Rgba {
+                    r: (color.r as f32 * t).round() as u8,
+                    g: (color.g as f32 * t).round() as u8,
+                    b: (color.b as f32 * t).round() as u8,
+                    a,
+                };
+                self.blend_pixel(at.x + x, at.y + y, c);
             }
         }
     }
@@ -449,5 +487,10 @@ mod tests {
         // Center pixel must be painted
         let center = ((3 * 100 + 50) * 4) as usize;
         assert_ne!(s.pixels[center + 3], 0, "center pixel alpha must be > 0");
+        // 审查 503：四个角落必须仍是全透明（clear_corners 真正生效的回归锁）
+        for (cx, cy) in [(0usize, 0usize), (99, 0), (0, 5), (99, 5)] {
+            let o = ((cy * 100 + cx) * 4) as usize;
+            assert_eq!(s.pixels[o + 3], 0, "corner ({cx},{cy}) must stay transparent");
+        }
     }
 }

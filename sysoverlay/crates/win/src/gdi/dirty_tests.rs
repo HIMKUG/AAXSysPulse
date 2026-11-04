@@ -7,13 +7,19 @@ use aaxsyspulse_ui::Rgba;
 
 /// 最小可比对 CellSig：脏判定只看 x/y/bbox_x/w/h/hash。
 fn cell(x: i32, hash: u64) -> CellSig {
+    cell_ra(x, x, false, hash)
+}
+
+/// 审查 556/557：可独立指定 bbox_x / right_align 的构造器 —— 旧夹具把
+/// bbox_x 恒写成 x，无法构造右对齐格"墨迹左缘与绘制原点分离"的情形。
+fn cell_ra(x: i32, bbox_x: i32, right_align: bool, hash: u64) -> CellSig {
     CellSig {
         x,
         y: 8,
         w: 40,
         h: 28,
-        bbox_x: x,
-        right_align: false,
+        bbox_x,
+        right_align,
         hash,
         text: StrBuf::new(),
         color: Rgba::default(),
@@ -109,6 +115,32 @@ fn position_drift_is_full() {
     assert!(d.is_full());
 }
 
+/// 审查 559：右对齐数值格的墨迹左缘（bbox_x）单独漂移也必须整窗
+/// （gdi.rs 布局漂移比较补 bbox_x/w/h 的直接回归锁）。
+#[test]
+fn bbox_only_drift_is_full() {
+    let st = fresh_state();
+    run(&st, &[cell_ra(10, 0, true, 1)]);
+    let (d, _) = run(&st, &[cell_ra(10, -8, true, 1)]); // 仅 bbox_x 变
+    assert!(d.is_full(), "bbox_x 单独漂移必须整窗");
+}
+
+/// 审查 557：右对齐格（right_align=true）的脏区行为覆盖 ——
+/// bbox_x < x（墨迹左溢）时不误判、bbox_x 变化时整窗。
+#[test]
+fn right_align_cells_dirty_behavior() {
+    let st = fresh_state();
+    // 基线：右对齐格，绘制原点 x=100、墨迹左缘 bbox_x=60
+    run(&st, &[cell_ra(100, 60, true, 1)]);
+    // 同几何同内容 → 空 Rects
+    let (d, _) = run(&st, &[cell_ra(100, 60, true, 1)]);
+    let Dirty::Rects(rs) = &d else { panic!("应为 Rects") };
+    assert!(rs.is_empty(), "未变的右对齐格必须跳过上屏");
+    // 仅 bbox_x 变（槽位变化导致墨迹左移）→ 整窗
+    let (d, _) = run(&st, &[cell_ra(100, 52, true, 1)]);
+    assert!(d.is_full(), "右对齐格 bbox_x 漂移必须整窗");
+}
+
 #[test]
 fn too_many_components_folds_to_full() {
     let st = fresh_state();
@@ -119,8 +151,31 @@ fn too_many_components_folds_to_full() {
     assert!(d.is_full(), "超过 MAX_DIRTY_RECTS(8) 必须折叠整窗");
 }
 
+/// 审查 560：恰好 7/8/9 个互不相邻变化格的折叠边界（上限 8）。
+#[test]
+fn dirty_rect_count_boundaries() {
+    for (n, expect_full) in [(7usize, false), (8usize, false), (9usize, true)] {
+        let st = fresh_state();
+        let base: Vec<CellSig> = (0..n).map(|i| cell((i * 100) as i32, i as u64 + 1)).collect();
+        run(&st, &base);
+        let changed: Vec<CellSig> =
+            (0..n).map(|i| cell((i * 100) as i32, i as u64 + 100)).collect();
+        let (d, _) = run(&st, &changed);
+        assert_eq!(d.is_full(), expect_full, "n={n} 的折叠判定错误");
+    }
+}
+
 #[test]
 fn upload_failure_gate_forces_full_next_frame() {
+    // 审查 561：断言中途 panic 会把真实全局闸门留在 true、污染后续测试
+    // —— 用 RAII 保证复位（其余状态都用 fresh_state，唯独这里是全局）。
+    struct ResetGate;
+    impl Drop for ResetGate {
+        fn drop(&mut self) {
+            NEEDS_FULL_REUPLOAD.store(false, AtomicOrdering::Relaxed);
+        }
+    }
+    let _guard = ResetGate;
     let st = fresh_state();
     let cells = [cell(0, 1), cell(100, 2)];
     run(&st, &cells);

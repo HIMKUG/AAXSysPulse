@@ -19,12 +19,14 @@
 //! - `D2D1_FACTORY_TYPE_SINGLE_THREADED` 工厂 ⇒ 本模块的 D2D 对象只在渲染线程
 //!   创建与使用，`D2DSurface` 不跨线程传递；DWrite 虽用 SHARED 工厂，其对象
 //!   同样只在渲染线程触碰；
-//! - COM 对象生命周期由 `D2DSurface` 持有、Drop 统一释放，无裸指针逃逸；
+//! - COM 对象生命周期由 `D2DSurface` 持有（RT/画刷按缓存世代失效重建；
+//!   审查 137：本文件并无 `impl Drop` —— RT 缓存是 thread_local，随线程
+//!   结束与世代更替自然释放，勿据旧注释寻找 Drop 路径）；
 //! - `BindDC` 的 HDC 来自 gdi.rs 的 DIB 缓存，由同一渲染线程在同一帧内使用，
 //!   不存在跨线程 DC 共享。
 
 use std::collections::HashMap;
-use std::cell::{Cell, OnceCell, RefCell};
+use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
 
 use windows::core::{w, Interface, PCWSTR};
@@ -65,11 +67,25 @@ use aaxsyspulse_ui::{Rect, RenderTarget};
 /// 换线程时自然重建，代价是多创建一次工厂（进程生命周期内 ≤ respawn 次数）。
 fn d2d_factory() -> Option<ID2D1Factory> {
     thread_local! {
-        static F: OnceCell<Option<ID2D1Factory>> = const { OnceCell::new() };
+        static F: RefCell<Option<Option<ID2D1Factory>>> = const { RefCell::new(None) };
     }
     F.with(|f| {
-        f.get_or_init(|| unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).ok() })
-            .clone()
+        let mut slot = f.borrow_mut();
+        // 审查 522：创建失败的 None 不驻留（下帧重试），只有成功结果才缓存。
+        if matches!(&*slot, Some(None)) {
+            *slot = None;
+        }
+        match &*slot {
+            Some(v) => v.clone(),
+            None => {
+                let created =
+                    unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).ok() };
+                if created.is_some() {
+                    *slot = Some(created.clone());
+                }
+                created
+            }
+        }
     })
 }
 
@@ -112,6 +128,10 @@ thread_local! {
     static FORMAT_CACHE: RefCell<HashMap<(u32, u32), IDWriteTextFormat>> =
         RefCell::new(HashMap::new());
 }
+
+/// 字号×字重组合缓存上限（审查 523：与 gfx_d2d 的 LAYOUT_CACHE_MAX 口径一致；
+/// 超限整表清空， pathological 配置不再无界堆入 IDWriteTextFormat）。
+const FORMAT_CACHE_MAX: usize = 256;
 
 // 画刷缓存（跨帧保留，**随 RT 世代失效**）。
 struct BrushCache {
@@ -191,8 +211,13 @@ fn cached_text_format(px: f32, weight: u8) -> Option<IDWriteTextFormat> {
             },
         };
         unsafe {
+            // 审查 518：判返回值 —— 设置失败仍以错误对齐/换行缓存复用。
             let _ = f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             let _ = f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        }
+        // 审查 523：上限淘汰。
+        if fc.len() >= FORMAT_CACHE_MAX {
+            fc.clear();
         }
         fc.insert(key, f.clone());
         Some(f)
@@ -270,9 +295,13 @@ pub fn warmup(cfg: &Config) {
     // 1) 私有字体集（DIN 三档之一）+ 字号 format：建立字体集与字号对象
     let _ = din_font(cfg.font_weight);
     let Some(dwrite) = dwrite_factory() else { return };
+    // 审查 524：预热字号去重 —— 全局字号与逐指标字号常重复，
+    // 每个重复字号都做一次 1e6×1e6 的 CreateTextLayout 纯属浪费。
     let mut sizes = vec![cfg.font_size];
     for s in cfg.metric_font_sizes.iter().flatten() {
-        sizes.push(*s);
+        if !sizes.contains(s) {
+            sizes.push(*s);
+        }
     }
     // 2) 真正触发字体解析的是第一次 CreateTextLayout——逐个字号做一次即弃。
     //    ⚠️ 文本必须覆盖**实际会渲染的字符集**：2026-09-14 实测，只喂 ASCII
@@ -282,7 +311,7 @@ pub fn warmup(cfg: &Config) {
     //    标点 + 常用中文标签全覆盖，一次性把回退链建好。
     let text = encode_text(
         " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`\
-         abcdefghijklmnopqrstuvwxyz{|}~处理器内存显卡网络功耗时钟温度频率使用率\
+         abcdefghijklmnopqrstuvwxyz{|}~↓↑处理器内存显卡网络功耗时钟温度频率使用率\
          综合占用显存延迟上传下载当前最高最低平均",
     );
     let n_sizes = sizes.len();
@@ -324,7 +353,9 @@ fn get_or_create_rt(mem_dc: HDC, w: i32, h: i32) -> Option<ID2D1DCRenderTarget> 
     });
 
     let size_changed = cache.w != w || cache.h != h;
-    let needs_create = cache.rt.is_none() || device_lost || size_changed;
+    // 审查 134：换新 mem_dc 而尺寸不变时，RT 仍绑在已删除的旧 DC 上 ——
+    // mem_dc 必须纳入失效条件。
+    let needs_create = cache.rt.is_none() || device_lost || size_changed || cache.mem_dc != mem_dc;
 
     if !needs_create {
         return cache.rt.clone();
@@ -354,7 +385,13 @@ fn get_or_create_rt(mem_dc: HDC, w: i32, h: i32) -> Option<ID2D1DCRenderTarget> 
         bottom: h,
     };
     unsafe {
-        new_rt.BindDC(mem_dc, &sub).ok()?;
+        if let Err(e) = new_rt.BindDC(mem_dc, &sub) {
+            // 审查 526：BindDC 失败要留痕并复位状态 —— `?` 提前返回会跳过
+            // gen 自增 / device_lost 复位 / 日志，旧 cache.rt 未清导致每帧盲重试。
+            crate::probe::log(&format!("d2d BindDC failed hr=0x{:08X}", e.code().0 as u32));
+            RT_DEVICE_LOST.with(|flag| *flag.borrow_mut() = true);
+            return None;
+        }
         new_rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     }
     cache.rt = Some(new_rt);
@@ -402,16 +439,16 @@ pub fn din_file_name(weight: u8) -> &'static str {
     }
 }
 
-/// 定位指定字重的 DIN.otf：用户 Downloads 目录优先（开发机字体来源），
-/// 再 exe 目录逐级向上找（适配构建树/便携布局），最后回退到工程根。
+/// 定位指定字重的 DIN.otf：exe 目录逐级向上找（适配构建树/便携布局；
+/// 仓库根的字体文件在开发机上由 target/…/exe 向上自然命中），再试 exe
+/// 同级 `fonts/` 资源目录。
+/// 审查 121：删除两处硬编码开发机绝对路径（`C:\Users\VOS_User\...` 与
+/// `D:\code\sys-overlay-c-master`）—— 用户机必然找不到，还泄漏私有路径。
 pub fn find_din_font_path(weight: u8) -> Option<std::path::PathBuf> {
     let fname = din_file_name(weight);
-    let user = std::path::Path::new(r"C:\Users\VOS_User\Downloads\en_Din_jb51\en_Din").join(fname);
-    if user.is_file() {
-        return Some(user);
-    }
-    let mut dir = std::env::current_exe().ok()?.parent().map(|p| p.to_path_buf());
-    for _ in 0..6 {
+    let exe_dir = std::env::current_exe().ok()?.parent().map(|p| p.to_path_buf());
+    let mut dir = exe_dir.clone();
+    for _ in 0..8 {
         if let Some(d) = &dir {
             let cand = d.join(fname);
             if cand.is_file() {
@@ -420,9 +457,12 @@ pub fn find_din_font_path(weight: u8) -> Option<std::path::PathBuf> {
         }
         dir = dir.and_then(|d| d.parent().map(|p| p.to_path_buf()));
     }
-    let literal = std::path::Path::new(r"D:\code\sys-overlay-c-master").join(fname);
-    if literal.is_file() {
-        return Some(literal);
+    // 资源目录兜底：exe 同级 fonts/ 子目录（便携安装布局）
+    if let Some(d) = &exe_dir {
+        let cand = d.join("fonts").join(fname);
+        if cand.is_file() {
+            return Some(cand);
+        }
     }
     None
 }
@@ -432,13 +472,31 @@ pub fn find_din_font_path(weight: u8) -> Option<std::path::PathBuf> {
 fn load_custom_font(weight: u8) -> Option<CustomFont> {
     let path = find_din_font_path(weight)?;
     let dwrite = dwrite_factory()?;
+    // 审查 528：失败也留痕 —— 链式 `.ok()?` 把每步失败折叠成 None，
+    // DIN 缺失/损坏时静默降级、无从诊断。
+    let result = load_custom_font_inner(&path, dwrite);
+    if result.is_none() {
+        crate::probe::log(&format!(
+            "d2d custom font load failed weight={weight} path={}",
+            path.display()
+        ));
+    } else {
+        crate::probe::log(&format!("d2d custom font loaded: {}", path.display()));
+    }
+    result
+}
+
+fn load_custom_font_inner(path: &std::path::Path, dwrite: &IDWriteFactory) -> Option<CustomFont> {
     unsafe {
         // Factory5（Win10 1809+）：CreateFontSetBuilder 返回 Builder1，
         // 其 AddFontFile 才能直接吃字体文件（基础 Builder 只收 FaceReference）。
         let factory5: IDWriteFactory5 = dwrite.cast().ok()?;
+        // 审查 527：OsStr 直转宽字符 —— to_string_lossy 会把非 UTF-8 目录名
+        // 变成 U+FFFD，CreateFontFileReference 静默失败、回退 Segoe UI。
+        use std::os::windows::ffi::OsStrExt;
         let wide: Vec<u16> = path
-            .to_string_lossy()
-            .encode_utf16()
+            .as_os_str()
+            .encode_wide()
             .chain(std::iter::once(0))
             .collect();
         let file: IDWriteFontFile =
@@ -456,10 +514,6 @@ fn load_custom_font(weight: u8) -> Option<CustomFont> {
         names.GetString(0, &mut buf).ok()?;
         let collection: IDWriteFontCollection1 =
             factory5.CreateFontCollectionFromFontSet(&set).ok()?;
-        crate::probe::log(&format!(
-            "d2d custom font loaded: {}",
-            path.display()
-        ));
         Some(CustomFont { family: buf, collection })
     }
 }
@@ -576,12 +630,16 @@ impl D2DSurface {
         let text_buf = encode_text(text);
         let lay = dwrite_factory()
             .and_then(|d| unsafe { d.CreateTextLayout(&text_buf, &fmt, 1e6, 1e6).ok() })
-            .map(|l| {
+            .and_then(|l| {
                 let mut tm = DWRITE_TEXT_METRICS::default();
                 unsafe {
-                    let _ = l.GetMetrics(&mut tm);
+                    // 审查 529：GetMetrics 失败必须处理 —— tm 全 0 会让
+                    // 右对齐修正与自愈扩窗全部基于 0 宽度。
+                    if l.GetMetrics(&mut tm).is_err() {
+                        return None;
+                    }
                 }
-                (l, tm.widthIncludingTrailingWhitespace)
+                Some((l, tm.widthIncludingTrailingWhitespace))
             });
         acc_add(ACC_LAYOUT, t_lay);
         let Some((layout, actual_w)) = lay else { return };
@@ -615,7 +673,10 @@ impl D2DSurface {
                 draw(self, 0, -1, b);
                 draw(self, 0, 1, b);
             }
-        } else if shadow {
+        }
+        // 审查 530：outline 与 shadow 独立分支（与 ui::draw_row_text 一致，
+        // 两项可叠加；原先 else if 互斥导致两引擎同配置绘制次数不一致）。
+        if shadow {
             if let Some(b) = &brush_shade {
                 draw(self, 1, 1, b);
             }
@@ -639,8 +700,14 @@ impl D2DSurface {
         match unsafe { self.rt.EndDraw(None, None) } {
             Ok(_) => true,
             Err(e) => {
-                crate::probe::log(&format!("d2d end_draw error: {}", e.code().0));
-                mark_device_lost();
+                let code = e.code().0 as u32;
+                crate::probe::log(&format!("d2d end_draw error: 0x{code:08X}"));
+                // 审查 531：按错误码分支 —— WRONG_STATE 等可恢复错误重建 RT
+                // 无用且会每帧重建；仅设备丢失类错误标记重建。
+                const D2DERR_WRONG_STATE: u32 = 0x8899_0001;
+                if code != D2DERR_WRONG_STATE {
+                    mark_device_lost();
+                }
                 false
             }
         }
@@ -673,6 +740,9 @@ impl RenderTarget for D2DSurface {
             Some(b) => b,
             None => return,
         };
+        // 审查 532：半径钳到短边一半 —— 大圆角矮矩形不再画出残角
+        // （与 gfx_d2d 同一钳位口径）。
+        let radius = radius.min(r.w / 2).min(r.h / 2);
         let rr = D2D1_ROUNDED_RECT {
             rect: D2D_RECT_F {
                 left: r.x as f32,
@@ -713,31 +783,19 @@ impl RenderTarget for D2DSurface {
     }
 
     fn measure_text(&self, s: &str, _font: aaxsyspulse_ui::FontSpec) -> (i32, i32) {
-        // 一次性 format（不走缓存：&self；此方法在 cell 绘制路径不被调用，仅为 trait 完整性）。
-        let fallback = (s.len() as i32 * 8, 16);
-        let Some(dwrite) = dwrite_factory() else { return fallback };
-        let fmt: IDWriteTextFormat = match unsafe {
-            dwrite.CreateTextFormat(
-                w!("Segoe UI"),
-                None,
-                DWRITE_FONT_WEIGHT_NORMAL,
-                DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL,
-                d2d_font_px(1.0),
-                w!(""),
-            )
-        } {
-            Ok(f) => f,
-            Err(_) => return fallback,
-        };
+        // 审查 533：fallback 按字符数估宽（原 `s.len()` 是字节数，非 ASCII
+        // 高估数倍）；度量走 cached_text_format —— 与绘制同一份字体，
+        // 不再出现"度量用 Segoe UI、绘制用 DIN"的分叉。
+        let fallback = || (s.chars().count() as i32 * 8, 16);
+        let Some(dwrite) = dwrite_factory() else { return fallback() };
+        let Some(fmt) = cached_text_format(d2d_font_px(1.0), 2) else { return fallback() };
         let text_buf = encode_text(s);
-        let layout = match unsafe { dwrite.CreateTextLayout(&text_buf, &fmt, 1e6, 1e6) } {
-            Ok(l) => l,
-            Err(_) => return fallback,
+        let Ok(layout) = (unsafe { dwrite.CreateTextLayout(&text_buf, &fmt, 1e6, 1e6) }) else {
+            return fallback();
         };
         let mut m = DWRITE_TEXT_METRICS::default();
         if unsafe { layout.GetMetrics(&mut m).is_err() } {
-            return fallback;
+            return fallback();
         }
         (m.width.ceil() as i32, m.height.ceil() as i32)
     }

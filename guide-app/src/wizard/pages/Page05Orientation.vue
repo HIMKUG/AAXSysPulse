@@ -2,6 +2,8 @@
 import { state, notifyConfig } from '../composables/useGuide.js'
 
 const choose = v => {
+  // 续篇 260：重复点同值不再重复写盘（一次点击 = 4 个 cfg 写入）
+  if (state.orientation === v) return
   state.orientation = v
   notifyConfig({ orientation: v }) // 主程序悬浮窗实时切换横竖
 }
@@ -21,7 +23,7 @@ const choose = v => {
           :aria-pressed="state.orientation === 'horizontal' ? 'true' : 'false'"
           @click="choose('horizontal')"
         >
-          <div class="mini-preview">
+          <div class="mini-preview" aria-hidden="true">
             <span class="mini-preview__bar"></span>
             <span class="mini-preview__bar"></span>
             <span class="mini-preview__bar"></span>
@@ -38,7 +40,7 @@ const choose = v => {
           :aria-pressed="state.orientation === 'vertical' ? 'true' : 'false'"
           @click="choose('vertical')"
         >
-          <div class="mini-preview mini-preview--v">
+          <div class="mini-preview mini-preview--v" aria-hidden="true">
             <span class="mini-preview__bar"></span>
             <span class="mini-preview__bar"></span>
             <span class="mini-preview__bar"></span>

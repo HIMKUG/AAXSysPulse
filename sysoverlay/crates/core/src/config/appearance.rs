@@ -4,7 +4,7 @@
 //! 取代旧 C 版 COLORREF(BBGGRR)。
 
 use crate::config::ini::{fmt_color, parse_bool, parse_color, parse_u32, Ini, Writer};
-use crate::config::{Config, FONT_PX_MAX, FONT_PX_MIN};
+use crate::config::Config;
 
 pub const APPEARANCE_FILE: &str = "appearance.cfg";
 
@@ -45,8 +45,11 @@ pub fn parse(cfg: &mut Config, text: &str) {
     }
     if let Some(v) = ini.get(s, "font_size") {
         if let Ok(n) = v.trim().parse::<f32>() {
-            // 0.5 步进钳位（与设置页滑杆共用区间）
-            cfg.font_size = (n.clamp(FONT_PX_MIN, FONT_PX_MAX) * 2.0).round() / 2.0;
+            // 审查 027："NaN" 能 parse 成功且 clamp 对 NaN 返回 NaN，先滤非有限值。
+            // 0.5 步进钳位统一走 snap_font_size（审查 028）。
+            if n.is_finite() {
+                cfg.font_size = crate::config::snap_font_size(n);
+            }
         }
     }
     if let Some(v) = ini.get(s, "font_weight") {

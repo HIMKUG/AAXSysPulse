@@ -24,8 +24,10 @@ button { font-family: inherit; }
 
 /* 键盘可达性（审查项 8B.K / P2-9）：统一焦点环。
    UA 默认环在本项目的深色玻璃背景上对比不足，键盘用户看不出焦点在哪。
-   用 :where() 保持 0 特异度 —— 卡片自己的圆角/边框规则不会被这条覆盖。 */
-:where(button, [tabindex]):focus-visible {
+   用 :where() 保持 0 特异度 —— 卡片自己的圆角/边框规则不会被这条覆盖。
+   续篇 753：补齐原生可聚焦控件 —— input[type=range]/color/number、select、
+   链接此前无可见焦点环。 */
+:where(button, [tabindex], input, select, textarea, a[href], summary):focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
@@ -62,7 +64,8 @@ button { font-family: inherit; }
 }
 .t-aux {
   font-size: var(--fs-aux);
-  font-weight: var(--fw-regular);
+  /* 续篇 754：删除被下一行覆盖的 font-weight: var(--fw-regular) ——
+     同一规则曾自相矛盾（字面 400 才是设计生效值）。 */
   line-height: var(--lh-aux);
   letter-spacing: var(--ls-aux);
   color: var(--text-secondary); font-style: italic; font-weight: 400;
@@ -285,7 +288,8 @@ button { font-family: inherit; }
 }
 .check-box svg { opacity: 0; transform: scale(0.6); transition: all var(--dur-hover) var(--ease-expo); }
 .check.checked .check-box { background: var(--success); border-color: var(--success); }
-.check.checked .check-box svg { opacity: 1; transform: scale(1); }
+/* 续篇 712：勾选图标 stroke=currentColor，颜色由这里给定（深色/高对比下不再依赖硬编码 #fff） */
+.check.checked .check-box svg { opacity: 1; transform: scale(1); color: var(--surface-white); }
 .check-label { font-size: var(--fs-body); color: var(--text-tertiary); font-style: italic; font-weight: 400; transition: color var(--dur-hover) ease-out; }
 .check.checked .check-label { color: var(--text-primary); font-weight: var(--fw-medium); }
 .check-tag {
@@ -396,7 +400,9 @@ input[type="range"]::-moz-range-thumb {
   width: 26px; height: 26px; border: none; border-radius: 50%;
   background: #fff; box-shadow: var(--shadow-btn);
 }
-/* 轨道填充：纯色（渐变更花，纯色更克制）；WebKit 无 range-progress，用硬色标模拟 */
+/* 轨道填充（续篇 755）：WebKit 无 ::-moz-range-progress —— 用双硬色标
+   linear-gradient 模拟**纯色**填充（视觉上是两段纯色拼接，非装饰渐变，
+   与 tokens.css「填充一律纯色」不冲突）；Firefox 走原生纯色 range-progress。 */
 .slider-fill::-webkit-slider-runnable-track {
   background: linear-gradient(
     to right,
@@ -406,7 +412,9 @@ input[type="range"]::-moz-range-thumb {
 }
 
 /* ============================ 滚动条 ============================ */
-/* 引导程序界面一律不显示可视滚动条；内容若超出仍可滚轮/触控板滚动，但不出现滚动条 */
+/* 引导程序界面一律不显示可视滚动条；内容若超出仍可滚轮/触控板滚动，但不出现滚动条。
+   续篇 756：键盘/读屏可达性由各滚动容器自身补齐 —— .sheet-body 已带
+   tabindex="0" + role="region"（WizardSheet.vue），不依赖滚动条可见性。 */
 .scroll {
   overflow-y: auto;
   overscroll-behavior: contain;

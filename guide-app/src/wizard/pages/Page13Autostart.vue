@@ -1,4 +1,5 @@
 <script setup>
+import { ref } from 'vue'
 import { state, setAutostart } from '../composables/useGuide.js'
 
 const OPTIONS = [
@@ -6,7 +7,14 @@ const OPTIONS = [
   { value: false, cls: 'autostart-card--no', title: '先不用，我需要时自己打开', desc: '从桌面快捷方式启动' }
 ]
 
-const pick = v => setAutostart(v) // 写入 system.cfg.autostart
+// 续篇 260/732：重复点同值不再重复写注册表；in-flight 去重防并发两次 autostart_set
+const pending = ref(false)
+const pick = async v => {
+  if (state.autostart === v || pending.value) return
+  pending.value = true
+  await setAutostart(v)
+  pending.value = false
+}
 </script>
 
 <template>

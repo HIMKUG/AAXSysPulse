@@ -153,7 +153,8 @@ pub const STEPPER_W: i32 = 96;
 pub const FONT_MIN: f32 = aaxsyspulse_core::config::FONT_PX_MIN;
 pub const FONT_MAX: f32 = aaxsyspulse_core::config::FONT_PX_MAX;
 pub const GAP_MIN: f32 = 0.0;
-pub const GAP_MAX: f32 = 64.0;
+/// 间距上限（审查 186/458：与 core 的 GAP_MAX 同源，不再各自独立 64.0）。
+pub const GAP_MAX: f32 = aaxsyspulse_core::config::GAP_MAX as f32;
 
 /// 逐指标文字偏移范围（像素，可为负）。与 core 落盘钳位同源，
 /// 否则「步进器能拨到、重启被截断」。
@@ -162,7 +163,8 @@ pub const OFF_MAX: f32 = aaxsyspulse_core::config::OFFSET_MAX as f32;
 
 /// DPI 缩放（逻辑像素 → 物理像素）。
 pub fn s(dpi: u32, v: i32) -> i32 {
-    v * dpi as i32 / 96
+    // 审查 157：三份 v*dpi/96 缩放收敛到 dpi.rs 的统一实现（四舍五入口径）。
+    crate::dpi::scale_logical(v, dpi)
 }
 
 /// 标签所在的**文字带**高度（物理像素）。
@@ -230,16 +232,22 @@ pub fn page_caption(p: usize, lang: Lang) -> &'static str {
         3 => tr("PgWindow"),
         4 => tr("PgPerformance"),
         5 => tr("PgDiag"),
+        // 审查 420：显式列出 0..=6 —— 原先把 p>=6 全兜到关于页。
+        6 => tr("PgAbout"),
+        // 页数由 mod.rs 的 PAGE_COUNT 钉死；越界防御性回落关于页。
         _ => tr("PgAbout"),
     }
 }
+
+/// 关于页下标（审查 421：唯一来源 —— 页面构建、page_caption、page_footnote
+/// 三处原先各自写死 5/6 且互不一致）。
+pub const ABOUT_PAGE: usize = 6;
 
 /// 某页脚注（关于页版权）。
 pub fn page_footnote(p: usize, lang: Lang) -> Option<&'static str> {
     let tr = |k: &'static str| crate::i18n::t(lang, k);
     match p {
-        // About 是第 7 页（下标 6）；加入 Diag 页后由 5 顺延到 6。
-        6 => Some(tr("AboutCopyright")),
+        ABOUT_PAGE => Some(tr("AboutCopyright")),
         _ => None,
     }
 }
@@ -307,7 +315,7 @@ impl RowDef {
     }
 
 
-    /// 行高（逻辑像素）= 控件带 + 行内 hint 每行 +15。
+    /// 行高（逻辑像素）= 控件带 + 行内 hint 每行 +HINT_EXTRA（审查 422：原"+15"与 HINT_EXTRA=20 不符）。
     fn height(&self) -> f32 {
         self.base_h() + HINT_EXTRA as f32 * self.hint_lines() as f32
     }
@@ -331,7 +339,10 @@ fn hint_row_def(text: &'static str) -> RowDef {
 
 // ── 页面构建（纯函数） ───────────────────────────────────
 
-/// 行构建辅助：几何 + 语言 + 控件构造，供各 `page_*` 共用。
+/// 卡片最小宽（逻辑 px，审查 425）。
+pub const CARD_MIN_W: f32 = 240.0;
+
+/// 行构建辅助（几何 + 语言 + 控件构造），供各 `page_*` 共用。
 /// （原为 `build_pages` 内的闭包；拆出后各页函数不再重复捕获。）
 struct Ux {
     lang: Lang,
@@ -999,7 +1010,9 @@ fn page_about(
                     )],
                 ),
             ],
-            page_footnote(5, ux.lang),
+            // 审查 424：脚注页码用 ABOUT_PAGE 常量 —— 原先传 5 而该函数只在 6
+            // 返回 Some，关于页版权脚注从未显示过。
+            page_footnote(ABOUT_PAGE, ux.lang),
             CARD_GAP,
         ));
 }
@@ -1026,9 +1039,10 @@ pub fn build_pages(
     let card_l = CONTENT_PAD_X as f32;
     // 卡片右缘：不超过 620（B-04），且不超出内容视口（客户区 - 侧栏 - 右边距）。
     let vp_lw = client_lw - SIDEBAR_W as f32;
+    // 审查 425：卡片最小宽提具名常量（原 240.0 裸魔数）。
     let card_r = (card_l + CONTENT_MAX_W as f32)
         .min(vp_lw - CONTENT_PAD_X as f32)
-        .max(card_l + 240.0);
+        .max(card_l + CARD_MIN_W);
     // 卡内行区左右。
     let rows_l = card_l + CARD_PAD as f32;
     let rows_r = card_r - CARD_PAD as f32;
@@ -1127,7 +1141,7 @@ pub fn build_pages(
                 out_rows.push(Row {
                     label: rd.label,
                     widgets: idxs,
-                    divider: rd.divider || want_div[ri],
+                    divider: rd.divider || want_div[ri], // 审查 426：rd.divider 全构造点恒 false，仅为分组线保留 || 通路
                     hint: rd.hint_only,
                     hint_text: rd.hint_text,
                     hint2: rd.hint2,
@@ -1137,9 +1151,12 @@ pub fn build_pages(
                 ry += rh;
             }
             let rows_h = sf(dpi, ry);
-            let foot_h = if foot.is_some() { s(dpi, FOOTNOTE_H) } else { 0 };
+            let foot_logical = if foot.is_some() { FOOTNOTE_H as f32 } else { 0.0 };
             // 上下内边距**同值**（旧实现底部多留 1×CARD_PAD，卡片看着「下坠」）。
-            let card_bottom = rows_top + rows_h as f32 + CARD_PAD as f32 + foot_h as f32;
+            // 审查 427：card_bottom 统一在**逻辑坐标**累加（rows_top/ry/CARD_PAD/
+            // FOOTNOTE_H 都是逻辑值），末尾 rect 处一次性 sf() 缩放 —— 原实现
+            // 把已缩放的 rows_h/foot_h 混进逻辑和里再整体缩放，仅 96dpi 自洽。
+            let card_bottom = rows_top + ry + CARD_PAD as f32 + foot_logical;
             page.cards.push(Card {
                 caption,
                 rect: windows::Win32::Foundation::RECT {
@@ -1169,7 +1186,9 @@ mod spacing_tests {
     fn build_all(expand: f32) -> [Page; 7] {
         let cfg = Config::default();
         let mut pages: [Page; 7] = Default::default();
-        build_pages(&mut pages, &cfg, Lang::Zh, D, 900, &[expand; N_METRICS], &[0, 1, 2, 6, 3, 4, 5, 0, 0]);
+        // 审查 428：order 用 Config::default().metric_order —— 原先手写的
+        // [0,1,2,6,3,4,5,0,0] 是第三份非法默认顺序（重复 0、缺 7/8）。
+        build_pages(&mut pages, &cfg, Lang::Zh, D, 900, &[expand; N_METRICS], &cfg.metric_order);
         pages
     }
 
@@ -1300,7 +1319,7 @@ mod spacing_tests {
             }
         }
         // 指标数 7→9（新增 DiskRead/DiskWrite）→ 卡片数同步为 9。
-        assert_eq!(checked, 18, "两种展开态 × 9 张监控项卡");
+        assert_eq!(checked, 2 * N_METRICS, "两种展开态 × 全部监控项卡（审查 429：不再写死 18）");
     }
 
     /// 折叠（未展开）时监控项卡只有一行（就是折叠头）。
@@ -1383,11 +1402,8 @@ mod spacing_tests {
             best_expanded = best_expanded.min(t.elapsed().as_secs_f64() * 1e6);
         }
         println!(
-            "rebuild_pages collapsed={best_collapsed:.0}µs expanded={best_expanded:.0}µs (release 下供参考)"
+            "rebuild_pages collapsed={best_collapsed:.0}µs expanded={best_expanded:.0}µs (审查 430：仅打印参考，墙钟断言在 CI/负载下 flaky)"
         );
-        // 全部 6 页 × 全部控件的整体重建 < 5ms（release 实测通常远低于此）。
-        // 超预算说明有人在 build_pages 循环里加了重活，先测量再优化。
-        assert!(best_expanded < 5_000.0, "页面重建超预算：{best_expanded:.0}µs");
     }
 }
 

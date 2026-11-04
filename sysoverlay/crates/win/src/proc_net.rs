@@ -14,7 +14,8 @@
 //! 含大量虚拟/过滤器子接口），单次 ~28ms，是采样主循环最大头。
 //!
 //! 新实现：
-//! 1. **拓扑缓存**：首次 / 全部掉线 / 安全间隔（10s）到期时，才跑一次
+//! 1. **拓扑缓存**：首次 / 全部掉线 / 兜底间隔（60s，`NET_ENUM_REFRESH_MS`，
+//!    审查 067：原注释误写 10s）到期时，才跑一次
 //!    `GetIfTable2` 过滤出「在线物理 NIC」的接口索引缓存（`nic_cache`）；
 //! 2. **增量查询**：每周期仅对缓存里的 ~1–2 个 NIC 调 `GetIfEntry2`
 //!    （O(活跃NIC数)，单接口 <0.1ms），按 `InterfaceIndex`（LUID 置零）精确取数；
@@ -30,10 +31,10 @@ use std::sync::Once;
 use windows::Win32::Foundation::{BOOLEAN, HANDLE};
 use windows::Win32::Networking::WinSock::ADDRESS_FAMILY;
 use windows::Win32::NetworkManagement::IpHelper::{
-    FreeMibTable, GetIfEntry2, GetIfTable2, MIB_IF_ROW2, MIB_IF_TABLE2, MIB_IPINTERFACE_ROW,
-    MIB_NOTIFICATION_TYPE, NotifyIpInterfaceChange,
+    CancelMibChangeNotify2, FreeMibTable, GetIfEntry2, GetIfTable2, MIB_IF_ROW2, MIB_IF_TABLE2,
+    MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE, NotifyIpInterfaceChange,
 };
-use windows::Win32::NetworkManagement::Ndis::{IfOperStatusUp, IF_OPER_STATUS};
+use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 use aaxsyspulse_core::sampler::{SampleOutcome, Sampler, SamplerId};
 use aaxsyspulse_core::snapshot::{NetStat, Snapshot};
 
@@ -41,6 +42,8 @@ const IF_TYPE_ETHERNET_CSMACD: u32 = 6;
 const IF_TYPE_IEEE80211: u32 = 71;
 const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
 const IF_TYPE_TUNNEL: u32 = 131;
+/// Hyper-V 虚拟交换机（审查 066：注释点名排除 53，代码此前只排 24/131）。
+const IF_TYPE_HYPERV_SWITCH: u32 = 53;
 
 /// 重新枚举活跃 NIC 的兜底间隔（ms）：正常情况下 NIC 增删/UP-DOWN 由
 /// `NotifyIpInterfaceChange` 事件驱动重枚举（见 `init_net_notify`），
@@ -64,13 +67,19 @@ unsafe extern "system" fn on_net_change(
     _row: *const MIB_IPINTERFACE_ROW,
     _notificationtype: MIB_NOTIFICATION_TYPE,
 ) {
-    NET_TOPO_INVALID.store(true, Ordering::SeqCst);
+    // 审查 568：纯标志位，Relaxed 足够（消费侧 swap 同为 Relaxed）。
+    NET_TOPO_INVALID.store(true, Ordering::Relaxed);
 }
+
+/// `NotifyIpInterfaceChange` 的注册句柄（审查 065：保存以便退出时注销）。
+/// HANDLE 本身不是 Send，包一层显式声明跨线程持有安全（句柄值仅用于注销）。
+struct SendHandle(HANDLE);
+unsafe impl Send for SendHandle {}
+static NET_NOTIFY_HANDLE: std::sync::Mutex<Option<SendHandle>> = std::sync::Mutex::new(None);
 
 /// 启动期调用一次：注册网卡变更通知，用事件驱动取代 10s 轮询重枚举。
 ///
 /// 回调仅置 `NET_TOPO_INVALID`；`sample()` 在重枚举前清掉它。
-/// 注册句柄由 OS 在进程退出时回收（回调只引用全局原子，安全），无需保存。
 pub fn init_net_notify() {
     NET_NOTIFY_INIT.call_once(|| {
         unsafe {
@@ -83,6 +92,10 @@ pub fn init_net_notify() {
                 &mut handle,
             );
             if err.is_ok() {
+                // 审查 065：句柄存入全局，进程退出前由 [`shutdown_net_notify`] 注销。
+                if let Ok(mut g) = NET_NOTIFY_HANDLE.lock() {
+                    *g = Some(SendHandle(handle));
+                }
                 crate::probe::log("net NotifyIpInterfaceChange registered");
             } else {
                 crate::probe::log(&format!("net NotifyIpInterfaceChange failed err={}", err.0));
@@ -91,12 +104,24 @@ pub fn init_net_notify() {
     });
 }
 
+/// 注销网卡变更通知（进程退出 / 采样线程关闭时调用；审查 065）。
+pub fn shutdown_net_notify() {
+    if let Ok(mut g) = NET_NOTIFY_HANDLE.lock() {
+        if let Some(SendHandle(h)) = g.take() {
+            unsafe {
+                let _ = CancelMibChangeNotify2(h);
+            }
+        }
+    }
+}
+
 /// 系统唤醒后调用：标记网卡拓扑待重枚举（与 GPU `invalidate_topology` /
 /// MSR `invalidate_on_resume` 对称的自愈入口）。睡眠期间网卡驱动可能重枚举
 /// （虚拟交换机重建 / 无线重连后接口序号变化），`NotifyIpInterfaceChange`
 /// 回调不保证覆盖唤醒事件；置位后下一次 net 采样即全表重枚举，不必等 60s 兜底。
 pub fn invalidate_topology() {
-    NET_TOPO_INVALID.store(true, Ordering::SeqCst);
+    // 审查 568：纯标志位，Relaxed 足够。
+    NET_TOPO_INVALID.store(true, Ordering::Relaxed);
 }
 
 /// Npcap / WFP / QoS 过滤器子接口的别名关键字。
@@ -163,6 +188,9 @@ impl NetSampler {
             let err = GetIfTable2(&mut table);
             if err.is_err() || table.is_null() {
                 probe::log(&format!("net enum GetIfTable2 failed err={}", err.0));
+                // 审查 569：失败也推进 last_enum_ms 做退避 —— 否则 nic_cache 为空
+                // 时 need_enum 每帧为真，每周期都重跑 ~28ms 全表枚举空转。
+                self.last_enum_ms = now_ms;
                 return false;
             }
 
@@ -173,7 +201,10 @@ impl NetSampler {
                 let t = row.Type;
                 let up = row.OperStatus == IfOperStatusUp;
                 let physical = t == IF_TYPE_ETHERNET_CSMACD || t == IF_TYPE_IEEE80211;
-                let not_virtual = t != IF_TYPE_SOFTWARE_LOOPBACK && t != IF_TYPE_TUNNEL;
+                // 显式列出排除集（审查 066：兑现注释承诺的 Hyper-V 交换机 53）。
+                let not_virtual = t != IF_TYPE_SOFTWARE_LOOPBACK
+                    && t != IF_TYPE_TUNNEL
+                    && t != IF_TYPE_HYPERV_SWITCH;
                 let alias = wide_to_str(&row.Alias, 128);
                 // 过滤器子接口与主接口共享计数器，必须跳过（否则网速放大 N 倍）
                 let keep = up
@@ -226,7 +257,7 @@ impl Sampler for NetSampler {
         // 决定是否需要重新枚举：首次 / 全部掉线 / 事件标记置位（NIC 变化）/
         // 60s 兜底（覆盖事件漏报）。事件驱动下稳态几乎只在 NIC 真变化时重枚举。
         let need_enum = self.nic_cache.is_empty()
-            || NET_TOPO_INVALID.swap(false, Ordering::SeqCst)
+            || NET_TOPO_INVALID.swap(false, Ordering::Relaxed)
             || now_ms.saturating_sub(self.last_enum_ms) >= NET_ENUM_REFRESH_MS;
         if need_enum {
             self.enum_cache(now_ms);
@@ -271,6 +302,9 @@ impl Sampler for NetSampler {
         let mut rx_bps: u64 = 0;
         let mut tx_bps: u64 = 0;
         let mut counter_reset = false;
+        // 审查 570：间隔太短（dt < MIN_DT_MS）时置位 —— 不把"间隔太短"
+        // 显示成 0 B/s 尖谷，保留 out.net 中的上帧速率。
+        let mut short_dt = false;
 
         if let Some((pms, pin, pout)) = self.prev {
             let dt = now_ms.saturating_sub(pms);
@@ -282,8 +316,14 @@ impl Sampler for NetSampler {
                 ));
             } else if dt >= MIN_DT_MS {
                 // bytes/s = Δbytes × 1000 / Δms
-                rx_bps = (sum_in - pin).saturating_mul(1000) / dt;
-                tx_bps = (sum_out - pout).saturating_mul(1000) / dt;
+                // 审查 064：u128 中间量 —— 先 saturating_mul(1000) 饱和到
+                // u64::MAX 再除会得出错误巨值。
+                rx_bps = (((sum_in - pin) as u128 * 1000) / dt.max(1) as u128)
+                    .min(u64::MAX as u128) as u64;
+                tx_bps = (((sum_out - pout) as u128 * 1000) / dt.max(1) as u128)
+                    .min(u64::MAX as u128) as u64;
+            } else {
+                short_dt = true;
             }
         }
 
@@ -304,17 +344,13 @@ impl Sampler for NetSampler {
             out.timestamp_ms = now_ms;
             return SampleOutcome::Ok;
         }
-
-        out.net = NetStat { rx_bps, tx_bps };
+        // 审查 570：间隔太短的帧不覆写 out.net（保留上帧速率）。
+        if !short_dt {
+            out.net = NetStat { rx_bps, tx_bps };
+        }
         out.timestamp_ms = now_ms;
         SampleOutcome::Ok
     }
-}
-
-/// `IF_OPER_STATUS` 的数值（诊断输出用），保持与 SDK 枚举一致。
-#[allow(dead_code)]
-fn oper_dbg(o: IF_OPER_STATUS) -> i32 {
-    o.0
 }
 
 #[cfg(test)]

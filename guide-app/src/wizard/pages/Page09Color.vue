@@ -6,16 +6,19 @@ import { state, activeItems, PRESET_COLORS, notifyConfig } from '../composables/
 const showSheet = ref(false)
 const items = computed(() => activeItems.value)
 
+// 续篇 720：同文件统一一个深拷贝 helper（曾一半展开浅拷贝、一半 JSON 深拷贝）
+const deepClone = v => JSON.parse(JSON.stringify(v))
+
 function setColor(field, value) {
   state.colors[field] = value.toUpperCase()
   state.perColors = null // 统一设置与逐项设置互斥
-  notifyConfig({ colors: { ...state.colors }, per_item_colors: null })
+  notifyConfig({ colors: deepClone(state.colors), per_item_colors: null })
 }
 function setPerColor(key, field, value) {
   if (!state.perColors) state.perColors = {}
   if (!state.perColors[key]) state.perColors[key] = { ...state.colors }
   state.perColors[key][field] = value.toUpperCase()
-  notifyConfig({ per_item_colors: JSON.parse(JSON.stringify(state.perColors)) })
+  notifyConfig({ per_item_colors: deepClone(state.perColors) })
 }
 const colorOf = (key, field) =>
   state.perColors && state.perColors[key] ? state.perColors[key][field] : state.colors[field]
@@ -39,7 +42,13 @@ const colorOf = (key, field) =>
         每个监控项都有「名字」与「数值」两种颜色，
         可在面板中统一设置，或逐项单独调整。
       </p>
-      <button class="btn btn-secondary btn-block r3" @click="showSheet = true">
+      <!-- 续篇 721：触发 sheet 的按钮补 aria-haspopup/aria-expanded -->
+      <button
+        class="btn btn-secondary btn-block r3"
+        aria-haspopup="dialog"
+        :aria-expanded="showSheet ? 'true' : 'false'"
+        @click="showSheet = true"
+      >
         打开颜色面板
       </button>
     </div>
@@ -51,7 +60,8 @@ const colorOf = (key, field) =>
         <div class="color-row">
           <label class="color-picker">
             <span class="swatch" style="width: 22px; height: 22px" :style="{ background: state.colors.name }"></span>
-            <input type="color" :value="state.colors.name" @change="e => setColor('name', e.target.value)" @cancel="e => (e.target.value = state.colors.name)" />
+            <!-- 续篇 722：input[type=color] 无可见文字 —— 补 aria-label 成为可访问名 -->
+            <input type="color" aria-label="名字颜色" :value="state.colors.name" @change="e => setColor('name', e.target.value)" @cancel="e => (e.target.value = state.colors.name)" />
           </label>
           <span class="color-hex">{{ state.colors.name }}</span>
           <div class="swatch-list">
@@ -74,7 +84,7 @@ const colorOf = (key, field) =>
         <div class="color-row">
           <label class="color-picker">
             <span class="swatch" style="width: 22px; height: 22px" :style="{ background: state.colors.value }"></span>
-            <input type="color" :value="state.colors.value" @change="e => setColor('value', e.target.value)" @cancel="e => (e.target.value = state.colors.value)" />
+            <input type="color" aria-label="数值颜色" :value="state.colors.value" @change="e => setColor('value', e.target.value)" @cancel="e => (e.target.value = state.colors.value)" />
           </label>
           <span class="color-hex">{{ state.colors.value }}</span>
           <div class="swatch-list">
@@ -98,11 +108,11 @@ const colorOf = (key, field) =>
           <span class="per-item-name">{{ it.label }}</span>
           <label class="color-picker" title="名字颜色">
             <span class="swatch" style="width: 18px; height: 18px" :style="{ background: colorOf(it.key, 'name') }"></span>
-            <input type="color" :value="colorOf(it.key, 'name')" @change="e => setPerColor(it.key, 'name', e.target.value)" @cancel="e => (e.target.value = colorOf(it.key, 'name'))" />
+            <input type="color" :aria-label="`${it.label} 名字颜色`" :value="colorOf(it.key, 'name')" @change="e => setPerColor(it.key, 'name', e.target.value)" @cancel="e => (e.target.value = colorOf(it.key, 'name'))" />
           </label>
           <label class="color-picker" title="数值颜色">
             <span class="swatch" style="width: 18px; height: 18px" :style="{ background: colorOf(it.key, 'value') }"></span>
-            <input type="color" :value="colorOf(it.key, 'value')" @change="e => setPerColor(it.key, 'value', e.target.value)" @cancel="e => (e.target.value = colorOf(it.key, 'value'))" />
+            <input type="color" :aria-label="`${it.label} 数值颜色`" :value="colorOf(it.key, 'value')" @change="e => setPerColor(it.key, 'value', e.target.value)" @cancel="e => (e.target.value = colorOf(it.key, 'value'))" />
           </label>
         </div>
       </div>

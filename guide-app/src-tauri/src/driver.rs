@@ -12,7 +12,6 @@ use thiserror::Error;
 #[cfg(windows)]
 use windows::{
     core::{HRESULT, PCWSTR},
-    Win32::Foundation::WIN32_ERROR,
     Win32::System::Services::{
         CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW,
         OpenServiceW, QueryServiceConfigW, QueryServiceStatus, StartServiceW, SC_HANDLE,
@@ -24,11 +23,13 @@ use windows::{
 
 #[derive(Error, Debug)]
 pub enum DriverError {
-    #[error("IO error: {0}")]
+    // 续篇 688：五个变体文案统一中文（曾中英混排），错误码即变体名（serde 上
+    // 由 `to_string()` 承载，稳定形态 = 各变体 Display 前缀）。
+    #[error("IO 错误：{0}")]
     Io(#[from] std::io::Error),
-    #[error("Not administrator")]
+    #[error("需要管理员权限")]
     NotAdmin,
-    #[error("SCM error: {0}")]
+    #[error("服务控制管理器错误：{0}")]
     Scm(String),
     #[error("服务删除超时，请重启电脑后再试")]
     ServiceDeleteTimeout,
@@ -57,7 +58,10 @@ fn driver_target_path() -> PathBuf {
 /// 检查是否是管理员权限
 #[cfg(windows)]
 pub fn is_admin() -> bool {
-    std::fs::metadata("C:\\Windows\\System32\\cfgmgr32.dll").is_ok()
+    // 首轮 235：旧实现用 cfgmgr32.dll 是否存在判管理员 —— 该 DLL 任何 Windows
+    // 都有，标准用户恒 true，与主程序 pre_launch_checks.rs 的 IsUserAnAdmin()
+    // 口径冲突。改用同一 API（Win32_UI_Shell feature 已启用）。
+    unsafe { windows::Win32::UI::Shell::IsUserAnAdmin() }.as_bool()
 }
 
 #[cfg(not(windows))]
@@ -79,13 +83,23 @@ fn is_driver_file_in_use(path: &PathBuf) -> bool {
 /// 停止服务并等待其完全停止
 #[cfg(windows)]
 fn stop_service(sc_manager: SC_HANDLE, service_name_wide: &[u16]) -> Result<(), DriverError> {
+    use windows::Win32::Foundation::ERROR_SERVICE_NOT_ACTIVE;
+
     unsafe {
         let service = OpenServiceW(sc_manager, PCWSTR::from_raw(service_name_wide.as_ptr()), SERVICE_ALL_ACCESS)
             .map_err(|e| DriverError::Scm(e.to_string()))?;
 
-        // 发送停止指令
+        // 发送停止指令（首轮 236：返回值不再丢弃 —— 服务本就没在运行时直接按
+        // 成功返回，不再空轮询 5 秒超时）。
         let mut status = std::mem::zeroed();
-        let _ = ControlService(service, SERVICE_CONTROL_STOP, &mut status);
+        match ControlService(service, SERVICE_CONTROL_STOP, &mut status) {
+            Ok(()) => {}
+            Err(e) if e.code() == HRESULT::from(ERROR_SERVICE_NOT_ACTIVE) => {
+                let _ = CloseServiceHandle(service);
+                return Ok(());
+            }
+            Err(e) => tracing::warn!("ControlService(SERVICE_CONTROL_STOP) failed: {e}"),
+        }
 
         // 关闭服务句柄
         let _ = CloseServiceHandle(service);
@@ -113,22 +127,25 @@ fn stop_service(sc_manager: SC_HANDLE, service_name_wide: &[u16]) -> Result<(), 
                     return Ok(());
                 }
                 if state != SERVICE_STOP_PENDING {
+                    // 续篇 683：RUNNING/PAUSED 等非 STOP_PENDING 状态曾直接 break
+                    // 并返回 Ok —— 没停掉也算成功。如实报失败，让上层记 fail。
                     let _ = CloseServiceHandle(svc);
-                    break;
+                    return Err(DriverError::Scm(format!(
+                        "服务未进入停止流程（当前状态码 {}），无法确认已停止",
+                        state.0
+                    )));
                 }
             }
             let _ = CloseServiceHandle(svc);
             std::thread::sleep(Duration::from_millis(200));
         }
-
-        Ok(())
     }
 }
 
-/// 把服务名转成 null 结尾宽字符缓冲
+/// 把服务名转成 null 结尾宽字符缓冲（首轮 006：统一走契约 `wide_of`，不再自留一份编码副本）
 #[cfg(windows)]
 fn service_name_wide() -> Vec<u16> {
-    DRIVER_SERVICE_NAME.encode_utf16().chain(std::iter::once(0)).collect()
+    aaxsyspulse_core::contract::wide_of(DRIVER_SERVICE_NAME)
 }
 
 /// 服务镜像路径（`QUERY_SERVICE_CONFIGW::lpBinaryPathName`）。
@@ -153,7 +170,29 @@ unsafe fn service_binary_path(svc: SC_HANDLE) -> Option<String> {
     if lp.0.is_null() {
         return None;
     }
-    PCWSTR(lp.0 as *const u16).to_string().ok()
+    // 续篇 684：不信任 NUL 结尾 —— 在**自有缓冲的边界内**限长扫描，越界读不可能发生。
+    // （`PCWSTR::to_string()` 对无 NUL 结尾的指针会一路读到野内存。）
+    let base = buf.as_ptr() as usize;
+    let off = lp.0 as usize - base;
+    if off >= buf.len() {
+        return None;
+    }
+    let mut end = off;
+    while end + 2 <= buf.len() {
+        let u = u16::from_le_bytes([buf[end], buf[end + 1]]);
+        if u == 0 {
+            break;
+        }
+        end += 2;
+    }
+    if end + 2 > buf.len() {
+        return None; // 缓冲内没有 NUL 结尾：拒绝而非越界读
+    }
+    let wide: Vec<u16> = buf[off..end]
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    String::from_utf16(&wide).ok()
 }
 
 /// 该服务的镜像路径是否就是本软件释放的那一个。
@@ -164,7 +203,18 @@ unsafe fn service_binary_path(svc: SC_HANDLE) -> Option<String> {
 #[cfg(windows)]
 fn is_our_driver_binary(path: Option<&str>) -> bool {
     let Some(raw) = path else { return false };
-    let p = raw.replace('/', "\\").to_ascii_lowercase();
+    // 续篇 237：SCM 常把镜像路径写成 `\??\C:\...` 或 `\SystemRoot\System32\...`，
+    // 直接 starts_with 会把"我们的"判成 foreign（进而反复改服务配置）。先剥前缀。
+    let mut p = raw.replace('/', "\\").to_ascii_lowercase();
+    if let Some(rest) = p.strip_prefix("\\??\\") {
+        p = rest.to_string();
+    }
+    if let Some(rest) = p.strip_prefix("\\systemroot\\") {
+        let root = std::env::var("SystemRoot")
+            .unwrap_or_else(|_| "C:\\Windows".to_string())
+            .to_ascii_lowercase();
+        p = format!("{root}\\{rest}");
+    }
     let name = p.rsplit('\\').next().unwrap_or("");
     p.starts_with(&DRIVER_TARGET_DIR.to_ascii_lowercase()) && name == "winring0x64.sys"
 }
@@ -244,8 +294,10 @@ pub fn delete_old_service() -> Result<bool, DriverError> {
             return Err(e);
         }
         // 标记删除；关闭句柄是服务能被彻底删除的必要条件
-        DeleteService(svc).map_err(|e| DriverError::Scm(e.to_string()))?;
+        // 首轮 238：DeleteService 失败也要先关句柄再返回，避免泄漏 svc / sc_manager。
+        let deleted = DeleteService(svc).map_err(|e| DriverError::Scm(e.to_string()));
         let _ = CloseServiceHandle(svc);
+        deleted?;
 
         // 等待服务真正从 SCM 中消失（轮询 5 秒）
         let timeout = Duration::from_secs(5);
@@ -261,7 +313,15 @@ pub fn delete_old_service() -> Result<bool, DriverError> {
                     let _ = CloseServiceHandle(s);
                     std::thread::sleep(Duration::from_millis(200));
                 }
-                Err(_) => break, // ERROR_SERVICE_DOES_NOT_EXIST：已彻底删除
+                Err(e) => {
+                    // 续篇 685：只有 ERROR_SERVICE_DOES_NOT_EXIST 才算删干净 ——
+                    // 任意错误都 break 曾把"拒绝访问"当成"已彻底删除"。
+                    if e.code() != HRESULT::from(windows::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST) {
+                        let _ = CloseServiceHandle(sc_manager);
+                        return Err(DriverError::Scm(format!("轮询确认删除时打开服务失败：{e}")));
+                    }
+                    break;
+                }
             }
         }
         let _ = CloseServiceHandle(sc_manager);
@@ -272,7 +332,8 @@ pub fn delete_old_service() -> Result<bool, DriverError> {
         if is_driver_file_in_use(&driver_path) {
             return Err(DriverError::DriverFileInUse);
         }
-        let _ = fs::remove_file(&driver_path);
+        // 首轮 239：删除失败曾返回 Ok(true) —— 假装删干净，注册阶段会继续用旧驱动。
+        fs::remove_file(&driver_path)?;
     }
 
     Ok(true)
@@ -296,6 +357,9 @@ pub fn release_driver_sys(driver_data: &[u8]) -> Result<(), DriverError> {
     }
     let driver_path = driver_target_path();
     let temp_path = driver_path.with_extension("sys.tmp");
+    // 首轮 239：rename 是否已成功 —— 只有成功过的失败路径才需要清理 target
+    // （坏 .sys 已就位）；更早的失败绝不能误删系统目录里的旧驱动。
+    let mut renamed = false;
     let result = (|| -> std::io::Result<()> {
         {
             let mut file = File::create(&temp_path)?;
@@ -303,6 +367,7 @@ pub fn release_driver_sys(driver_data: &[u8]) -> Result<(), DriverError> {
             file.sync_all()?;
         }
         fs::rename(&temp_path, &driver_path)?;
+        renamed = true;
         let len = fs::metadata(&driver_path)?.len();
         if len != driver_data.len() as u64 {
             return Err(std::io::Error::other(format!(
@@ -315,6 +380,9 @@ pub fn release_driver_sys(driver_data: &[u8]) -> Result<(), DriverError> {
     if result.is_err() {
         // 不把半成品留在目录里等下一次"看起来已经装好"。
         let _ = fs::remove_file(&temp_path);
+        if renamed {
+            let _ = fs::remove_file(&driver_path);
+        }
     }
     result.map_err(DriverError::Io)
 }
@@ -327,6 +395,8 @@ pub fn release_driver_sys(_driver_data: &[u8]) -> Result<(), DriverError> {
 /// 65%：注册内核服务（CreateServiceW，DEMAND_START）
 #[cfg(windows)]
 pub fn register_driver_service() -> Result<(), DriverError> {
+    use windows::Win32::Foundation::ERROR_SERVICE_EXISTS;
+
     if !is_admin() {
         return Err(DriverError::NotAdmin);
     }
@@ -335,10 +405,15 @@ pub fn register_driver_service() -> Result<(), DriverError> {
         let sc_manager: SC_HANDLE = OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)
             .map_err(|e| DriverError::Scm(e.to_string()))?;
 
-        let driver_path_str = driver_path.to_string_lossy();
-        let driver_path_wide: Vec<u16> = driver_path_str.encode_utf16().chain(std::iter::once(0)).collect();
+        // 续篇 686：镜像路径改走 OsStr::encode_wide —— to_string_lossy() 曾把
+        // 非 UTF-8 字符变 U+FFFD，服务指向坏路径后驱动永远起不来。
+        use std::os::windows::ffi::OsStrExt;
+        let driver_path_wide: Vec<u16> = std::ffi::OsStr::new(&driver_path)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
         let name = service_name_wide();
-        let display_name_wide: Vec<u16> = DRIVER_DISPLAY_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+        let display_name_wide: Vec<u16> = aaxsyspulse_core::contract::wide_of(DRIVER_DISPLAY_NAME);
 
         let service = CreateServiceW(
             sc_manager,
@@ -354,18 +429,24 @@ pub fn register_driver_service() -> Result<(), DriverError> {
             None,
             None,
             None,
-        )
-        .map_err(|e| {
-            // ERROR_SERVICE_EXISTS(1073)：名字已被占用。走到这里说明 45% 的
-            // `delete_old_service` **主动拒绝**了删除（归属不匹配）⇒ 占名的是别人的服务。
-            // 报成 ForeignService 而不是笼统的 SCM 错误，安装日志里才看得出为什么
-            // 最终功耗监控不可用。
-            if e.code() == HRESULT::from(WIN32_ERROR(1073)) {
-                DriverError::ForeignService
-            } else {
-                DriverError::Scm(e.to_string())
+        );
+        // 首轮 241：注册失败要有回滚 —— 55% 已落地的 .sys 至少清掉并留痕，
+        // 避免"服务不在、文件在"的半成品（旧服务已删，无法复原，只能如实记账）。
+        let service = match service {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = CloseServiceHandle(sc_manager);
+                // 首轮 243：ERROR_SERVICE_EXISTS(1073) 提为具名常量。
+                if e.code() == HRESULT::from(ERROR_SERVICE_EXISTS) {
+                    tracing::warn!("CreateServiceW failed: name occupied by foreign service; rolling back released driver");
+                    let _ = fs::remove_file(&driver_path);
+                    return Err(DriverError::ForeignService);
+                }
+                tracing::warn!("CreateServiceW failed: {e}; rolling back released driver");
+                let _ = fs::remove_file(&driver_path);
+                return Err(DriverError::Scm(e.to_string()));
             }
-        })?;
+        };
 
         let _ = CloseServiceHandle(service);
         let _ = CloseServiceHandle(sc_manager);
@@ -404,8 +485,9 @@ pub fn start_driver_service() -> Result<(), DriverError> {
 
         let r = match StartServiceW(service, None) {
             Ok(()) => Ok(()),
-            // ERROR_SERVICE_ALREADY_RUNNING(1056)：已在运行按成功处理
-            Err(e) if e.code() == HRESULT::from(WIN32_ERROR(1056)) => Ok(()),
+            // 首轮 243：ERROR_SERVICE_ALREADY_RUNNING(1056) 提为具名常量。
+            // 已在运行按成功处理
+            Err(e) if e.code() == HRESULT::from(windows::Win32::Foundation::ERROR_SERVICE_ALREADY_RUNNING) => Ok(()),
             Err(e) => Err(DriverError::Scm(e.to_string())),
         };
 
@@ -426,7 +508,9 @@ pub fn start_driver_service() -> Result<(), DriverError> {
 #[cfg(windows)]
 pub fn get_driver_status() -> Result<DriverStatus, DriverError> {
     if !is_admin() {
-        return Ok(DriverStatus { installed: false, running: false, has_file: false });
+        // 续篇 687：非管理员探测 SCM 必失败 —— 曾返回"全 false 的正常态"，上层
+        // 无法区分"没装"与"没权限"。改为 Err，调用方按失败记账并提示提权。
+        return Err(DriverError::NotAdmin);
     }
 
     let has_file = driver_target_path().exists();
@@ -497,7 +581,9 @@ pub fn restart_as_admin() -> Result<(), DriverError> {
     crate::process::release_guide_single_instance();
 
     unsafe {
-        ShellExecuteW(
+        // 首轮 242：返回值 ≤32（SE_ERR_*）表示失败 —— 不判返回值就 exit(0) 会让
+        // "两个窗口都没了"（单实例锁已释放、本进程又退了）。
+        let hinst = ShellExecuteW(
             None,
             PCWSTR::from_raw(windows::core::w!("runas").as_ptr()),
             PCWSTR::from_raw(exe_wide.as_ptr()),
@@ -505,6 +591,14 @@ pub fn restart_as_admin() -> Result<(), DriverError> {
             None,
             SW_SHOWNORMAL,
         );
+        if (hinst.0 as usize) <= 32 {
+            // 失败：把刚释放的单实例锁重新拿回来，让当前实例继续可用。
+            crate::process::acquire_guide_single_instance();
+            return Err(DriverError::Scm(format!(
+                "ShellExecuteW(runas) 失败（SE 代码 {}）：用户取消或权限被拒",
+                hinst.0 as isize
+            )));
+        }
     }
 
     // 退出当前进程
@@ -529,6 +623,9 @@ mod ownership_tests {
         assert!(is_our_driver_binary(Some("c:\\windows\\AAXSYSPULSE\\winring0x64.sys")));
         // 正斜杠写法同样认（注册表里手工写出来的常见形态）
         assert!(is_our_driver_binary(Some("C:/Windows/AAXSysPulse/WinRing0x64.sys")));
+        // 续篇 237：SCM 常见的前缀形态 —— `\??\` 与 `\SystemRoot\` 同样要认出来
+        assert!(is_our_driver_binary(Some("\\??\\C:\\Windows\\AAXSysPulse\\WinRing0x64.sys")));
+        assert!(is_our_driver_binary(Some("\\SystemRoot\\AAXSysPulse\\WinRing0x64.sys")));
     }
 
     #[test]

@@ -46,39 +46,14 @@ pub fn cpu_usage(idle_delta: u64, kernel_delta: u64, user_delta: u64) -> Metric<
     Metric::Value(usage)
 }
 
-/// Calculate a per-second rate from a byte delta and elapsed time.
-///
-/// `byte_delta` is the difference in byte count since the last sample
-/// (can be negative due to counter wrap-around on 32-bit interfaces).
-///
-/// `elapsed_ms` is the time elapsed since the last sample in milliseconds.
-///
-/// Returns `None` if:
-/// - `elapsed_ms` is outside the expected sampling interval (200ms..5000ms)
-/// - `byte_delta` is negative (indicates counter wrap-around that we can't correct)
-pub fn rate_per_sec(byte_delta: i64, elapsed_ms: u64) -> Option<u64> {
-    // Guard against unrealistic sampling intervals.
-    if !(200..=5000).contains(&elapsed_ms) {
-        return None;
-    }
-    // Negative byte_delta means counter wrapped; we cannot compute a rate.
-    if byte_delta < 0 {
-        return None;
-    }
-
-    // Convert bytes/ms to bytes/sec: multiply by 1000, divide by elapsed_ms.
-    // Use f64 to avoid overflow for large byte counters.
-    let rate = (byte_delta as f64) * 1000.0 / (elapsed_ms as f64);
-    Some(rate as u64)
-}
-
 /// Exponential moving average.
 ///
 /// `prev` is the previous EMA value (or seed).
 /// `next` is the new raw observation.
-/// `alpha` is the smoothing factor (0.0 < alpha <= 1.0); higher = more weight to new value.
+/// `alpha` is the smoothing factor (0.0 <= alpha <= 1.0，0 = 保持旧值；
+/// 审查 102：文档原先写 "0.0 < alpha" 与实现允许 0 不符). Higher = more weight to new value.
 pub fn ema(prev: f32, next: f32, alpha: f32) -> f32 {
-    debug_assert!((0.0..=1.0).contains(&alpha), "alpha must be in range (0.0, 1.0]");
+    debug_assert!((0.0..=1.0).contains(&alpha), "alpha must be in range [0.0, 1.0]");
     prev + alpha * (next - prev)
 }
 
@@ -159,37 +134,6 @@ mod tests {
     fn test_cpu_usage_tiny_busy() {
         let m = cpu_usage(9_999, 10_000, 0);
         assert_eq!(m, Metric::Value(0.01));
-    }
-
-    // ── rate_per_sec ────────────────────────────────────────────────
-
-    #[test]
-    fn test_rate_per_sec_normal() {
-        // 1000 bytes in 1000ms = 1000 bytes/sec
-        assert_eq!(rate_per_sec(1000, 1000), Some(1000));
-
-        // 1 MiB in 1000ms = 1 MiB/s = 1048576 bytes/sec
-        assert_eq!(rate_per_sec(1048576, 1000), Some(1048576));
-    }
-
-    #[test]
-    fn test_rate_per_sec_interval_rejected() {
-        // Too fast (< 200ms)
-        assert_eq!(rate_per_sec(1000, 100), None);
-        // Too slow (> 5000ms)
-        assert_eq!(rate_per_sec(1000, 6000), None);
-    }
-
-    #[test]
-    fn test_rate_per_sec_negative_delta() {
-        // Counter wrapped; should be rejected.
-        assert_eq!(rate_per_sec(-100, 1000), None);
-    }
-
-    #[test]
-    fn test_rate_per_sec_zero() {
-        // Zero bytes is a valid rate (idle link).
-        assert_eq!(rate_per_sec(0, 1000), Some(0));
     }
 
     // ── ema ─────────────────────────────────────────────────────────

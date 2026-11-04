@@ -25,11 +25,15 @@
   box-shadow: var(--shadow-window);
   -webkit-app-region: no-drag;
 }
-@supports not (backdrop-filter: blur(1px)) {
+/* 续篇 763：补 -webkit- 前缀探针 —— 仅支持前缀形式的引擎曾误走实色回退
+   （与 liquid-glass.css 的回退探针同口径） */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
   .guide-window { background: var(--bg-primary); }
 }
 
-/* 第 12 页：背景透明度提高，让用户看到桌面上的悬浮窗（同样不加模糊） */
+/* 第 12 页：背景透明度提高，让用户看到桌面上的悬浮窗（同样不加模糊）。
+   续篇 764：该类已由 GuideWizard.vue 在第 12 页接线（state.page === 12），
+   不再是全仓唯一的死规则。 */
 .guide-window.translucent {
   background: rgba(250, 251, 252, 0.4);
 }
@@ -157,7 +161,8 @@
 
 /* ---------------- 前进（点击“继续”）：总时长 ≈ 500ms ---------------- */
 .page-forward-enter-active {
-  animation: pageIn 380ms var(--ease-out-expo) 20ms both;
+  /* 续篇 765：backwards —— 祖先常驻 transform 动画会截死玻璃折射采样（base.css 同源结论） */
+  animation: pageIn 380ms var(--ease-out-expo) 20ms backwards;
   will-change: transform, opacity;
 }
 .page-forward-leave-active {
@@ -168,7 +173,8 @@
 
 /* ---------------- 后退（点击“上一步”）：总时长 ≈ 450ms ---------------- */
 .page-backward-enter-active {
-  animation: pageIn 330ms var(--ease-out-expo) 10ms both;
+  /* 续篇 765：backwards（同上） */
+  animation: pageIn 330ms var(--ease-out-expo) 10ms backwards;
   will-change: transform, opacity;
 }
 .page-backward-leave-active {
@@ -489,6 +495,8 @@
 .install-title { font-size: 30px; font-weight: var(--fw-bold); line-height: 1.3; letter-spacing: var(--ls-title); }
 .install-step-text { font-size: var(--fs-aux); font-weight: var(--fw-regular); color: var(--text-secondary); min-height: 1.6em; }
 .install-error { font-size: var(--fs-aux); color: var(--danger); line-height: 1.6; }
+/* 续篇 731：表单校验错误的通用类（不再复用安装页专用的 .install-error） */
+.form-error { font-size: var(--fs-aux); color: var(--danger); line-height: 1.6; }
 
 /* 第九部分：已安装检测四选一（2×2）与卸载确认复选框 */
 .installed-choices {
@@ -506,8 +514,6 @@
   cursor: pointer;
   user-select: none;
 }
-
-.status-failed .page-title { color: var(--danger); }
 
 /* ============================ 第 4 页：样式 Bento Grid ============================
    3 列 × 2 行：680×560 下每格约 173×140，六张卡片无需滚动即可完整展示。 */
@@ -578,27 +584,6 @@
 .mini-preview--v .mini-preview__bar { height: 100%; width: 5px; }
 .mini-preview__bar:nth-child(2) { opacity: 0.6; }
 .mini-preview__bar:nth-child(3) { opacity: 0.35; }
-
-/* GDI 开关 */
-.gdi-row {
-  display: flex;
-  gap: 14px;
-  align-items: flex-start;
-  margin-top: var(--sp-6);
-  padding: var(--sp-4);
-  border-radius: var(--r-ctrl);
-  background: var(--surface-subtle);
-  cursor: pointer;
-}
-.gdi-text { display: flex; flex-direction: column; gap: 2px; }
-.gdi-title { font-size: var(--fs-aux); font-weight: var(--fw-regular); }
-.gdi-desc {
-  font-size: var(--fs-foot);
-  font-style: italic; font-weight: 400;                /* 技术性说明用斜体 */
-  color: var(--text-tertiary); font-style: italic; font-weight: 400;
-  line-height: var(--lh-foot);
-  letter-spacing: var(--ls-foot);
-}
 
 /* ============================ 第 5 页：布局方向 ============================ */
 .orient-list { display: flex; flex-direction: column; gap: var(--gap-card); }

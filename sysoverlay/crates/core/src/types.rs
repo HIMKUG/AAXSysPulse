@@ -246,8 +246,9 @@ impl Appearance {
 /// 可逐项调色的指标。顺序即配置数组的下标序（**不是**悬浮窗的显示序 ——
 /// 显示序由 [`Config` 的 `metric_order`](crate::config::Config) 决定）。
 /// `Time` 是时钟行（非采样指标），配色/字号槽位复用同一套逐项数组。
-/// `Util`（综合占用）追加在末尾（下标 6）：保持既有下标 0..=5 稳定，
-/// 旧配置的 `mc_*`/`mfs_*`/`morder` 语义不变。
+/// `Util`（综合占用）位于下标 6：下标 0..=5 保持稳定，
+/// 磁盘读写（7/8）在其后追加 —— 旧配置的 `mc_*`/`mfs_*`/`morder` 语义不变
+/// （审查 642：原文"追加在末尾"已过时，末尾现在是 DiskWrite）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Metric {
     Cpu,
@@ -474,7 +475,8 @@ impl VertLayout {
     }
 }
 
-/// 功耗显示语义。详见 v2 方案 §2.1（A/B/C/D 四类功耗）。
+/// 功耗显示语义。详见 v2 方案 §2.1（A/C/D 三类；B 类方案未采纳，
+/// 审查 643：原注释"四类"与枚举变体数不符）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum PowerDisplay {
     /// A. CPU 封装功耗（RAPL），跨设备语义明确，默认。
@@ -597,11 +599,12 @@ mod tests {
 
     #[test]
     fn c_enum_ordering_is_preserved() {
-        assert_eq!(
-            VertLayout::from_config("1"),
-            VertLayout::from_config("single_col")
-        );
-        assert_eq!(NetUnit::from_config("2"), NetUnit::from_config("GB"));
+        // 审查 646：两侧自比较是恒真式，from_config 整体退化时照样通过；
+        // 改为断言 C 版数值序对应的具体枚举值。
+        assert_eq!(VertLayout::from_config("1"), Some(VertLayout::SingleCol));
+        assert_eq!(VertLayout::from_config("single_col"), Some(VertLayout::SingleCol));
+        assert_eq!(NetUnit::from_config("2"), Some(NetUnit::GB));
+        assert_eq!(NetUnit::from_config("GB"), Some(NetUnit::GB));
 
         // 未知值返回 None（交给调用方保留原值）
         assert_eq!(NetUnit::from_config("tb"), None);

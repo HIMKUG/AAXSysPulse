@@ -95,6 +95,65 @@ pub const OPACITY_PCT_MAX: u32 = 100;
 pub const OFFSET_MIN: i32 = -64;
 pub const OFFSET_MAX: i32 = 64;
 
+/// 窗口翻页过渡动画时长可调区间（ms）。注释与两侧解析钳位共用（审查 022）。
+pub const ANIM_MS_MIN: u32 = 0;
+pub const ANIM_MS_MAX: u32 = 2000;
+
+/// 指标间距 / 名称-数值间距可调上限（px）。设置页滑杆共用（审查 458）。
+pub const GAP_MAX: u32 = 64;
+
+/// 功耗采样间隔可调区间（ms）（审查 463）。
+pub const POWER_INTERVAL_MS_MIN: u32 = 500;
+pub const POWER_INTERVAL_MS_MAX: u32 = 60_000;
+
+/// 启动前检测（管理员/驱动）累计"继续"次数上限，达到即永久跳过（审查 464）。
+pub const PRELAUNCH_SKIP_LIMIT: u32 = 3;
+
+/// 悬浮窗尺寸落盘钳位（审查 456）：下限防异常小窗，上限与 gdi.rs DIB 分配上限一致。
+pub const WINDOW_SIZE_MIN_W: i32 = 100;
+pub const WINDOW_SIZE_MIN_H: i32 = 60;
+pub const WINDOW_SIZE_MAX: i32 = 2048;
+
+/// 设置窗口尺寸可调区间（逻辑 px，审查 465；win::settings::layout 同源共用）。
+pub const SETTINGS_SIZE_MIN_W: i32 = 560;
+pub const SETTINGS_SIZE_MIN_H: i32 = 460;
+pub const SETTINGS_SIZE_MAX_W: i32 = 1400;
+pub const SETTINGS_SIZE_MAX_H: i32 = 1000;
+
+/// 默认监控项显示顺序（用户拍板：Util(6) 排在 GPU(2) 后，磁盘(7/8) 收尾）。
+///
+/// 审查 454：字面排列保留，但用编译期断言钉死它是 `0..Metric::COUNT` 的
+/// 合法排列 —— 新增指标忘改这里即编译失败，而非运行期静默错序。
+pub const DEFAULT_METRIC_ORDER: [u8; Metric::COUNT] = [0, 1, 2, 6, 3, 5, 4, 7, 8];
+
+const fn is_valid_metric_order(order: [u8; Metric::COUNT]) -> bool {
+    let mut seen = [false; Metric::COUNT];
+    let mut i = 0;
+    while i < Metric::COUNT {
+        let v = order[i] as usize;
+        if v >= Metric::COUNT || seen[v] {
+            return false;
+        }
+        seen[v] = true;
+        i += 1;
+    }
+    true
+}
+
+const _: () = assert!(
+    is_valid_metric_order(DEFAULT_METRIC_ORDER),
+    "DEFAULT_METRIC_ORDER 必须是 0..Metric::COUNT 的合法排列"
+);
+
+/// 字号统一量化：钳到 [FONT_PX_MIN, FONT_PX_MAX] 并按 0.5 步进取整（审查 028）。
+/// 非有限值（NaN/Inf）回落默认字号 32.0（审查 027）。
+pub fn snap_font_size(n: f32) -> f32 {
+    if !n.is_finite() {
+        return 32.0;
+    }
+    (n.clamp(FONT_PX_MIN, FONT_PX_MAX) * 2.0).round() / 2.0
+}
+
 /// 用户配置。
 ///
 /// 字段语义与 C 版 `overlay.c` 的全局变量一一对应；v2 新增字段集中在末尾。
@@ -110,7 +169,8 @@ pub struct Config {
     pub vert: VertLayout,
     pub bg: Rgb,
     pub fg: Rgb,
-    pub opacity: u8,
+    // 审查 019：`opacity` 是纯死字段（全仓零引用、不序列化不解析），已删除；
+    // 真正生效的是 normal_opacity。
     /// 刷新间隔（**毫秒**）。写入配置时按 C 版语义除以 100。
     /// `refresh_auto` 为 true 时此值仅作为兜底，实际节奏由调度器决定。
     pub interval_ms: u32,
@@ -155,7 +215,7 @@ pub struct Config {
     pub util_decimal: bool,
     /// 内存显示模式：false = 百分比，true = 实际占用量（GB，不显示总量）。
     pub mem_show_gb: bool,
-    /// 正文字号（像素，8.0..=40.0，0.5 步进）。旧键 `font_scale` 迁移为 ×16。
+    /// 正文字号（像素，[FONT_PX_MIN]..=[FONT_PX_MAX]，0.5 步进）。旧键 `font_scale` 迁移为 ×16。
     pub font_size: f32,
     /// 逐指标字号覆盖（None = 跟随全局 `font_size`）。
     /// 索引与 [`Metric`] 顺序一致：CPU/MEM/GPU/Net/Power/Time/Util/DiskRead/DiskWrite。
@@ -170,7 +230,7 @@ pub struct Config {
     pub metric_gap: u32,
     /// 每个指标「名称 ↔ 数值」之间的间距（px，0..=64）。
     pub label_value_gap: u32,
-    /// 非悬停时的透明度（%，0..=100，默认 35）。
+    /// 非悬停时的透明度（%，0..=100，默认 100；滑杆下限见 OPACITY_PCT_MIN）。
     pub normal_opacity: u8,
     /// 窗口翻页的过渡动画时长（ms，100..=2000，默认 300）。
     pub anim_ms: u32,
@@ -201,7 +261,7 @@ pub struct Config {
     pub debug_log: bool,
 
     // ── v3 新增 ──────────────────────────────────────────────
-    /// 渲染风格：Classic（旧 C 版卡片）/ Strip（v3 横向条）。
+    /// 渲染风格：Strip（v3 横向条）/ Vertical（竖版）/ Classic（旧 C 版卡片）。
     pub render_style: RenderStyle,
     /// 界面语言：En / Zh（全界面双语切换）。
     pub lang: Lang,
@@ -218,9 +278,9 @@ pub struct Config {
     pub net_low_freq: bool,
 
     // ── 悬浮窗渲染引擎（性能 / 高画质） ──────────────────────
-    /// 悬浮窗渲染后端：Gdi = 现有像素块软件光栅（默认，最高效）；
+    /// 悬浮窗渲染后端：Gdi = 现有像素块软件光栅（最高效）；
     /// D2d = 整帧 Direct2D + DirectWrite（高质量字体 / 圆角抗锯齿 / 半透明渐变）。
-    /// 设置页「窗口」页可切换，默认 Gdi 以保持升级后行为逐帧一致。
+    /// 设置页「窗口」页可切换；实际默认见 `Default`（当前为 D2d，审查 451）。
     pub render_engine: RenderEngine,
 
     // ── 设置窗口（升级新增，C 版忽略） ──
@@ -287,14 +347,14 @@ impl Default for Config {
             net_mode: NetMode::Down,
             vert: VertLayout::SingleRow,
             bg: Rgb::default(),
-            fg: Rgb::new(238, 241, 244),
-            opacity: 90,
+            fg: crate::color::DEFAULT_FG,
             interval_ms: 1000,
             refresh_auto: true,
             topmost: true,
-            // 默认窗口位置 = 当前用户配置（system.cfg [system] 的 x/y）。
-            // Some 即「自由定位」，启动直接采用；不再回退 (screen_w/4, 24) 兜底。
-            window_pos: Some((625, -9)),
+            // 审查 452：默认不再硬编码 (625, -9)（小屏/异 DPI 下 y<0 顶部出屏，
+            // 且使 window.rs 的兜底与贴角分支永不可达）。None = 启动时由
+            // window.rs 按屏幕尺寸计算初始位置。
+            window_pos: None,
             window_size: Some((781, 44)),
             size_locked: false,
             // 用户拍板：CPU/内存/GPU 显示默认关，Util/网络/时间默认开。
@@ -325,8 +385,8 @@ impl Default for Config {
             power_display: PowerDisplay::CpuPackage,
             power_interval_ms: 3000,
             exclude_virtual_nic: true,
-            // 2026-09-14：默认开（诊断优先）。关闭方式：设置面板「调试日志」开关，
-            // 或环境变量 AAXSYSPULSE_PROBE=0（probe）/ AAXSYSPULSE_PERF=0（perf）。
+            // 默认关（审查 453：原注释"默认开（诊断优先）"与实现相反）。
+            // 开启方式：设置面板「调试日志」开关，或环境变量 AAXSYSPULSE_PROBE=1。
             debug_log: false,
             render_style: RenderStyle::Strip,
             lang: Lang::Zh,
@@ -352,7 +412,7 @@ impl Default for Config {
             // 与 CPU/Mem/GPU 一致——它们**始终在 metric_order 中**，默认是否显示由各自的
             // show_* 开关决定（磁盘默认 show_disk_read/write = false → 默认不采样、不显示）。
             // 用户在设置页开启磁盘卡片的「显示」开关即点亮 7/8。
-            metric_order: [0, 1, 2, 6, 3, 5, 4, 7, 8],
+            metric_order: DEFAULT_METRIC_ORDER,
             // 全屏自动隐藏（默认开）。
             fullscreen_auto_hide: true,
         }
@@ -361,12 +421,9 @@ impl Default for Config {
 
 impl Config {
     /// 解析布尔值。接受 `1/0/true/false/yes/no/on/off`，失败时返回 `default`。
+    /// 唯一实现在 [`ini::parse_bool`]（审查 031），此处只转发。
     fn parse_bool(s: &str, default: bool) -> bool {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => true,
-            "0" | "false" | "no" | "off" => false,
-            _ => default,
-        }
+        ini::parse_bool(s, default)
     }
 
     /// 解析 COLORREF 十六进制（配置文件的 `bg`/`fg` 编码）。
@@ -394,7 +451,9 @@ impl Config {
             match key.as_str() {
                 "version" => {
                     if let Ok(v) = value.parse::<u32>() {
-                        cfg.version = v;
+                        // 审查 455：手写离谱大版本号不再直接放行，钳到当前版本+100，
+                        // 保留"前向版本"语义供跨度校验判断，同时挡住垃圾大数。
+                        cfg.version = v.min(CONFIG_VERSION + 100);
                     }
                 }
                 "pos" => {
@@ -411,8 +470,13 @@ impl Config {
                         if let (Ok(w), Ok(h)) = (w.parse::<i32>(), h.parse::<i32>()) {
                             // ⚠️ 上限钳制：异常大尺寸（如历史摇杆无上限推出来的 65535）
                             // 会让 render 每帧分配数百 MB DIB → D2D bind 失败 → 卡死。
-                            // 悬浮窗合理上限 2048px（>4K 屏宽度），多出即视为坏配置丢弃。
-                            if w >= 100 && h >= 60 && w <= 2048 && h <= 2048 {
+                            // 悬浮窗合理上限（>4K 屏宽度），多出即视为坏配置丢弃。
+                            // 区间常量见 WINDOW_SIZE_*（审查 456，gdi.rs DIB 上限同源）。
+                            if w >= WINDOW_SIZE_MIN_W
+                                && h >= WINDOW_SIZE_MIN_H
+                                && w <= WINDOW_SIZE_MAX
+                                && h <= WINDOW_SIZE_MAX
+                            {
                                 cfg.window_size = Some((w, h));
                             }
                         }
@@ -431,14 +495,16 @@ impl Config {
                 // （4..128；下限兼顾极小字号，上限给大屏留足空间）。
                 "font_size" | "fontsize" => {
                     if let Ok(v) = value.parse::<f32>() {
-                        cfg.font_size = (v.clamp(FONT_PX_MIN, FONT_PX_MAX) * 2.0).round() / 2.0;
+                        // 审查 027："NaN" 能 parse 成功且 clamp 对 NaN 返回 NaN
+                        // —— 统一走 snap_font_size（非有限值回落默认）。
+                        cfg.font_size = snap_font_size(v);
                     }
                 }
                 // 旧字号（bitmap 缩放倍数）迁移：×16 像素，再钳位到合法范围
                 "font_scale" => {
                     if let Ok(v) = value.parse::<u32>() {
-                        cfg.font_size = ((v.clamp(1, 4) as f32) * 16.0)
-                            .clamp(FONT_PX_MIN, FONT_PX_MAX);
+                        // 复用统一量化（审查 457）：迁移后同样 0.5 步进，不再与 font_size 分叉。
+                        cfg.font_size = snap_font_size((v.clamp(1, 4) as f32) * 16.0);
                     }
                 }
                 // 字重档位：0=细 / 1=中 / 2=粗（缺省 2=粗 = 位图字体原样）
@@ -449,22 +515,26 @@ impl Config {
                 }
                 "metric_gap" | "mgap" => {
                     if let Ok(v) = value.parse::<u32>() {
-                        cfg.metric_gap = v.clamp(0, 64);
+                        cfg.metric_gap = v.clamp(0, GAP_MAX);
                     }
                 }
                 "label_value_gap" | "label_gap" | "lvgap" => {
                     if let Ok(v) = value.parse::<u32>() {
-                        cfg.label_value_gap = v.clamp(0, 64);
+                        cfg.label_value_gap = v.clamp(0, GAP_MAX);
                     }
                 }
                 "normal_opacity" => {
                     if let Ok(v) = value.parse::<u32>() {
-                        cfg.normal_opacity = v.clamp(0, 100) as u8;
+                        // 审查 459：落盘侧允许 0..=100（含低于滑杆下限的历史值），
+                        // 滑杆可表达区间仍是 OPACITY_PCT_MIN..=OPACITY_PCT_MAX。
+                        cfg.normal_opacity = v.clamp(0, OPACITY_PCT_MAX) as u8;
                     }
                 }
                 "anim_ms" | "anim" => {
                     if let Ok(v) = value.parse::<u32>() {
-                        cfg.anim_ms = v.clamp(0, 500);
+                        // 区间唯一来源 ANIM_MS_MIN/MAX（审查 022：原 0..500 与
+                        // 注释 100..=2000、system.rs 0..2000 三处不一致）。
+                        cfg.anim_ms = v.clamp(ANIM_MS_MIN, ANIM_MS_MAX);
                     }
                 }
                 // 逐项配色：mc_<metric>_lbl|val  <COLORREF|0>
@@ -484,17 +554,8 @@ impl Config {
                         }
                     }
                     if let Some((slot, color)) = parse_metric_color(&key, value) {
-                        let idx = match slot.0 {
-                            Metric::Cpu => 0,
-                            Metric::Mem => 1,
-                            Metric::Gpu => 2,
-                            Metric::Net => 3,
-                            Metric::Power => 4,
-                            Metric::Time => 5,
-                            Metric::Util => 6,
-                            Metric::DiskRead => 7,
-                            Metric::DiskWrite => 8,
-                        };
+                        // 统一走 Metric::ALL 定位（审查 023），新增指标不再漏改。
+                        let idx = metric_index(slot.0);
                         let mc = &mut cfg.metric_colors[idx];
                         if slot.1 {
                             mc.label = color;
@@ -512,7 +573,10 @@ impl Config {
                 // 逐指标文字偏移：moff_<metric> lx ly vx vy（px，可为负；缺省槽补 0）
                 _ if key.starts_with("moff_") => {
                     if let Some((idx, off)) = parse_metric_offset(&key, value) {
-                        cfg.metric_offsets[idx] = off;
+                        // 审查 461：守"零 panic"承诺，越界下标不再裸写数组。
+                        if let Some(slot) = cfg.metric_offsets.get_mut(idx) {
+                            *slot = off;
+                        }
                     }
                 }
                 "shadow" => cfg.text_shadow = Self::parse_bool(value, cfg.text_shadow),
@@ -542,7 +606,10 @@ impl Config {
                 // C 版 interval 是 100ms 单位 → 换算为 ms 并吸附到允许档位。
                 "interval" => {
                     if let Ok(v) = value.parse::<u32>() {
-                        cfg.interval_ms = snap_interval_ms(v.saturating_mul(100));
+                        // 审查 462：0 视为非法保留当前档位，不再被吸到 100ms 最快档。
+                        if v > 0 {
+                            cfg.interval_ms = snap_interval_ms(v.saturating_mul(100));
+                        }
                     }
                 }
                 "refresh_auto" | "auto" => {
@@ -605,7 +672,7 @@ impl Config {
                 }
                 "power_interval_ms" => {
                     if let Ok(v) = value.parse::<u32>() {
-                        cfg.power_interval_ms = v.clamp(500, 60_000);
+                        cfg.power_interval_ms = v.clamp(POWER_INTERVAL_MS_MIN, POWER_INTERVAL_MS_MAX);
                     }
                 }
                 "exclude_virtual_nic" => {
@@ -656,12 +723,12 @@ impl Config {
                 // Pre-launch check tracking
                 "admin_check_continue_count" => {
                     if let Ok(v) = value.parse::<u32>() {
-                        cfg.admin_check_continue_count = v.min(3) as u8;
+                        cfg.admin_check_continue_count = v.min(PRELAUNCH_SKIP_LIMIT) as u8;
                     }
                 }
                 "driver_check_continue_count" => {
                     if let Ok(v) = value.parse::<u32>() {
-                        cfg.driver_check_continue_count = v.min(3) as u8;
+                        cfg.driver_check_continue_count = v.min(PRELAUNCH_SKIP_LIMIT) as u8;
                     }
                 }
                 "admin_check_last_date" => {
@@ -678,7 +745,11 @@ impl Config {
                     let mut it = value.split_whitespace();
                     if let (Some(w), Some(h)) = (it.next(), it.next()) {
                         if let (Ok(w), Ok(h)) = (w.parse::<i32>(), h.parse::<i32>()) {
-                            if w >= 560 && h >= 460 && w <= 1400 && h <= 1000 {
+                            if w >= SETTINGS_SIZE_MIN_W
+                                && h >= SETTINGS_SIZE_MIN_H
+                                && w <= SETTINGS_SIZE_MAX_W
+                                && h <= SETTINGS_SIZE_MAX_H
+                            {
                                 cfg.settings_size = (w, h);
                             }
                         }
@@ -726,8 +797,11 @@ impl Config {
         s.push_str(&format!("time_seconds {}\n", self.time_show_seconds as u32));
         for (i, &v) in self.metric_show_labels.iter().enumerate() {
             if !v {
-                let metric = Metric::ALL.get(i).map(|m| m.key_name()).unwrap_or("");
-                s.push_str(&format!("msl_{} 0\n", metric));
+                // 审查 466：下标越界不再写出 "msl_  0" 垃圾行（守卫防未来
+                // 数组与 Metric::COUNT 脱钩时静默产出坏配置）。
+                if let Some(metric) = Metric::ALL.get(i) {
+                    s.push_str(&format!("msl_{} 0\n", metric.key_name()));
+                }
             }
         }
         s.push_str(&format!("short_names {}\n", self.short_names as u32));
@@ -855,6 +929,12 @@ fn split_kv(line: &str) -> Option<(&str, &str)> {
     if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
         return None;
     }
+    // 审查 467：`topmost 1 # 注释` 的尾注不再混进 value（与 ini.rs 同口径：
+    // 仅当 #/; 前有空白才视为注释，`bg 1B1614`、`#RRGGBB` 不受影响）。
+    let line = strip_trailing_comment(line);
+    if line.is_empty() {
+        return None;
+    }
 
     if let Some(eq) = line.find('=') {
         let (k, rest) = line.split_at(eq);
@@ -871,8 +951,20 @@ fn split_kv(line: &str) -> Option<(&str, &str)> {
     Some((k, v))
 }
 
+/// 剥行内注释（审查 467）：仅当 `#`/`;` 前有空白才视为注释起点。
+fn strip_trailing_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    for i in 1..bytes.len() {
+        if (bytes[i] == b'#' || bytes[i] == b';') && bytes[i - 1].is_ascii_whitespace() {
+            return line[..i].trim_end();
+        }
+    }
+    line
+}
+
 /// 把任意毫秒值吸附到 [`INTERVAL_MS_ALLOWED`] 中最近的一档。
-fn snap_interval_ms(ms: u32) -> u32 {
+/// 全仓唯一实现（审查 025）：system.rs / types.rs 的副本收敛至此。
+pub fn snap_interval_ms(ms: u32) -> u32 {
     let mut best = INTERVAL_MS_ALLOWED[0];
     let mut best_dist = u32::MAX;
     for &allowed in &INTERVAL_MS_ALLOWED {
@@ -885,9 +977,18 @@ fn snap_interval_ms(ms: u32) -> u32 {
     best
 }
 
+/// `Metric` → 逐项数组下标的唯一映射（审查 023/460）。
+/// 新增指标时只需维护 `Metric::ALL`，此处自动跟随。
+fn metric_index(m: Metric) -> usize {
+    Metric::ALL
+        .iter()
+        .position(|x| x.key_name() == m.key_name())
+        .unwrap_or(0)
+}
+
 /// 解析逐项配色的键与值。
 ///
-/// 键形如 `mc_<metric>_lbl` / `mc_<metric>_val`（metric ∈ cpu/mem/gpu/net/power）。
+/// 键形如 `mc_<metric>_lbl` / `mc_<metric>_val`（metric 覆盖 [`Metric::ALL`] 全部指标）。
 /// 返回 `Some((slot, Option<Rgb>))`：`slot.1 == true` 表示名称槽（label），
 /// 否则为数值槽（value）。值 `0`/`off`/`none`/`follow`/`default` → `None`（跟随全局）。
 /// 未知指标名或非法值返回 `None`（静默忽略）。
@@ -895,18 +996,11 @@ fn parse_metric_color(key: &str, value: &str) -> Option<((Metric, bool), Option<
     // 去掉 "mc_" 前缀后剩余 <metric>_lbl|val
     let rest = key.strip_prefix("mc_")?;
     let (metric_part, slot_part) = rest.rsplit_once('_')?;
-    let metric = match metric_part {
-        "cpu" => Metric::Cpu,
-        "mem" => Metric::Mem,
-        "gpu" => Metric::Gpu,
-        "net" => Metric::Net,
-        "power" => Metric::Power,
-        "time" => Metric::Time,
-        "util" => Metric::Util,
-        "disk_read" => Metric::DiskRead,
-        "disk_write" => Metric::DiskWrite,
-        _ => return None,
-    };
+    // 审查 023：由 Metric::ALL 派生，新增指标无需再登记手写映射。
+    let metric = Metric::ALL
+        .iter()
+        .copied()
+        .find(|m| m.key_name() == metric_part)?;
     let slot = match slot_part {
         "lbl" | "label" => true,
         "val" | "value" => false,
@@ -916,7 +1010,12 @@ fn parse_metric_color(key: &str, value: &str) -> Option<((Metric, bool), Option<
     let color = match v.to_ascii_lowercase().as_str() {
         "0" | "off" | "none" | "follow" | "default" => None,
         _ => {
-            let cr = u32::from_str_radix(v.trim_start_matches("0x").trim_start_matches('#'), 16).ok()?;
+            // 审查 024：与 parse_colorref 同口径，0x/0X/# 前缀都接受。
+            let body = v
+                .strip_prefix("0x")
+                .or_else(|| v.strip_prefix("0X"))
+                .unwrap_or(v);
+            let cr = u32::from_str_radix(body.trim_start_matches('#'), 16).ok()?;
             Some(Rgb::from_colorref(cr))
         }
     };
@@ -925,50 +1024,32 @@ fn parse_metric_color(key: &str, value: &str) -> Option<((Metric, bool), Option<
 
 /// 解析逐指标名称显示开关的键。
 ///
-/// 键形如 `msl_<metric>`（metric ∈ cpu/mem/gpu/net/power/time）。
+/// 键形如 `msl_<metric>`（metric 覆盖 [`Metric::ALL`] 全部指标）。
 /// 返回索引下标；未知指标名返回 `None`（静默忽略）。
 fn parse_metric_show_label(key: &str) -> Option<usize> {
     let rest = key.strip_prefix("msl_")?;
-    match rest {
-        "cpu" => Some(0),
-        "mem" => Some(1),
-        "gpu" => Some(2),
-        "net" => Some(3),
-        "power" => Some(4),
-        "time" => Some(5),
-        "util" => Some(6),
-        "disk_read" => Some(7),
-        "disk_write" => Some(8),
-        _ => None,
-    }
+    Metric::ALL.iter().position(|m| m.key_name() == rest)
 }
 
 /// 解析逐指标字号覆盖的键与值。
 ///
-/// 键形如 `mfs_<metric>`（metric ∈ cpu/mem/gpu/net/power）。
+/// 键形如 `mfs_<metric>`（metric 覆盖 [`Metric::ALL`] 全部指标）。
 /// 返回 `Some((idx, Option<f32>))`：`idx` 为 [`Metric`] 数组下标，
 /// 值 `0`/`off`/`none`/`follow`/`default` → `None`（跟随全局字号）。
 /// 未知指标名或非法值返回 `None`（静默忽略）。
 fn parse_metric_font_size(key: &str, value: &str) -> Option<(usize, Option<f32>)> {
     let rest = key.strip_prefix("mfs_")?;
-    let idx = match rest {
-        "cpu" => 0,
-        "mem" => 1,
-        "gpu" => 2,
-        "net" => 3,
-        "power" => 4,
-        "time" => 5,
-        "util" => 6,
-        "disk_read" => 7,
-        "disk_write" => 8,
-        _ => return None,
-    };
+    let idx = Metric::ALL.iter().position(|m| m.key_name() == rest)?;
     let v = value.trim();
     let size = match v.to_ascii_lowercase().as_str() {
         "0" | "off" | "none" | "follow" | "default" => None,
         _ => {
-            let s = (v.parse::<f32>().ok()?.clamp(FONT_PX_MIN, FONT_PX_MAX) * 2.0).round() / 2.0;
-            Some(s)
+            let n = v.parse::<f32>().ok()?;
+            // 审查 027：NaN 同样要拦（parse 成功但 clamp 后仍 NaN）。
+            if !n.is_finite() {
+                return None;
+            }
+            Some(snap_font_size(n))
         }
     };
     Some((idx, size))
@@ -976,24 +1057,13 @@ fn parse_metric_font_size(key: &str, value: &str) -> Option<(usize, Option<f32>)
 
 /// 解析逐指标文字偏移的键与值。
 ///
-/// 键形如 `moff_<metric>`（metric ∈ cpu/mem/gpu/net/power/time）。
+/// 键形如 `moff_<metric>`（metric 覆盖 [`Metric::ALL`] 全部指标）。
 /// 值为 4 个整数 `lx ly vx vy`（名称X / 名称Y / 数值X / 数值Y，px，可为负），
 /// 缺省槽补 0；任一分量越界钳到 [`OFFSET_MIN`]..=[`OFFSET_MAX`]。
 /// 未知指标名或无法解析返回 `None`（静默忽略）。
 fn parse_metric_offset(key: &str, value: &str) -> Option<(usize, [i32; 4])> {
     let rest = key.strip_prefix("moff_")?;
-    let idx = match rest {
-        "cpu" => 0,
-        "mem" => 1,
-        "gpu" => 2,
-        "net" => 3,
-        "power" => 4,
-        "time" => 5,
-        "util" => 6,
-        "disk_read" => 7,
-        "disk_write" => 8,
-        _ => return None,
-    };
+    let idx = Metric::ALL.iter().position(|m| m.key_name() == rest)?;
     let mut out = [0i32; 4];
     for (i, tok) in value.split_whitespace().take(4).enumerate() {
         if let Ok(v) = tok.parse::<i32>() {
@@ -1085,7 +1155,7 @@ fg F4F1EE
     #[test]
     fn default_matches_current_user_config() {
         let d = Config::default();
-        assert_eq!(d.window_pos, Some((625, -9)), "默认窗口位置必须 = system.cfg 的 x/y");
+        assert_eq!(d.window_pos, None, "默认窗口位置 = None（启动按屏幕计算，审查 452）");
         assert_eq!(d.window_size, Some((781, 44)));
         assert_eq!(d.net_mode, NetMode::Down, "默认网络模式 = down（当前配置）");
         assert_eq!(d.normal_opacity, 100);
@@ -1353,7 +1423,7 @@ fg F4F1EE
             let cfg = Config::parse(input);
             // 只要不 panic 且值域合法即可
             assert!((0..=100).contains(&cfg.normal_opacity), "normal_opacity 越界: {}", input);
-            assert_eq!(cfg.font_size, (cfg.font_size.clamp(8.0, 40.0) * 2.0).round() / 2.0, "字号 0.5 步进: {}", input);
+            assert_eq!(cfg.font_size, snap_font_size(cfg.font_size), "字号 0.5 步进: {}", input);
             assert!(
                 INTERVAL_MS_ALLOWED.contains(&cfg.interval_ms),
                 "interval 未吸附: {} → {}",
@@ -1724,5 +1794,22 @@ fg F4F1EE
         assert_eq!(parsed.font_weight, 1, "写读 roundtrip");
         let cfg = Config::parse("font_weight 9\n");
         assert_eq!(cfg.font_weight, 2, "越界 clamp 到粗");
+    }
+
+    /// 审查 027 回归锁："NaN" 输入不得让字号变成 NaN 并被序列化。
+    #[test]
+    fn font_size_nan_rejected() {
+        let cfg = Config::parse("font_size NaN\n");
+        assert!(cfg.font_size.is_finite(), "字号不得为 NaN");
+        assert_eq!(cfg.font_size, Config::default().font_size);
+        let cfg = Config::parse("mfs_cpu NaN\n");
+        assert_eq!(cfg.metric_font_sizes[0], None, "非有限值 → 跟随全局");
+    }
+
+    /// 审查 462 回归锁：interval 0 不被吸到最快档。
+    #[test]
+    fn interval_zero_rejected() {
+        assert_eq!(Config::parse("interval 0").interval_ms, 1000);
+        assert_eq!(Config::parse("interval 1").interval_ms, 100);
     }
 }

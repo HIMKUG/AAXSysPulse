@@ -10,9 +10,9 @@
 //!
 //! 新模型：控件构造时持有一个 [`CfgRef`]，读写都走它——
 //! `sync = cfg_ref.get(cfg)`，`apply = cfg_ref.set(cfg, value)`。
-//! **类型错配时：debug panic + release panic（写日志后）。**
-//! 不再区分 debug/release：类型错配是代码 bug，用户改了没反应比崩溃更难排查，
-//! panic 会留下崩溃日志便于定位，eprintln! 同时写日志流。
+//! **类型错配时：debug/release 均 panic（写日志后）——审查 173：现实现
+//! 实际是 `eprintln! + return false`，类型错配不 panic；上面的粗体断言
+//! 是设计意图，与代码不符时以代码为准。**
 //!
 //! # 单元测试
 //!
@@ -70,7 +70,8 @@ impl CfgRef {
             CfgRef::Topmost => Value::Bool(cfg.topmost),
             CfgRef::Opacity => Value::Num(cfg.normal_opacity as f64),
             CfgRef::NetMode => Value::Select(match cfg.net_mode { NetMode::Both => 0, NetMode::Down => 1, NetMode::Up => 2 }),
-            CfgRef::Style => Value::Select(match cfg.render_style { RenderStyle::Vertical => 1, _ => 0 }),
+            // 审查 174：与 set 侧三变体对称（Classic=0）。
+            CfgRef::Style => Value::Select(match cfg.render_style { RenderStyle::Classic => 0, RenderStyle::Strip => 1, RenderStyle::Vertical => 2 }),
             CfgRef::RenderEngine => Value::Select(if cfg.render_engine == RenderEngine::D2d { 1 } else { 0 }),
             CfgRef::Lang => Value::Select(cfg.lang as usize),
             CfgRef::PowerEnabled => Value::Bool(cfg.power_enabled),
@@ -118,11 +119,15 @@ impl CfgRef {
             (CfgRef::ShowTime, v) => {  match v { Value::Bool(x) => { cfg.show_time = x; true } _ => { eprintln!("[CfgRef] 类型错配: ShowTime <- {:?}", v); false }  } },
             (CfgRef::TimeSeconds, v) => {  match v { Value::Bool(x) => { cfg.time_show_seconds = x; true } _ => { eprintln!("[CfgRef] 类型错配: TimeSeconds <- {:?}", v); false }  } },
             (CfgRef::ShortNames, v) => {  match v { Value::Bool(x) => { cfg.short_names = x; true } _ => { eprintln!("[CfgRef] 类型错配: ShortNames <- {:?}", v); false }  } },
-            (CfgRef::MemUnit, v) => {  match v { Value::Select(i) => { cfg.mem_show_gb = i == 1; true } _ => { eprintln!("[CfgRef] 类型错配: MemUnit <- {:?}", v); false }  } },
-            (CfgRef::FontSize, v) => {  match v { Value::Num(x) => { cfg.font_size = x as f32; true } _ => { eprintln!("[CfgRef] 类型错配: FontSize <- {:?}", v); false }  } },
+            (CfgRef::MemUnit, v) => {  match v { Value::Select(i) => { // 审查 175：越界统一 false。
+                  match i { 0 => { cfg.mem_show_gb = false; true } 1 => { cfg.mem_show_gb = true; true } _ => false } } _ => { eprintln!("[CfgRef] 类型错配: MemUnit <- {:?}", v); false }  } },
+            (CfgRef::FontSize, v) => {  match v { Value::Num(x) => { // 审查 176：钳位复用 core 常量（负/NaN 落 0 的旧行为不再有）。
+                  cfg.font_size = aaxsyspulse_core::config::snap_font_size(x as f32); true } _ => { eprintln!("[CfgRef] 类型错配: FontSize <- {:?}", v); false }  } },
             (CfgRef::FontWeight, v) => {  match v { Value::Select(i) => { if i <= 2 { cfg.font_weight = i as u8; true } else { false } } _ => { eprintln!("[CfgRef] 类型错配: FontWeight <- {:?}", v); false }  } },
-            (CfgRef::MetricGap, v) => {  match v { Value::Num(x) => { cfg.metric_gap = x as u32; true } _ => { eprintln!("[CfgRef] 类型错配: MetricGap <- {:?}", v); false }  } },
-            (CfgRef::LabelValueGap, v) => {  match v { Value::Num(x) => { cfg.label_value_gap = x as u32; true } _ => { eprintln!("[CfgRef] 类型错配: LabelValueGap <- {:?}", v); false }  } },
+            (CfgRef::MetricGap, v) => {  match v { Value::Num(x) => { // 审查 176：钳位（负/NaN 落 0）。
+                  cfg.metric_gap = (if x.is_finite() { x } else { 0.0 }).clamp(0.0, aaxsyspulse_core::config::GAP_MAX as f64) as u32; true } _ => { eprintln!("[CfgRef] 类型错配: MetricGap <- {:?}", v); false }  } },
+            (CfgRef::LabelValueGap, v) => {  match v { Value::Num(x) => { // 审查 176：同上。
+                  cfg.label_value_gap = (if x.is_finite() { x } else { 0.0 }).clamp(0.0, aaxsyspulse_core::config::GAP_MAX as f64) as u32; true } _ => { eprintln!("[CfgRef] 类型错配: LabelValueGap <- {:?}", v); false }  } },
             (CfgRef::TextShadow, v) => {  match v { Value::Bool(x) => { cfg.text_shadow = x; true } _ => { eprintln!("[CfgRef] 类型错配: TextShadow <- {:?}", v); false }  } },
             (CfgRef::TextOutline, v) => {  match v { Value::Bool(x) => { cfg.text_outline = x; true } _ => { eprintln!("[CfgRef] 类型错配: TextOutline <- {:?}", v); false }  } },
             (CfgRef::AutoStart, v) => {  match v { Value::Bool(x) => { cfg.autostart = x; true } _ => { eprintln!("[CfgRef] 类型错配: AutoStart <- {:?}", v); false }  } },
@@ -130,8 +135,11 @@ impl CfgRef {
             (CfgRef::Topmost, v) => {  match v { Value::Bool(x) => { cfg.topmost = x; true } _ => { eprintln!("[CfgRef] 类型错配: Topmost <- {:?}", v); false }  } },
             (CfgRef::Opacity, v) => {  match v { Value::Num(x) => { cfg.normal_opacity = (x as u32).clamp(0, 100) as u8; true } _ => { eprintln!("[CfgRef] 类型错配: Opacity <- {:?}", v); false }  } },
             (CfgRef::NetMode, v) => {  match v { Value::Select(i) => { match i { 0 => { cfg.net_mode = NetMode::Both; true } 1 => { cfg.net_mode = NetMode::Down; true } 2 => { cfg.net_mode = NetMode::Up; true } _ => false } } _ => { eprintln!("[CfgRef] 类型错配: NetMode <- {:?}", v); false }  } },
-            (CfgRef::Style, v) => {  match v { Value::Select(i) => { match i { 0 => { cfg.render_style = RenderStyle::Strip; true } 1 => { cfg.render_style = RenderStyle::Vertical; true } _ => false } } _ => { eprintln!("[CfgRef] 类型错配: Style <- {:?}", v); false }  } },
-            (CfgRef::RenderEngine, v) => {  match v { Value::Select(i) => { cfg.render_engine = if i == 1 { RenderEngine::D2d } else { RenderEngine::Gdi }; true } _ => { eprintln!("[CfgRef] 类型错配: RenderEngine <- {:?}", v); false }  } },
+            (CfgRef::Style, v) => {  match v { Value::Select(i) => { // 审查 174：Classic 显式处理 —— 原先把 0 写回 Strip，
+                  // 经 get(0=Classic 分段)→set 的读改写会静默丢失 Classic。
+                  match i { 0 => { cfg.render_style = RenderStyle::Classic; true } 1 => { cfg.render_style = RenderStyle::Strip; true } 2 => { cfg.render_style = RenderStyle::Vertical; true } _ => false } } _ => { eprintln!("[CfgRef] 类型错配: Style <- {:?}", v); false }  } },
+            (CfgRef::RenderEngine, v) => {  match v { Value::Select(i) => { // 审查 175：越界统一回落 false（与 Lang 口径一致），不再静默兜底默认值。
+                  match i { 0 => { cfg.render_engine = RenderEngine::Gdi; true } 1 => { cfg.render_engine = RenderEngine::D2d; true } _ => false } } _ => { eprintln!("[CfgRef] 类型错配: RenderEngine <- {:?}", v); false }  } },
             (CfgRef::Lang, v) => {  match v { Value::Select(i) => { match i { 0 => { cfg.lang = Lang::En; true } 1 => { cfg.lang = Lang::Zh; true } _ => false } } _ => { eprintln!("[CfgRef] 类型错配: Lang <- {:?}", v); false }  } },
             (CfgRef::PowerEnabled, v) => {  match v { Value::Bool(x) => { cfg.power_enabled = x; true } _ => { eprintln!("[CfgRef] 类型错配: PowerEnabled <- {:?}", v); false }  } },
             (CfgRef::PowerQuery, v) => {  match v { Value::Bool(x) => { cfg.power_query = x; true } _ => { eprintln!("[CfgRef] 类型错配: PowerQuery <- {:?}", v); false }  } },
@@ -271,8 +279,29 @@ mod tests {
         ]
     }
 
-    #[test]
-    fn every_variant_set_then_get_roundtrips() {
+            // 审查 177：补"预置非默认值 → get"用例 —— 全部从 default() 起
+            // set→get 的 roundtrip 抓不到 get/set 不对称（如 174 的 Style）。
+            // 这里预置非默认值后只 get，断言读到的是写入值。
+            #[test]
+            fn get_reads_preset_non_default_values() {
+                let mut c = cfg();
+                // Style：Classic（此前 get 把 Classic 映射成 0、set 把 0 写成 Strip）
+                c.render_style = RenderStyle::Classic;
+                assert_eq!(CfgRef::Style.get(&c), Value::Select(0));
+                c.render_style = RenderStyle::Vertical;
+                assert_eq!(CfgRef::Style.get(&c), Value::Select(2));
+                // RenderEngine 越界档位不再兜底成默认
+                assert!(!CfgRef::RenderEngine.set(&mut c, Value::Select(7)));
+                assert!(!CfgRef::MemUnit.set(&mut c, Value::Select(7)));
+                // FontSize 钳位
+                assert!(CfgRef::FontSize.set(&mut c, Value::Num(9999.0)));
+                assert_eq!(c.font_size, aaxsyspulse_core::config::FONT_PX_MAX);
+                assert!(CfgRef::FontSize.set(&mut c, Value::Num(f64::NAN)));
+                assert_eq!(c.font_size, 32.0, "NaN 回落默认字号");
+            }
+
+            #[test]
+            fn every_variant_set_then_get_roundtrips() {
         for (r, v) in roundtrip_cases() {
             let mut c = cfg();
             assert!(r.set(&mut c, v), "set 失败: {r:?}");

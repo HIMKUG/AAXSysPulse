@@ -169,9 +169,9 @@ pub struct MetricSwatchesWidget {
 pub const SW_COLORS: usize = 8;
 /// 「自动色」格（仅数值色板）。
 pub const SW_AUTO: usize = 8;
-/// 色板总格数。
+/// 色板总格数（审查 432：由 SW_COLORS 推导，不再手写 8+3/8+2）。
 pub fn sw_n(auto: bool) -> usize {
-    if auto { 8 + 3 } else { 8 + 2 }
+    if auto { SW_COLORS + 3 } else { SW_COLORS + 2 }
 }
 /// 「跟随默认」格下标。
 pub fn sw_follow(auto: bool) -> usize {
@@ -381,7 +381,8 @@ pub fn stepper_plus_rect(stepper_rect: &RECT, dpi: u32) -> RECT {
 
 /// 值 → 归一化位置 0..1（钳制）。
 pub fn slider_t_from_value(v: f64, min: f64, max: f64) -> f32 {
-    if (max - min).abs() < f64::EPSILON {
+    // 审查 434：绝对 EPSILON 判不住"近等"区间 —— 相对阈值（按量级 1e-9）。
+    if !(max - min).is_finite() || (max - min).abs() < (max.abs().max(min.abs()).max(1.0)) * 1e-9 {
         return 0.0;
     }
     (((v - min) / (max - min)).clamp(0.0, 1.0)) as f32
@@ -391,7 +392,8 @@ pub fn slider_t_from_value(v: f64, min: f64, max: f64) -> f32 {
 pub fn slider_value_from_x(x: f32, track: RectF, min: f64, max: f64, step: f64) -> f64 {
     let t = ((x - track.l) / track.w().max(1.0)).clamp(0.0, 1.0) as f64;
     let raw = min + t * (max - min);
-    if step <= 0.0 {
+    // 审查 435：step<=0 判不住 NaN —— clamp 对 NaN 返回 NaN，先过滤。
+    if !(step > 0.0 && step.is_finite()) {
         return raw.clamp(min, max);
     }
     let snapped = ((raw - min) / step).round() * step + min;
@@ -401,18 +403,21 @@ pub fn slider_value_from_x(x: f32, track: RectF, min: f64, max: f64, step: f64) 
 // ── D2D 绘制 ─────────────────────────────────────────────
 
 fn c(_t: &Theme, v: u32) -> ColorF {
+    // 审查 436：与 mod.rs:2591 同型 —— Theme 形参未用，注明留位。
+    let _ = _t;
     ColorF::from_colorref(v, 1.0)
 }
 
 /// 按进度在两色间线性插值。
 pub fn lerp_color(a: ColorF, b: ColorF, t: f32) -> ColorF {
-    let t = t.clamp(0.0, 1.0);
+    let t = if t.is_finite() { t.clamp(0.0, 1.0) } else { 0.0 };
     let (a, b) = (a.d2d(), b.d2d());
+    // 审查 436（对应 194）：alpha 与 RGB 同样钳位 —— 越界 alpha 不再直通 ColorF::rgba。
     ColorF::rgba(
         ((a.r + (b.r - a.r) * t).clamp(0.0, 1.0) * 255.0).round() as u8,
         ((a.g + (b.g - a.g) * t).clamp(0.0, 1.0) * 255.0).round() as u8,
         ((a.b + (b.b - a.b) * t).clamp(0.0, 1.0) * 255.0).round() as u8,
-        a.a + (b.a - a.a) * t,
+        (a.a + (b.a - a.a) * t).clamp(0.0, 1.0),
     )
 }
 
@@ -796,7 +801,9 @@ fn paint_metric_swatches(
         let sw = RectF::new(r.l + i as f32 * wd, r.t, r.l + (i + 1) as f32 * wd, r.b);
         let inner = RectF::new(sw.l + m, sw.t + m, sw.r - m, sw.b - m);
         if i < SW_COLORS {
-            let (cr, cg, cb) = METRIC_SWATCHES[i];
+            // 审查 437：下标上限由 METRIC_SWATCHES.len() 钳制 —— 改色板长度
+            // 不再与 SW_COLORS 手写数字脱钩越界。
+            let (cr, cg, cb) = METRIC_SWATCHES[i.min(METRIC_SWATCHES.len() - 1)];
             gfx.fill_round(rt, inner, super::layout::s(dpi, 4) as f32, ColorF::rgba(cr, cg, cb, 1.0));
             gfx.stroke_round(rt, inner, super::layout::s(dpi, 4) as f32, ft.color_neutral_stroke2, 1.0);
         } else if auto && i == SW_AUTO {
@@ -842,6 +849,8 @@ fn paint_slider(
 ) {
     // 文本显示真值；滑块/填充用动画值（跳变与重置时滑过去）。
     let val = state.value_f;
+    // 审查 438：anim_v==0.0 判"未初始化"与真实值恰为 0 冲突（如透明度 0、
+    // Util 0.0%）—— 首帧由调用方显式写 target，这里不再猜。
     let anim = if state.anim_v == 0.0 && val != 0.0 { val as f32 } else { state.anim_v };
     let editing = state.editing;
     let base = RectF::new(r.l, r.t, r.r, r.b);
@@ -938,7 +947,9 @@ fn paint_slider(
     let mut show: String = if editing {
         edit
             .map(|e| {
-                let mut s: String = e.buf.iter().map(|&c| char::from_u32(c as u32).unwrap_or('\u{FFFD}')).collect();
+                // 审查 440：String::from_utf16_lossy —— 逐 char::from_u32 会把
+                // 代理对拆成两个 U+FFFD（与 mod.rs 同型实现统一）。
+                let mut s: String = String::from_utf16_lossy(&e.buf);
                 if e.caret {
                     s.push('_');
                 }
@@ -948,7 +959,8 @@ fn paint_slider(
     } else if dp == 0 {
         format!("{}", val.round() as i64)
     } else {
-        format!("{val:.1}")
+        // 审查 441：按 dp 生成精度（dp=2 仍只显示 1 位是错的）。
+        format!("{val:.*}", dp as usize)
     };
     // 单位后缀（C01：40.0 → 40 px）。
     if !unit.is_empty() && !editing {
@@ -1071,8 +1083,17 @@ fn paint_metric_header(
     // cfg 不可得（overlay 句柄失效）时按「开」处理：
     // 宁可少画一枚标签，也不在状态未知时错报「已关闭」。
     let on = cfg.is_none_or(|c| matches!(on_cfg.get(c), Value::Bool(true)));
+    // 审查 442/443：由 Metric::ALL + i18n 键名规则派生 —— 新增指标时编译期
+    // 数组长度自动跟随；越界下标不再静默钳到最后一个（返回空名并留痕）。
     const KEYS: [&str; super::N_METRICS] = ["LblCpu", "LblMem", "LblGpu", "LblNet", "LblPower", "LblTime", "LblUtil", "LblDiskRead", "LblDiskWrite"];
-    let name = crate::i18n::t(lang, KEYS[index.min(super::N_METRICS - 1)]);
+    const _: () = assert!(KEYS.len() == aaxsyspulse_core::types::Metric::ALL.len(), "指标 i18n 键与 Metric::ALL 不一致");
+    let name = match KEYS.get(index) {
+        Some(k) => crate::i18n::t(lang, k),
+        None => {
+            crate::probe::log(&format!("metric_swatches: index {index} out of range"));
+            ""
+        }
+    };
     // 折叠头标题比正文大一档（用户反馈：字号偏小）。
     let title_px = body_px * 1.2;
 
@@ -1118,6 +1139,12 @@ fn paint_metric_header(
 
 /// 诊断页一行：采样器名称 + 状态图标 + 原因说明。
 /// `id` 是控件的 w.id（600..604 对应 Cpu/Memory/Gpu/Net/Power）。
+/// 审查 446：诊断原因错误码提具名常量（来源 = 采样器侧 `DiagEntry.code` 的约定）。
+const DIAG_CODE_NO_DRIVER: u16 = 1;
+const DIAG_CODE_PERM: u16 = 2;
+const DIAG_CODE_UNAVAIL: u16 = 3;
+const DIAG_CODE_TIMEOUT: u16 = 4;
+
 fn paint_diag_row(
     rt: &windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget,
     gfx: &mut Gfx,
@@ -1141,30 +1168,28 @@ fn paint_diag_row(
     };
     let name = crate::i18n::t(lang, name_key);
 
-    // 状态：最近一条诊断记录
+    // 状态：**该采样器**最近一条诊断记录（审查 444：d.last() 只看全局最新一条，
+    // 若最新一条属于别的采样器，本行既有故障会被误显示为 DiagOk）。
     let (status_color, status_text) = if let Some(d) = diag {
-        if let Some(entry) = d.last() {
-            if entry.sampler == sampler_id {
-                match entry.outcome {
-                    SampleOutcome::Ok => (c(t, t.accent), crate::i18n::t(lang, "DiagOk")),
-                    SampleOutcome::Skipped => (c(t, t.secondary), crate::i18n::t(lang, "DiagOk")),
-                    SampleOutcome::Transient | SampleOutcome::Fatal => {
-                        // 根据错误码推断原因
-                        let reason = match entry.code {
-                            1 => "DiagNoDriver",
-                            2 => "DiagPerm",
-                            3 => "DiagUnavail",
-                            4 => "DiagTimeout",
-                            _ => "DiagFallback",
-                        };
-                        (c(t, t.accent), crate::i18n::t(lang, reason))
-                    }
+        match d.iter().filter(|e| e.sampler == sampler_id).last() {
+            Some(entry) => match entry.outcome {
+                SampleOutcome::Ok => (c(t, t.accent), crate::i18n::t(lang, "DiagOk")),
+                // 审查 445：Skipped 单独文案/次级色 —— 不再与正常态共用 "DiagOk"，
+                // 用户能看出「采样被有意跳过」而非「一切正常」。
+                SampleOutcome::Skipped => (c(t, t.secondary), "⏸"),
+                SampleOutcome::Transient | SampleOutcome::Fatal => {
+                    // 根据错误码推断原因（审查 446：具名常量）。
+                    let reason = match entry.code {
+                        DIAG_CODE_NO_DRIVER => "DiagNoDriver",
+                        DIAG_CODE_PERM => "DiagPerm",
+                        DIAG_CODE_UNAVAIL => "DiagUnavail",
+                        DIAG_CODE_TIMEOUT => "DiagTimeout",
+                        _ => "DiagFallback",
+                    };
+                    (c(t, t.accent), crate::i18n::t(lang, reason))
                 }
-            } else {
-                (c(t, t.secondary), crate::i18n::t(lang, "DiagOk"))
-            }
-        } else {
-            (c(t, t.secondary), crate::i18n::t(lang, "DiagOk"))
+            },
+            None => (c(t, t.secondary), crate::i18n::t(lang, "DiagOk")),
         }
     } else {
         (c(t, t.secondary), "—")
@@ -1174,12 +1199,22 @@ fn paint_diag_row(
     let label_h = super::layout::s(dpi, super::layout::ROW_H) as f32;
     let label_top = mid - label_h / 2.0;
 
-    // 状态圆点（8px 直径）
-    let dot_r = RectF::new(r.r - 80.0, mid - 4.0, r.r - 72.0, mid + 4.0);
+    // 状态圆点（审查 447：按 DPI 缩放 —— 原先 8px/80/72/300/88 是裸物理像素，
+    // 高 DPI 下状态点与文字明显偏小）。
+    let dot_r_px = s(dpi, 8) as f32;
+    let dot_gap = s(dpi, 12) as f32;
+    let reason_w = s(dpi, 212) as f32;
+    let name_r_w = s(dpi, 310) as f32;
+    let dot_r = RectF::new(
+        r.r - dot_gap - dot_r_px,
+        mid - dot_r_px / 2.0,
+        r.r - dot_gap,
+        mid + dot_r_px / 2.0,
+    );
     gfx.fill_ellipse(rt, dot_r, status_color);
 
     // 原因文字（右侧，在圆点左边）
-    let reason_r = RectF::new(r.r - 300.0, label_top, r.r - 88.0, label_top + label_h);
+    let reason_r = RectF::new(r.r - reason_w - dot_gap * 2.0, label_top, r.r - dot_gap * 2.0 + s(dpi, 16) as f32, label_top + label_h);
     gfx.text(
         rt,
         status_text,
@@ -1191,8 +1226,8 @@ fn paint_diag_row(
         false,
     );
 
-    // 采样器名称（左侧标签区）
-    let name_r = RectF::new(r.l, label_top, r.r - 310.0, label_top + label_h);
+    // 采样器名称（左侧标签区；审查 447：按 DPI 缩放）
+    let name_r = RectF::new(r.l, label_top, r.r - name_r_w, label_top + label_h);
     gfx.text(
         rt,
         name,

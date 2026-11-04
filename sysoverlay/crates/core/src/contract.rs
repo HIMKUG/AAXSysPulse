@@ -25,6 +25,9 @@
 pub const OVERLAY_WINDOW_CLASS: &str = "AAXSysPulse_WndClass";
 /// 设置窗口类名。注册处：`win/src/settings/mod.rs`。
 pub const SETTINGS_WINDOW_CLASS: &str = "AAXSysPulse_Settings";
+/// 引导程序单实例互斥体名（审查 005：由 guide 私有字面量收进契约唯一真源）。
+/// 注册处：`guide-app/src-tauri/src/process.rs`。
+pub const GUIDE_MUTEX_NAME: &str = "Local\\AAXSysPulseGuide_SingleInstance";
 /// 悬浮窗窗口标题（仅用于任务管理器/辅助工具识别，不注册类名）。
 pub const OVERLAY_WINDOW_TITLE: &str = APP_USER_NAME;
 
@@ -58,7 +61,7 @@ pub const WM_QUICK_RESTART: u32 = WM_APP + 9;
 /// 发送方 `win::autostart::apply_user_async`（阻塞操作必须离开 UI 线程，
 /// 见该函数文档）；接收方 `win::window` 的 wndproc。
 pub const WM_AUTOSTART_DONE: u32 = WM_APP + 10;
-/// 诊断：在悬浮窗上点击某个区域。与上面 1–9 同一基址，但号段靠后，
+/// 诊断：在悬浮窗上点击某个区域。与上面 1–10 同一基址，但号段靠后，
 /// 避免和"外部程序可投递"的 8/9 混在一起。
 pub const WM_DIAG_CLICK: u32 = WM_APP + 41;
 
@@ -66,6 +69,17 @@ pub const WM_DIAG_CLICK: u32 = WM_APP + 41;
 // `assert!(常量比较)` —— 两侧操作数都是常量，运行时**永远不可能失败**，属假测试）。
 // 与 `cadence.rs` / `theme.rs` 同法：越界直接变编译错误，而不是等某次 `cargo test`。
 const _: () = assert!(WM_APP >= 0x8000 && WM_APP <= 0xBFFF);
+// 每条消息逐一钉在号段内（审查 008）：新增 WM_* 时这里会直接编译失败，逼你登记。
+const _: () = assert!(WM_TRAY <= WM_APP_SEG_MAX);
+const _: () = assert!(WM_RECONFIG <= WM_APP_SEG_MAX);
+const _: () = assert!(WM_NEW_SNAPSHOT <= WM_APP_SEG_MAX);
+const _: () = assert!(WM_GET_SAMPLER_DIAG <= WM_APP_SEG_MAX);
+const _: () = assert!(WM_SAMPLER_DIAG <= WM_APP_SEG_MAX);
+const _: () = assert!(WM_OPEN_SETTINGS <= WM_APP_SEG_MAX);
+const _: () = assert!(WM_DISABLE_D2D <= WM_APP_SEG_MAX);
+const _: () = assert!(WM_RELOAD_CONFIG <= WM_APP_SEG_MAX);
+const _: () = assert!(WM_QUICK_RESTART <= WM_APP_SEG_MAX);
+const _: () = assert!(WM_AUTOSTART_DONE <= WM_APP_SEG_MAX);
 const _: () = assert!(WM_DIAG_CLICK <= WM_APP_SEG_MAX, "越过号段上界");
 
 // ───────────────────────── 磁盘 / 系统侧名字 ─────────────────────────
@@ -89,6 +103,9 @@ pub const APP_DATA_DIR_NAME: &str = "AAXSysPulseC";
 /// 驱动文件名。
 pub const DRIVER_FILE_NAME: &str = "WinRing0x64.sys";
 /// 驱动落地目录（引导写、主程序按同一路径打开）。
+/// 已钉死的假设：系统盘固定为 `C:`。core 保持零依赖、无法调 `GetWindowsDirectoryW`，
+/// 引导释放与主程序打开两侧都以本常量为准；若未来要支持非 C 系统盘，
+/// 必须两侧同批改为系统目录派生（审查 001）。
 pub const DRIVER_DIR: &str = "C:\\Windows\\AAXSysPulse\\";
 /// 驱动服务名（`CreateServiceW` / `OpenServiceW` 两端同名）。
 pub const DRIVER_SERVICE_NAME: &str = "AAXSysPulseWinRing0";
@@ -137,6 +154,17 @@ pub fn wide_of(s: &str) -> Vec<u16> {
     let mut v: Vec<u16> = s.encode_utf16().collect();
     v.push(0);
     v
+}
+
+/// 配置目录唯一真源：`%APPDATA%\AAXSysPulseC\config`（审查 010/011）。
+/// 主程序与引导都从这里派生路径，任何一端都不得手拼目录串，
+/// 否则一端改名即静默失联。`APPDATA` 取不到时返回 `None`，由调用方决定回退。
+pub fn app_config_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("APPDATA").map(|root| {
+        std::path::PathBuf::from(root)
+            .join(APP_DATA_DIR_NAME)
+            .join("config")
+    })
 }
 
 #[cfg(test)]
@@ -203,6 +231,10 @@ mod tests {
             TASK_NAME,
             RUN_VALUE_MAIN,
             RUN_VALUE_GUIDE,
+            RUN_KEY,
+            APPROVED_RUN_KEY,
+            UNINSTALL_SUBKEY,
+            START_MENU_FOLDER,
         ] {
             assert!(
                 s.is_ascii(),
@@ -257,5 +289,14 @@ mod tests {
         let body = &buf[..buf.len() - 1];
         assert_eq!(String::from_utf16(body).unwrap(), OVERLAY_WINDOW_CLASS);
         assert_eq!(body.len(), OVERLAY_WINDOW_CLASS.len(), "ASCII ⇒ 码元数=字节数");
+    }
+
+    /// 配置目录助手：拼接结果必须落在 `APP_DATA_DIR_NAME/config` 之下（审查 010）。
+    #[test]
+    fn app_config_dir_is_under_app_data_dir() {
+        if let Some(p) = app_config_dir() {
+            let s = p.to_string_lossy().to_lowercase();
+            assert!(s.contains("aaxsyspulsec\\config"), "{s}");
+        }
     }
 }

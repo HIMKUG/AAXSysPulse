@@ -24,14 +24,35 @@ use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteFactory5, IDWriteFontFace, IDWriteFontFile,
     IDWriteGlyphRunAnalysis, DWRITE_FACTORY_TYPE_SHARED,
-    DWRITE_FONT_FACE_TYPE_CFF, DWRITE_GLYPH_OFFSET, DWRITE_GLYPH_RUN, DWRITE_MATRIX,
-    DWRITE_MEASURING_MODE_NATURAL, DWRITE_RENDERING_MODE_NATURAL, DWRITE_TEXTURE_TYPE,
+    DWRITE_FONT_FACE_TYPE, DWRITE_FONT_FACE_TYPE_CFF, DWRITE_FONT_FACE_TYPE_TRUETYPE,
+    DWRITE_GLYPH_OFFSET, DWRITE_GLYPH_RUN, DWRITE_MATRIX, DWRITE_MEASURING_MODE_NATURAL,
+    DWRITE_RENDERING_MODE_NATURAL, DWRITE_TEXTURE_TYPE,
 };
+use aaxsyspulse_ui::font::{FONT_WIDTH, GLYPH_VISIBLE_ROWS};
 
-/// 点阵格（与 `ui::font::FONT_WIDTH/GLYPH_VISIBLE_ROWS` 对齐：
-/// 字形墨迹只放进顶部 8 行，布局按 8 行预留，避免纵向下压到下一指标）。
-const CELL_W: f32 = 8.0;
-const CELL_H: f32 = 8.0;
+/// 点阵格：引用 ui 常量（审查 537：ui 侧一改即自动跟随，不再手写 8.0）。
+/// 字形墨迹只放进顶部 GLYPH_VISIBLE_ROWS 行，布局按该行数预留。
+const CELL_W: f32 = FONT_WIDTH as f32;
+const CELL_H: f32 = GLYPH_VISIBLE_ROWS as f32;
+
+/// Grayscale 纹理类型（windows-0.58 未导出命名常量，值固定为 2；
+/// 审查 539：原先两处各写一份硬编码 + 注释，收敛为一份）。
+const DWRITE_TEXTURE_TYPE_GRAYSCALE: DWRITE_TEXTURE_TYPE = DWRITE_TEXTURE_TYPE(2);
+
+/// 按文件魔数判定 DWRITE_FONT_FACE_TYPE（审查 133：硬编码 CFF 会在
+/// TrueType 字体上静默回退内置点阵）。支持 OTF(CFF/OTTO) 与 TTF 两类。
+fn font_face_type_for(path: &std::path::Path) -> Option<DWRITE_FONT_FACE_TYPE> {
+    use std::io::Read;
+    let mut head = [0u8; 4];
+    std::fs::File::open(path).ok()?.read_exact(&mut head).ok()?;
+    match head {
+        [b'O', b'T', b'T', b'O'] => Some(DWRITE_FONT_FACE_TYPE_CFF),
+        [0x00, 0x01, 0x00, 0x00] | [b't', b'r', b'u', b'e'] => {
+            Some(DWRITE_FONT_FACE_TYPE_TRUETYPE)
+        }
+        _ => None,
+    }
+}
 
 fn factory() -> Option<&'static IDWriteFactory> {
     static F: OnceLock<Option<IDWriteFactory>> = OnceLock::new();
@@ -43,6 +64,7 @@ fn factory() -> Option<&'static IDWriteFactory> {
 fn face_for(weight: u8) -> Option<IDWriteFontFace> {
     let dwrite = factory()?;
     let path = crate::render_d2d::find_din_font_path(weight)?;
+    let face_type = font_face_type_for(&path)?;
     let factory5: IDWriteFactory5 = dwrite.cast().ok()?;
     let wide: Vec<u16> = path
         .to_string_lossy()
@@ -54,7 +76,7 @@ fn face_for(weight: u8) -> Option<IDWriteFontFace> {
     unsafe {
         factory5
             .CreateFontFace(
-                DWRITE_FONT_FACE_TYPE_CFF,
+                face_type,
                 std::slice::from_ref(&Some(file)),
                 0,
                 Default::default(),
@@ -75,9 +97,11 @@ fn rasterize_char(face: &IDWriteFontFace, c: u32) -> Option<[u8; 16]> {
         return None; // 字形缺失（含 DIN 无此字符）→ 回退内置点阵
     }
 
-    let run = |face: &IDWriteFontFace, transform: Option<&DWRITE_MATRIX>,
-               origin_y: f32| -> Option<(IDWriteGlyphRunAnalysis, RECT)> {
-        let gr = DWRITE_GLYPH_RUN {
+    let run = |face: &IDWriteFontFace,
+               transform: Option<&DWRITE_MATRIX>|
+     -> Option<(IDWriteGlyphRunAnalysis, RECT)> {
+        // 审查 538：origin_y 恒 0.0，参数删除。
+        let mut gr = DWRITE_GLYPH_RUN {
             fontFace: ManuallyDrop::new(Some(face.clone())),
             fontEmSize: 16.0,
             glyphCount: 1,
@@ -88,26 +112,32 @@ fn rasterize_char(face: &IDWriteFontFace, c: u32) -> Option<[u8; 16]> {
             bidiLevel: 0,
         };
         unsafe {
-            let analysis = dwrite
-                .CreateGlyphRunAnalysis(
-                    &gr,
-                    1.0,
-                    transform.map(|m| m as *const DWRITE_MATRIX),
-                    DWRITE_RENDERING_MODE_NATURAL,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                    0.0,
-                    origin_y,
-                )
-                .ok()?;
-            // windows-0.58 未导出命名常量，Grayscale 纹理类型值为 2。
-            let gs = DWRITE_TEXTURE_TYPE(2);
-            let bounds = analysis.GetAlphaTextureBounds(gs).ok()?;
+            // 审查 132：clone 进 glyph run 的 COM 引用手动保管后从不释放
+            // （3 档 × 95 字符 × 2 趟 = 570 次泄漏）—— 分析对象创建后立即
+            // 配对 drop（含错误路径）。
+            let analysis = match dwrite.CreateGlyphRunAnalysis(
+                &gr,
+                1.0,
+                transform.map(|m| m as *const DWRITE_MATRIX),
+                DWRITE_RENDERING_MODE_NATURAL,
+                DWRITE_MEASURING_MODE_NATURAL,
+                0.0,
+                0.0,
+            ) {
+                Ok(a) => a,
+                Err(_) => {
+                    ManuallyDrop::drop(&mut gr.fontFace);
+                    return None;
+                }
+            };
+            ManuallyDrop::drop(&mut gr.fontFace);
+            let bounds = analysis.GetAlphaTextureBounds(DWRITE_TEXTURE_TYPE_GRAYSCALE).ok()?;
             Some((analysis, bounds))
         }
     };
 
     // 趟 1：identity，仅取墨迹包围盒尺寸（位置无关）。
-    let (_a1, b1) = run(face, None, 0.0)?;
+    let (_a1, b1) = run(face, None)?;
     let w1 = (b1.right - b1.left).max(0) as f32;
     let h1 = (b1.bottom - b1.top).max(0) as f32;
     if w1 < 0.5 || h1 < 0.5 {
@@ -128,7 +158,7 @@ fn rasterize_char(face: &IDWriteFontFace, c: u32) -> Option<[u8; 16]> {
     };
 
     // 趟 2：带缩放/平移变换 → 墨迹落在 (0..8, 0..8)。
-    let (a2, b2) = run(face, Some(&mat), 0.0)?;
+    let (a2, b2) = run(face, Some(&mat))?;
     let bw = (b2.right - b2.left).max(0) as usize;
     let bh = (b2.bottom - b2.top).max(0) as usize;
     if bw == 0 || bh == 0 {
@@ -136,12 +166,7 @@ fn rasterize_char(face: &IDWriteFontFace, c: u32) -> Option<[u8; 16]> {
     }
     let mut alpha = vec![0u8; bw * bh];
     unsafe {
-        a2.CreateAlphaTexture(
-            DWRITE_TEXTURE_TYPE(2), // Grayscale 纹理类型（windows-0.58 未导出命名常量）
-            &b2,
-            &mut alpha,
-        )
-        .ok()?;
+        a2.CreateAlphaTexture(DWRITE_TEXTURE_TYPE_GRAYSCALE, &b2, &mut alpha).ok()?;
     }
 
     let mut table = [0u8; 16];
@@ -169,8 +194,17 @@ fn rasterize_char(face: &IDWriteFontFace, c: u32) -> Option<[u8; 16]> {
 /// 若 DIN 不可用则什么都不注入，软渲染器继续用内置点阵（各字重同形，
 /// 回到历史行为，但不崩溃）。
 pub fn ensure_loaded() {
-    static DONE: OnceLock<()> = OnceLock::new();
-    let _ = DONE.get_or_init(|| {
+    // 审查 131：改用 thread_local 守护 —— 进程级 OnceLock 只注入一次，而
+    // 字形表是 thread_local 的：渲染线程 respawn 后新线程的表回到内置点阵，
+    // DIN 三档注入永久丢失。thread_local 标记让每个新渲染线程重新注入一次。
+    thread_local! {
+        static DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if DONE.with(|d| d.get()) {
+        return;
+    }
+    DONE.with(|d| d.set(true));
+    {
         // 逐字符写入常驻表；未注入的槽位保持内置点阵（get_char_bitmap 原样回退）。
         // 写入与读取同线程（UI 渲染线程），thread_local 纯数组写，无锁、无发布。
         for weight in 0..3u8 {
@@ -178,17 +212,22 @@ pub fn ensure_loaded() {
                 crate::probe::log(&format!("din_bitmap: DIN weight {} not loaded — skip", weight));
                 continue;
             };
+            let mut ok_chars = 0usize;
             for cp in 0x20u32..=0x7E {
                 if let Some(t) = rasterize_char(&face, cp) {
-                    aaxsyspulse_ui::font::set_weight_glyph(weight, (cp - 0x20) as usize, t);
+                    // 审查 540：set_weight_glyph 现在返回是否生效，按真实成功数记录
+                    // —— DIN 存在但栅格化全失败时日志不再谎报"注入成功"。
+                    if aaxsyspulse_ui::font::set_weight_glyph(weight, (cp - 0x20) as usize, t) {
+                        ok_chars += 1;
+                    }
                 }
             }
             crate::probe::log(&format!(
-                "din_bitmap: weight {} injected (DIN {})",
+                "din_bitmap: weight {} injected {ok_chars}/95 chars (DIN {})",
                 weight,
                 crate::render_d2d::din_file_name(weight)
             ));
         }
         // 全部装完无需发布：thread_local 表对本线程即刻可见（get_char_bitmap 同线程读）。
-    });
+    }
 }

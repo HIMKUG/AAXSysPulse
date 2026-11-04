@@ -1,12 +1,18 @@
 # 固定 MSVC 工具链路径（本机 VS 2022 BuildTools）：
 # 1. linker — 避免 Git Bash / 沙箱环境下 link.exe 被 /usr/bin/link.exe（coreutils 硬链接工具）劫持；
 # 2. /LIBPATH — 沙箱会剥离环境变量导致 rustc 的 MSVC 自动探测失效，显式传入库搜索路径。
+#
+# ⚠️ 审查 793：workspace 清单已上移到仓库根 Cargo.toml —— cargo 从仓库根跑时
+# **不读本目录**（.cargo/config.toml 只从 CWD 向上发现）。本文件仅在本机于
+# sysoverlay/ 目录内手工跑 cargo 时仍有效（历史遗留，标注「仅本机历史有效」）；
+# 机器/VS 版本一变（审查 794 的 14.44.35207、审查 796 的 SDK 10.0.26100.0）
+# 即失效。审查 795：/LIBPATH 含空格已用引号包裹。
 [target.x86_64-pc-windows-msvc]
-linker = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\link.exe"
+linker = "\"C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\link.exe\""
 rustflags = [
-  "-C", "link-arg=/LIBPATH:C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64",
-  "-C", "link-arg=/LIBPATH:C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\um\\x64",
-  "-C", "link-arg=/LIBPATH:C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\ucrt\\x64",
+  "-C", "link-arg=\"/LIBPATH:C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64\"",
+  "-C", "link-arg=\"/LIBPATH:C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\um\\x64\"",
+  "-C", "link-arg=\"/LIBPATH:C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\ucrt\\x64\"",
   # 体积优化：磁盘分节对齐 4096→512（只影响文件布局，不影响内存加载/性能），
   # 并显式开启 COMDAT 折叠（同内容函数/数据合并，LTO 后仍可再省几 KB）。
   "-C", "link-arg=/FILEALIGN:512",

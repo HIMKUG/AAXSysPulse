@@ -38,6 +38,10 @@ use std::sync::OnceLock;
 /// 一轮厂商读数：(利用率%, 功耗W)。
 pub type VendorReading = (Option<f32>, Option<f32>);
 
+/// 单卡功耗守卫上限（瓦）。真实消费级卡峰值 < 600W（审查 078：
+/// 三处 800.0 硬编码收敛于此具名常量）。
+const MAX_CARD_WATTS: f32 = 800.0;
+
 /// 多后端集合：按厂商懒初始化，可同时持有多个厂商后端。
 /// 混合机器（如 NVIDIA 独显 + AMD 核显）两套后端并行采样，各卡功耗都能纳入。
 struct BackendSet {
@@ -61,7 +65,10 @@ fn merge_reading(dst: &mut VendorReading, (u, w): VendorReading) {
         dst.0 = Some(dst.0.map_or(ui, |cur| cur.max(ui)));
     }
     if let Some(wi) = w {
-        dst.1 = Some(dst.1.map_or(wi, |cur| cur + wi));
+        // 审查 075：仅累加有限值 —— 单后端 NaN/Inf 会污染整包读数。
+        if wi.is_finite() {
+            dst.1 = Some(dst.1.map_or(wi, |cur| cur + wi));
+        }
     }
 }
 
@@ -108,20 +115,34 @@ pub fn sample() -> VendorReading {
         }
     };
     perf::note_section("gpusample", t0);
+    // 审查 577：功耗读数全失败时复位瓦数缓存，cached_watts() 不再返回陈旧值
+    // （利用率缓存不在此清 —— D3DKMT 采样器以它作"无值兜底"，清掉会失去回退，
+    // 由 sampler 侧"仅当 D3DKMT 也无值才回退"的门控保证不冻结）。
+    if r.1.is_none() {
+        GPU_WATTS.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
     if let Some(w) = r.1 {
-        GPU_WATTS.store((w * 100.0).clamp(0.0, u32::MAX as f32) as u32,
-            std::sync::atomic::Ordering::Relaxed);
+        GPU_WATTS.store(
+            (w * 100.0).clamp(0.0, u32::MAX as f32) as u32,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
     if let Some(u) = r.0 {
-        // 利用率也缓存（D3DKMT 约 74ms，vendor 成功时直接缓存复用）
-        GPU_UTIL.store(u.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        // 利用率也缓存（D3DKMT 约 74ms，vendor 成功时直接缓存复用）。
+        // 审查 076：非有限值不得进缓存 —— 哨兵 0xFFFF_FFFF 恰是 NaN 位型，
+        // 会被 cached_util() 误判成"有缓存"。
+        if u.is_finite() {
+            GPU_UTIL.store(u.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
     }
     r
 }
 
 /// 卸载厂商后端（GPU 行关闭时由采样线程调用）：
-/// 取出并 drop BackendSet → NVML/ADL 驱动库 unload，清除利用率/功耗缓存。
+/// 取出并 drop BackendSet → 各后端调用自身的 shutdown/destroy 反初始化。
 /// 幂等；重开 GPU 行后走 D3DKMT 兜底（厂商库本会话不热恢复）。
+/// 审查 074：DLL 本身**不** FreeLibrary（保持加载至进程退出）—— 厂商库的
+/// 内部工作线程/回调在 unload 窗口期内触发是 UB 风险，据实更正文档。
 pub fn teardown() {
     if let Some(m) = BACKEND.get() {
         *m.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -149,15 +170,24 @@ pub fn cached_watts() -> Option<f32> {
 }
 
 fn load_library(name: &str) -> Option<windows::Win32::Foundation::HMODULE> {
-    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    let local = exe_dir.join(name);
-    let wide: Vec<u16> = local.to_string_lossy().encode_utf16().chain(Some(0)).collect();
+    // 审查 578：exe 目录解析失败不短路 —— 仍继续系统 DLL 搜索路径与
+    // GetModuleHandleW 兜底（原 `?` 链会把后两步一起跳过）。
+    if let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
+        let local = exe_dir.join(name);
+        let wide: Vec<u16> = local.to_string_lossy().encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            use windows::Win32::System::LibraryLoader::LoadLibraryW;
+            if let Ok(h) = LoadLibraryW(windows::core::PCWSTR(wide.as_ptr())) {
+                return Some(h);
+            }
+        }
+    }
+    let w: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
     unsafe {
         use windows::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
-        if let Ok(h) = LoadLibraryW(windows::core::PCWSTR(wide.as_ptr())) {
-            return Some(h);
-        }
-        let w: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
         if let Ok(h) = LoadLibraryW(windows::core::PCWSTR(w.as_ptr())) {
             return Some(h);
         }
@@ -181,12 +211,12 @@ fn as_fn<T>(ptr: *mut c_void) -> Option<T> {
     if ptr.is_null() { None } else { Some(unsafe { std::mem::transmute_copy(&ptr) }) }
 }
 
+// 审查 579：Igcl 只含 bool，本就自动 Send+Sync —— 手写 unsafe impl 反而
+// 绕过编译器校验，删除。Nvml/Adl 含裸指针成员，其 unsafe impl 仍必要。
 unsafe impl Send for Nvml {}
 unsafe impl Sync for Nvml {}
 unsafe impl Send for Adl {}
 unsafe impl Sync for Adl {}
-unsafe impl Send for Igcl {}
-unsafe impl Sync for Igcl {}
 
 // ─────────────────────────── NVIDIA: NVML ───────────────────────────
 
@@ -224,7 +254,12 @@ impl Nvml {
                 };
             if init() != 0 { probe::log("nvml init failed"); return None; }
             let mut count = 0u32;
-            if get_count(&mut count) != 0 || count == 0 { probe::log("nvml no devices"); return None; }
+            if get_count(&mut count) != 0 || count == 0 {
+                // 审查 580：init 已成功，失败路径必须配对 shutdown（NVML 全局状态残留）。
+                if let Some(f) = shutdown { f(); }
+                probe::log("nvml no devices");
+                return None;
+            }
             // 收集全部 NVIDIA 卡（多卡共同工作 ⇒ 功耗需逐张累加）。
             let mut devs: Vec<*mut c_void> = Vec::with_capacity(count as usize);
             for i in 0..count {
@@ -232,7 +267,12 @@ impl Nvml {
                 if get_by_index(i, &mut d) != 0 { continue; }
                 devs.push(d);
             }
-            if devs.is_empty() { probe::log("nvml no usable device"); return None; }
+            if devs.is_empty() {
+                // 审查 580：同上，配对 shutdown。
+                if let Some(f) = shutdown { f(); }
+                probe::log("nvml no usable device");
+                return None;
+            }
             probe::log(&format!("nvml backend ready gpus={}", devs.len()));
             Some(Self { devs, get_util: Some(get_util), get_power: Some(get_power), shutdown })
         }
@@ -243,8 +283,13 @@ impl Nvml {
             // 利用率取第一张卡（多卡以主卡为准，功耗累加）。
             let mut util = NvmlUtil { gpu: 0, memory: 0 };
             let u = if let Some(&dev) = self.devs.first() {
+                // 审查 581：与 ADL 口径一致，钳 0..=100（驱动垃圾值不进缓存）。
                 self.get_util.and_then(|f|
-                    if f(dev, &mut util) == 0 { Some(util.gpu as f32) } else { None })
+                    if f(dev, &mut util) == 0 {
+                        Some((util.gpu as f32).clamp(0.0, 100.0))
+                    } else {
+                        None
+                    })
             } else { None };
             // 功耗逐张累加（多卡共同工作 ⇒ 整机显存总功耗）。
             let mut total_w = 0.0;
@@ -253,8 +298,16 @@ impl Nvml {
                 let mut mw = 0u32;
                 if let Some(f) = self.get_power {
                     if f(dev, &mut mw) == 0 {
-                        total_w += mw as f32 / 1000.0;
-                        any = true;
+                        let card = mw as f32 / 1000.0;
+                        // 审查 582：与 ADL 同一单卡上限守卫 —— 驱动垃圾 mW 不并入整机。
+                        if card <= MAX_CARD_WATTS {
+                            total_w += card;
+                            any = true;
+                        } else {
+                            probe::log(&format!(
+                                "nvml card power {card}W > {MAX_CARD_WATTS}W — discarded (bad sensor)"
+                            ));
+                        }
                     }
                 }
             }
@@ -392,8 +445,11 @@ impl Adl {
 
             // 拿到一份驱动接受的 AdapterInfo 缓冲（候选值只定缓冲大小）。
             let mut filled: Option<Vec<u8>> = None;
+            // 审查 077：n 直接来自驱动 —— 钳上限 + checked_mul，垃圾值不再
+            // 触发巨量分配。
+            let n_capped = (n as usize).min(64);
             for &stride in ADL_INFO_SIZE_CANDIDATES {
-                let total = stride * n as usize;
+                let Some(total) = stride.checked_mul(n_capped) else { continue };
                 let mut buf = vec![0u8; total];
                 let ret = if use_adl2 {
                     if let Some(f) = info2 { f(ctx, buf.as_mut_ptr() as *mut c_void, total as i32) } else { -1 }
@@ -416,6 +472,7 @@ impl Adl {
             // 起点在 iSize+iAdapterIndex 之后 = 记录头 +8）。相邻锚点即真实步长，
             // 锚点前 4 字节就是 iAdapterIndex——完全不依赖 iSize/候选步长。
             let entries = scan_udid_entries(&buf);
+            // 步长仅作诊断输出（审查 583：收集走 UDID 锚点偏移，不依赖步长）。
             let stride = if entries.len() >= 2 {
                 Some(entries[1].0 - entries[0].0)
             } else {
@@ -556,12 +613,12 @@ impl Adl {
                             },
                         }
                         .map(|w| w.max(0) as f32);
-                        // 功耗守卫：单卡读数超 800W 判定为传感器垃圾（真实消费级卡
+                        // 功耗守卫：单卡读数超上限判定为传感器垃圾（真实消费级卡
                         // 峰值 < 600W），丢弃并告警，不上污染数。
                         if let Some(w) = card_w {
-                            if w > 800.0 {
+                            if w > MAX_CARD_WATTS {
                                 probe::log(&format!(
-                                    "adl board_power idx={adapter_index} value={w}W > 800W — discarded (bad sensor)"
+                                    "adl board_power idx={adapter_index} value={w}W > {MAX_CARD_WATTS}W — discarded (bad sensor)"
                                 ));
                                 card_w = None;
                             }
@@ -604,15 +661,15 @@ impl Adl {
                 }
             }
 
-            // 总功耗守卫：张数已知（≤ cap），单卡已被 800W 截断；总和超过
-            // 800×张数 即说明仍混入伪读数，整体作废返回 None（不显示假功耗）。
-            let total = if any_w && sum_w <= 800.0 * self.adapter_indices.len() as f32 {
+            // 总功耗守卫：张数已知（≤ cap），单卡已被上限截断；总和超过
+            // 上限×张数 即说明仍混入伪读数，整体作废返回 None（不显示假功耗）。
+            let total = if any_w && sum_w <= MAX_CARD_WATTS * self.adapter_indices.len() as f32 {
                 Some(sum_w)
             } else {
                 if any_w {
                     probe::log(&format!(
                         "adl total power {sum_w:.1}W > {}×cards — discarded",
-                        800.0 * self.adapter_indices.len() as f32
+                        MAX_CARD_WATTS * self.adapter_indices.len() as f32
                     ));
                 }
                 None

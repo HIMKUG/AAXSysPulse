@@ -45,19 +45,29 @@ impl Sampler for MemSampler {
                 return SampleOutcome::Transient;
             }
 
+            // 审查 059/564：total == 0（API 异常/受限 VM）时不写 0.0/0.0G 假值，
+            // 保持 Unavailable；API 失败路径由上层诊断环记 Transient。
+            if mem_status.ullTotalPhys == 0 {
+                out.memory = MemoryStat::default();
+                out.timestamp_ms = now_ms;
+                return SampleOutcome::Transient;
+            }
+
             let total_gb =
                 mem_status.ullTotalPhys as f64 / (1024.0 * 1024.0 * 1024.0);
             let avail_gb =
                 mem_status.ullAvailPhys as f64 / (1024.0 * 1024.0 * 1024.0);
-            let used_gb = total_gb - avail_gb;
+            // 审查 059：avail > total（异常/VM）时 used 为负 —— 双向钳制，
+            // 不再只 min(100) 留下负百分比/负 GB。
+            let used_gb = (total_gb - avail_gb).max(0.0);
             let load_pct = if total_gb > 0.0 {
-                ((used_gb / total_gb) * 100.0) as f32
+                ((used_gb / total_gb) * 100.0).clamp(0.0, 100.0) as f32
             } else {
                 0.0
             };
 
             out.memory = MemoryStat {
-                load_pct: load_pct.min(100.0),
+                load_pct,
                 used_gb: used_gb as f32,
                 total_gb: total_gb as f32,
             };

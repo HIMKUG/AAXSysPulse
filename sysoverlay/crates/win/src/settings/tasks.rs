@@ -7,7 +7,9 @@
 //! 立刻关窗、500ms 未到，改动就丢了。
 //!
 //! 新模型：[`DebouncedSave`] 是纯逻辑（合成时钟，可单测）；归属 `SettingsWindow`，
-//! **Drop 时强制 flush**，关窗必落盘。
+//! **flush 由窗口生命周期事件显式驱动**（WM_CLOSE / WM_DESTROY 里 `has_pending()`
+//! → `flush_config`，审查 199：原注释"Drop 时强制 flush"与实现不符 ——
+//! 本结构没有 `impl Drop`，实际 flush 点在 settings/mod.rs 的关窗/销毁分支）。
 
 /// 防抖窗口（毫秒）：高频操作期间跳过磁盘写入。
 pub const SAVE_DEBOUNCE_MS: u64 = 500;
@@ -42,6 +44,16 @@ impl DebouncedSave {
     /// 是否有未落盘改动（关窗 flush 用）。
     pub fn has_pending(&self) -> bool {
         self.pending
+    }
+
+    /// 防抖窗是否已到点（审查 200：模块本身没有"到点补写"机制 ——
+    /// 由调用方（定时器/帧循环）周期性查询本方法驱动补写；
+    /// 返回 true 时调用方应读 overlay 当前配置并 `save_config_async`）。
+    pub fn is_due(&self, now_ms: u64) -> bool {
+        self.pending
+            && self
+                .last_save_ms
+                .map_or(true, |t| now_ms.saturating_sub(t) >= SAVE_DEBOUNCE_MS)
     }
 }
 
@@ -91,5 +103,21 @@ mod tests {
         let mut d = DebouncedSave::default();
         assert!(d.on_change(0));
         assert!(d.has_pending());
+    }
+
+    /// 审查 200：防抖窗内漏写的改动必须可由 is_due 驱动补写。
+    #[test]
+    fn pending_change_becomes_due_after_window() {
+        let mut d = DebouncedSave::default();
+        assert!(d.on_change(1000));
+        d.on_saved(1000);
+        // 防抖窗内：pending 但未到期（不重复写盘）。
+        assert!(!d.on_change(1200), "窗内跳过");
+        assert!(d.has_pending());
+        assert!(!d.is_due(1200), "窗内未到期");
+        // 超窗后：is_due 置位，调用方补写成功后 on_saved 清 pending。
+        assert!(d.is_due(1000 + SAVE_DEBOUNCE_MS), "到点必须可补写");
+        d.on_saved(1000 + SAVE_DEBOUNCE_MS);
+        assert!(!d.has_pending() && !d.is_due(1000 + SAVE_DEBOUNCE_MS + 1));
     }
 }

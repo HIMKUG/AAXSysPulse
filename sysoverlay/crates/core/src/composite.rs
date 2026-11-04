@@ -278,7 +278,8 @@ fn alpha(dt: f64, tau: f64) -> f64 {
 /// 而是直接采信本次读数。显示节奏仍由提交侧的刷新下限约束。
 const JUMP_STEP: f64 = 0.25;
 
-/// 状态化的负载计。O(1) 内存（5 个 f64 + 2 个整数），无环形缓冲区，无分配。
+/// 状态化的负载计。O(1) 内存（配置 6 个 f64 + 状态 3 个 f64 / 1 bool / 2 个 u32），
+/// 无环形缓冲区，无分配（审查 633：字段数注释与实际不符，已更正）。
 #[derive(Clone, Copy, Debug)]
 pub struct Meter {
     cfg: MeterConfig,
@@ -291,6 +292,9 @@ pub struct Meter {
 }
 
 /// 一次更新的输出快照。
+///
+/// 审查 634：`stutter_milli` / `spikes` / `grade` 当前无 UI 消费方
+/// （仅诊断与单测使用），保留为诊断出口，接入 UI 前勿据此做行为分支。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MeterSnapshot {
     /// 本次瞬时综合占用（千分制）
@@ -307,6 +311,22 @@ pub struct MeterSnapshot {
 impl Meter {
     #[must_use]
     pub fn new(cfg: MeterConfig) -> Self {
+        // 审查 102/632：构造期校验 —— 负/NaN tau 会让 α 变负或 NaN、EMA 发散
+        // （alpha 只净化了 dt 一侧）；spike_release 必须不高于 spike（迟滞语义）。
+        // `!(x > 0.0)` 是否定式 NaN 安全写法（见本模块顶部说明）。
+        let mut cfg = cfg;
+        if !(cfg.tau_up > 0.0) {
+            cfg.tau_up = MeterConfig::default().tau_up;
+        }
+        if !(cfg.tau_down > 0.0) {
+            cfg.tau_down = MeterConfig::default().tau_down;
+        }
+        if !(cfg.tau_duty > 0.0) {
+            cfg.tau_duty = MeterConfig::default().tau_duty;
+        }
+        if !(cfg.spike_release <= cfg.spike) {
+            cfg.spike_release = cfg.spike;
+        }
         Self {
             cfg,
             ema: 0.0,
@@ -562,5 +582,23 @@ mod tests {
         let (s, degraded) = aggregate3([Some(f64::NAN), Some(5.0), Some(-1.0)]).unwrap();
         assert!(!degraded, "有值但坏 ≠ 缺源");
         assert!(s.is_finite() && (0.0..=1.0).contains(&s));
+    }
+
+    /// 审查 102 回归锁：坏 tau / 坏迟滞在构造期被钳回合法值。
+    #[test]
+    fn meter_config_bad_tau_is_sanitized() {
+        let mut m = Meter::new(MeterConfig {
+            tau_up: -1.0,
+            tau_down: f64::NAN,
+            tau_duty: 0.0,
+            spike: 0.85,
+            spike_release: 0.99, // 高于 spike，必须被压回
+            ..MeterConfig::default()
+        });
+        let snap = m.update(0.5, 1.0);
+        assert!(snap.smooth_milli <= 1000, "坏 tau 不得让 EMA 发散");
+        // spike_release 被 clamp 到 spike，迟滞不变式成立
+        assert!(m.cfg.spike_release <= m.cfg.spike);
+        assert!(m.cfg.tau_up > 0.0 && m.cfg.tau_down.is_finite() && m.cfg.tau_duty > 0.0);
     }
 }

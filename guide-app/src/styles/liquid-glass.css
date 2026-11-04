@@ -43,7 +43,10 @@
   --glass-tint: rgba(255, 255, 255, 0.25);
 }
 
-/* ============================ 1. 三层骨架（示例原值） ============================ */
+/* ============================ 1. 三层骨架（示例原值） ============================
+   续篇 760：三层的选择器列表曾逐字重复四份（本块 / ::before / ::after / 回退块）
+   —— 用原生 CSS 嵌套把 ::before/::after 收进基块，新增玻璃控件只需改两处
+   （此处 + 末尾回退块）。目标 WebView2 支持嵌套语法。 */
 .btn-primary, .btn-secondary, .btn-danger,
 .style-card, .orient-card, .nm-chip, .opt-row, .check,
 .autostart-card, .stat-card, .color-row, .per-item-row,
@@ -56,54 +59,51 @@
   box-shadow: 0 6px 6px rgba(0, 0, 0, 0.2),
               0 0 20px rgba(0, 0, 0, 0.1);   /* wrapper 原值 */
   transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 2.2); /* wrapper 原值 */
-}
 
-/* effect 层 = .liquidGlass-effect 逐字（z 用 -2：文字未包进独立层）·
-   v8 回归 v5：真实 backdrop 采样（下方 = 页面背景 + 大窗白纱 +
-   磨砂垫底色 + 一切真实内容），切页/祖先合成期采样被截时
-   本层不绘，由本体磨砂垫底继续撑起「有色玻璃胚」。 */
-.btn-primary::before, .btn-secondary::before, .btn-danger::before,
-.style-card::before, .orient-card::before, .nm-chip::before, .opt-row::before, .check::before,
-.autostart-card::before, .stat-card::before, .color-row::before, .per-item-row::before,
-.drag-item.dragging::before, .seg-item.active::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: -2;
-  border-radius: inherit;
-  pointer-events: none;
-  backdrop-filter: blur(3px);
-  -webkit-backdrop-filter: blur(3px);
-  filter: url(#glass-distortion);
-  overflow: hidden;
-  isolation: isolate;
-}
+  /* effect 层 = .liquidGlass-effect 逐字（z 用 -2：文字未包进独立层）·
+     v8 回归 v5：真实 backdrop 采样（下方 = 页面背景 + 大窗白纱 +
+     磨砂垫底色 + 一切真实内容），切页/祖先合成期采样被截时
+     本层不绘，由本体磨砂垫底继续撑起「有色玻璃胚」。 */
+  &::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -2;
+    border-radius: inherit;
+    pointer-events: none;
+    backdrop-filter: blur(3px);
+    -webkit-backdrop-filter: blur(3px);
+    filter: url(#glass-distortion);
+    overflow: hidden;
+    isolation: isolate;
+  }
 
-/* tint + shine 层 = .liquidGlass-tint + .liquidGlass-shine 逐字合并 */
-.btn-primary::after, .btn-secondary::after, .btn-danger::after,
-.style-card::after, .orient-card::after, .nm-chip::after, .opt-row::after, .check::after,
-.autostart-card::after, .stat-card::after, .color-row::after, .per-item-row::after,
-.drag-item.dragging::after, .seg-item.active::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: -1;
-  border-radius: inherit;
-  pointer-events: none;
-  background: var(--glass-tint);
-  box-shadow: var(--glass-shine);
-  /* 选中态切换动画：描边环以 spring 过冲生长（1px→2px），色调同步淡入。
-     未选中侧需带同结构 0 扩圈占位才能平滑插值，见第 2 节各基态 ::after。 */
-  transition: background-color 280ms var(--ease-out-expo),
-              box-shadow 380ms var(--ease-spring);
+  /* tint + shine 层 = .liquidGlass-tint + .liquidGlass-shine 逐字合并 */
+  &::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: inherit;
+    pointer-events: none;
+    background: var(--glass-tint);
+    box-shadow: var(--glass-shine);
+    /* 选中态切换动画：描边环以 spring 过冲生长（1px→2px），色调同步淡入。
+       未选中侧需带同结构 0 扩圈占位才能平滑插值，见第 2 节各基态 ::after。 */
+    transition: background-color 280ms var(--ease-out-expo),
+                box-shadow 380ms var(--ease-spring);
+  }
 }
 
 /* ============================ 2. 状态覆写 ============================
    元素本体的实色背景 / 彩色边框按原特异度改回透明（本体的 border 会画在
    折射层之下被位移搅边，边框一律改画 ::after 的 inset 环）。 */
 
-/* —— 按钮（demo 已验证，保持不动） —— */
-.btn-primary, .btn-secondary, .btn-danger { color: black; }  /* wrapper 原值 */
+/* —— 按钮 ——
+   续篇 761：wrapper 原值 color:black 曾把 base.css 的语义色覆成黑字 ——
+   primary（蓝底白字）与 danger（深红底白字）对比度崩。删除该覆盖，
+   颜色由 base.css 的 .btn-primary/.btn-secondary/.btn-danger 语义色承担；
+   无 backdrop 的实色回退块（文件尾）会重放完整配色。 */
 .btn-primary:hover:not(:disabled), .btn-primary:active:not(:disabled),
 .btn-secondary:hover:not(:disabled), .btn-secondary:active:not(:disabled),
 .btn-danger:hover:not(:disabled) {
@@ -202,8 +202,10 @@
 
 /* ============================ 3. 技术回退 ============================
    v7 假层路线不依赖 backdrop 采样，理论上无兼容断档；但 @supports
-   仍以 backdrop-filter 为探针 —— 支持的引擎必然支持本路线全部特性，
-   不支持的老引擎走下面的实色回退。
+   仍以 backdrop-filter 为探针 —— 续篇 762：该探针**不**覆盖
+   color-mix()/独立 translate/内联 SVG filter 等特性，极老引擎可能
+   "支持 backdrop 但缺其余"导致个别属性失效（实测目标 WebView2 全支持），
+   注释按真实覆盖面收窄，不再断言"必然支持全部特性"。
    （本表按特异度重放 wizard.css / base.css 的原始背景与边框色） */
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
   .btn-primary::before, .btn-secondary::before, .btn-danger::before,

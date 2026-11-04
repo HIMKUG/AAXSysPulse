@@ -26,7 +26,12 @@ impl Timeline {
     }
 
     /// 写入一个样本；溢出时覆盖最旧值。
+    /// 审查 635：非有限值（NaN/Inf）直接拒绝入缓冲 —— 单点污染会让
+    /// values()/max() 之后的全部统计不可信，且环形缓冲没有净化出口。
     pub fn push(&mut self, v: f32) {
+        if !v.is_finite() {
+            return;
+        }
         self.buf[self.head] = v;
         self.head = (self.head + 1) % self.cap;
         if self.count < self.cap {
@@ -48,30 +53,33 @@ impl Timeline {
         self.cap
     }
 
-    /// 按时间顺序（旧 → 新）返回快照（零分配：栈上填充回调或 Vec）。
+    /// 环形下标统一换算（审查 277：values()/max() 共用，不再各写一份）。
+    fn idx_at(&self, i: usize) -> usize {
+        if self.count < self.cap {
+            i
+        } else {
+            (self.head + i) % self.cap
+        }
+    }
+
+    /// 按时间顺序（旧 → 新）返回快照（分配一个 Vec；低频读取路径，容量预分配）。
     pub fn values(&self) -> Vec<f32> {
         let mut out = Vec::with_capacity(self.count);
         for i in 0..self.count {
-            let idx = if self.count < self.cap {
-                i
-            } else {
-                (self.head + i) % self.cap
-            };
-            out.push(self.buf[idx]);
+            out.push(self.buf[self.idx_at(i)]);
         }
         out
     }
 
-    /// 最大值（空则 0.0）。
+    /// 最大值（空则 0.0；审查 277：以 NEG_INFINITY 起算，
+    /// 全负样本返回真实最大值而不是伪装的 0）。
     pub fn max(&self) -> f32 {
-        let mut m = 0.0f32;
+        if self.count == 0 {
+            return 0.0;
+        }
+        let mut m = f32::NEG_INFINITY;
         for i in 0..self.count {
-            let idx = if self.count < self.cap {
-                i
-            } else {
-                (self.head + i) % self.cap
-            };
-            m = m.max(self.buf[idx]);
+            m = m.max(self.buf[self.idx_at(i)]);
         }
         m
     }
@@ -161,6 +169,23 @@ mod tests {
         t.push(9.0);
         t.push(3.0);
         assert_eq!(t.max(), 9.0);
+        // 审查 277：全负样本返回真实最大值
+        let mut t2 = Timeline::new(4);
+        t2.push(-5.0);
+        t2.push(-2.0);
+        assert_eq!(t2.max(), -2.0);
+    }
+
+    /// 审查 635 回归锁：NaN/Inf 被拒绝入缓冲。
+    #[test]
+    fn timeline_rejects_non_finite() {
+        let mut t = Timeline::new(4);
+        t.push(1.0);
+        t.push(f32::NAN);
+        t.push(f32::INFINITY);
+        t.push(2.0);
+        assert_eq!(t.values(), vec![1.0, 2.0]);
+        assert_eq!(t.max(), 2.0);
     }
 
     #[test]

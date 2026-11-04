@@ -76,22 +76,28 @@ mod profile_guard_tests {
     //! —— 所以必须有一条断言守着。报告建议放 CI，本仓库无 CI ⇒ 落在 `cargo test` 里。
 
     fn release_section() -> String {
-        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../Cargo.toml"))
-            .expect("workspace 根 Cargo.toml 必须与 crate 保持相对位置（见仓库根）");
+        // 审查 834：以 CARGO_MANIFEST_DIR 的祖先目录定位仓库根并显式断言，
+        // 不再硬编码三层 `..` 相对路径。
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("crate 至少有三层父目录（crates/win → sysoverlay → 仓库根）")
+            .join("Cargo.toml");
+        let text = std::fs::read_to_string(&root).unwrap_or_else(|e| {
+            panic!("workspace 根 Cargo.toml 读取失败（{}）：{e}", root.display())
+        });
         let head = "[profile.release]";
         let Some(at) = text.find(head) else {
             panic!("根 Cargo.toml 里没有 [profile.release] 段 —— 断言失效本身就是结论");
         };
-        let rest = &text[at + head.len()..];
-        let sec = match rest.find("[") {
-            Some(next) => &rest[..next],
-            None => rest,
-        };
-        // 只留**赋值行**：根 Cargo.toml 里那段 why-comment 本身就写着
-        // "panic=abort 会使其失效"，注释不过滤掉会让下面的 `!contains("abort")`
-        // 永远红（实测：第一次跑就是被自己的注释判死的）。
-        sec.lines()
-            .filter(|l| !l.trim_start().starts_with('#'))
+        // 审查 018：逐行 trim + 遇到下一个 `[` 段头停止 + 过滤注释 ——
+        // 原先 `rest.find("[")` 会被 why-comment 里的 `[` 截断，
+        // `replace(' ', "")` 会让 `panic =\t"unwind"` 误判。
+        text[at + head.len()..]
+            .lines()
+            .map(str::trim_start)
+            .take_while(|l| !l.starts_with('['))
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -99,12 +105,16 @@ mod profile_guard_tests {
     #[test]
     fn release_profile_must_keep_unwind() {
         let sec = release_section();
+        let panic_line = sec
+            .lines()
+            .find(|l| l.starts_with("panic"))
+            .expect("[profile.release] 缺少 panic 配置行（catch_unwind 自愈依赖 unwind）");
         assert!(
-            sec.replace(' ', "").contains("panic=\"unwind\""),
+            panic_line.replace(' ', "").contains("panic=\"unwind\""),
             "[profile.release] 必须是 `panic = \"unwind\"`：D2D/MSR/渲染线程的自愈都靠 catch_unwind（审查项 9.1）\n实际配置：{sec}"
         );
         assert!(
-            !sec.contains("abort"),
+            !panic_line.contains("abort"),
             "[profile.release] 出现 `abort` 会静默废掉全部 catch_unwind 自愈路径（审查项 9.1）\n实际配置：{sec}"
         );
     }

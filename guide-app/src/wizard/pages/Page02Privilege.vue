@@ -1,7 +1,8 @@
 <template>
   <section class="page page--center page--top">
     <div class="page-body">
-      <h1 class="t-title r1">需要管理员权限</h1>
+      <!-- 续篇 703：切页后读屏不播报 —— 标题挂 aria-live="polite" -->
+      <h1 class="t-title r1" aria-live="polite">需要管理员权限</h1>
 
       <p class="t-body r2" style="margin-top: var(--sp-8); color: var(--text-secondary); font-style: italic; font-weight: 400; line-height: 1.6; max-width: 460px">
         功耗监控需要安装驱动，需要管理员权限。<br />

@@ -15,7 +15,9 @@
 //! 整项显隐（`show`）对应旧 `show_*`；名称显隐（`name`）对应旧 `metric_show_labels`。
 
 use crate::config::ini::{fmt_color, parse_bool, parse_color, parse_u32, Ini, Writer};
-use crate::config::{Config, FONT_PX_MAX, FONT_PX_MIN};
+use crate::config::{
+    snap_font_size, Config, POWER_INTERVAL_MS_MAX, POWER_INTERVAL_MS_MIN,
+};
 use crate::types::{Metric, NameMode, PowerDisplay};
 
 pub const MONITOR_FILE: &str = "monitor.cfg";
@@ -121,22 +123,26 @@ pub fn parse(cfg: &mut Config, text: &str) {
             Some(i) => i,
             None => continue,
         };
-        if let Some(sec) = ini.section(&format!("item.{}", id)) {
-            if let Some(v) = sec.get("show") {
-                let b = parse_bool(v, cfg.metric_show_labels[idx]);
-                match id {
-                    1 => cfg.show_cpu = b,
-                    2 => cfg.show_mem = b,
-                    3 => cfg.show_gpu = b,
-                    4 => cfg.show_net = b,
-                    5 => cfg.power_enabled = b,
-                    6 => cfg.show_time = b,
-                    7 => cfg.show_util = b,
-                    8 => cfg.show_disk_read = b,
-                    9 => cfg.show_disk_write = b,
-                    _ => {}
+            if let Some(sec) = ini.section(&format!("item.{}", id)) {
+                if let Some(v) = sec.get("show") {
+                    // 审查 037：解析失败的兜底取「整项显隐」（visibility），
+                    // 而不是名称显隐（metric_show_labels），语义不再错位。
+                    let vis = visibility(cfg);
+                    let b = parse_bool(v, vis[idx]);
+                    // 审查 038：按 Metric 枚举穷尽映射 —— 新增指标漏登记时
+                    // 这里直接编译失败，而不是静默丢项。
+                    match Metric::ALL[idx] {
+                        Metric::Cpu => cfg.show_cpu = b,
+                        Metric::Mem => cfg.show_mem = b,
+                        Metric::Gpu => cfg.show_gpu = b,
+                        Metric::Net => cfg.show_net = b,
+                        Metric::Power => cfg.power_enabled = b,
+                        Metric::Time => cfg.show_time = b,
+                        Metric::Util => cfg.show_util = b,
+                        Metric::DiskRead => cfg.show_disk_read = b,
+                        Metric::DiskWrite => cfg.show_disk_write = b,
+                    }
                 }
-            }
             if let Some(v) = sec.get("name") {
                 cfg.metric_show_labels[idx] = parse_bool(v, cfg.metric_show_labels[idx]);
             }
@@ -150,25 +156,28 @@ pub fn parse(cfg: &mut Config, text: &str) {
                 if t.is_empty() || t == "0" {
                     cfg.metric_font_sizes[idx] = None;
                 } else if let Ok(n) = t.parse::<f32>() {
-                    let n = n.clamp(FONT_PX_MIN, FONT_PX_MAX);
-                    // 与全局字号相等 = 跟随全局（防止误钉死）
-                    cfg.metric_font_sizes[idx] =
-                        if (n - cfg.font_size).abs() < 0.05 { None } else { Some(n) };
+                    // 审查 039：去掉"与全局字号相等 = 跟随"推断 —— 两个 .cfg
+                    // 加载顺序独立，推断结果不稳定；显式写 0 才是跟随全局。
+                    cfg.metric_font_sizes[idx] = Some(snap_font_size(n));
                 }
             }
             if let Some(v) = sec.get("color_l") {
-                cfg.metric_colors[idx].label = if v.trim().is_empty() {
-                    None
-                } else {
-                    parse_color(v)
-                };
+                let t = v.trim();
+                // 审查 040：区分「空 = 跟随全局」与「非法值 = 保留原槽」，
+                // 坏颜色不再把用户已设的色槽清掉。
+                if t.is_empty() {
+                    cfg.metric_colors[idx].label = None;
+                } else if let Some(c) = parse_color(t) {
+                    cfg.metric_colors[idx].label = Some(c);
+                }
             }
             if let Some(v) = sec.get("color_v") {
-                cfg.metric_colors[idx].value = if v.trim().is_empty() {
-                    None
-                } else {
-                    parse_color(v)
-                };
+                let t = v.trim();
+                if t.is_empty() {
+                    cfg.metric_colors[idx].value = None;
+                } else if let Some(c) = parse_color(t) {
+                    cfg.metric_colors[idx].value = Some(c);
+                }
             }
             if let Some(v) = sec.get("auto") {
                 cfg.metric_colors[idx].value_auto = parse_bool(v, cfg.metric_colors[idx].value_auto);
@@ -189,7 +198,8 @@ pub fn parse(cfg: &mut Config, text: &str) {
         }
     }
     if let Some(v) = ini.get("power", "interval_ms") {
-        cfg.power_interval_ms = parse_u32(v, cfg.power_interval_ms).clamp(500, 60_000);
+        cfg.power_interval_ms =
+            parse_u32(v, cfg.power_interval_ms).clamp(POWER_INTERVAL_MS_MIN, POWER_INTERVAL_MS_MAX);
     }
     if let Some(v) = ini.get("power", "exclude_virtual_nic") {
         cfg.exclude_virtual_nic = parse_bool(v, cfg.exclude_virtual_nic);
@@ -215,7 +225,7 @@ mod tests {
         assert_eq!(c2.show_net, cfg.show_net);
         assert_eq!(c2.show_util, cfg.show_util);
         // order 已移至 layout 文件，monitor 文件不负责顺序
-        assert_eq!(c2.metric_order, [0, 1, 2, 6, 3, 5, 4, 7, 8]); // 默认 = 当前配置顺序
+        assert_eq!(c2.metric_order, crate::config::DEFAULT_METRIC_ORDER);
     }
 
     #[test]

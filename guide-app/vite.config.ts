@@ -23,9 +23,9 @@ export default defineConfig(() => ({
   server: {
     port: 5173,
     strictPort: true,
-    // 显式只监听回环：`false` 会走 Vite 的默认分支，语义随版本变化，
-    // 而 dev server（esbuild 文件读取面）一旦监听 0.0.0.0 就是局域网敞口（8B.N）。
-    host: host || "127.0.0.1",
+    // 续篇 772：显式只监听回环 —— TAURI_DEV_HOST 只用于 HMR 客户端，
+    // 不再把 dev server 绑到外部地址（esbuild 文件读取面一旦上 0.0.0.0 就是局域网敞口）。
+    host: "127.0.0.1",
     hmr: host
       ? {
           protocol: "ws",
@@ -34,8 +34,10 @@ export default defineConfig(() => ({
         }
       : undefined,
     watch: {
-      // 3. tell Vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      // 3. tell Vite to ignore watching `src-tauri`，但保留对 tauri.conf.json 与
+      //    capabilities/ 的监听 —— 续篇 773：改窗口 label / 权限后 tauri dev
+      //    必须重建上下文，否则前端一直用旧权限（"listen 被拒"那类静默失败）。
+      ignored: ["**/src-tauri/target/**", "**/src-tauri/gen/**"],
     },
   },
 }));

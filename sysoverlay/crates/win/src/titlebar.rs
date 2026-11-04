@@ -31,7 +31,8 @@ const BTN_MARGIN_R: i32 = 6;
 pub const CAPTION_PAD_L: i32 = 12;
 
 fn s(dpi: u32, v: i32) -> i32 {
-    v * dpi as i32 / 96
+    // 审查 157：三份 v*dpi/96 缩放收敛到 dpi.rs 的统一实现（四舍五入口径）。
+    crate::dpi::scale_logical(v, dpi)
 }
 
 /// 创建标题栏 / 正文通用字体句柄（96 DPI 基准 12pt，跟随 DPI）。窗口销毁时用
@@ -39,7 +40,8 @@ fn s(dpi: u32, v: i32) -> i32 {
 pub fn title_font(dpi_value: u32) -> HFONT {
     unsafe {
         CreateFontW(
-            -(12 * dpi_value as i32) / 72,
+            // 审查 541：12pt@96dpi = 16px（pt→px 换算与 DIP 口径一致），统一走 s()。
+            -s(dpi_value, 16),
             0,
             0,
             0,
@@ -54,6 +56,19 @@ pub fn title_font(dpi_value: u32) -> HFONT {
             0,
             windows::core::w!("Segoe UI"),
         )
+        .is_invalid()
+        .then(|| {
+            // 审查 158：GDI 资源耗尽时回退系统 stock 字体（DeleteObject 对
+            // stock 对象是无害 no-op，调用方统一释放的约定不被破坏）。
+            crate::probe::log("titlebar: CreateFontW failed -> fallback DEFAULT_GUI_FONT");
+            HFONT(
+                windows::Win32::Graphics::Gdi::GetStockObject(
+                    windows::Win32::Graphics::Gdi::DEFAULT_GUI_FONT,
+                )
+                .0,
+            )
+        })
+        .unwrap_or_default()
     }
 }
 
@@ -89,16 +104,19 @@ pub fn btn_rects(dpi_value: u32, win_w: i32, pinned: bool) -> Vec<(TitleBtn, REC
     let mut out: Vec<(TitleBtn, RECT)> = Vec::new();
     if pinned {
         let w = s(dpi_value, BTN_W_UNLOCK);
+        // 审查 542：窄窗口下 left 不得变负（矩形反向 → 绘制/命中错乱）。
+        let left = (win_w - mr - w).max(0);
         out.push((
             TitleBtn::Unlock,
-            RECT { left: win_w - mr - w, top, right: win_w - mr, bottom: top + bh },
+            RECT { left, top, right: left + w, bottom: top + bh },
         ));
         return out;
     }
     // Pin / Min / Close 从右往左排；先算 Close 的右边
-    let right_close = win_w - mr;
-    let right_min = right_close - bw - gap;
-    let right_pin = right_min - bw - gap;
+    // 审查 542：窄窗口钳到 >=0，避免反向矩形。
+    let right_close = (win_w - mr).max(0);
+    let right_min = (right_close - bw - gap).max(0);
+    let right_pin = (right_min - bw - gap).max(0);
     for (b, right) in [
         (TitleBtn::Pin, right_pin),
         (TitleBtn::Min, right_min),
@@ -147,23 +165,33 @@ pub unsafe fn draw(
     let rect = RECT { left: 0, top: 0, right: win_w, bottom: h };
 
     // 底层：与卡片底同色 + 底部一条分隔线
+    // 审查 543：判空 —— GDI 资源耗尽时静默失败最难排查。
     let bg = CreateSolidBrush(COLORREF(theme.card));
-    let _ = FillRect(hdc, &rect, bg);
-    let _ = DeleteObject(bg);
+    if !bg.is_invalid() {
+        let _ = FillRect(hdc, &rect, bg);
+        let _ = DeleteObject(bg);
+    } else {
+        crate::probe::log("titlebar: CreateSolidBrush failed (bg)");
+    }
     let pen = CreatePen(PS_SOLID, 1, COLORREF(theme.card_stroke));
-    let old_pen = SelectObject(hdc, pen);
-    let _ = MoveToEx(hdc, 0, h - 1, None);
-    let _ = LineTo(hdc, win_w, h - 1);
-    let _ = SelectObject(hdc, old_pen);
-    let _ = DeleteObject(pen);
+    if !pen.is_invalid() {
+        let old_pen = SelectObject(hdc, pen);
+        let _ = MoveToEx(hdc, 0, h - 1, None);
+        let _ = LineTo(hdc, win_w, h - 1);
+        let _ = SelectObject(hdc, old_pen);
+        let _ = DeleteObject(pen);
+    } else {
+        crate::probe::log("titlebar: CreatePen failed (separator)");
+    }
 
     // 标题（左侧）
     if let Some(t) = title {
         if !t.is_empty() {
+            // 审查 544：右缘硬编码 200 在窄窗口下会产生反向矩形 —— 钳位。
             let tx = RECT {
                 left: s(dpi_value, CAPTION_PAD_L),
                 top: 0,
-                right: win_w - s(dpi_value, 200),
+                right: (win_w - s(dpi_value, 200)).max(s(dpi_value, CAPTION_PAD_L) + 8),
                 bottom: h,
             };
             draw_text(hdc, t, tx, theme.label, font, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
@@ -214,14 +242,20 @@ unsafe fn draw_text(
         return;
     }
     let old = SelectObject(hdc, font);
-    let _ = SetTextColor(hdc, COLORREF(color));
-    let _ = SetBkMode(hdc, TRANSPARENT);
+    // 审查 156：保存并还原 DC 状态 —— 旧值被丢弃会泄漏到同 DC 的后续绘制。
+    let old_color = SetTextColor(hdc, COLORREF(color));
+    let old_bk = SetBkMode(hdc, TRANSPARENT);
     let mut buf: Vec<u16> = text.encode_utf16().collect();
     let mut r = rect;
     let _ = DrawTextW(hdc, &mut buf, &mut r, fmt);
     let _ = SelectObject(hdc, old);
+    let _ = SetTextColor(hdc, old_color);
+    // SetBkMode 返回 i32（上一模式），重设需包回 BACKGROUND_MODE（Gdi 模块）。
+    let _ = SetBkMode(
+        hdc,
+        windows::Win32::Graphics::Gdi::BACKGROUND_MODE(old_bk as u32),
+    );
 }
-
 /// 图标按钮（含悬停高亮）。
 unsafe fn draw_icon_btn(
     hdc: HDC,
@@ -272,6 +306,8 @@ unsafe fn draw_icon_btn(
             let _ = MoveToEx(hdc, cx + s(dpi_value, 4), cy - s(dpi_value, 4), None);
             let _ = LineTo(hdc, cx - s(dpi_value, 4), cy + s(dpi_value, 4));
         }
+        // 审查 545：Unlock 由 draw_unlock_btn 绘制，此臂实际不可达 ——
+        // 但 match 必须穷尽枚举，保留空臂并注明。
         TitleBtn::Unlock => {}
     }
     let _ = SelectObject(hdc, old_pen);
@@ -280,8 +316,19 @@ unsafe fn draw_icon_btn(
 
 /// 圆角矩形（描边 + 填充）。
 unsafe fn round_rect(hdc: HDC, r: RECT, radius: i32, fill: u32, stroke: u32) {
+    // 审查 543：判空 —— 资源耗尽时不再用无效句柄继续画。
     let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(fill));
     let pen = CreatePen(PS_SOLID, 1, windows::Win32::Foundation::COLORREF(stroke));
+    if brush.is_invalid() || pen.is_invalid() {
+        crate::probe::log("titlebar: round_rect GDI resource creation failed");
+        if !brush.is_invalid() {
+            let _ = DeleteObject(brush);
+        }
+        if !pen.is_invalid() {
+            let _ = DeleteObject(pen);
+        }
+        return;
+    }
     let old_brush = SelectObject(hdc, brush);
     let old_pen = SelectObject(hdc, pen);
     let _ = RoundRect(hdc, r.left, r.top, r.right, r.bottom, radius * 2, radius * 2);

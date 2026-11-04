@@ -1,6 +1,6 @@
 //! 智能调度节拍常量。
 //!
-//! 所有采样周期取 1500ms 的约数，保证每个节拍点所有源必然都有新值。
+//! 多数采样周期取 1500ms 的约数（GPU 例外为 2000ms），保证节拍点各源都有新值。
 //! 这是 v2 相比 v1 木桶的核心简化：**用周期整除代替状态机维护**。
 //!
 //! # 设计原则
@@ -27,11 +27,18 @@ pub const REFRESH_FLOOR_MS: u64 = 1500;
 pub const TICK_MS: u64 = 500;
 
 /// Idle 兜底：无显著变化也至少这么久刷一次（保时钟/运行时间新鲜）。
+/// 由 app/main.rs 的提交门使用；与 scheduler 的 IDLE_INTERVAL_MS（1s，全源
+/// 停用时的唤醒心跳）是两个不同机制，勿合并（审查 094：已核实语义不同）。
 pub const IDLE_MAX_MS: u64 = 4500;
 
 /// EMA 平滑系数（越小越平滑，对振荡抑制越强）。
 /// 0.3 意味着新值占 30% 权重，EMA 在 ~3 轮内追上真实值。
 pub const EMA_ALPHA: f32 = 0.3;
+
+// 审查 097：编译期关系断言放在模块顶层（普通构建也生效）；原先写在
+// #[cfg(test)] 测试体内的 const 断言在 release 构建里根本不存在。
+const _: () = assert!(REFRESH_FLOOR_MS.is_multiple_of(TICK_MS));
+const _: () = assert!(IDLE_MAX_MS > REFRESH_FLOOR_MS);
 
 /// 显著变化进入阈值（百分比）：EMA 与上次提交的差值 ≥ 此值时认为"有变化"。
 pub const DELTA_ENTER: f32 = 3.0;
@@ -52,18 +59,12 @@ pub const ACTIVE_NET_BPS: f32 = 1_048_576.0;
 mod tests {
     use super::*;
 
+    /// 审查 622：`assert_eq!(常量, 1500)` 这类恒真式已删除，常量间关系
+    /// 由模块顶层的编译期断言把关；这里只断言派生量纲。
     #[test]
-    fn refresh_floor_is_1500() {
-        assert_eq!(REFRESH_FLOOR_MS, 1500);
-    }
-
-    #[test]
-    fn tick_is_divisor_of_refresh_floor() {
-        const _: () = assert!(REFRESH_FLOOR_MS.is_multiple_of(TICK_MS));
-    }
-
-    #[test]
-    fn idle_max_exceeds_refresh_floor() {
-        const _: () = assert!(IDLE_MAX_MS > REFRESH_FLOOR_MS);
+    fn constants_derive_sensibly() {
+        assert!(EMA_ALPHA > 0.0 && EMA_ALPHA <= 1.0);
+        assert!(TICK_MS > 0);
+        assert!(REFRESH_FLOOR_MS % TICK_MS == 0);
     }
 }

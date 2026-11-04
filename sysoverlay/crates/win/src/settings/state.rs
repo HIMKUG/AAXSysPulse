@@ -60,6 +60,9 @@ pub struct WidgetState {
     /// 过渡弹簧的当前值：Toggle = 0..1、Segment/Swatch = 选中下标、Slider = 数值。
     /// 由 `paint_page` 从逐控件弹簧写入；绘制侧据此做「滑动 / 渐变」而非硬切换。
     pub anim_v: f32,
+    /// 配置色（审查 189：`sync_via_cfg` 原先对 `Value::Color(_)` 空臂，
+    /// 色板控件读不到配置颜色 —— 现由本字段承载）。
+    pub color: Option<aaxsyspulse_core::color::Rgb>,
 }
 
 /// 单向数据流的动作枚举：交互层只产出 Action，写 Config 只在 dispatch。
@@ -130,7 +133,8 @@ pub struct Page {
     pub widgets: Vec<Widget>,
     /// 内容区高度（DPI 缩放后，物理像素）。
     pub h: i32,
-    /// 内容滚动偏移（DPI 缩放后，物理像素）——负值向上滚动。
+    /// 内容滚动偏移（DPI 缩放后，物理像素）。符号约定（审查 188）：
+    /// `0..=max`、向下滚动增大；绘制时取 `-scroll_y` 上移内容。
     pub scroll_y: i32,
 }
 
@@ -169,7 +173,10 @@ pub fn sync_via_cfg(r: CfgRef, cfg: &Config, state: &mut WidgetState) {
             state.selected = o.unwrap_or(0);
             state.has_sel = o.is_some();
         }
-        Value::Color(_) => {}
+        Value::Color(c) => {
+            // 审查 189：色板控件经 state 读配置颜色（原空臂让颜色永远读不到）。
+            state.color = c;
+        }
     }
 }
 
@@ -185,6 +192,8 @@ pub struct SpatialGrid {
 
 impl SpatialGrid {
     pub fn new(w: i32, h: i32, cell_size: i32) -> Self {
+        // 审查 190：cell_size <= 0 会导致除零 panic —— 钳到 1。
+        let cell_size = cell_size.max(1);
         let cols = (w / cell_size).max(1);
         let rows = (h / cell_size).max(1);
         let cells = vec![Vec::new(); (cols * rows) as usize];
@@ -247,6 +256,29 @@ mod tests {
         g.insert(7, RECT { left: 0, top: 0, right: 120, bottom: 40 });
         assert!(g.query(POINT { x: 5, y: 5 }).contains(&7));
         assert!(g.query(POINT { x: 100, y: 30 }).contains(&7));
+    }
+
+    /// 审查 190：cell_size<=0 钳 1，不再除零 panic。
+    #[test]
+    fn spatial_grid_zero_cell_size_is_safe() {
+        let mut g = SpatialGrid::new(300, 200, 0);
+        g.insert(0, RECT { left: 0, top: 0, right: 50, bottom: 20 });
+        assert!(g.query(POINT { x: 10, y: 5 }).contains(&0));
+    }
+
+    /// 审查 189：色值经 sync 写入 state.color。
+    #[test]
+    fn sync_via_cfg_carries_color() {
+        let mut c = Config::default();
+        let rgb = aaxsyspulse_core::color::Rgb::new(1, 2, 3);
+        c.metric_colors[0].label = Some(rgb);
+        let mut st = WidgetState::default();
+        sync_via_cfg(CfgRef::MetricLabel(0), &c, &mut st);
+        assert_eq!(st.color, Some(rgb));
+        // None（跟随默认）也如实传递
+        let mut st2 = WidgetState::default();
+        sync_via_cfg(CfgRef::MetricValue(1), &c, &mut st2);
+        assert_eq!(st2.color, None);
     }
 
     #[test]

@@ -100,8 +100,8 @@ impl StrBuf {
             return;
         }
         let mut v = v;
-        if v < 0.0 {
-            self.push_byte(b'-');
+        let neg = v < 0.0;
+        if neg {
             v = -v;
         }
         let scale = pow10(decimals) as f64;
@@ -114,6 +114,11 @@ impl StrBuf {
         let int_part = scaled / pow10(decimals);
         let frac = scaled % pow10(decimals);
 
+        // 审查 278：四舍五入后非零才写负号 —— "-0.4" 输出 "0" 而非 "-0"；
+        // "-1.5"(0 位小数) 输出 "-2"，符号跟随舍入结果。
+        if neg && scaled > 0 {
+            self.push_byte(b'-');
+        }
         self.push_u64(int_part);
 
         if decimals > 0 {
@@ -133,7 +138,7 @@ impl Default for StrBuf {
     }
 }
 
-/// 10 的幂（0..=9）。
+/// 10 的幂（0..=9）。`decimals` 超过 9 按 9 处理（审查 278：显式注明）。
 fn pow10(n: u8) -> u64 {
     const P: [u64; 10] = [
         1,
@@ -260,16 +265,6 @@ pub fn fmt_power(buf: &mut StrBuf, watts: f32, estimated: bool) {
     buf.push_byte(b'W');
 }
 
-/// 给数值加 `~` 前缀（陈旧/估算的通用标注）。
-///
-/// v2 Q16：Eco 模式无中文字形，统一用 ASCII 标记：
-/// `~` = 估算值、降饱和 = 陈旧值、隐藏整行 = 不可用。
-pub fn with_estimate_prefix(buf: &mut StrBuf, value: f32, decimals: u8) {
-    buf.clear();
-    buf.push_byte(b'~');
-    buf.push_fixed(value as f64, decimals);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +317,11 @@ mod tests {
         assert_eq!(s(&b), "0%");
         fmt_pct(&mut b, 100.0);
         assert_eq!(s(&b), "100%");
+        // 审查 278：负零不出现
+        fmt_pct(&mut b, -0.4);
+        assert_eq!(s(&b), "0%", "-0.4 不得输出 \"-0\"");
+        fmt_pct(&mut b, -1.5);
+        assert_eq!(s(&b), "-2%", "负数符号跟随舍入结果");
     }
 
     #[test]

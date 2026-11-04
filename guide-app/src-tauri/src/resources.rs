@@ -24,7 +24,9 @@ fn get_resource_bytes(app: &AppHandle, name: &str) -> Result<Vec<u8>, InstallErr
         name,
         tauri::path::BaseDirectory::Resource,
     ).map_err(|e| InstallError::Resource(format!("{name}: {e}")))?;
-    std::fs::read(resource_path).map_err(InstallError::from)
+    // 首轮 244：读失败统一转 InstallError::Io 会丢失资源名 —— 带上 name，
+    // 排障时才能知道是谁读不到。
+    std::fs::read(&resource_path).map_err(|e| InstallError::Resource(format!("{name}: {e}")))
 }
 
 #[cfg(test)]
@@ -35,14 +37,26 @@ mod tests {
     /// 引用 Rust 常量的副本 —— JSON 吃不了常量。于是把它钉进测试：
     /// 改契约里的 exe / 驱动文件名而不改 conf，安装会在运行期才炸，这条测试先红。
     /// （审查项 7.1.2 / P1-22 的收尾。）
+    /// 首轮 244：断言改用 serde_json 解析后按键比对 —— 子串匹配曾对 JSON 加
+    /// 空格/换行假失败。
     #[test]
     fn bundled_resource_names_match_contract() {
-        let conf = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json"))
+        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json"))
             .expect("tauri.conf.json 必须与 crate 同目录");
+        let conf: serde_json::Value =
+            serde_json::from_str(&text).expect("tauri.conf.json 不是合法 JSON");
+        let resources = conf["bundle"]["resources"]
+            .as_object()
+            .unwrap_or_else(|| panic!("tauri.conf.json 缺少 bundle.resources 映射"));
         for name in [c::MAIN_EXE_NAME, c::DRIVER_FILE_NAME] {
-            assert!(
-                conf.contains(&format!("\"resources/{name}\": \"{name}\"")),
-                "bundle.resources 缺少 {name} 的映射，运行期取资源必失败"
+            let key = format!("resources/{name}");
+            let target = resources
+                .get(&key)
+                .unwrap_or_else(|| panic!("bundle.resources 缺少 {key} 的映射，运行期取资源必失败"));
+            assert_eq!(
+                target.as_str(),
+                Some(name),
+                "bundle.resources 的 {key} 目标应为平铺文件名 {name}"
             );
         }
     }

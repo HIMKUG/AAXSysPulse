@@ -10,14 +10,17 @@
 //!
 //! - `render` — 渲染抽象（`Rect`/`Rgba`/`RenderTarget`/`FontSpec`）
 //! - `offscreen` — `SoftwareSurface`：BGRA **预乘**缓冲，与 Windows DIB 布局一致
-//! - `font` — 8×16 ASCII 点阵字体（支持浮点放大，0.5 步进）
+//! - `font` — 8×16 ASCII 点阵字体（浮点缩放；0.5 步进由配置层
+//!   `core::config::snap_font_size` 保证，审查 118）
 //! - `palette` — `Style`：把 `core::color` 的纯逻辑调色板转成预乘色
 //! - `renderer` — 渲染器接口 + 横版/竖版两种条状实现
+//! - `clock` — 本地时钟源（时间行的数据来源，审查 509）
 
 // 批次 6·①分类基线：与 core 同一口径 —— fixture 用「default() 后逐字段赋值」，
 // 只在测试编译时放过该 lint（生产代码 0 处命中）。
 #![cfg_attr(test, allow(clippy::field_reassign_with_default))]
-// 批次 6·②：非测试代码禁 `unwrap()`（生产代码实测 0 处命中，只挡未来回归）。
+// 批次 6·②：非测试代码对 `unwrap()` 保持 warn 级告警（审查 510：与 lint
+// 实现一致；升级为 deny 属用户决策项）。
 #![cfg_attr(not(test), warn(clippy::unwrap_used))]
 
 pub mod render;

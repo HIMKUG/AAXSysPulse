@@ -72,7 +72,8 @@ pub struct RowsShown {
 }
 
 impl RowsShown {
-    /// 全部显示。
+    /// 全部显示（功耗行除外 —— 功耗默认整体关闭；启用时由调用方显式置 true。
+    /// 审查 278：`all()` 名实差异已注明，勿据名误判功耗行会出现）。
     pub const fn all() -> Self {
         Self {
             cpu: true,
@@ -179,12 +180,10 @@ pub struct CardLayout {
 ///
 /// 与旧版不同：不再依赖下标顺序，调用方一律通过 [`RowLayout::kind`] 取行。
 pub fn compute(input: &LayoutInput) -> CardLayout {
-    let scale = input.dpi as f32 / 96.0;
-    let zoom_factor = input.zoom.scale_factor();
-    let f = |logical: i32| -> i32 { (logical as f32 * scale * zoom_factor + 0.5) as i32 };
+    // 缩放统一走 [`scale`]（审查 278：compute 内联公式与独立 scale() 收敛为单一来源）。
+    let f = |logical: i32| -> i32 { scale(logical, input.dpi, input.zoom) };
 
     let n = input.rows.count();
-    let _has_power = input.rows.power;
 
     let (card_w, card_h) = if input.minimal {
         match input.vert {
@@ -547,19 +546,6 @@ mod tests {
         assert!(!rows.gpu, "GPU 不可用 → 隐藏");
         assert!(!rows.power, "功耗不可用 → 隐藏");
         assert_eq!(rows.count(), 3);
-    }
-
-    /// 陈旧值仍要显示（只是标灰），不能当成不可用隐藏。
-    #[test]
-    fn stale_metric_still_occupies_a_row() {
-        let i = input();
-        let _ = i;
-        use crate::snapshot::Metric;
-        let snap_metric: Metric<f32> = Metric::Stale {
-            value: 42.0,
-            stale_for: 3,
-        };
-        assert_eq!(metric_pct(snap_metric), 42.0, "陈旧值仍参与布局与绘制");
     }
 
     #[test]

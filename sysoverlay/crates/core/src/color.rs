@@ -47,7 +47,8 @@ impl Rgb {
     /// 本函数仅用于 UI/调试等 RRGGBB 场景，不参与配置解析。
     pub fn from_hex(s: &str) -> Option<Self> {
         let s = s.trim().trim_start_matches('#');
-        if s.len() != 6 {
+        // 审查 278：非 ASCII 输入（如全角数字）按字节切片会 panic，先拦。
+        if s.len() != 6 || !s.is_ascii() {
             return None;
         }
         let r = u8::from_str_radix(&s[0..2], 16).ok()?;
@@ -86,7 +87,12 @@ impl Rgb {
     }
 
     /// 按系数缩放（乘以每个分量）。用于从 fg 派生 title/name/sub。
+    /// 审查 636：非有限 factor 直接返回原色 —— NaN 经 clamp 仍为 NaN，
+    /// `as u8` 得 0，会把颜色静默变成全黑。
     pub fn scale(self, factor: f32) -> Self {
+        if !factor.is_finite() {
+            return self;
+        }
         Self {
             r: (self.r as f32 * factor).clamp(0.0, 255.0) as u8,
             g: (self.g as f32 * factor).clamp(0.0, 255.0) as u8,
@@ -107,7 +113,8 @@ impl Rgb {
 
     /// 降饱和（向灰度靠拢）。`t=0` 原色，`t=1` 完全灰。
     ///
-    /// 用于 `Metric::Stale` 的「陈旧标灰」—— 值还显示，但要一眼看出不是新鲜数据。
+    /// 用于「陈旧标灰」—— 值还显示，但要一眼看出不是新鲜数据
+    /// （当前由 ui palette 的 `stale_accent_for` 使用）。
     pub fn desaturate(self, t: f32) -> Self {
         let t = t.clamp(0.0, 1.0);
         // 感知加权灰度（与 luminance 同权重）
@@ -127,6 +134,13 @@ impl Default for Rgb {
     }
 }
 
+/// 默认前景色（审查 505：config Default / Palette Default / ui palette 三处共用）。
+pub const DEFAULT_FG: Rgb = Rgb::new(238, 241, 244);
+
+/// 陈旧降饱和系数（审查 504：core `stale_accent_for` 与 ui `UiPalette`
+/// 的 name_stale/value_stale 共用一份，不再两处硬编码）。
+pub const STALE_DESATURATION: f32 = 0.55;
+
 /// 强调色档位（负载分级的**纯规则**，与具体颜色解耦）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Accent {
@@ -143,6 +157,11 @@ pub enum Accent {
 impl Accent {
     /// 由百分比判定档位。阈值与 C 版一致。
     pub fn for_pct(pct: f32) -> Self {
+        // 审查 637：NaN 与任何比较都为 false，会落到 Ok（绿色"正常"），
+        // 掩盖坏读数；显式归入 Idle（最暗中性色，"不可用"语义）。
+        if pct.is_nan() {
+            return Accent::Idle;
+        }
         if pct >= 85.0 {
             Accent::Hot
         } else if pct >= 60.0 {
@@ -185,6 +204,10 @@ pub struct Palette {
 impl Palette {
     /// 由背景/前景两色派生整块配色。
     ///
+    /// 审查 631：`title/name/sub/track/border` 确由 (bg, fg) 派生；
+    /// `ok/warn/hot/idle` 四个强调色是固定的语义常量（不随 bg/fg 变化），
+    /// 与 C 版保持一致。
+    ///
     /// 镜像 C 版推导规则：
     /// - `title = fg * 0.76`
     /// - `name  = fg * 0.65`
@@ -226,14 +249,13 @@ impl Palette {
     ///
     /// v2 Q16：陈旧用「降饱和灰」标注，与估算值的 `~` 前缀区分开。
     pub fn stale_accent_for(&self, pct: f32) -> Rgb {
-        const STALE_DESATURATION: f32 = 0.55;
         self.accent_for(pct).desaturate(STALE_DESATURATION)
     }
 }
 
 impl Default for Palette {
     fn default() -> Self {
-        Self::derive(Rgb::default(), Rgb { r: 238, g: 241, b: 244 })
+        Self::derive(Rgb::default(), DEFAULT_FG)
     }
 }
 
@@ -271,6 +293,18 @@ mod tests {
         assert_eq!(Rgb::from_hex("invalid"), None);
         assert_eq!(Rgb::from_hex("12345"), None);
         assert_eq!(Rgb::from_hex(""), None);
+        // 审查 278：非 ASCII 不得 panic
+        assert_eq!(Rgb::from_hex("１２３４５６"), None);
+        assert_eq!(Rgb::from_hex("ＡＢ"), None);
+    }
+
+    /// 审查 636/637 回归锁：NaN 因子不变黑，NaN 百分比不进 Ok。
+    #[test]
+    fn nan_inputs_are_contained() {
+        let fg = Rgb::new(200, 200, 200);
+        assert_eq!(fg.scale(f32::NAN), fg, "NaN 因子应返回原色");
+        assert_eq!(fg.scale(f32::INFINITY), fg);
+        assert_eq!(Accent::for_pct(f32::NAN), Accent::Idle, "NaN 不应判为 Ok");
     }
 
     #[test]

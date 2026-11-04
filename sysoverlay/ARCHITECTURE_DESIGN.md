@@ -21,7 +21,7 @@
 | 主线程不阻塞 | UI 线程只画图 + 处理消息；采集走独立线程，慢了就丢帧，绝不卡 UI |
 | 自愈 | 长驻悬浮窗需容忍睡眠唤醒 / 显示器变更 / 锁屏 / 网卡热插拔 / GPU TDR |
 
-**硬约束**：`core` 与 `ui` 不得 `use windows::...`；`unsafe` 仅出现在 `win`。
+**硬约束**：`core` 与 `ui` 不得 `use windows::...`；`unsafe` 仅出现在 `win` 与 `app` 的 FFI 胶水层（审查 849：app/main.rs 与 pre_launch_checks.rs 有手写 unsafe FFI）。
 
 ---
 
@@ -74,7 +74,7 @@ core 不依赖任何上层
 | `sampler` | 可插拔采集器 trait | `trait Sampler: Send { name()->&str; sample(prev,now_ms)->SampleOutcome }`；`enum SampleOutcome{Ok,Transient(&str),Fatal(&str)}` | ✅ 已实现 |
 | `metrics` | 确定性指标计算 | `cpu_usage(idle,kernel,user)->Metric<f32>`（**待修公式**）；`rate_per_sec(i64,u64)->Option<u64>`；`ema(f32,f32,f32)->f32`；`node_key(&str)->Option<&str>`；`aggregate_gpu_nodes(iter)->Option<f32>`（**待修：死代码+bug**） | ✅ 已实现(待修) |
 | `layout` | 卡片布局（DPI/zoom/shape 感知） | `compute(minimal,vert,zoom,dpi,shape)->CardLayout`；`CardLayout{width,height,rows:Vec<RowLayout>}`；`enum Zoom/Shape/VertLayout`（**应与 config 合并为唯一真源**） | ✅ 已实现 |
-| `config` | 配置解析/序列化/校验（**宽容读 + 保守写**，见下） | `Config{...}`；`Config::parse(&str)->Config`；`Config::serialize()->String`；`Rgb{from_hex,to_hex,from_colorref,luminance}`；`enum NetUnit/Shape/VertLayout/Zoom/RenderMode/PowerDisplay`；`CONFIG_VERSION=2`；`INTERVAL_MS_ALLOWED` | ✅ **已修复**(2026-09-04) |
+| `config` | 配置解析/序列化/校验（**宽容读 + 保守写**，见下） | `Config{...}`；`Config::parse(&str)->Config`；`Config::serialize()->String`；`Rgb{from_hex,to_hex,from_colorref,luminance}`；`enum NetUnit/VertLayout/Zoom/RenderMode/PowerDisplay`（审查 281：Shape 已移除）；`CONFIG_VERSION=3`（审查 851：v3 起拆 5 个 .cfg）；`INTERVAL_MS_ALLOWED` | ✅ **已修复**(2026-09-04) |
 | `color` | 调色板 / 强调色派生 | `Palette`；`accent_for(metric)->Rgb`（**目标接口，当前空文件**） | ⬜ 占位 |
 | `units` | 数值格式化 | `format_rate(u64)->String`；`format_pct(f32)->String`；`format_uptime(u64)->String`（**目标接口，当前空文件**） | ⬜ 占位 |
 
@@ -265,8 +265,9 @@ pub trait RenderTarget {
     fn measure_text(&self, s: &str, font: FontSpec) -> (i32, i32);
 }
 
-// ui/card.rs
-pub fn draw_card<S: RenderTarget>(s: &mut S, snap: &Snapshot, cfg: &Config, layout: &CardLayout, alpha: f32);
+// ui/renderer.rs（审查 850：原 ui/card.rs 不存在，卡片绘制已并入
+// StripRenderer/VerticalRenderer 的 layout+paint 流水线）
+pub fn draw(out: &mut SoftwareSurface, snap: &Snapshot, cfg: &Config) -> (i32, i32);
 
 // win/gdi.rs  (目标签名)
 pub fn render(hwnd: HWND, snap: &Snapshot, cfg: &Config); // 内部: ui::draw_card → SoftwareSurface → DIB → UpdateLayeredWindow

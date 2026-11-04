@@ -7,11 +7,14 @@
 pub struct Snapshot {
     /// Monotonically increasing sequence number.
     pub seq: u64,
-    /// Unix timestamp in milliseconds.
+    /// 采样时间戳（毫秒）。
+    ///
+    /// 审查 629：当前实现里 `win::sampler` 把 `GetTickCount64()`（开机以来的
+    /// 单调毫秒）同时写进本字段与 `uptime_ms`，两者数值恒等 —— 本字段**不是**
+    /// Unix 墙钟（量级 ~1.7e12），不要拿它换算日历时间。
     pub timestamp_ms: u64,
     /// 系统已运行时长（毫秒，来自 `GetTickCount64`）。
     ///
-    /// 与 `timestamp_ms` 是两回事：后者是墙钟时间（量级 ~1.7e12），
     /// 早期版本直接拿 `timestamp_ms / 1000` 当"运行时长"显示，是个明显错误。
     pub uptime_ms: u64,
     /// CPU utilization percentage (0.0..=100.0).
@@ -60,14 +63,13 @@ impl Snapshot {
 }
 
 /// A metric value with optional staleness information.
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[derive(Default)]
+///
+/// 审查 630：`Stale` 变体生产代码零构造（陈旧语义由 ui 侧 SnapMetric 承担），
+/// 已删除以简化枚举；如需恢复"带陈旧标记的值"，先在采样层接线再扩枚举。
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum Metric<T> {
     /// Fresh value.
     Value(T),
-    /// Value is stale: we are still showing `value` but it hasn't been updated
-    /// for `stale_for` sampling cycles.
-    Stale { value: T, stale_for: u32 },
     /// No data available (sensor unavailable, etc.).
     #[default]
     Unavailable,
@@ -79,7 +81,6 @@ impl<T: Copy> Metric<T> {
     pub fn value(&self) -> Option<T> {
         match self {
             Metric::Value(v) => Some(*v),
-            Metric::Stale { value, .. } => Some(*value),
             Metric::Unavailable => None,
         }
     }
@@ -88,10 +89,6 @@ impl<T: Copy> Metric<T> {
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Metric<U> {
         match self {
             Metric::Value(v) => Metric::Value(f(v)),
-            Metric::Stale { value, stale_for } => Metric::Stale {
-                value: f(value),
-                stale_for,
-            },
             Metric::Unavailable => Metric::Unavailable,
         }
     }
@@ -117,13 +114,16 @@ pub struct NetStat {
     pub tx_bps: u64,
 }
 
-/// Disk I/O statistics (bytes per second), via PDH.
+/// Disk I/O statistics, via PDH.
+///
+/// 审查 278：PDH 原生返回 double，故与 [`NetStat`] 的 u64 口径不同，属有意差异。
+/// 审查 087：速率分侧用 [`Metric`] 包装 —— 单侧读不到显示 `--`，不再伪装 0 B/s。
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct DiskStat {
     /// Read throughput in bytes/sec.
-    pub read_bps: f64,
+    pub read_bps: Metric<f64>,
     /// Write throughput in bytes/sec.
-    pub write_bps: f64,
-    /// PDH 基线是否已建立（首次采样前为 false，渲染层据此显示 `--`）。
+    pub write_bps: Metric<f64>,
+    /// PDH 任一侧拿到过有效读数（首轮基线未建立前为 false）。
     pub ready: bool,
 }

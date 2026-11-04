@@ -29,9 +29,21 @@ use aaxsyspulse_win::{tray, autostart};
 mod pre_launch_checks;
 use pre_launch_checks::run_pre_launch_checks;
 
+/// 诊断自动点击循环参数（审查 823：裸魔数提具名）。
+const DIAG_CLICK_FIRST_DELAY_MS: u64 = 2_500;
+const DIAG_CLICK_INTERVAL_MS: u64 = 3_000;
+const DIAG_CLICK_REPEATS: usize = 9;
+
 /// Enables the panic hook that writes a minidump before aborting.
+///
+/// 审查 240：原实现先 `set_hook`（写 stderr + minidump），随后 :272 的
+/// `probe::install_panic_hook()` 又 `take_hook + set_hook` 把它**整个覆盖**，
+/// minidump 从未生成。修复：本函数改为**链式**安装 —— 先 take 默认 hook，
+/// 在新 hook 内完成「stderr + probe 落盘 + minidump」后调用默认 hook；
+/// `main` 后续的 `probe::install_panic_hook()` 调用已删除（全仓只装一个 hook）。
 fn setup_panic_hook() {
-    std::panic::set_hook(Box::new(|panic_info| {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
         let location = panic_info
             .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
@@ -43,14 +55,18 @@ fn setup_panic_hook() {
             .or_else(|| panic_info.payload().downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "unknown panic".to_string());
 
-        // stderr 只写一次：eprintln 自带换行与 flush；此前在 minidump 之后又
-        // write_all 了同一条消息，属纯重复输出。
         eprintln!("[AAX SysPulse] PANIC at {}: {}", location, message);
+        // 与 probe 流同格式落盘（无条件：panic 时开关多半没开，但这是最需要抓的现场）。
+        aaxsyspulse_win::probe::log(&format!(
+            "PANIC thread loc={location} msg={message}"
+        ));
 
         #[cfg(feature = "minidump")]
         {
             write_minidump(&location, &message);
         }
+        // 保留默认 hook（adb/调试器集成等）。
+        default(panic_info);
     }));
 }
 
@@ -266,10 +282,9 @@ fn main() {
     // 调试日志开关：按配置初始化（必须在下面任何 probe::log 之前，
     // 否则本次启动的 cfg / 启动头会被自己吞掉）。设置面板可实时改。
     aaxsyspulse_win::probe::set_debug(cfg.debug_log);
-    // 全局 panic hook：任何线程 panic 都把「位置 + 消息」无条件写进统一日志。
-    // 没有它时，wndproc（extern "system"）里的 panic 会跨 FFI 边界直接 abort，
-    // 表现就是「开个设置窗、点一下按钮整个进程无声消失」，日志里毫无痕迹。
-    aaxsyspulse_win::probe::install_panic_hook();
+    // 全局 panic hook：审查 240 —— `setup_panic_hook()` 已把 probe 落盘逻辑
+    // 链进统一 hook（stderr + probe + [minidump]），此处**不再**重复安装
+    // probe 的 hook（它会把本 hook 覆盖掉，minidump 将永不生成）。
     // 探针：记录运行时实际生效的配置（裁决「power 分支没跑」这类问题）
     {
         let appdata = std::env::var_os("APPDATA");
@@ -399,23 +414,29 @@ fn main() {
     //   ",click"      → 附加：每 3s 自动模拟点击设置页 CPU 开关（复现 UI 不刷新）
     let diag = std::env::var("AAXSYSPULSE_DIAG").unwrap_or_default();
     let diag_on = |token: &str| {
-        diag == "1" || diag == "all" || diag.split(',').any(|t| t == token)
+        // 审查 822：逐 token trim —— "settings, click" 的 click 此前永远匹配不上。
+        diag == "1" || diag == "all" || diag.split(',').any(|t| t.trim() == token)
     };
     if diag_on("settings") {
         aaxsyspulse_win::settings::open_settings(window.hwnd());
         if diag_on("click") {
             aaxsyspulse_win::probe::log("diag: auto click loop started");
-            thread::spawn(move || {
-                // 先等设置窗口完成首帧，再每 3s 模拟点击一次 CPU 开关（共 10 次）
-                thread::sleep(Duration::from_millis(2_500));
-                aaxsyspulse_win::probe::log("diag: first click");
-                aaxsyspulse_win::settings::diag_click_cpu();
-                for i in 0..9 {
-                    thread::sleep(Duration::from_millis(3_000));
-                    aaxsyspulse_win::probe::log(&format!("diag: click #{}", i + 2));
+            // 审查 823：一次性开关 —— 重复触发不再起多个线程；常量提具名。
+            static CLICK_LOOP_STARTED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !CLICK_LOOP_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                thread::spawn(move || {
+                    // 先等设置窗口完成首帧，再每 3s 模拟点击一次 CPU 开关（共 10 次）
+                    thread::sleep(Duration::from_millis(DIAG_CLICK_FIRST_DELAY_MS));
+                    aaxsyspulse_win::probe::log("diag: first click");
                     aaxsyspulse_win::settings::diag_click_cpu();
-                }
-            });
+                    for i in 0..DIAG_CLICK_REPEATS {
+                        thread::sleep(Duration::from_millis(DIAG_CLICK_INTERVAL_MS));
+                        aaxsyspulse_win::probe::log(&format!("diag: click #{}", i + 2));
+                        aaxsyspulse_win::settings::diag_click_cpu();
+                    }
+                });
+            }
         }
     }
 
@@ -674,8 +695,11 @@ fn main() {
                 let delta_gpu = (ema_gpu - ema_gpu_committed).abs();
                 let delta_net = (ema_net - ema_net_committed).abs();
                 // 磁盘读写速率（读+写，字节/秒）同样计入活跃度：磁盘不在 EMA 源里，
-                // 只能拿本帧直采值比上次提交值。
-                let disk_bps = (pending.disk.read_bps + pending.disk.write_bps) as f32;
+                // 只能拿本帧直采值比上次提交值。审查 87 侧效应：read/write 变为
+                // Metric<f64> —— 单侧不可用按 0 计入（不可用 ≠ 阻塞活跃度判定）。
+                let disk_bps = (pending.disk.read_bps.value().unwrap_or(0.0)
+                    + pending.disk.write_bps.value().unwrap_or(0.0))
+                    as f32;
                 let delta_disk = (disk_bps - disk_bps_committed).abs();
                 let max_delta = delta_cpu
                     .max(delta_mem)
@@ -817,7 +841,10 @@ fn main() {
         }
     }
     if !config_io::save_config(&final_cfg) {
-        eprintln!("[AAX SysPulse] Warning: failed to save config on exit");
+        // 审查 817：GUI 子系统无控制台 —— 关键警告统一走 probe（无条件落盘）。
+        aaxsyspulse_win::probe::degrade(
+            "degrade: exit 时落盘配置失败 —— 本次会话的最终设置未持久化",
+        );
     }
 }
 

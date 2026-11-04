@@ -1,5 +1,5 @@
 import { reactive, computed } from 'vue'
-import { cmd, on, patchConfig, flushConfig, setBridgeErrorHandler, sealWrites } from '../bridge.js'
+import { cmd, on, patchConfig, flushConfig, setBridgeErrorHandler, sealWrites, unsealWrites } from '../bridge.js'
 
 /* ============================================================
    引导程序状态与页面流 · v2
@@ -41,8 +41,23 @@ export const PRESET_COLORS = [
  *  2 = 权限说明页：两个序列都不含它 —— 是否接入（或整页删除）属产品决策，见审查报告 8B.B。 */
 const PRESET_FLOW = [1, 3, 4, 13, 14]
 const CUSTOM_FLOW = [1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
-/** 合法页号上界：由两条流程反推，新增页面时不必再改 `goTo` 的校验。 */
+/** 合法页号上界：由两条流程反推，新增页面时不必再改 `goTo` 的校验。
+ *  续篇 258：readMirror / bootstrap 的硬编码 14 一并改引本常量。 */
 const LAST_PAGE = Math.max(...PRESET_FLOW, ...CUSTOM_FLOW)
+
+/** 续篇 255：前端默认值表（唯一出处）。与后端 `config.rs` 各 `default()` 的交叉
+ *  断言见 `config.rs::guide_frontend_defaults_match_backend` —— 曾漂移的三处：
+ *  opacity（前端 80 vs 后端 100）、font_size（14 vs 12）、监控项（6 项 vs 9 项全开）。
+ *  界面显示的初值必须与磁盘上（未触碰时的）真实值一致，否则是"界面承诺了
+ *  磁盘上没有的东西"。改任一端必须同步另一端。 */
+const FRONTEND_DEFAULTS = Object.freeze({
+  selected: { cpu: true, mem: true, gpu: true, net: true, power: true, time: true, util: true, disk_read: true, disk_write: true },
+  order: ['cpu', 'mem', 'gpu', 'net', 'power', 'time', 'util', 'disk_read', 'disk_write'],
+  nameMode: 'full',
+  colors: { name: '#FFFFFF', value: '#34A853' },
+  opacity: 100,
+  fontName: 12
+})
 
 const defaults = () => ({
   page: 1,
@@ -101,28 +116,24 @@ const defaults = () => ({
   orientation: 'horizontal',
 
   /* 第 6 页 */
-  selected: {
-    cpu: true, mem: true, gpu: true, net: true, power: true,
-    time: true, util: false, disk_read: false, disk_write: false
-  },
+  selected: { ...FRONTEND_DEFAULTS.selected },
 
   /* 第 7 页 */
-  order: ['cpu', 'mem', 'gpu', 'net', 'power', 'time', 'util', 'disk_read', 'disk_write'],
+  order: [...FRONTEND_DEFAULTS.order],
 
   /* 第 8 页 */
-  nameMode: 'simple',
+  nameMode: FRONTEND_DEFAULTS.nameMode,
   perNameMode: null,
 
   /* 第 9 页 */
-  colors: { name: '#FFFFFF', value: '#34A853' },
+  colors: { ...FRONTEND_DEFAULTS.colors },
   perColors: null,
 
   /* 第 10 页 */
-  opacity: 80,
+  opacity: FRONTEND_DEFAULTS.opacity,
 
   /* 第 11 页 */
-  fontName: 14,
-  fontValue: 14,
+  fontName: FRONTEND_DEFAULTS.fontName,
   perFonts: null,
 
   /** 字重：主程序口径 0=细 / 1=中 / 2=粗。只由样式预设写入，无独立 UI。 */
@@ -147,12 +158,20 @@ export const state = reactive(defaults())
    ============================================================ */
 export const toasts = reactive([])
 let toastSeq = 0
+// 续篇 749：每条 toast 的自动关闭定时器句柄 —— 手动关闭后必须 clear，
+// 否则高频诊断风暴会累积大量悬挂定时器。
+const toastTimers = new Map()
 export function notify(text, type = 'warn', ttl = 6000) {
   const t = { id: ++toastSeq, text, type }
   toasts.push(t)
-  setTimeout(() => dismissToast(t.id), ttl)
+  toastTimers.set(t.id, setTimeout(() => dismissToast(t.id), ttl))
 }
 export function dismissToast(id) {
+  const timer = toastTimers.get(id)
+  if (timer) {
+    clearTimeout(timer)
+    toastTimers.delete(id)
+  }
   const i = toasts.findIndex(t => t.id === id)
   if (i >= 0) toasts.splice(i, 1)   // 离场动画由 <TransitionGroup> 承担
 }
@@ -215,19 +234,24 @@ export function snapshot() {
     per_item_colors: state.perColors ? JSON.parse(JSON.stringify(state.perColors)) : null,
     opacity: state.opacity,
     font_name: state.fontName,
-    font_value: state.fontValue,
     font_weight: state.fontWeight,
     per_item_fonts: state.perFonts ? JSON.parse(JSON.stringify(state.perFonts)) : null
     // 刻意不含 position：坐标唯一权威是主程序 system.cfg（由第 12 页拖动 /
     // cmd.overlaySetPos 直接写入）。若快照带上 state.pos（启动时的硬编码默认值），
     // 退出时的 saveConfig 会把用户拖好的悬浮窗位置回退到默认值。
+    // 续篇 255/726：`font_value` 已删除 —— 后端 patch_from_json 只读 font_name，
+    // 该字段是纯死载荷。
   }
 }
+
+/** 续篇 750：style 白名单 —— 坏值（'Z'）会让第 4 页六卡全不高亮且
+ *  ensureStyleApplied 静默跳过。 */
+const STYLE_KEYS = new Set(['A', 'B', 'C', 'D', 'E', 'F'])
 
 /** 把后端返回的配置灌进 state（恢复引导 / 已有配置时使用） */
 export function hydrate(cfg = {}) {
   if (!cfg || typeof cfg !== 'object') return
-  if (cfg.style) state.style = cfg.style
+  if (cfg.style) state.style = STYLE_KEYS.has(cfg.style) ? cfg.style : 'A'
   if (typeof cfg.gdi_mode === 'boolean') state.gdi = cfg.gdi_mode
   if (cfg.orientation) state.orientation = cfg.orientation
   if (cfg.items) Object.assign(state.selected, cfg.items)
@@ -238,7 +262,6 @@ export function hydrate(cfg = {}) {
   if (cfg.per_item_colors) state.perColors = JSON.parse(JSON.stringify(cfg.per_item_colors))
   if (typeof cfg.opacity === 'number') state.opacity = cfg.opacity
   if (typeof cfg.font_name === 'number') state.fontName = cfg.font_name
-  if (typeof cfg.font_value === 'number') state.fontValue = cfg.font_value
   if (typeof cfg.font_weight === 'number') state.fontWeight = cfg.font_weight
   if (cfg.per_item_fonts) state.perFonts = JSON.parse(JSON.stringify(cfg.per_item_fonts))
   if (cfg.position) state.pos = { ...cfg.position }
@@ -274,7 +297,7 @@ export { flushConfig }
    为什么是这两个量级：100ms 约等于"人手一次连续操作"的间隔，小于它会把用户
    的第二次改动切进两个 IPC；50ms 是"后端连续多次 `save_config`"的合并窗口，
    再短就退化成每笔都发。改任何一个都要同时想另一边：backup 收敛后才会 flush
-   配置，两者叠起来的最坏延迟 = 100 + 50 = 150ms。
+   配置，两者叠起来的最坏延迟 = 100 + 50 = 200ms（首轮 017：旧注释写成 150ms）。
    ============================================================ */
 const DEBOUNCE = { backup: 100 }
 
@@ -286,6 +309,16 @@ const DEBOUNCE = { backup: 100 }
    ============================================================ */
 let backupTimer = null
 let backupPending = false
+// 续篇 256：cmd.backup 的返回值不再丢弃 —— 写入失败至少留痕（不弹 toast，
+// 高频防抖下会刷屏；诊断面板与日志面板可见）。
+function doBackup() {
+  cmd.backup(state.page, state.path, snapshot()).then(r => {
+    if (r && !r.ok) {
+      log.warn('断点备份写入失败', r.code, r.message)
+      diagNote(`断点备份写入失败（${r.code}）`)
+    }
+  })
+}
 export function scheduleBackup() {
   if (state.mode === 'uninstall') return
   writeMirror() // 同步本地镜像：IPC 是异步的，进程被杀时只有它是确定落下的
@@ -293,7 +326,7 @@ export function scheduleBackup() {
   clearTimeout(backupTimer)
   backupTimer = setTimeout(() => {
     backupPending = false
-    cmd.backup(state.page, state.path, snapshot())
+    doBackup()
   }, DEBOUNCE.backup)
 }
 /** 立即冲刷备份（退出 / 保存前调用，确保最后一笔改动落盘） */
@@ -302,7 +335,7 @@ export function flushBackup() {
   if (!backupPending) return
   clearTimeout(backupTimer)
   backupPending = false
-  cmd.backup(state.page, state.path, snapshot())
+  doBackup()
 }
 
 /* ============================================================
@@ -338,7 +371,8 @@ function readMirror() {
     const m = JSON.parse(raw)
     if (!m || typeof m !== 'object') return null
     if (!m.snapshot || typeof m.snapshot !== 'object') return null
-    if (!Number.isInteger(m.page) || m.page < 1 || m.page > 14) return null
+    // 续篇 258：页号上界统一引用 LAST_PAGE（曾与 :672 各写一份硬编码 14）
+    if (!Number.isInteger(m.page) || m.page < 1 || m.page > LAST_PAGE) return null
     return m
   } catch {
     return null
@@ -566,7 +600,7 @@ export const PRESETS = {
  *  主程序设置里设过的逐项命名模式（审查项 3.2.1 / P1-8）。 */
 const PRESET_KEYS = [
   'gdi_mode', 'orientation', 'items', 'order', 'colors', 'per_item_colors',
-  'opacity', 'font_name', 'font_value', 'font_weight', 'per_item_fonts'
+  'opacity', 'font_name', 'font_weight', 'per_item_fonts'
 ]
 
 function presetPatch() {
@@ -596,7 +630,6 @@ export function pickStyle(key) {
     state.perColors = null
     // 字号 / 字重：同样复位逐项覆盖
     state.fontName = p.font
-    state.fontValue = p.font
     state.fontWeight = p.weight
     state.perFonts = null
     // 透明度（前端本就是 0–100，直接对应主程序 normal_opacity）
@@ -667,9 +700,10 @@ export async function bootstrap() {
   if (d.screen) state.boot.screen = { w: d.screen.width, h: d.screen.height }
   state.boot.configCorrupted = !!d.config_corrupted
   // 存档容错（防御#6）：逐字段校验，坏字段降级为「无断点」，绝不崩
+  // 续篇 258：页号上界统一引用 LAST_PAGE（曾与 readMirror 各写一份硬编码 14）
   const rs = d.resume
   const validResume = rs
-    && Number.isInteger(rs.last_page) && rs.last_page >= 1 && rs.last_page <= 14
+    && Number.isInteger(rs.last_page) && rs.last_page >= 1 && rs.last_page <= LAST_PAGE
     && (rs.path === 'preset' || rs.path === 'custom')
   if (rs && !validResume) log.warn('断点存档非法，忽略续引导', rs)
   state.boot.resume = validResume
@@ -693,7 +727,9 @@ export async function bootstrap() {
   }
 
   if (state.boot.configCorrupted) {
-    notify('配置文件已损坏，已恢复为默认设置。')
+    // 续篇 256：文案对齐后端语义 —— 后端补齐缺失文件 + 重写损坏文件（249），
+    // 不是"全部恢复默认"。
+    notify('配置文件缺失或已损坏，已用默认值补齐。')
   }
   state.boot.installedDetected = !!d.installed_detected
   state.boot.uninstallMode = !!d.uninstall_mode
@@ -718,11 +754,10 @@ export async function resumeGuide() {
     if (res.style) state.style = res.style
     if (res.path) state.path = res.path
     // goTo 现会校验目标页在当前流程内；坏存档导致跳不进时，归位而非卡死。
-    // ⚠️ 兜底那句 `state.page = …` 是**直接赋值、绕过 goTo**（审查项 3.2.9 的
-    // "resumeGuide 绕过 mode 守卫"），所以卸载态下必须先挡住，否则坏存档会把
-    // 用户从卸载清单扔回某个配置页，那条页面上的写盘按钮就又能点了。
+    // ⚠️ 兜底**不再直接赋值 state.page 绕过 flow 守卫**（续篇 258）—— 卸载态下
+    // 必须先挡住（否则坏存档会把用户从卸载清单扔回配置页）；goTo 拒绝后走
+    // ensurePageInFlow 归位到当前流程的合法页，不再有白名单外的赋值路径。
     if (state.mode !== 'uninstall' && !goTo(res.lastPage, 'next')) {
-      state.page = res.lastPage
       ensurePageInFlow()
       assertInvariants()
       scheduleBackup()
@@ -772,6 +807,15 @@ async function runInstallNow(mode = 'full') {
   if (!r.ok && state.install.status === 'running') {
     state.install.status = 'error'
     state.install.error = r.message || '安装失败'
+    return
+  }
+  // 首轮 206：后端 Ok 值带终态 status —— install-done 事件丢失时凭返回值收敛
+  if (r.ok && r.data?.status === 'done' && state.install.status === 'running') {
+    state.install.status = 'done'
+    state.install.pct = 100
+    state.install.text = '安装完成'
+    state.install.driverOk = !!(r.data.driver_ok)
+    if (!state.install.driverOk) state.install.driverPrompt = true
   }
 }
 
@@ -810,6 +854,18 @@ export async function retryDriverInstall() {
   if (!r.ok && state.install.status === 'running') {
     state.install.status = 'error'
     state.install.error = r.message || '驱动安装失败'
+  }
+  // 首轮 206：事件丢失兜底同 runInstallNow
+  if (r.ok && r.data?.status === 'done' && state.install.status === 'running') {
+    state.install.status = 'done'
+    state.install.pct = 100
+    state.install.text = '安装完成'
+    state.install.driverOk = !!(r.data.driver_ok)
+    if (state.install.driverOk) {
+      scheduleGoToStylePage()
+    } else {
+      state.install.driverPrompt = true
+    }
   }
 }
 
@@ -870,6 +926,13 @@ export async function runUninstall() {
   } else {
     state.uninstall.steps = Array.isArray(r.data?.steps) ? r.data.steps : []
   }
+  // 续篇 751：卸载没有完整成功时必须**解除写侧封禁**并退出卸载态 —— 否则用户
+  // 既不能重试卸载也不能回引导，只能重启进程（bridge.unsealWrites 为受控解除入口）。
+  const allOk = r.ok && state.uninstall.steps.every(s => s.status === 'ok')
+  if (!allOk) {
+    unsealWrites()
+    if (!state.boot.uninstallMode) state.mode = 'guide'
+  }
   state.uninstall.done = true
 }
 /** 取消卸载：--uninstall 启动模式下无事可做，直接退出进程 */
@@ -885,10 +948,28 @@ export async function finishUninstall() {
   await cmd.quitAll()
 }
 
+/** 安装成功后自动进样式页（续篇 752）：句柄可清理，且触发前复查状态 ——
+ *  500ms 内用户已退出/换页/进入卸载态时不再被强制拉回第 4 页。 */
+let installDoneTimer = null
+function scheduleGoToStylePage() {
+  clearTimeout(installDoneTimer)
+  installDoneTimer = setTimeout(() => {
+    installDoneTimer = null
+    if (state.install.status === 'done' && state.mode === 'guide') goTo(4, 'next')
+  }, 500)
+}
+
 function watchInstall() {
+  // 续篇 256：进度事件带后端单调 seq —— 心跳重发/迟到事件不许把进度打回去。
+  let lastProgressSeq = 0
   const offs = [
     on('install-progress', p => {
       if (!p) return
+      const seq = Number(p.seq) || 0
+      if (seq > 0) {
+        if (seq < lastProgressSeq) return   // 迟到/重发事件：丢弃
+        lastProgressSeq = seq
+      }
       // 事件层常驻（不在页面组件里订阅）：pct 强制 clamp 到 0–100。
       // 不再按 state.page 丢弃迟到事件 —— 安装进度是全局状态，
       // 与「当前是否正看着第 3 页」无关，页面只负责渲染它。
@@ -902,8 +983,8 @@ function watchInstall() {
       state.install.text = '安装完成'
       state.install.driverOk = !!(p && p.driver_ok)
       if (state.install.driverOk) {
-        // 驱动成功 → 自动进入样式选择页
-        setTimeout(() => goTo(4, 'next'), 500)
+        // 驱动成功 → 自动进入样式选择页（续篇 752：句柄保存、触发前复查）
+        scheduleGoToStylePage()
       } else {
         // 驱动失败 → 「功耗监控不可用」sheet（重试 / 跳过）
         state.install.driverPrompt = true
@@ -914,7 +995,10 @@ function watchInstall() {
       state.install.error = (p && p.message) || '安装失败'
     })
   ]
-  return () => offs.forEach(f => f && f())
+  return () => {
+    clearTimeout(installDoneTimer)
+    offs.forEach(f => f && f())
+  }
 }
 
 /** 常驻订阅：整个进程只订一次、永不 unlisten。
@@ -924,10 +1008,21 @@ function watchInstall() {
  *  由 GuideWizard 在 setup 阶段调用一次。
  */
 let installWatched = false
+let installWatchOff = null
 export function ensureInstallWatch() {
   if (installWatched) return
   installWatched = true
-  watchInstall()
+  installWatchOff = watchInstall()
+}
+
+/** 续篇 735：订阅清理入口 —— 向导卸载时注销三个常驻监听，重建后旧监听
+ *  不再持有旧 state。 */
+export function disposeInstallWatch() {
+  if (installWatchOff) {
+    installWatchOff()
+    installWatchOff = null
+  }
+  installWatched = false
 }
 
 /* ============================================================
@@ -936,11 +1031,13 @@ export function ensureInstallWatch() {
 export async function launchMain() {
   if (state.mainLaunched) return
   const r = await cmd.mainLaunch()
-  state.mainLaunched = true
+  // 续篇 257：不再无条件置 mainLaunched —— 失败保持可重试语义
   if (!r.ok) {
     state.mainFailed = true
     notify('主程序启动失败，请手动启动后再继续。配置仍可正常调整。')
+    return
   }
+  state.mainLaunched = true
 }
 
 /* ============================================================
@@ -951,23 +1048,46 @@ export async function fetchOverlayRect() {
   if (r.ok && r.data) {
     state.pos = { x: r.data.x, y: r.data.y }
     state.overlaySize = { w: r.data.width, h: r.data.height }
+    // 续篇 651/729：screen_w/h 此前全仓零读取 —— 存下供第 12 页做坐标越界校验
+    if (r.data.screen_w && r.data.screen_h) {
+      state.boot.screen = { w: r.data.screen_w, h: r.data.screen_h }
+    }
   }
 }
 export async function setOverlayPos(x, y) {
   state.pos = { x, y }
-  await cmd.overlaySetPos(x, y)
-  cmd.reloadConfig()
+  // 续篇 257/730：结果不再忽略 —— 返回布尔让调用方决定是否关闭面板/提示
+  const r = await cmd.overlaySetPos(x, y)
+  if (!r.ok) {
+    log.error('悬浮窗位置写入失败', r.code, r.message)
+    notify(`位置写入失败（${r.code}），本次拖动/输入可能未生效。`, 'error')
+    return false
+  }
+  cmd.reloadConfig().then(rr => {
+    if (rr && !rr.ok) reportReloadFailure(rr)
+  })
+  return true
+}
+
+/** 续篇 748：reloadConfig 失败不再 fire-and-forget —— 统一走诊断留痕 */
+function reportReloadFailure(r) {
+  diagNote(`重载通知未送达（${r.code}）：${r.message || '未知原因'}`)
 }
 
 /* ============================================================
    第 13 页：开机自启
    ============================================================ */
 export async function setAutostart(v) {
+  const prev = state.autostart
   state.autostart = v
   const r = await cmd.autostartSet(v)
   if (!r.ok) {
+    // 续篇 257：失败回滚 UI 态，卡片高亮与磁盘真实状态保持一致
+    state.autostart = prev
     notify('开机自启设置写入失败（可能是权限不足），可在设置中重试。')
+    return false
   }
+  return true
 }
 
 /* ============================================================
@@ -975,7 +1095,13 @@ export async function setAutostart(v) {
    ============================================================ */
 export async function fetchInstallInfo() {
   const r = await cmd.getInstallInfo()
-  if (r.ok && r.data) {
+  if (!r.ok) {
+    // 续篇 260（Page14）：失败不再静默 —— 留痕并返回 false 让页面提示
+    log.warn('安装信息读取失败', r.code, r.message)
+    diagNote(`安装信息读取失败（${r.code}）`)
+    return false
+  }
+  if (r.data) {
     state.boot.installPath = r.data.install_path ?? state.boot.installPath
     // 后端取不到真值时返回 null（主程序未运行 / 句柄权限不足），
     // 完成页据此隐藏对应卡片 —— 不再显示与本机无关的 0.03% / 1MB。
@@ -984,6 +1110,7 @@ export async function fetchInstallInfo() {
     state.stats.cpu = typeof cpu === 'number' ? `${cpu.toFixed(1)}%` : null
     state.stats.mem = typeof mem === 'number' && mem > 0 ? `${Math.round(mem / 1048576)}MB` : null
   }
+  return true
 }
 
 /* ============================================================
@@ -991,7 +1118,14 @@ export async function fetchInstallInfo() {
    ============================================================ */
 export async function saveConfig() {
   flushAll()
-  await cmd.saveConfig(snapshot())
+  const r = await cmd.saveConfig(snapshot())
+  // 续篇 257：保存失败必须让调用方知道（GuideWizard onSave 不再推进"已保存"）
+  if (!r.ok) {
+    log.error('配置保存失败', r.code, r.message)
+    notify(`配置保存失败（${r.code}）：${r.message || '请重试'}`, 'error', 8000)
+    return false
+  }
+  return true
 }
 export async function quitGuide() {
   flushAll() // 退出前落盘「页 + 设置」断点备份，确保下次可续引导

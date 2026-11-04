@@ -63,6 +63,10 @@ pub fn watts_from_energy_delta(delta_joules: f64, dt_ms: u64, interval_ms: u64) 
 /// 倍 —— 16 核机器上整整差 16 倍。统一到「占总算力」口径后不再需要
 /// `cores` 参数，调用方也不会再传错。
 pub fn share_cpu_power(total_w: f32, cpu_pct: f32) -> f32 {
+    // 审查 102：NaN 输入会让 clamp 返回 NaN 污染下游，非有限值一律按 0 处理。
+    if !total_w.is_finite() || !cpu_pct.is_finite() {
+        return 0.0;
+    }
     let share = (cpu_pct / 100.0).clamp(0.0, 1.0);
     (total_w * share).clamp(0.0, MAX_CPU_WATTS)
 }
@@ -120,5 +124,8 @@ mod tests {
         // 越界值钳制
         assert_eq!(share_cpu_power(100.0, 9999.0), 100.0);
         assert_eq!(share_cpu_power(100.0, -5.0), 0.0);
+        // 审查 102：NaN 不逃逸
+        assert_eq!(share_cpu_power(100.0, f32::NAN), 0.0);
+        assert_eq!(share_cpu_power(f32::NAN, 50.0), 0.0);
     }
 }

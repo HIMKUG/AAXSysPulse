@@ -6,15 +6,19 @@ import { state, activeItems, notifyConfig } from '../composables/useGuide.js'
 const showSheet = ref(false)
 const items = computed(() => activeItems.value)
 
+// 续篇 725：字号区间提为常量共用（min/max、填充计算曾三处重复 8/24、8/32）
+const FONT_MIN = 8
+const FONT_MAX = 32
+const clampFill = v => Math.max(0, Math.min(100, ((v - FONT_MIN) / (FONT_MAX - FONT_MIN)) * 100))
+
 // 全局字号：主程序以单一 font_size 同时作用于「名称」与「数值」，故二者统一调整
-const globalFill = computed(() => ({ '--fill': ((state.fontName - 8) / 24) * 100 + '%' }))
+const globalFill = computed(() => ({ '--fill': clampFill(state.fontName) + '%' }))
 
 function onGlobalFont() {
-  // 名称与数值同字号：同步 font_value 以保持快照一致（主程序只读 font_name → font_size）
-  state.fontValue = state.fontName
   // 统一设置与逐项设置互斥（与颜色/名称页一致）：改统一字号即复位逐项覆盖
+  // （续篇 255/726：font_value 为后端死载荷，已删除）
   state.perFonts = null
-  notifyConfig({ font_name: state.fontName, font_value: state.fontValue, per_item_fonts: null })
+  notifyConfig({ font_name: state.fontName, per_item_fonts: null })
 }
 
 /** 拖动中：只更新 state 让数值跟手显示，不发配置通知 */
@@ -31,7 +35,7 @@ const fontOf = (key) =>
   state.perFonts && state.perFonts[key]
     ? state.perFonts[key].value
     : state.fontName
-const fillOf = (key) => ({ '--fill': ((fontOf(key) - 8) / 24) * 100 + '%' })
+const fillOf = (key) => ({ '--fill': clampFill(fontOf(key)) + '%' })
 </script>
 
 <template>
@@ -44,7 +48,13 @@ const fillOf = (key) => ({ '--fill': ((fontOf(key) - 8) / 24) * 100 + '%' })
       <p class="t-body r2" style="color: var(--text-secondary); font-style: italic; font-weight: 400; line-height: 1.6; max-width: 460px">
         悬浮窗文字为 8–32px，可整体统一调整，或在面板中逐项单独设置。
       </p>
-      <button class="btn btn-secondary btn-block r3" @click="showSheet = true">
+      <!-- 续篇 721：aria-haspopup/aria-expanded -->
+      <button
+        class="btn btn-secondary btn-block r3"
+        aria-haspopup="dialog"
+        :aria-expanded="showSheet ? 'true' : 'false'"
+        @click="showSheet = true"
+      >
         打开字号面板
       </button>
     </div>
@@ -59,9 +69,11 @@ const fillOf = (key) => ({ '--fill': ((fontOf(key) - 8) / 24) * 100 + '%' })
         <input
           class="slider-fill"
           type="range"
-          min="8"
-          max="32"
+          :min="FONT_MIN"
+          :max="FONT_MAX"
           step="1"
+          aria-label="统一字号"
+          :aria-valuetext="`${state.fontName}px`"
           :style="globalFill"
           v-model.number="state.fontName"
           @change="onGlobalFont"
@@ -74,9 +86,11 @@ const fillOf = (key) => ({ '--fill': ((fontOf(key) - 8) / 24) * 100 + '%' })
       <div class="font-grid">
         <div v-for="it in items" :key="it.key" class="font-row">
           <span class="per-item-name">{{ it.label }}</span>
+          <!-- 续篇 727：逐项滑条补 aria-label —— 读屏分不清是哪一项 -->
           <input
             class="slider-fill"
-            type="range" min="8" max="32" step="1"
+            type="range" :min="FONT_MIN" :max="FONT_MAX" step="1"
+            :aria-label="`${it.label} 字号`"
             :value="fontOf(it.key)"
             :style="fillOf(it.key)"
             @input="e => onPerFontInput(it.key, e.target.value)"

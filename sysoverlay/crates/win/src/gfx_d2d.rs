@@ -8,8 +8,9 @@
 //!
 //! # 资源规则（本模块的三条铁律）
 //!
-//! 1. `Gfx` 是 D2D/DWrite 资源的**唯一持有者**——窗口销毁 = `Gfx` Drop = COM
-//!    引用计数归零，不存在第二种释放路径；
+//! 1. `Gfx` 是 D2D/DWrite 资源的**唯一持有者**——窗口销毁 = `Gfx` 析构 =
+//!    成员 COM 引用计数归零（结构性 Drop，无自定义逻辑；审查 137：原
+//!    "Drop 统一释放"措辞易被读成存在手写 `impl Drop`）；
 //! 2. [`Gfx::rebuild`] 是**唯一重建入口**——设备丢失（`D2DERR_RECREATE_TARGET`）
 //!    与未来 DPI 变化都走它，不存在第二套重建逻辑；
 //! 3. 画刷按颜色缓存、文字格式按 (字号,字重,对齐) 缓存，**创建一次复用到底**
@@ -37,7 +38,8 @@ use windows::Foundation::Numerics::Matrix3x2;
 use windows::Win32::Foundation::{BOOL, D2DERR_RECREATE_TARGET, HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BEZIER_SEGMENT, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
-    D2D1_FIGURE_END_CLOSED, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F, D2D_SIZE_U,
+    D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F,
+    D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Factory, ID2D1GeometrySink, ID2D1HwndRenderTarget, ID2D1Layer,
@@ -96,7 +98,9 @@ impl ColorF {
 
     /// 以新 alpha 重着色（UI 选中态/悬停态半透明用）。
     pub fn with_alpha(mut self, a: f32) -> Self {
-        self.0.a = a;
+        // 审查 511：与 key() 的量化口径一致 —— 不钳位时 a=2 与 a=1
+        // 得到同一缓存键但颜色不同。
+        self.0.a = a.clamp(0.0, 1.0);
         self
     }
 }
@@ -182,23 +186,39 @@ impl HAlign {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct FormatKey(u32, u32, u64, bool);
 
-/// 文字布局缓存键：(文本, 格式键, 布局宽度px)。
+/// 文字布局缓存键：(文本哈希, 格式键, 布局尺寸键)。
 ///
 /// `CreateTextLayout` 是 D2D/DWrite 的头号开销（逐次做 Unicode 断行 + shaping）。
 /// 设置页绝大多数是静态标签（行名/导航/标题/脚注），逐帧重建纯属浪费——
 /// 这里按「文本 + 格式 + 宽度」缓存 `IDWriteTextLayout` 与其度量。
+/// 审查 512：首字段改文本 FNV 哈希 + 条目内存原文校验 —— 原先每次
+/// `draw_text` 都 `text.to_string()` 堆分配做查表键。
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct LayoutKey(String, FormatKey, u32);
+struct LayoutKey(u64, FormatKey, u32);
 
 /// 缓存的布局 + 实测度量（避免每帧再 `GetMetrics`）。
 struct LayoutEntry {
     layout: IDWriteTextLayout,
     width: f32,
     height: f32,
+    /// 哈希冲突校验用原文（键只存 64 位哈希）。
+    text: String,
 }
 
 /// 布局缓存上限：超出即整表清空（设置页文本量远小于此，正常永不触发）。
 const LAYOUT_CACHE_MAX: usize = 512;
+/// 测量缓存上限（审查 519：与绘制缓存分表，动态文本不再冲掉静态标签）。
+const MEASURE_CACHE_MAX: usize = 512;
+
+/// FNV-1a 文本哈希（审查 512：避免每次 draw_text 为构造查表键堆分配）。
+fn text_hash(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
 
 // ── SVG 路径（图标用） ─────────────────────────────────────
 
@@ -226,14 +246,19 @@ pub struct Gfx {
     /// 文字格式缓存：DWrite 对象，不随 RT 失效。
     formats: HashMap<FormatKey, IDWriteTextFormat>,
     /// 文字布局缓存：DWrite 对象，不随 RT 失效（只依赖 dwrite + format）。
+    /// 审查 519：绘制与测量分表 —— measure 的动态文本不再把静态标签
+    /// 缓存周期性整表冲掉（shaping 尖峰）。
     layouts: HashMap<LayoutKey, LayoutEntry>,
+    measure_cache: HashMap<LayoutKey, LayoutEntry>,
     /// 淡入层（翻页动画用）：与 RT 绑定，RT 重建即失效。
     layer: Option<ID2D1Layer>,
     /// C2：已探测的 UI 字体族（null 结尾 UTF-16），首次绘制时惰性填充，之后复用。
     ui_family: Option<Vec<u16>>,
-    /// 图标路径几何缓存：键 = (图标号, 目标宽, 目标高)。
+    /// 图标路径几何缓存：键 = (图标号, l, t, 目标宽, 目标高)。
+    /// 审查 138：build_path 把绝对坐标烘进了几何 —— 图标随窗口/卡片宽度
+    /// 移动后会复用旧几何画错位置，l/t 必须纳入键。
     /// 几何由工厂创建、与 RT 无关，故 RT 重建后仍可复用（无需清理）。
-    paths: HashMap<(usize, i32, i32), ID2D1PathGeometry>,
+    paths: HashMap<(usize, i32, i32, i32, i32), ID2D1PathGeometry>,
     /// 全局圆角半径（物理 px）。设置页所有圆角按「不小于它」统一，
     /// 再由控件几何钳位 —— 见 [`Gfx::set_global_radius`] 与 [`Gfx::round_radius`]。
     global_radius: f32,
@@ -272,7 +297,8 @@ fn probe_font_family(dwrite: &IDWriteFactory) -> Vec<u16> {
 
 /// 把归一化路径段按 `rect` 线性缩放，构建 D2D 路径几何。
 ///
-/// `view` = SVG viewBox 边长（本项目统一 1024）。坐标为 viewBox 单位。
+/// `view` = SVG viewBox 边长（本项目统一 1024 = `settings::icons::VIEW`，
+/// 审查 546：单一真源在 icons.rs，此处注释指向它）。坐标为 viewBox 单位。
 fn build_path(
     factory: &ID2D1Factory,
     segs: &[PathSeg],
@@ -281,7 +307,13 @@ fn build_path(
 ) -> Option<ID2D1PathGeometry> {
     let sx = rect.w() / view.max(1.0);
     let sy = rect.h() / view.max(1.0);
-    let pt = |x: f32, y: f32| D2D_POINT_2F { x: rect.l + x * sx, y: rect.t + y * sy };
+    let pt = |x: f32, y: f32| -> Option<D2D_POINT_2F> {
+        // 审查 513：icons.rs 解析出的 ±Inf/NaN 控制点会生成非法几何 —— 过滤。
+        if !(x.is_finite() && y.is_finite()) {
+            return None;
+        }
+        Some(D2D_POINT_2F { x: rect.l + x * sx, y: rect.t + y * sy })
+    };
     unsafe {
         let geom = factory.CreatePathGeometry().ok()?;
         let sink: ID2D1GeometrySink = geom.Open().ok()?;
@@ -290,22 +322,24 @@ fn build_path(
             match *seg {
                 PathSeg::Move(x, y) => {
                     if open {
-                        sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+                        // 审查 514：Move 触发的隐式结束此前一律 CLOSED ——
+                        // 未闭合子路径被强制连回起点画出杂线。补开放结束变体。
+                        sink.EndFigure(D2D1_FIGURE_END_OPEN);
                     }
-                    sink.BeginFigure(pt(x, y), D2D1_FIGURE_BEGIN_FILLED);
+                    sink.BeginFigure(pt(x, y)?, D2D1_FIGURE_BEGIN_FILLED);
                     open = true;
                 }
                 PathSeg::Line(x, y) => {
                     if open {
-                        sink.AddLine(pt(x, y));
+                        sink.AddLine(pt(x, y)?);
                     }
                 }
                 PathSeg::Cubic(x1, y1, x2, y2, x3, y3) => {
                     if open {
                         let bez = D2D1_BEZIER_SEGMENT {
-                            point1: pt(x1, y1),
-                            point2: pt(x2, y2),
-                            point3: pt(x3, y3),
+                            point1: pt(x1, y1)?,
+                            point2: pt(x2, y2)?,
+                            point3: pt(x3, y3)?,
                         };
                         sink.AddBezier(&bez);
                     }
@@ -321,7 +355,8 @@ fn build_path(
         if open {
             sink.EndFigure(D2D1_FIGURE_END_CLOSED);
         }
-        let _ = sink.Close();
+        // 审查 515：Close 失败仍返回 Some(geom) 会把未定稿几何当有效用。
+        sink.Close().ok()?;
         Some(geom)
     }
 }
@@ -342,6 +377,7 @@ impl Gfx {
                 brushes: HashMap::new(),
                 formats: HashMap::new(),
                 layouts: HashMap::new(),
+                measure_cache: HashMap::new(),
                 layer: None,
                 ui_family: None,
                 paths: HashMap::new(),
@@ -365,8 +401,11 @@ impl Gfx {
     /// **唯一重建入口**：设备丢失、DPI 变化、窗口主题切换后调用。
     /// 下一次 [`Gfx::rt`] 按新参数重建。
     pub fn rebuild(&mut self) {
+        // 审查 516：layer 与 RT 绑定（见字段注释），失效集中到本入口，
+        // rt() 懒创建与 rebuild 两处职责不再分叉。
         self.rt = None;
         self.brushes.clear();
+        self.layer = None;
     }
 
     /// 尺寸变化（窗口固定尺寸的设置页基本用不到，防御性保留）。
@@ -414,7 +453,14 @@ impl Gfx {
 
     /// 文字格式缓存键（与 [`Self::text_format`] 同一套规则；布局缓存用它做键）。
     fn format_key(px: f32, weight: u32, align: HAlign, wrap: bool) -> FormatKey {
-        FormatKey((px * 4.0).round() as u32, weight, align.key(), wrap)
+        // 审查 517：量化对齐配置侧 0.5px 步进（原 0.25px 会产生双倍格式对象）；
+        // 非有限 px 按最小字号处理，避免 NaN 恒 0 键。
+        let q = if px.is_finite() {
+            (px * 2.0).round() / 2.0
+        } else {
+            1.0
+        };
+        FormatKey((q * 2.0).round() as u32, weight, align.key(), wrap)
     }
 
     /// 取（或创建并缓存）文字格式。`px` 为像素字号（RT 恒等 DPI 下 = DIP）。
@@ -447,12 +493,18 @@ impl Gfx {
                 .ok()?
         };
         unsafe {
-            let _ = fmt.SetTextAlignment(align.dwrite());
-            let _ = fmt.SetWordWrapping(if wrap {
-                DWRITE_WORD_WRAPPING_WRAP
-            } else {
-                DWRITE_WORD_WRAPPING_NO_WRAP
-            });
+            // 审查 518：判返回值 —— 设置失败仍缓存复用会以错误对齐/换行渲染。
+            if fmt.SetTextAlignment(align.dwrite()).is_err()
+                || fmt
+                    .SetWordWrapping(if wrap {
+                        DWRITE_WORD_WRAPPING_WRAP
+                    } else {
+                        DWRITE_WORD_WRAPPING_NO_WRAP
+                    })
+                    .is_err()
+            {
+                return None;
+            }
         }
         self.formats.insert(key, fmt.clone());
         Some(fmt)
@@ -474,11 +526,15 @@ impl Gfx {
         brush: &ID2D1SolidColorBrush,
         vcenter: bool,
     ) -> Option<(f32, f32)> {
-        // 宽度取整进键：0.5px 内的抖动不值得重建一次布局。
-        let key = LayoutKey(text.to_string(), fkey, (rect.w() * 2.0).round() as u32);
+        // 审查 139：wrap=true 时高度影响换行结果 —— 高度一起进键。
+        // 审查 512：键用文本哈希（命中后以条目原文校验冲突），
+        // 不再每次 draw_text 为构造键做 String 堆分配。
+        let wq = ((rect.w() * 2.0).round() as u32).min(0xFFFF);
+        let hq = ((rect.h() * 2.0).round() as u32).min(0xFFFF);
+        let key = LayoutKey(text_hash(text), fkey, (wq << 16) | hq);
         let entry = match self.layouts.get(&key) {
-            Some(e) => (e.layout.clone(), e.width, e.height),
-            None => {
+            Some(e) if e.text == text => (e.layout.clone(), e.width, e.height),
+            _ => {
                 let wide: Vec<u16> = text.encode_utf16().collect();
                 let layout: IDWriteTextLayout = unsafe {
                     self.dwrite.CreateTextLayout(&wide, fmt, rect.w().max(1.0), rect.h().max(1.0)).ok()?
@@ -490,7 +546,12 @@ impl Gfx {
                 }
                 self.layouts.insert(
                     key,
-                    LayoutEntry { layout: layout.clone(), width: m.width, height: m.height },
+                    LayoutEntry {
+                        layout: layout.clone(),
+                        width: m.width,
+                        height: m.height,
+                        text: text.to_string(),
+                    },
                 );
                 (layout, m.width, m.height)
             }
@@ -509,13 +570,16 @@ impl Gfx {
     }
 
     /// 只测量不绘制（toast 胶囊等需要先量宽再画底的场景）。
-    /// 复用布局缓存：宽度键取哨兵值 u32::MAX，与任何绘制调用不冲突。
+    /// 复用独立的测量缓存：尺寸键取哨兵值（0xFFFF/0xFFFE，与绘制键不冲突）。
+    /// 审查 519：分表 —— 动态文本不再把绘制侧静态标签缓存整表冲掉。
     pub fn measure_text(&mut self, text: &str, px: f32, weight: u32) -> Option<(f32, f32)> {
         let fmt = self.text_format(px, weight, HAlign::Leading, false)?;
         let fkey = Self::format_key(px, weight, HAlign::Leading, false);
-        let key = LayoutKey(text.to_string(), fkey, u32::MAX);
-        if let Some(e) = self.layouts.get(&key) {
-            return Some((e.width, e.height));
+        let key = LayoutKey(text_hash(text), fkey, (0xFFFFu32 << 16) | 0xFFFE);
+        if let Some(e) = self.measure_cache.get(&key) {
+            if e.text == text {
+                return Some((e.width, e.height));
+            }
         }
         let wide: Vec<u16> = text.encode_utf16().collect();
         let layout: IDWriteTextLayout = unsafe {
@@ -523,11 +587,19 @@ impl Gfx {
         };
         let mut m = DWRITE_TEXT_METRICS::default();
         unsafe { layout.GetMetrics(&mut m).ok()? };
-        if self.layouts.len() >= LAYOUT_CACHE_MAX {
-            self.layouts.clear();
+        if self.measure_cache.len() >= MEASURE_CACHE_MAX {
+            self.measure_cache.clear();
         }
         let out = (m.width, m.height);
-        self.layouts.insert(key, LayoutEntry { layout, width: m.width, height: m.height });
+        self.measure_cache.insert(
+            key,
+            LayoutEntry {
+                layout,
+                width: m.width,
+                height: m.height,
+                text: text.to_string(),
+            },
+        );
         Some(out)
     }
 
@@ -542,18 +614,39 @@ impl Gfx {
         let Some(rt) = self.rt.clone() else { return false };
         unsafe {
             rt.BeginDraw();
-            painter(&rt, self);
-            if let Err(e) = rt.EndDraw(None, None) {
+        }
+        // 审查 140：painter panic 会让 EndDraw 不执行，RT 卡在 BeginDraw
+        // （后续每帧 WRONG_STATE）—— catch_unwind 包住 painter，
+        // 异常路径补 EndDraw 并重建 RT。
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| painter(&rt, self)));
+        let end = unsafe { rt.EndDraw(None, None) };
+        if outcome.is_err() {
+            crate::probe::log("gfx_d2d: painter PANIC caught -> rebuild rt");
+            self.rebuild();
+            return false;
+        }
+        match end {
+            Ok(_) => true,
+            Err(e) => {
                 if e.code() == D2DERR_RECREATE_TARGET {
                     crate::probe::log("d2d device lost -> rebuild");
                     self.rebuild();
+                } else if e.code().0 as u32 == 0x8899_0001 {
+                    // D2DERR_WRONG_STATE：配对性错误，下一帧即可恢复，不重建。
+                    crate::probe::log("d2d EndDraw wrong-state (recoverable)");
                 } else {
-                    crate::probe::log(&format!("d2d EndDraw err=0x{:08x}", e.code().0));
+                    // 审查 141：其余错误（设备域失效等）也重建 —— 原先只打日志，
+                    // RT 永久带错。
+                    crate::probe::log(&format!(
+                        "d2d EndDraw err=0x{:08x} -> rebuild",
+                        e.code().0
+                    ));
+                    self.rebuild();
                 }
                 return false;
             }
         }
-        true
     }
 
     // ── 绘制基元（画刷经缓存；调用方持 rt 克隆，与 &mut self 无别名） ──
@@ -624,7 +717,14 @@ impl Gfx {
         rect: RectF,
         color: ColorF,
     ) {
-        let ck = (key, rect.w() as i32, rect.h() as i32);
+        // 审查 138：l/t 纳入缓存键（见 paths 字段注释）。
+        let ck = (
+            key,
+            rect.l as i32,
+            rect.t as i32,
+            rect.w() as i32,
+            rect.h() as i32,
+        );
         if !self.paths.contains_key(&ck) {
             let Some(g) = build_path(&self.d2d, segs, view, rect) else { return };
             self.paths.insert(ck, g);
@@ -752,9 +852,14 @@ impl Gfx {
         chosen
     }
 
-    fn create_rt(&self) -> Option<ID2D1HwndRenderTarget> {        unsafe {
+    fn create_rt(&self) -> Option<ID2D1HwndRenderTarget> {
+        unsafe {
             let mut rc = RECT::default();
-            GetClientRect(self.hwnd, &mut rc).ok()?;
+            if GetClientRect(self.hwnd, &mut rc).is_err() {
+                // 审查 520：失败留痕（原先折叠成 None 无 HRESULT，设备异常时静默黑屏）。
+                crate::probe::log("gfx_d2d: GetClientRect failed");
+                return None;
+            }
             let size = D2D_SIZE_U {
                 width: (rc.right - rc.left).max(1) as u32,
                 height: (rc.bottom - rc.top).max(1) as u32,
@@ -766,6 +871,9 @@ impl Gfx {
                     alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
                 },
                 // 恒等 DPI：布局全部按物理像素（与 s(dpi,v) 体系对接）。
+                // 审查 521：RT 的 DPI 不随系统缩放变化 —— DWrite 字号按物理
+                // 像素给、设置页自身用 s(dpi,v) 换算；接 per-monitor DPI 时
+                // 需在此同步调整（局限注明）。
                 dpiX: 96.0,
                 dpiY: 96.0,
                 usage: D2D1_RENDER_TARGET_USAGE_NONE,
@@ -776,7 +884,16 @@ impl Gfx {
                 pixelSize: size,
                 presentOptions: D2D1_PRESENT_OPTIONS_NONE,
             };
-            self.d2d.CreateHwndRenderTarget(&props, &hwnd_props).ok()
+            match self.d2d.CreateHwndRenderTarget(&props, &hwnd_props) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    crate::probe::log(&format!(
+                        "gfx_d2d: CreateHwndRenderTarget failed hr=0x{:08X}",
+                        e.code().0 as u32
+                    ));
+                    None
+                }
+            }
         }
     }
 }
@@ -788,7 +905,10 @@ mod font_tests {
     #[test]
     fn probe_returns_null_terminated_wide() {
         unsafe {
-            let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).unwrap();
+            // 审查 598：unwrap → expect（与 win/lib.rs "生产代码 0 处 unwrap" 的
+            // 口径说明一致；此为测试代码，expect 语义更明确）。
+            let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)
+                .expect("DWrite factory available on Windows");
             let fam = probe_font_family(&dwrite);
             assert!(!fam.is_empty(), "字族名不应为空");
             assert_eq!(*fam.last().unwrap(), 0, "须为空结尾 UTF-16 串");

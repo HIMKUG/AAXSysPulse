@@ -3,8 +3,8 @@
 //! This module defines the core rendering abstraction used by the UI crate.
 //! Implementors must provide software rasterization primitives for:
 //! - Filled rectangles (with optional rounded corners)
-//! - Text rendering with font control
-//! - Text measurement
+//! - Text drawing / measurement（注意审查 497：`FontSpec` 目前被 offscreen 与
+//!   D2D 两个实现忽略，字号走各自的全局体系，规范仅为占位契约）
 
 /// Rectangle with pixel coordinates (top-left origin).
 #[derive(Clone, Copy, Debug, Default)]
@@ -40,14 +40,14 @@ impl Rect {
         }
     }
 
-    /// Returns the right edge (x + w).
+    /// Returns the right edge (x + w). 饱和加法（审查 103）：极端几何不回绕。
     pub fn right(&self) -> i32 {
-        self.x + self.w
+        self.x.saturating_add(self.w)
     }
 
-    /// Returns the bottom edge (y + h).
+    /// Returns the bottom edge (y + h). 饱和加法（审查 103）。
     pub fn bottom(&self) -> i32 {
-        self.y + self.h
+        self.y.saturating_add(self.h)
     }
 
     /// Clips this rect to not exceed surface bounds.
@@ -55,7 +55,8 @@ impl Rect {
         let x = self.x.max(0).min(surface_w);
         let y = self.y.max(0).min(surface_h);
         let w = (self.w - (x - self.x)).max(0).min(surface_w - x);
-        let h = self.h - (y - self.y).max(0).min(surface_h - y);
+        // 与 w 对称（审查 104）：max(0) 防负高，min 防越下界。
+        let h = (self.h - (y - self.y)).max(0).min(surface_h - y);
         Self { x, y, w, h }
     }
 }
@@ -83,9 +84,10 @@ impl Rgba {
     pub fn new(r: u8, g: u8, b: u8, a: u8) -> Self {
         let a_f = a as f32 / 255.0;
         Self {
-            r: (r as f32 * a_f) as u8,
-            g: (g as f32 * a_f) as u8,
-            b: (b as f32 * a_f) as u8,
+            // 四舍五入（审查 105）：截断会让暗色系统性偏低。
+            r: (r as f32 * a_f).round() as u8,
+            g: (g as f32 * a_f).round() as u8,
+            b: (b as f32 * a_f).round() as u8,
             a,
         }
     }
@@ -106,6 +108,9 @@ impl Rgba {
     }
 
     /// Converts to a Windows COLORREF value (0x00BBGGRR format).
+    ///
+    /// 审查 106：本结构是**预乘** alpha 的，半透明色转出的 RGB 已按 alpha
+    /// 变暗；仅 `a == 255` 的颜色适合直接拿去建 GDI 画刷，勿用于半透明色。
     pub fn to_colorref(&self) -> u32 {
         (self.r as u32) | ((self.g as u32) << 8) | ((self.b as u32) << 16)
     }
@@ -164,7 +169,8 @@ pub trait RenderTarget {
 
     /// Draws text at the specified position with the given color and font.
     ///
-    /// Text is clipped to the `at` rectangle bounds.
+    /// 审查 498：当前实现只保证横向裁剪（`offscreen.rs` 丢弃纵向 `_clip_h`，
+    /// D2D 路径不裁剪）；调用方需自行保证文本不越界，勿依赖纵向裁剪语义。
     fn draw_text(&mut self, s: &str, at: Rect, color: Rgba, font: FontSpec);
 
     /// Measures the pixel dimensions of text when rendered with the given font.
@@ -182,7 +188,8 @@ pub trait RenderTarget {
     ///
     /// * `coverage` - 行优先的灰度蒙版，每行 `cov_stride` 字节。
     /// * `at` - 合成区域，尺寸应 <= 蒙版尺寸。
-    /// * `color` - 文字颜色（**非**预乘，本方法内部按覆盖率预乘）。
+    /// * `color` - 文字颜色（Rgba **预乘**存储；本方法按覆盖率同步缩放
+    ///   RGB 与 alpha，审查 110：不得再走二次预乘）。
     fn blit_coverage(
         &mut self,
         at: Rect,

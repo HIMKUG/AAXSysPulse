@@ -5,15 +5,17 @@
   "type": "module",
   "description": "AAXSysPulseC 引导程序（14 页拆分方案 · Liquid Glass 设计）",
   "scripts": {
+    "predev": "node scripts/check-bridge.mjs",
     "dev": "vite",
     "check-bridge": "node scripts/check-bridge.mjs",
     "build": "node scripts/check-bridge.mjs && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "typecheck": "vue-tsc --noEmit"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
-    "vue": "^3.4.21"
+    "vue": "^3.5.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.4",

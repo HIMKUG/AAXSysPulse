@@ -13,20 +13,17 @@ use crate::types::{Appearance, Lang, NetMode, NetUnit, RenderEngine, RenderMode,
 pub const SYSTEM_FILE: &str = "system.cfg";
 
 fn snap_interval(ms: u32) -> u32 {
-    const ALLOWED: [u32; 5] = [5000, 2000, 1000, 200, 100];
-    // `min_by_key` 在空迭代器上返回 None。这里迭代的是定长常量数组，实际不可能空
-    // （审查报告"上游传入空集合即 panic"的前提不成立），但仍写成不可失败的形式：
-    // 兜底值 = 中间档 1000 ms，日后有人把 ALLOWED 改成切片/迭代器时行为依旧确定。
-    *ALLOWED
-        .iter()
-        .min_by_key(|&&a| (a as i64 - ms as i64).abs())
-        .unwrap_or(&1000)
+    // 档位表与吸附逻辑收敛到 config.rs 唯一一份（审查 034/025），此处只转发。
+    crate::config::snap_interval_ms(ms)
 }
 
 pub fn serialize(cfg: &Config) -> String {
     let mut w = Writer::new();
+    // version 与其余 4 个 .cfg 一致写进 [meta]（审查 032：旧实现写 [system]、
+    // parse 却读 [meta]，版本永远读不回来）。parse 侧兼容读两处历史格式。
+    w.section("meta");
+    w.kv("version", crate::contract::CONFIG_VERSION);
     w.section("system");
-    w.kv("version", 3);
     match cfg.window_pos {
         Some((x, y)) => {
             w.kv("x", x);
@@ -53,7 +50,8 @@ pub fn serialize(cfg: &Config) -> String {
         "layout",
         match cfg.render_style {
             RenderStyle::Vertical => "vertical",
-            _ => "horizontal",
+            // 显式穷尽（审查 036）：新增变体时这里必须做出选择。
+            RenderStyle::Strip | RenderStyle::Classic => "horizontal",
         },
     );
     w.kv("zoom", cfg.zoom.to_config());
@@ -97,8 +95,8 @@ pub fn parse(cfg: &mut Config, text: &str) {
     let ini = Ini::parse(text);
     let s = "system";
 
-    // [meta] version（用于跨文件一致性校验）
-    if let Some(v) = ini.get("meta", "version") {
+    // [meta] version（用于跨文件一致性校验）；兼容旧版写进 [system] 的历史文件。
+    if let Some(v) = ini.get("meta", "version").or_else(|| ini.get("system", "version")) {
         cfg.version = parse_u32(v, cfg.version);
     }
 
@@ -106,9 +104,15 @@ pub fn parse(cfg: &mut Config, text: &str) {
     // 负坐标合法（副屏 / 顶边外），只有序列化端的 -1/-1「未设置」哨兵对
     // 才视为无位置。旧判据 `x>=0 && y>=0` 会把 y<0 的窗口位置判丢，
     // 且下一次退出把真位置反写成 -1/-1，表现为"不记忆窗口位置"。
-    let x = ini.get(s, "x").map(|v| parse_i32(v, -1)).unwrap_or(-1);
-    let y = ini.get(s, "y").map(|v| parse_i32(v, -1)).unwrap_or(-1);
-    cfg.window_pos = if x == -1 && y == -1 { None } else { Some((x, y)) };
+    // 审查 035：只写其一（如只有 x=100）时不得得到 (100, -1) 半哨兵坐标，
+    // 缺任一键整体视为未设置。
+    let x = ini.get(s, "x").map(|v| parse_i32(v, -1));
+    let y = ini.get(s, "y").map(|v| parse_i32(v, -1));
+    cfg.window_pos = match (x, y) {
+        (Some(xv), Some(yv)) if xv == -1 && yv == -1 => None,
+        (Some(xv), Some(yv)) => Some((xv, yv)),
+        _ => None,
+    };
     let ww = ini.get(s, "w").map(|v| parse_i32(v, 0)).unwrap_or(0);
     let hh = ini.get(s, "h").map(|v| parse_i32(v, 0)).unwrap_or(0);
     cfg.window_size = if ww > 0 && hh > 0 && ww <= 2048 && hh <= 2048 {

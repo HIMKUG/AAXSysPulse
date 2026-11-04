@@ -79,10 +79,11 @@
   /* ============================================================
      6. 字体 —— 厚字重，禁用 Light / Thin
      ============================================================ */
-  /* 中英混排：系统 UI 字体优先，中文回退苹方 / 雅黑 */
-  --font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display",
-    "Segoe UI Variable", "Segoe UI", "PingFang SC", "Microsoft YaHei UI",
-    "Microsoft YaHei", "WenQuanYi Micro Hei", system-ui, sans-serif;
+  /* 中英混排：Windows 字体优先（本项目 targets 只有 nsis/Windows —— 续篇 757：
+     macOS/iOS 字体曾排在前三位，实际总回退到 Segoe UI，顺序与平台不符），
+     中文回退雅黑 / 苹方 */
+  --font-family: "Segoe UI Variable", "Segoe UI", "Microsoft YaHei UI",
+    "Microsoft YaHei", "PingFang SC", "WenQuanYi Micro Hei", system-ui, sans-serif;
 
   /* 等宽字体：仅用于路径、坐标、技术术语等斜体场景 */
   --font-mono: "SF Mono", "Cascadia Code", "Cascadia Mono", "Consolas", ui-monospace, monospace;
@@ -95,7 +96,9 @@
   --fs-foot: 13px;      /* 脚注 */
   --fs-data: 32px;      /* 完成页大数字 */
 
-  /* 字重（2026-09-19 用户裁决：黑字一律加粗；灰字改黑后靠斜体+字面 400 区分层级） */
+  /* 字重（2026-09-19 用户裁决：黑字一律加粗；灰字改黑后靠斜体+字面 400 区分层级）
+     续篇 758：四个 token 同值是**有意为之**（分级语义保留给未来调整），
+     不要"恢复分级"——斜体辅助文字的 400 是各规则里的字面值，与本表无关。 */
   --fw-regular: 700;    /* 正文、说明 */
   --fw-medium: 700;     /* 卡片标题、选项标题、强调 */
   --fw-semi: 700;       /* 按钮文字、当前值 */
@@ -189,6 +192,9 @@
 
   /* ============================================================
      11. 窗口
+     与 tauri.conf.json app.windows[0] 的 width/height 必须一致 ——
+     续篇 759：一致性由 src-tauri/build.rs 的 json_window_size 断言钉死，
+     改任一侧都要同步另一侧。
      ============================================================ */
   --win-w: 680px;
   --win-h: 560px;

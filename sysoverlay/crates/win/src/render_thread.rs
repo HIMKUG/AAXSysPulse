@@ -11,9 +11,10 @@
 //!
 //! - **UI 线程**：wndproc 把「hwnd + 最新 Config（`Copy`，顺手发布到镜像）」投进
 //!   通道；`RENDER_QUEUED` 原子去重——突发多请求合并为一次渲染，队列恒长 ≤1。
-//! - **渲染线程**：取请求 → 读配置镜像 + `Arc<Snapshot>`（arc_swap 共享，无锁读）
-//!   → [`crate::gdi::render`]。`SetTimer` / `SetWindowPos` 跨线程调用均合法
-//!   （定时器与几何归属窗口本身，WM_TIMER 仍投递回 UI 线程队列）。
+//! - **渲染线程**：取请求 → 读配置镜像（`Mutex<Option<Config>>`，UI 线程每次
+//!   请求时覆盖发布；审查 129：原注释"arc_swap 共享、无锁读"与实现不符）
+//!   + `Arc<Snapshot>` → [`crate::gdi::render`]。`SetTimer` / `SetWindowPos`
+//!   跨线程调用均合法（定时器与几何归属窗口本身，WM_TIMER 仍投递回 UI 线程队列）。
 //! - **D2D 工厂**：render_d2d 与设置页 gfx_d2d 各持独立 SINGLE_THREADED 工厂，
 //!   无跨线程共享；DIB / D2D RT 自此只被渲染线程触碰，线程亲和性一致。
 //!
@@ -43,8 +44,14 @@ static RENDER_CFG: Mutex<Option<Config>> = Mutex::new(None);
 /// 幂等：看门狗自愈（[`respawn`]）复用同一路径重建通道 + 线程。
 pub fn start() {
     let (tx, rx) = mpsc::channel::<isize>();
-    if let Ok(mut g) = RENDER_TX.lock() {
-        *g = Some(tx);
+    // 审查 534：锁中毒时恢复内层值再发布 —— 静默跳过会让 request() 永远
+    // send 失败（与 :126/:159 的 into_inner 恢复口径统一）。
+    match RENDER_TX.lock() {
+        Ok(mut g) => *g = Some(tx),
+        Err(p) => {
+            crate::probe::log("rt: RENDER_TX poisoned in start -> recovering inner value");
+            *p.into_inner() = Some(tx);
+        }
     }
     RENDER_QUEUED.store(false, Ordering::Relaxed);
     // 开启新世代：让旧线程（可能仍卡在原生调用里）的迟到帧心跳失效，
@@ -77,6 +84,10 @@ pub fn start() {
                 }));
                 if outcome.is_err() {
                     crate::probe::log("rt: PANIC caught, thread survives");
+                    // 审查 128：panic 展开会跳过 render_once 内的 render_frame_end
+                    // （它是普通语句，不在 catch_unwind 里）—— FRAME_START_MS
+                    // 不复位会让看门狗把后续每一帧都当成"在途"。Err 分支补调配对。
+                    crate::gdi::render_frame_end(my_gen);
                     // BUG-3：panic 可能把 prev-cells/帧指纹停在半新半旧——
                     // 下一帧哈希可能误判「内容未变」而跳过上传，画面从此
                     // 停在 panic 时刻。强制下一帧整窗重绘，把自愈做完整。
@@ -130,12 +141,18 @@ fn render_once(hwnd_addr: isize, gen: u64) {
             *p.into_inner()
         }
     };
-    let Some(cfg) = cfg else { return };
+    let Some(cfg) = cfg else {
+        // 审查 535：首帧黑洞留痕 —— respawn 后镜像未发布时每帧静默跳过，
+        // 表现是"窗口不出现且零日志"，难诊断。
+        crate::probe::log("rt: render skipped — config mirror not published yet");
+        return;
+    };
     let snap = crate::window::snap_get();
     let hwnd = HWND(hwnd_addr as *mut _);
     // 帧在途标记：watchdog 据此区分「线程死了」与「线程活着但卡在原生调用里」。
     // 携带本线程的世代号——旧线程（被 respawn 淘汰）的迟到写入会被 frame_end 忽略。
-    // 包在 catch_unwind 外层——panic 被兜住后本函数仍会返回，frame_end 照常调用。
+    // 注意（审查 128）：frame_begin/end 都在本函数内、catch_unwind 之外 ——
+    // panic 展开会跳过 frame_end，由调用方的 Err 分支补调（见 start()）。
     crate::gdi::render_frame_begin(gen);
     crate::gdi::render(hwnd, &snap, &cfg);
     crate::gdi::render_frame_end(gen);
@@ -146,6 +163,20 @@ fn render_once(hwnd_addr: isize, gen: u64) {
 /// 首次渲染时的尺寸检查自愈。由采样线程在
 /// [`crate::gdi::render_watchdog_tick`] 返回 true 时调用。
 pub fn respawn() {
+    // 幂等/健康判断（审查 130）：短窗内的重复触发只重建一次 ——
+    // 看门狗与手动路径并发时不再遗留多条渲染线程。
+    static LAST_RESPAWN: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let now = std::time::Instant::now();
+    {
+        let mut g = LAST_RESPAWN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = *g {
+            if now.duration_since(t) < std::time::Duration::from_secs(10) {
+                crate::probe::log("rt respawn: throttled (recent respawn <10s)");
+                return;
+            }
+        }
+        *g = Some(now);
+    }
     crate::probe::log("rt respawn: rebuilding render thread after stall");
     start();
 }
@@ -173,7 +204,15 @@ pub fn request(hwnd: HWND, cfg: &Config) {
     if RENDER_QUEUED.swap(true, Ordering::Relaxed) {
         return; // 已有请求排队：配置镜像已更新，在途那次渲染即为最新
     }
-    let tx = RENDER_TX.lock().ok().and_then(|g| g.clone());
+    // 审查 536：中毒恢复与 start/render_once 统一 —— `lock().ok()` 会把
+    // 中毒当 None 丢弃，一次 panic 污染后所有 request 永久失败直到 respawn。
+    let tx = match RENDER_TX.lock() {
+        Ok(g) => g.clone(),
+        Err(p) => {
+            crate::probe::log("rt: RENDER_TX poisoned in request -> recovering inner value");
+            p.into_inner().clone()
+        }
+    };
     let send_ok = match tx {
         Some(tx) => tx.send(hwnd.0 as isize).is_ok(),
         None => false,

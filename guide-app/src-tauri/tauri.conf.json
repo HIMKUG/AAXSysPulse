@@ -16,6 +16,8 @@
         "title": "AAXSysPulse 引导",
         "width": 680,
         "height": 560,
+        "minWidth": 680,
+        "minHeight": 560,
         "resizable": false,
         "decorations": false,
         "transparent": true,
@@ -24,7 +26,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:"
     },
     "withGlobalTauri": true
   },

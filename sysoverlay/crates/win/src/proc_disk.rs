@@ -45,11 +45,15 @@ pub struct DiskState {
     write_counter: isize,
     /// 是否可用（查询/计数器至少注册成功一个；全失败 → 直接返回 Unavailable）。
     valid: bool,
-    /// 上次采样时间戳（毫秒，GetTickCount64 单位），用于 1Hz 节流。
+    /// 上次采样时间戳（毫秒；采样时钟与 GetTickCount64 同源，由调度器传入，
+    /// 审查 063：原注释误写"GetTickCount64 单位"），用于 1Hz 节流。
     ///
     /// ⚠️ 收集失败时也要推进：否则失败会绕过节流、每周期都重打 PDH 并刷日志
     /// （2026-09-17 实测：故障时 1s 内可打 3~4 条 "PdhCollectQueryData failed"）。
     last_sample_ms: u64,
+    /// 连续无效轮数（审查 061：locale 版"假成功"（句柄非 0 却永不出数）
+    /// 无法在 new() 识别 —— 出数前维持待验证态，连续多轮无效判 invalid）。
+    invalid_streak: u32,
     /// 上次读/写速率（字节/秒）；`None` = 该计数器无效或无数据。
     ///
     /// ⚠️ 用 `Option` 而不是 `f64` + `> 0.0` 判断，是为了区分「**有效的** 0 B/s
@@ -89,14 +93,10 @@ impl DiskState {
             let mut rc: isize = 0;
             let en_r = PdhAddEnglishCounterW(query, read_p, 0, &mut rc);
             if en_r != 0 {
-                let loc_r = PdhAddCounterW(query, read_p, 0, &mut rc);
-                if loc_r != 0 {
-                    crate::probe::log(&format!(
-                        "disk: add read counter failed (english=0x{en_r:08X} locale=0x{loc_r:08X})"
-                    ));
-                } else {
-                    crate::probe::log("disk: read counter added (locale fallback)");
-                }
+                // 审查 062：locale 回退已删除 —— 路径本身是英文字面量，
+                // 传给期望本地化名的 PdhAddCounterW 在中文系统上必然失败，
+                // 还会"假成功"占用句柄（见模块头 2026-09-17 实测）。
+                crate::probe::log(&format!("disk: add read counter failed (0x{en_r:08X})"));
             } else {
                 crate::probe::log("disk: read counter added");
             }
@@ -104,14 +104,7 @@ impl DiskState {
             let mut wc: isize = 0;
             let en_w = PdhAddEnglishCounterW(query, write_p, 0, &mut wc);
             if en_w != 0 {
-                let loc_w = PdhAddCounterW(query, write_p, 0, &mut wc);
-                if loc_w != 0 {
-                    crate::probe::log(&format!(
-                        "disk: add write counter failed (english=0x{en_w:08X} locale=0x{loc_w:08X})"
-                    ));
-                } else {
-                    crate::probe::log("disk: write counter added (locale fallback)");
-                }
+                crate::probe::log(&format!("disk: add write counter failed (0x{en_w:08X})"));
             } else {
                 crate::probe::log("disk: write counter added");
             }
@@ -124,8 +117,12 @@ impl DiskState {
                 crate::probe::log("disk: no usable counters -> sampler disabled");
             }
 
-            // 立即建立基线（第一次收集）
-            let _ = PdhCollectQueryData(query);
+            // 立即建立基线（第一次收集）。审查 565：失败要留痕，
+            // 不得无声吞掉 —— 待验证态由 sample() 的 invalid_streak 继续把关。
+            let base = PdhCollectQueryData(query);
+            if base != 0 {
+                crate::probe::log(&format!("disk: baseline collect failed (0x{base:08X})"));
+            }
 
             crate::probe::log("disk: PDH query initialized");
             Self {
@@ -134,6 +131,7 @@ impl DiskState {
                 write_counter: wc,
                 valid,
                 last_sample_ms: 0,
+                invalid_streak: 0,
                 last_read: None,
                 last_write: None,
             }
@@ -172,13 +170,28 @@ impl DiskState {
                 // 带错误码：PDH_NO_DATA(0x800007D5)=计数器无实例/无数据，
                 // PDH_CSTATUS_NO_MACHINE(0x800007D0)=路径被当成机器名（见 DISK_READ_PATH）。
                 crate::probe::log(&format!("disk: PdhCollectQueryData failed (0x{ret:08X})"));
+                // 审查 566：失败时清掉上次值 —— 否则下一帧命中 1Hz 节流会把
+                // 上次成功值当新值返回（"读不到"被伪装成旧速率）。
+                self.last_read = None;
+                self.last_write = None;
                 return (Metric::Unavailable, Metric::Unavailable);
             }
 
             // 读取格式化值（PDH_FMT_DOUBLE）；无效数据由 CStatus 过滤为 None。
-            let read_val = self.read_counter_value();
-            let write_val = self.write_counter_value();
+            let read_val = self.counter_value(self.read_counter);
+            let write_val = self.counter_value(self.write_counter);
 
+            // 审查 061：双侧持续无数 → 判计数器假成功并禁用采样器。
+            match (read_val, write_val) {
+                (None, None) => {
+                    self.invalid_streak += 1;
+                    if self.invalid_streak >= 10 && self.valid {
+                        self.valid = false;
+                        crate::probe::log("disk: no valid data for 10 cycles -> sampler disabled");
+                    }
+                }
+                _ => self.invalid_streak = 0,
+            }
             self.last_read = read_val;
             self.last_write = write_val;
 
@@ -189,40 +202,19 @@ impl DiskState {
         }
     }
 
-    /// 读取格式化后的读速率；`None` = 计数器未注册 / 调用失败 / `CStatus` 表明数据无效。
-    unsafe fn read_counter_value(&self) -> Option<f64> {
-        if self.read_counter == 0 {
+    /// 读取格式化后的计数器值；`None` = 句柄无效 / 调用失败 / `CStatus` 表明数据无效。
+    ///
+    /// 审查 567：读/写两个逐字重复的读取函数收敛为这一份。
+    unsafe fn counter_value(&self, handle: isize) -> Option<f64> {
+        if handle == 0 {
             return None;
         }
         let mut buf: PDH_FMT_COUNTERVALUE = std::mem::zeroed();
-        let ret = PdhGetFormattedCounterValue(
-            self.read_counter,
-            PDH_FMT_DOUBLE,
-            None,
-            &mut buf,
-        );
+        let ret = PdhGetFormattedCounterValue(handle, PDH_FMT_DOUBLE, None, &mut buf);
         if ret != 0 || !pdh_status_is_valid(buf.CStatus) {
             return None;
         }
         // PDH_FMT_COUNTERVALUE::Anonymous 是 union，PDH_FMT_DOUBLE 格式下用 doubleValue
-        Some(buf.Anonymous.doubleValue)
-    }
-
-    /// 读取格式化后的写速率；语义同 [`Self::read_counter_value`]。
-    unsafe fn write_counter_value(&self) -> Option<f64> {
-        if self.write_counter == 0 {
-            return None;
-        }
-        let mut buf: PDH_FMT_COUNTERVALUE = std::mem::zeroed();
-        let ret = PdhGetFormattedCounterValue(
-            self.write_counter,
-            PDH_FMT_DOUBLE,
-            None,
-            &mut buf,
-        );
-        if ret != 0 || !pdh_status_is_valid(buf.CStatus) {
-            return None;
-        }
         Some(buf.Anonymous.doubleValue)
     }
 }

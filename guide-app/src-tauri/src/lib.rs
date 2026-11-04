@@ -29,6 +29,39 @@ use std::sync::{Arc, Mutex};
 /// 主程序版本号：由 build.rs 同源编译时注入（草案 2.3），引导程序与主程序版本保持一致
 pub const MAIN_PROGRAM_VERSION: &str = env!("MAIN_PROGRAM_VERSION");
 
+// ============ 启动旗标（首轮 201）============
+//
+// `--elevated` / `--uninstall` / `--autostart` 曾在三处各自全量扫 `args().any`，
+// 且 driver.rs 曾拼出带前导空格的 " --elevated" —— 在 run() 入口集中解析一次
+// 为枚举并复用。
+#[derive(Debug, Clone, Copy, Default)]
+struct LaunchFlags {
+    elevated: bool,
+    uninstall: bool,
+    autostart: bool,
+}
+
+impl LaunchFlags {
+    fn parse() -> Self {
+        let mut f = Self::default();
+        for a in std::env::args() {
+            match a.as_str() {
+                "--elevated" => f.elevated = true,
+                "--uninstall" => f.uninstall = true,
+                "--autostart" => f.autostart = true,
+                _ => {}
+            }
+        }
+        f
+    }
+}
+
+static LAUNCH_FLAGS: std::sync::OnceLock<LaunchFlags> = std::sync::OnceLock::new();
+
+fn launch_flags() -> LaunchFlags {
+    *LAUNCH_FLAGS.get_or_init(LaunchFlags::parse)
+}
+
 // ============ 错误类型 ============
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,25 +110,26 @@ type CmdResult<T = ()> = Result<T, GuideError>;
 // 双击按钮、`install_run` 超时后用户重试、Page03 挂载自动开跑与手动重试并发。
 // 进程内用原子标志互斥，`Drop` 里释放 —— 出错、panic、被 tokio 取消都不会漏锁。
 
-static INSTALL_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static UNINSTALL_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// 首轮 205：INSTALL_BUSY / UNINSTALL_BUSY 曾是两把独立锁 —— 安装与卸载并发跑会
+// 同时改写同一批文件与服务。装卸共用这一把互斥。
+static FLOW_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-struct BusyGuard(&'static std::sync::atomic::AtomicBool);
+struct BusyGuard;
 
 impl BusyGuard {
     /// 抢占标志；已被占用时返回 `None`，调用方据此给出"正在进行中"的错误。
-    fn try_lock(flag: &'static std::sync::atomic::AtomicBool) -> Option<Self> {
-        if flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
+    fn try_lock() -> Option<Self> {
+        if FLOW_BUSY.swap(true, std::sync::atomic::Ordering::SeqCst) {
             None
         } else {
-            Some(Self(flag))
+            Some(Self)
         }
     }
 }
 
 impl Drop for BusyGuard {
     fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        FLOW_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -106,6 +140,10 @@ pub struct BootstrapResume {
     #[serde(rename = "last_page")]
     pub last_page: u32,
     pub path: String,
+    /// 上次选中的样式预设（A–F）。guide_state 已有该字段、前端 `useGuide.js`
+    /// 也在读（`rs.style`）—— 结构体曾漏声明导致前端永远拿到空串（首轮 210）。
+    #[serde(default)]
+    pub style: String,
     /// 完整前端快照（无损恢复设置）。旧版状态文件无此字段时为 `null`，
     /// 前端据此回退到「从 INI 反推」的有损路径。
     #[serde(default)]
@@ -138,20 +176,21 @@ pub struct BootstrapResult {
 
 #[tauri::command]
 fn guide_bootstrap() -> CmdResult<BootstrapResult> {
-    // 补齐 5 个配置文件（缺失的用默认值补成 v3；已存在的一律不动）。
+    // 补齐 5 个配置文件（缺失的用默认值补成 v3；损坏的重写默认，见 ensure_all_files）。
     // 必须早于主程序启动：主程序 `check_version_consistency` 对**任一缺失**的
     // .cfg 判为 v1，与其余 v3 文件组成 span=2 → 弹「版本跨度过大」破坏性弹窗。
+    // 续篇 649：改走 tracing 落进 guide_*.log —— main.rs 在 release 用
+    // windows_subsystem="windows"，eprintln! 进的是不存在的控制台，日志面板永远读不到。
     match config::ensure_all_files() {
         Ok(created) if !created.is_empty() => {
-            eprintln!("[guide_bootstrap] 已补齐缺失配置: {:?}", created);
+            tracing::info!("[guide_bootstrap] 已补齐缺失配置: {:?}", created);
         }
-        Err(e) => eprintln!("[guide_bootstrap] 补齐配置失败（继续）: {}", e),
+        Err(e) => tracing::warn!("[guide_bootstrap] 补齐配置失败（继续）: {}", e),
         _ => {}
     }
 
     // 传递 --elevated 参数时（提权重启后），强制 has_privilege=true 跳过权限检测页
-    let has_privilege = driver::is_admin()
-        || std::env::args().any(|a| a == "--elevated");
+    let has_privilege = driver::is_admin() || launch_flags().elevated;
 
     // 检查是否有未完成的引导
     let state = GuideState::load().unwrap_or_default();
@@ -159,14 +198,24 @@ fn guide_bootstrap() -> CmdResult<BootstrapResult> {
         Some(BootstrapResume {
             last_page: state.last_page,
             path: state.path,
+            style: state.style.clone(),
             snapshot: state.snapshot.clone(),
         })
     } else {
         None
     };
 
-    // 检查配置是否损坏（读取 INI 配置试试）
-    let config_corrupted = config::SystemConfig::load().is_err();
+    // 检查配置是否损坏。首轮 202：load() 对「文件缺失」返回 Ok(default)，只探
+    // SystemConfig 探不到其余 4 个损坏文件 —— 五个文件挨个 load 汇总失败集合。
+    let config_corrupted = [
+        config::SystemConfig::load().is_err(),
+        config::AppearanceConfig::load().is_err(),
+        config::MonitorConfig::load().is_err(),
+        config::LayoutConfig::load(false).is_err(),
+        config::LayoutConfig::load(true).is_err(),
+    ]
+    .into_iter()
+    .any(|bad| bad);
 
     // 安装路径（取不到即空串：前端相应文案整段隐藏，不再伪造 Program Files 路径）
     let install_path = get_install_dir()
@@ -178,9 +227,9 @@ fn guide_bootstrap() -> CmdResult<BootstrapResult> {
 
     // 第九部分：已安装检测 + --uninstall 启动标记
     let installed_detected = get_install_dir()
-        .map(|p| p.join(aaxsyspulse_core::contract::MAIN_EXE_NAME).exists())
+        .map(|p| looks_like_installed_exe(&p.join(aaxsyspulse_core::contract::MAIN_EXE_NAME)))
         .unwrap_or(false);
-    let uninstall_mode = std::env::args().any(|a| a == "--uninstall");
+    let uninstall_mode = launch_flags().uninstall;
 
     Ok(BootstrapResult {
         has_privilege,
@@ -193,24 +242,43 @@ fn guide_bootstrap() -> CmdResult<BootstrapResult> {
     })
 }
 
+/// 已安装判定（首轮 203）：0 字节 / 截断残留也满足 `exists()` —— 要求至少
+/// 4KB 且带 `MZ` 头（PE 镜像的 DOS 签名），与 build.rs 的驱动体检同口径。
+fn looks_like_installed_exe(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if meta.len() <= 4096 {
+        return false;
+    }
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 2];
+    f.read_exact(&mut head).is_ok() && &head == b"MZ"
+}
+
+/// 屏幕尺寸回退值（首轮 204：裸魔数提为具名常量）
+const FALLBACK_SCREEN_W: u32 = 1920;
+const FALLBACK_SCREEN_H: u32 = 1080;
+
 fn get_primary_screen_size() -> BootstrapScreen {
     #[cfg(windows)]
     {
-        use windows::Win32::UI::WindowsAndMessaging::{GetDesktopWindow, GetWindowRect};
-        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
+        // 首轮 204：GetDesktopWindow 的 RECT 含整套虚拟桌面几何且失败静默回退 ——
+        // 改用 GetSystemMetrics(SM_CXSCREEN/SM_CYSCREEN) 取主屏尺寸。
         unsafe {
-            let desktop = GetDesktopWindow();
-            let mut rect = RECT::default();
-            if GetWindowRect(desktop, &mut rect).is_ok() {
-                return BootstrapScreen {
-                    width: (rect.right - rect.left) as u32,
-                    height: (rect.bottom - rect.top) as u32,
-                };
+            let w = GetSystemMetrics(SM_CXSCREEN);
+            let h = GetSystemMetrics(SM_CYSCREEN);
+            if w > 0 && h > 0 {
+                return BootstrapScreen { width: w as u32, height: h as u32 };
             }
         }
     }
-    BootstrapScreen { width: 1920, height: 1080 }
+    BootstrapScreen { width: FALLBACK_SCREEN_W, height: FALLBACK_SCREEN_H }
 }
 
 // ============ 权限 ============
@@ -229,11 +297,14 @@ fn privilege_restart_as_admin() -> CmdResult {
 
 #[tauri::command]
 async fn install_run(app: tauri::AppHandle, mode: Option<String>) -> CmdResult<serde_json::Value> {
-    let _busy = BusyGuard::try_lock(&INSTALL_BUSY).ok_or_else(|| {
-        GuideError::new("INSTALL_BUSY", "安装已经在进行中")
-            .with_hint("请等待当前安装结束，或取消后再重试。")
+    let _busy = BusyGuard::try_lock().ok_or_else(|| {
+        GuideError::new("INSTALL_BUSY", "安装或卸载已经在进行中")
+            .with_hint("请等待当前流程结束，或取消后再重试。")
     })?;
-    let mode = install::InstallMode::from_arg(mode.as_deref().unwrap_or("full"));
+    // 续篇 677 配套：from_arg 现返回 Result —— 未知模式在命令层白名单拒绝，
+    // 不再静默回落 Full 触发完整重装。
+    let mode = install::InstallMode::from_arg(mode.as_deref().unwrap_or("full"))
+        .map_err(|e| GuideError::new("INSTALL_BAD_MODE", &e))?;
     let a = app.clone();
     let outcome = tokio::task::spawn_blocking(move || install::run_install(&a, mode))
         .await
@@ -258,7 +329,9 @@ async fn install_run(app: tauri::AppHandle, mode: Option<String>) -> CmdResult<s
                 "install-done",
                 serde_json::json!({ "driver_ok": o.driver_ok }),
             );
-            Ok(serde_json::json!({ "driver_ok": o.driver_ok }))
+            // 首轮 206：Ok 值带终态 —— 前端 install-done 事件若丢失，可凭返回值
+            // 的 status 把进度条从 running 收敛到 done（不再永远转圈）。
+            Ok(serde_json::json!({ "driver_ok": o.driver_ok, "status": "done" }))
         }
         Err(e) => {
             let msg = e.to_string();
@@ -275,14 +348,14 @@ async fn install_run(app: tauri::AppHandle, mode: Option<String>) -> CmdResult<s
 /// 第九部分：卸载（尽力执行全部步骤，逐步回报真实结果）
 #[tauri::command]
 async fn uninstall_run(keep_config: bool) -> CmdResult<serde_json::Value> {
-    let _busy = BusyGuard::try_lock(&UNINSTALL_BUSY).ok_or_else(|| {
-        GuideError::new("UNINSTALL_BUSY", "卸载已经在进行中")
-            .with_hint("请等待当前卸载结束。")
+    let _busy = BusyGuard::try_lock().ok_or_else(|| {
+        GuideError::new("UNINSTALL_BUSY", "安装或卸载已经在进行中")
+            .with_hint("请等待当前流程结束。")
     })?;
     let steps = tokio::task::spawn_blocking(move || install::run_uninstall(keep_config))
         .await
         .map_err(|e| GuideError::new("UNINSTALL_PANIC", &e.to_string()))?;
-    let all_done = steps.iter().all(|s| s.status != "fail");
+    let all_done = steps.iter().all(|s| s.status != install::StepStatus::Fail);
     Ok(serde_json::json!({ "done": all_done, "steps": steps }))
 }
 
@@ -297,45 +370,69 @@ fn main_launch(app: tauri::AppHandle) -> CmdResult {
     start_main_process(Some(&app)).map_err(|e| GuideError::new("MAIN_LAUNCH_FAILED", &e.to_string()))
 }
 
-#[tauri::command]
-fn config_patch(patch: serde_json::Value) -> CmdResult {
+/// 4 文件扇出写盘的唯一实现（首轮 207：config_patch 与 guide_save_config 曾是
+/// 两份逐字重复的扇出 —— 现在两处共用本函数）。
+/// 首轮 208：`load().unwrap_or_default()` 曾把 IO 读失败降级成默认值再被
+/// `save()` 覆盖用户配置 —— Err 一律透传为 CONFIG_WRITE_FAILED。
+fn write_all_configs(patch: &serde_json::Value) -> CmdResult {
     // 写 system.cfg（style/gdi_mode/orientation/opacity/position）
     {
-        let mut sys = config::SystemConfig::load().unwrap_or_default();
-        sys.patch_from_json(&patch);
+        let mut sys = config::SystemConfig::load()
+            .map_err(|e| GuideError::new("CONFIG_WRITE_FAILED", &format!("读取 system.cfg 失败：{e}")))?;
+        sys.patch_from_json(patch);
         sys.save().map_err(|e| GuideError::new("CONFIG_WRITE_FAILED", &e.to_string()))?;
     }
     // 写 appearance.cfg（colors/font_name）
     {
-        let mut app = config::AppearanceConfig::load().unwrap_or_default();
-        app.patch_from_json(&patch);
+        let mut app = config::AppearanceConfig::load()
+            .map_err(|e| GuideError::new("CONFIG_WRITE_FAILED", &format!("读取 appearance.cfg 失败：{e}")))?;
+        app.patch_from_json(patch);
         app.save().map_err(|e| GuideError::new("CONFIG_WRITE_FAILED", &e.to_string()))?;
     }
     // 写 monitor.cfg（items/per_item_colors/per_item_fonts；order 由 layout 承载）
     {
-        let mut mon = config::MonitorConfig::load().unwrap_or_default();
-        mon.patch_from_json(&patch);
+        let mut mon = config::MonitorConfig::load()
+            .map_err(|e| GuideError::new("CONFIG_WRITE_FAILED", &format!("读取 monitor.cfg 失败：{e}")))?;
+        mon.patch_from_json(patch);
         mon.save().map_err(|e| GuideError::new("CONFIG_WRITE_FAILED", &e.to_string()))?;
     }
     // 写布局文件（order → layout_h.cfg / layout_v.cfg，按当前激活布局决定文件名）
     {
-        let sys_for_layout = config::SystemConfig::load().unwrap_or_default();
+        let sys_for_layout = config::SystemConfig::load()
+            .map_err(|e| GuideError::new("CONFIG_WRITE_FAILED", &format!("读取 system.cfg 失败：{e}")))?;
         let vertical = sys_for_layout.layout == "vertical";
-        let mut lay = config::LayoutConfig::load(vertical).unwrap_or_default();
-        lay.patch_from_json(&patch);
+        let mut lay = config::LayoutConfig::load(vertical)
+            .map_err(|e| GuideError::new("CONFIG_WRITE_FAILED", &format!("读取布局文件失败：{e}")))?;
+        lay.patch_from_json(patch);
         lay.save(vertical).map_err(|e| GuideError::new("CONFIG_WRITE_FAILED", &e.to_string()))?;
     }
     Ok(())
 }
 
 #[tauri::command]
+fn config_patch(patch: serde_json::Value) -> CmdResult {
+    write_all_configs(&patch)
+}
+
+#[tauri::command]
 fn main_reload_config() -> CmdResult {
-    notify_main_reload_config();
-    Ok(())
+    // 续篇 650：投递结果不再丢弃 —— 送达失败映射成错误码，前端才知道 reload
+    // 没有真正到达主程序（此前恒返回 Ok 谎报成功）。
+    if notify_main_reload_config() {
+        Ok(())
+    } else {
+        Err(GuideError::new(
+            "MAIN_NOTIFY_FAILED",
+            "配置重载消息未能送达主程序（可能未运行）",
+        ))
+    }
 }
 
 // ============ 悬浮窗位置 ============
 
+// 续篇 651：screen_w/screen_h 曾"计算并序列化但全仓零读取"—— 保留字段并改为
+// 实际消费：第 12 页（Page12Position）用它们做坐标越界校验（fetchOverlayRect 落
+// 到 state.boot.screen）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverlayRect {
     pub x: i32,
@@ -362,17 +459,23 @@ fn overlay_get_rect() -> CmdResult<OverlayRect> {
 
         let hwnd = unsafe { FindWindowW(PCWSTR(class_w.as_ptr()), PCWSTR::null()) };
         if let Ok(hwnd) = hwnd {
-            let mut rect = RECT::default();
-            if unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok() {
-                let screen = get_primary_screen_size();
-                return Ok(OverlayRect {
-                    x: rect.left,
-                    y: rect.top,
-                    width: rect.right - rect.left,
-                    height: rect.bottom - rect.top,
-                    screen_w: screen.width,
-                    screen_h: screen.height,
-                });
+            // 首轮 013：只取第一个 HWND 会命中同名类/残留窗口 —— 复用 012 的
+            // 归属校验；失败留日志后回落到配置路径，不再静默拿错窗口。
+            if process::hwnd_belongs_to_main_process(hwnd) {
+                let mut rect = RECT::default();
+                if unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok() {
+                    let screen = get_primary_screen_size();
+                    return Ok(OverlayRect {
+                        x: rect.left,
+                        y: rect.top,
+                        width: rect.right - rect.left,
+                        height: rect.bottom - rect.top,
+                        screen_w: screen.width,
+                        screen_h: screen.height,
+                    });
+                }
+            } else {
+                tracing::warn!("overlay_get_rect: 命中的窗口不属于主程序进程，忽略");
             }
         }
     }
@@ -405,14 +508,25 @@ fn overlay_get_rect() -> CmdResult<OverlayRect> {
 
 #[tauri::command]
 fn overlay_set_position(x: i32, y: i32) -> CmdResult {
+    // 续篇 652：写盘前按主屏钳制 —— 拒绝把悬浮窗写到屏外
+    // （第 12 页前端用同一份 screen 尺寸做了同口径校验）。
+    let screen = get_primary_screen_size();
+    let x = x.clamp(0, screen.width as i32 - 1);
+    let y = y.clamp(0, screen.height as i32 - 1);
+
     // 写 system.cfg
     let mut sys = config::SystemConfig::load().unwrap_or_default();
     sys.x = x;
     sys.y = y;
     sys.save().map_err(|e| GuideError::new("CONFIG_WRITE_FAILED", &e.to_string()))?;
 
-    // 通知主程序
-    notify_main_reload_config();
+    // 通知主程序（续篇 650：投递失败不再静默）
+    if !notify_main_reload_config() {
+        return Err(GuideError::new(
+            "MAIN_NOTIFY_FAILED",
+            "位置已写入，但重载消息未能送达主程序",
+        ));
+    }
     Ok(())
 }
 
@@ -427,6 +541,17 @@ fn autostart_set(enabled: bool) -> CmdResult {
     set_autostart_run_key(enabled)
         .map_err(|e| GuideError::new("AUTOSTART_WRITE_FAILED", &e))?;
 
+    // 续篇 653：非 Windows 无 Run 键可写 —— 返回"不支持"而不是谎报已开启
+    // （旧实现非 Windows 也把 sys.autostart 写成 true 并返回 Ok）。
+    #[cfg(not(windows))]
+    {
+        let _ = enabled;
+        return Err(GuideError::new(
+            "AUTOSTART_UNSUPPORTED",
+            "当前平台不支持开机自启",
+        ));
+    }
+
     let mut sys = config::SystemConfig::load().unwrap_or_default();
     sys.autostart = enabled;
     sys.save().map_err(|e| GuideError::new("AUTOSTART_WRITE_FAILED", &e.to_string()))?;
@@ -434,11 +559,38 @@ fn autostart_set(enabled: bool) -> CmdResult {
     Ok(())
 }
 
+/// 按 CommandLineToArgvW 规则给路径加引号并转义（首轮 654）。
+/// 尾随反斜杠的目录名（如 `C:\Program Files\AAX\`）会吃掉收尾引号写坏启动命令。
+fn quote_and_escape(p: &str) -> String {
+    let mut out = String::with_capacity(p.len() + 3);
+    out.push('"');
+    let mut slashes = 0usize;
+    for ch in p.chars() {
+        match ch {
+            '\\' => {
+                slashes += 1;
+            }
+            '"' => {
+                out.push_str(&"\\".repeat(slashes * 2 + 2));
+                slashes = 0;
+                out.push('"');
+            }
+            _ => {
+                out.push_str(&"\\".repeat(slashes));
+                slashes = 0;
+                out.push(ch);
+            }
+        }
+    }
+    // 收尾的反斜杠必须翻倍，防止转义掉结束引号
+    out.push_str(&"\\".repeat(slashes * 2));
+    out.push('"');
+    out
+}
+
 /// 写/删 HKCU 的 Run 值。返回 `Err(描述)` 而不是静默吞掉返回值。
 #[cfg(windows)]
 fn set_autostart_run_key(enabled: bool) -> Result<(), String> {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
     use windows::Win32::System::Registry::{
         RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, RegCloseKey, HKEY_CURRENT_USER, KEY_WRITE,
         REG_SZ,
@@ -450,7 +602,19 @@ fn set_autostart_run_key(enabled: bool) -> Result<(), String> {
     let value_name_w =
         aaxsyspulse_core::contract::wide_of(aaxsyspulse_core::contract::RUN_VALUE_GUIDE);
     let value_name = windows::core::PCWSTR::from_raw(value_name_w.as_ptr());
-    let subkey_wide: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
+    let subkey_wide = aaxsyspulse_core::contract::wide_of(subkey);
+
+    // 首轮 209：先取 exe 路径、再开注册表 —— 旧代码在 RegOpenKeyExW 成功后、
+    // RegCloseKey 前用 `current_exe()?` 提前返回，泄漏 HKEY。
+    // 首轮 654：路径按 CommandLineToArgvW 规则加引号转义 + OsStr::encode_wide
+    // 直写（to_string_lossy + 只首尾加引号会写坏含尾随反斜杠/引号的路径）。
+    let exe_path = std::env::current_exe().map_err(|e| format!("取不到自身路径：{e}"))?;
+    let exe_str = match exe_path.clone().into_os_string().into_string() {
+        Ok(s) => s,
+        Err(os) => os.to_string_lossy().to_string(), // 极端非 UTF-8 路径：退化为替换字符
+    };
+    let exe_value = format!("{} --autostart", quote_and_escape(&exe_str));
+    let exe_wide = aaxsyspulse_core::contract::wide_of(&exe_value);
 
     unsafe {
         let mut hkey = std::mem::zeroed();
@@ -466,11 +630,6 @@ fn set_autostart_run_key(enabled: bool) -> Result<(), String> {
             return Err(format!("无法打开注册表项 {subkey}"));
         }
         let result = if enabled {
-            // 获取引导程序 exe 路径，并附加 --autostart 参数
-            let exe_path = std::env::current_exe().map_err(|e| format!("取不到自身路径：{e}"))?;
-            let exe_str = format!("\"{}\" --autostart", exe_path.to_string_lossy());
-            let exe_wide: Vec<u16> =
-                OsStr::new(&exe_str).encode_wide().chain(std::iter::once(0)).collect();
             // windows 0.61 的这两个注册表函数返回 `WIN32_ERROR` 而非 `Result`，
             // 必须显式判码 —— 旧代码的 `let _ =` 连错误码都不看。
             let err = RegSetValueExW(
@@ -568,15 +727,19 @@ fn load_config_from_ini() -> serde_json::Value {
     }
 
     // 全局数值色：主程序没有「全局数值色」字段，数值色落在逐项 `[item.N] color_v`。
-    // 取 9 项 color_v 的**公共值**；为空或不一致（例如配置只由主程序生成过）
+    // 取全部项 color_v 的**公共值**；为空或不一致（例如配置只由主程序生成过）
     // 则回落到前端默认绿。
-    let value_color = if mon.items.len() == 9
-        && mon.items.iter().all(|i| !i.color_v.is_empty())
-        && mon.items.iter().all(|i| i.color_v == mon.items[0].color_v)
-    {
-        mon.items[0].color_v.clone()
-    } else {
-        "#34A853".to_string()
+    // 续篇 655：判据改用 METRIC_COUNT 常量（曾写死 9），公共值按 id 显式取
+    // （曾直接取 items[0]，依赖下标顺序）。
+    let value_color = match mon.items.iter().find(|i| i.id == 1) {
+        Some(first)
+            if mon.items.len() == config::METRIC_COUNT
+                && mon.items.iter().all(|i| !i.color_v.is_empty())
+                && mon.items.iter().all(|i| i.color_v == first.color_v) =>
+        {
+            first.color_v.clone()
+        }
+        _ => "#34A853".to_string(),
     };
 
     // 名称显示方式：从 monitor.cfg 反推（有损恢复用；无损恢复走前端 guide_state 快照）。
@@ -619,11 +782,17 @@ fn load_config_from_ini() -> serde_json::Value {
         },
         "per_item_colors": serde_json::Value::Null,
         "opacity": sys.normal_opacity,
-        "font_name": app.font_size as u32,
-        "font_value": app.font_size as u32,
+        // 首轮 211：as u32 曾把 13.5 截成 13 —— round 后下发单一 font_size。
+        "font_name": app.font_size.round() as u32,
         "font_weight": app.font_weight,
         "per_item_fonts": serde_json::Value::Null,
-        "position": { "x": sys.x, "y": sys.y }
+        // 续篇 656：x/y = -1 是"未设置"哨兵（core 半哨兵口径）—— 原样下发曾让
+        // 第 12 页输入面板显示 -1。缺任一坐标就不下发。
+        "position": if sys.x >= 0 && sys.y >= 0 {
+            serde_json::json!({ "x": sys.x, "y": sys.y })
+        } else {
+            serde_json::Value::Null
+        }
     })
 }
 
@@ -636,30 +805,8 @@ fn config_load() -> CmdResult<serde_json::Value> {
 
 #[tauri::command]
 fn guide_save_config(config: serde_json::Value) -> CmdResult {
-    // 通过 config_patch 逻辑写 INI 文件
-    {
-        let mut sys = config::SystemConfig::load().unwrap_or_default();
-        sys.patch_from_json(&config);
-        sys.save().map_err(|e| GuideError::new("CONFIG_WRITE_FAILED", &e.to_string()))?;
-    }
-    {
-        let mut app = config::AppearanceConfig::load().unwrap_or_default();
-        app.patch_from_json(&config);
-        app.save().map_err(|e| GuideError::new("CONFIG_WRITE_FAILED", &e.to_string()))?;
-    }
-    {
-        let mut mon = config::MonitorConfig::load().unwrap_or_default();
-        mon.patch_from_json(&config);
-        mon.save().map_err(|e| GuideError::new("CONFIG_WRITE_FAILED", &e.to_string()))?;
-    }
-    // 写布局文件（order → layout_h.cfg / layout_v.cfg，按当前激活布局决定文件名）
-    {
-        let sys_for_layout = config::SystemConfig::load().unwrap_or_default();
-        let vertical = sys_for_layout.layout == "vertical";
-        let mut lay = config::LayoutConfig::load(vertical).unwrap_or_default();
-        lay.patch_from_json(&config);
-        lay.save(vertical).map_err(|e| GuideError::new("CONFIG_WRITE_FAILED", &e.to_string()))?;
-    }
+    // 通过 write_all_configs（首轮 207 抽取的共用实现）写 4 组 INI 文件
+    write_all_configs(&config)?;
 
     // 注意：**不清除** incomplete 标记 —— 用户要求「中途退出时保留上一页与之前的设定」，
     // 因此「保存」后退出仍能续引导。只有「完成引导」(guide_finish) 与
@@ -672,19 +819,23 @@ fn guide_backup(page: u32, path: String, snapshot: serde_json::Value) -> CmdResu
     // 备份「当前页 + 完整设置快照」到 guide_state.json。
     // 中途退出后据此**无损**续引导（含 name_mode / 逐项颜色字号等 INI 无法反推的字段）。
     // 「重新引导 / 不保存」会删除该文件；「完成引导」把 incomplete 置回 false。
-    let mut state = GuideState::load().unwrap_or_default();
-    state.incomplete = true;
-    state.last_page = page;
-    state.path = path;
-    if let Some(s) = snapshot.get("style").and_then(|v| v.as_str()) {
-        state.style = s.to_string();
-    }
-    state.snapshot = snapshot;
-    state.timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    state.save().map_err(|e| GuideError::new("CONFIG_WRITE_FAILED", &e.to_string()))
+    // 续篇 669：整个 load→改→save 序列持锁 —— 前端 scheduleBackup/flushBackup
+    // 可并发发两次 guide_backup，无锁时后写覆盖先写。
+    GuideState::with_state_lock(|| {
+        let mut state = GuideState::load().unwrap_or_default();
+        state.incomplete = true;
+        state.last_page = page;
+        state.path = path;
+        if let Some(s) = snapshot.get("style").and_then(|v| v.as_str()) {
+            state.style = s.to_string();
+        }
+        state.snapshot = snapshot;
+        state.timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        state.save().map_err(|e| GuideError::new("CONFIG_WRITE_FAILED", &e.to_string()))
+    })
 }
 
 #[tauri::command]
@@ -694,34 +845,52 @@ fn guide_reset_state() -> CmdResult {
 }
 
 #[tauri::command]
-fn guide_finish(create_shortcut: bool) -> CmdResult {
+fn guide_finish(create_shortcut: bool) -> CmdResult<serde_json::Value> {
     // 1. config.json 已由前端 saveConfig 保存
     // 2. 清除 incomplete 标记（审查项 7.2.4 / P1-21：旧写法 `let _ = state.save()`
     //    把失败吞掉 ⇒ 引导已"完成"，下次启动却仍弹"继续上次引导"。这里不阻断完成
     //    流程（配置本身已写盘成功），但必须留痕。）
-    if let Ok(mut state) = GuideState::load() {
-        state.incomplete = false;
-        if let Err(e) = state.save() {
-            install::log_install("清除引导断点标记", "失败", Some(&e.to_string()));
+    //    首轮 212：load 失败也曾被 `if let Ok` 静默吞掉 —— 与"必须留痕"注释不符，
+    //    load 失败同样写一条日志。
+    GuideState::with_state_lock(|| {
+        match GuideState::load() {
+            Ok(mut state) => {
+                state.incomplete = false;
+                if let Err(e) = state.save() {
+                    install::log_install("清除引导断点标记", "失败", Some(&e.to_string()));
+                }
+            }
+            Err(e) => {
+                install::log_install("清除引导断点标记", "失败", Some(&format!("读取存档失败：{e}")));
+            }
         }
-    }
+    });
     // 3. 通知主程序刷新
     notify_main_reload_config();
-    // 4. 创建快捷方式（可选）——失败必须可见：这是用户勾选项，静默失败 = 谎报成功
+    // 4. 创建快捷方式（可选）——失败必须可见：这是用户勾选项，静默失败 = 谎报成功。
+    //    首轮 213：结果透传给前端（shortcut_created / shortcut_error），
+    //    不再只写 install.log 且命令仍返回 Ok。
+    let mut shortcut_created = false;
+    let mut shortcut_error: Option<String> = None;
     if create_shortcut {
         match create_desktop_shortcut() {
-            Ok(path) => install::log_install(
-                "创建桌面快捷方式",
-                "成功",
-                Some(&path.to_string_lossy()),
-            ),
-            Err(e) => install::log_install("创建桌面快捷方式", "失败", Some(&e.to_string())),
+            Ok(path) => {
+                shortcut_created = true;
+                install::log_install("创建桌面快捷方式", "成功", Some(&path.to_string_lossy()));
+            }
+            Err(e) => {
+                shortcut_error = Some(e.to_string());
+                install::log_install("创建桌面快捷方式", "失败", Some(&e.to_string()));
+            }
         }
     }
     // 5. 通知主程序快速重启：重启后从盘重读全部配置（含新逐项命名模式），
     //    新进程天然完成采样器/驱动的重新初始化。消息按队列顺序排在 reload 之后。
     notify::notify_main_quick_restart();
-    Ok(())
+    Ok(serde_json::json!({
+        "shortcut_created": shortcut_created,
+        "shortcut_error": shortcut_error,
+    }))
 }
 
 /// 删除引导程序自身（第 14 页「删除引导文件」）。
@@ -781,16 +950,23 @@ fn guide_delete_self() -> CmdResult<String> {
     Ok("非 Windows 平台：已清除引导存档。".to_string())
 }
 
+/// 退出前的延迟毫秒数（首轮 214：裸魔数 120 提为具名常量）
+const QUIT_DELAY_MS: u64 = 120;
+
 #[tauri::command]
 fn app_quit_all(app: tauri::AppHandle) -> CmdResult {
     // 旧实现是 `std::process::exit(0)`：命令在 Tauri 线程里当场终止进程 ⇒
     // 前端的 Promise 永不 settle，`quitted.value = true` 与其后的整条分支不可达
     // （报告 9.9）。现在先把 Ok 回给前端，再让 Tauri 走正常收尾流程。
-    std::thread::spawn(move || {
-        // 留一点时间让 invoke 的响应送达渲染进程
-        std::thread::sleep(std::time::Duration::from_millis(120));
-        app.exit(0);
-    });
+    // 首轮 214：重复点击曾每次 spawn 一个 sleep 线程 —— 原子标志保证只排一次。
+    static QUIT_SCHEDULED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !QUIT_SCHEDULED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        std::thread::spawn(move || {
+            // 留一点时间让 invoke 的响应送达渲染进程
+            std::thread::sleep(std::time::Duration::from_millis(QUIT_DELAY_MS));
+            app.exit(0);
+        });
+    }
     Ok(())
 }
 
@@ -815,31 +991,46 @@ fn decrypt_log(data: &[u8]) -> Vec<u8> {
 /// 写入方（run 的 tracing）与读取方（guide_view_logs）必须共用这一个来源，
 /// 之前两处各写一份路径常量，读取方多写了一个 `C`，永远读不到自己写的日志。
 fn guide_log_dir() -> std::path::PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_default()
-        .join(aaxsyspulse_core::contract::INSTALL_DIR_NAME)
-        .join("logs")
+    // 续篇 672：日志目录唯一出处 = install::logs_dir()，不再各自 join("logs")。
+    install::logs_dir().unwrap_or_default()
 }
+
+/// 日志查看的默认行数（续篇 657：曾默认 200，而 bridge.js / GuideWizard.vue 都是
+/// 400 —— 统一到 400；上限 .min(2000) 保留，实际生效行数经返回值 `lines` 回传）。
+const DEFAULT_LOG_LINES: usize = 400;
+const MAX_LOG_LINES: usize = 2000;
 
 #[tauri::command]
 fn guide_view_logs(lines: Option<usize>) -> CmdResult<serde_json::Value> {
     let log_dir = guide_log_dir();
 
-    let count = lines.unwrap_or(200).min(2000);
-    let mut all_content = String::new();
+    let count = lines.unwrap_or(DEFAULT_LOG_LINES).min(MAX_LOG_LINES);
 
     // 读取所有日志文件（按修改时间倒序）
+    // 首轮 215：read_dir 失败曾返回空 content 且 r.ok=true，用户以为"暂无日志"。
     let mut files: Vec<_> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&log_dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            if entry.path().extension().is_some_and(|ext| ext == "log") {
-                files.push(entry);
+    match std::fs::read_dir(&log_dir) {
+        Ok(entries) => {
+            for entry in entries.filter_map(|e| e.ok()) {
+                // 续篇 658：扩展名比较改大小写不敏感 —— `.LOG` 曾被漏读。
+                if entry.path().extension().is_some_and(|ext| ext.eq_ignore_ascii_case("log")) {
+                    files.push(entry);
+                }
             }
+        }
+        Err(e) => {
+            return Err(GuideError::new(
+                "LOG_DIR_READ_FAILED",
+                &format!("读取日志目录失败：{}（{e}）", log_dir.display()),
+            ));
         }
     }
 
     files.sort_by_key(|e| std::cmp::Reverse(e.metadata().and_then(|m| m.modified()).ok()));
 
+    // 首轮 216：旧实现把三个文件全文 push 后统一 `lines().rev().take(count)` ——
+    // 取到的是**最旧**文件末尾的旧日志。改为逐文件取各自尾部，再合并取前 count 行。
+    let mut merged_rev: Vec<String> = Vec::new();
     for entry in files.into_iter().take(3) {
         let Ok(data) = std::fs::read(entry.path()) else { continue };
         // 只有 guide_*.log 经过 XOR 混淆；install.log 是明文，异或后会变成乱码。
@@ -853,13 +1044,18 @@ fn guide_view_logs(lines: Option<usize>) -> CmdResult<serde_json::Value> {
             data
         };
         if let Ok(s) = String::from_utf8(bytes) {
-            all_content.push_str(&s);
+            let tail_rev: Vec<String> = s.lines().rev().take(count).map(|l| l.to_string()).collect();
+            merged_rev.extend(tail_rev);
         }
     }
-
-    // 取最后 count 行
-    let all_lines: Vec<_> = all_content.lines().rev().take(count).collect();
-    let result: String = all_lines.into_iter().rev().collect::<Vec<_>>().join("\n");
+    let result: String = merged_rev
+        .into_iter()
+        .take(count)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
 
     Ok(serde_json::json!({
         "path": log_dir.to_string_lossy(),
@@ -923,6 +1119,24 @@ impl std::io::Write for EncryptedLogWriter {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 首轮 201：启动旗标入口集中解析一次（三处 args().any 全量扫描就此收敛）
+    let _ = LAUNCH_FLAGS.get_or_init(LaunchFlags::parse);
+
+    // 首轮 219：引导侧此前没有 panic hook —— `run()` 末尾的 `.expect` 崩掉时
+    // 窗口线程静默消失。最小 set_hook：panic 摘要另存一份明文 guide_panic.log
+    // （不能写进 XOR 日志 —— 明文追加会破坏按绝对偏移取密钥流的解密对齐）。
+    let panic_log_dir = guide_log_dir();
+    let _ = std::fs::create_dir_all(&panic_log_dir);
+    std::panic::set_hook(Box::new(move |info| {
+        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let line = format!("[{ts}] PANIC: {info}\n");
+        let path = panic_log_dir.join("guide_panic.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            use std::io::Write;
+            let _ = f.write_all(line.as_bytes());
+        }
+    }));
+
     // 日志目录：%LOCALAPPDATA%\AAXSysPulse\logs\
     let log_dir = guide_log_dir();
     let _ = std::fs::create_dir_all(&log_dir);
@@ -949,29 +1163,46 @@ pub fn run() {
         pos,
     })));
 
-    let _ = tracing_subscriber::fmt()
+    // 首轮 217：try_init 的结果不再 `let _` 丢弃 —— 失败留痕（subscriber 已被占用
+    // 时 tracing 输出会整体丢失）。直接经由同一 writer 追加一条 XOR 对齐的记录。
+    let fail_writer = writer.clone();
+    if tracing_subscriber::fmt()
         .with_env_filter("info")
         .with_writer(move || writer.clone())
         .with_ansi(false)
-        .try_init();
+        .try_init()
+        .is_err()
+    {
+        use std::io::Write;
+        let mut w = fail_writer;
+        let _ = w.write_all("[tracing] subscriber init failed: tracing 日志将不会记录\n".as_bytes());
+    }
 
-    // --autostart 模式：引导程序自启后启动主程序，然后退出
-    if std::env::args().any(|a| a == "--autostart") {
+    // --autostart 模式：引导程序自启后启动主程序，然后退出。
+    // 首轮 217：start_main_process 的返回值不再丢弃 —— 拉起失败非零退出，
+    // 否则系统以为自启成功而主程序根本没起。
+    if launch_flags().autostart {
         if !is_main_process_running() {
-            let _ = start_main_process(None);
+            if let Err(e) = start_main_process(None) {
+                tracing::error!("--autostart 启动主程序失败：{e}");
+                std::process::exit(2);
+            }
         }
         std::process::exit(0);
     }
 
-    // 单实例：拿到锁才继续；已被占用则直接退出。
+    // 单实例：拿到锁才继续；已被占用则把已有窗口带到前台后退出（首轮 218 /
+    // 首轮 240 引导侧：直接 exit(1) 曾让用户点图标"没反应"——投递 WM_OPEN_SETTINGS
+    // 给主程序窗口（契约常量，主程序 UIPI 白名单已放行）再退出）。
     // 锁句柄在 process 模块内故意不 CloseHandle，靠进程退出释放。
     if !acquire_guide_single_instance() {
-        eprintln!("Another guide instance is already running");
-        std::process::exit(1);
+        notify::notify_main_open_settings();
+        std::process::exit(0);
     }
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
+        // 续篇 659：tauri_plugin_opener 前端零调用，插件与 capabilities 里的
+        // opener:default 一并移除（见 Cargo.toml / capabilities/default.json）。
         .invoke_handler(tauri::generate_handler![
             // 生命周期
             guide_bootstrap,

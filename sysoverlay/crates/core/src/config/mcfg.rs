@@ -72,7 +72,9 @@ fn block(name: &str, content: &str) -> String {
 /// 解析 `.mcfg` 容器，返回若干 `(文件名, 文件内容)`。
 /// 失败返回 `Err`（如缺少 `MCFG1` 头）。
 pub fn parse_mcfg(text: &str) -> Result<Vec<(String, String)>, String> {
-    if !text.starts_with(MAGIC) {
+    // 审查 047：MAGIC 必须独占首行，"MCFG1garbage" 不得被接受。
+    let first_line = text.lines().next().unwrap_or("").trim_end();
+    if first_line != MAGIC {
         return Err("不是合法的 MCFG 容器（缺少 MCFG1 头）".into());
     }
 
@@ -82,22 +84,28 @@ pub fn parse_mcfg(text: &str) -> Result<Vec<(String, String)>, String> {
 
     for line in text.lines() {
         let t = line.trim_end();
-        if let Some(name) = t.strip_prefix("--- ") {
-            if let Some(n) = name.strip_suffix(" ---") {
-                if let Some(prev) = cur_name.take() {
-                    files.push((prev, cur_body.join("\n")));
-                    cur_body.clear();
-                }
-                cur_name = Some(n.trim().to_string());
-                continue;
-            }
-        }
+        // 审查 045：END 判据必须先于段头判据，否则 "--- END ---" 会被
+        // strip_prefix/strip_suffix 拆成名为 "END" 的段头，END 分支永不可达。
         if t == "--- END ---" {
             if let Some(prev) = cur_name.take() {
                 files.push((prev, cur_body.join("\n")));
                 cur_body.clear();
             }
             break;
+        }
+        if let Some(name) = t.strip_prefix("--- ") {
+            if let Some(n) = name.strip_suffix(" ---") {
+                if let Some(prev) = cur_name.take() {
+                    files.push((prev, cur_body.join("\n")));
+                    cur_body.clear();
+                }
+                let n = n.trim();
+                // 审查 048：解析处直接过滤白名单外段名，防注入任意路径。
+                if is_known_file(n) {
+                    cur_name = Some(n.to_string());
+                }
+                continue;
+            }
         }
         if cur_name.is_some() {
             cur_body.push(line.to_string());
@@ -136,7 +144,12 @@ mod tests {
 
     #[test]
     fn mcfg_roundtrip() {
-        let cfg = Config::default();
+        // 审查 647：从非默认配置出发，避免"parse 什么都没改也通过"的假阳性。
+        let mut cfg = Config::default();
+        cfg.render_style = RenderStyle::Vertical;
+        cfg.normal_opacity = 77;
+        cfg.interval_ms = 200;
+        cfg.autostart = true;
         let text = export_config(&cfg);
         assert!(text.starts_with(MAGIC));
         assert!(text.contains("--- system.cfg ---"));
@@ -145,17 +158,25 @@ mod tests {
 
         let files = parse_mcfg(&text).expect("解析应成功");
         let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+        // 审查 046：精确断言块数量，且 END 不得被当成段名解析进来。
+        assert_eq!(files.len(), 4, "应为 4 个文件块（仅当前激活布局）");
+        assert!(!names.contains(&"END"));
         assert!(names.contains(&system::SYSTEM_FILE));
+        assert!(names.contains(&appearance::APPEARANCE_FILE));
         assert!(names.contains(&monitor::MONITOR_FILE));
-        // 当前激活布局应为 layout_h.cfg（默认 Strip）
-        assert!(names.contains(&LAYOUT_H_FILE));
+        // 激活布局为 Vertical ⇒ 携带 layout_v.cfg
+        assert!(names.contains(&LAYOUT_V_FILE));
+        assert!(!names.contains(&LAYOUT_H_FILE));
 
-        // 重新落盘后应与直接序列化一致
+        // 重新落盘后应与直接序列化一致（逐字段）
         for (name, content) in &files {
             if name == system::SYSTEM_FILE {
                 let mut c2 = Config::default();
                 system::parse(&mut c2, content);
                 assert_eq!(c2.render_style, cfg.render_style);
+                assert_eq!(c2.normal_opacity, cfg.normal_opacity);
+                assert_eq!(c2.interval_ms, cfg.interval_ms);
+                assert_eq!(c2.autostart, cfg.autostart);
             }
         }
     }
@@ -166,13 +187,29 @@ mod tests {
         cfg.admin_check_continue_count = 3;
         cfg.admin_check_last_date = 20260914;
         let text = export_config(&cfg);
-        // 脱敏后容器里不应再出现这些计数值
+        // 审查 648：脱敏断言 —— 关键是**值**被抹成 0（键名仍在序列化输出里），
+        // 原断言只比"精确串 3"，序列化格式一变（无空格/多空格）即假通过。
+        // mcfg 容器走 INI（` = `），断言"键名后跟的值不是原隐私值"的两种形态都不出现。
         assert!(!text.contains("admin_check_continue_count = 3"));
         assert!(!text.contains("admin_check_last_date = 20260914"));
+        // 脱敏后必须写出显式的 0 值（而不是整键消失 —— 保留键结构才能被旧版读回）。
+        assert!(text.contains("admin_check_continue_count = 0"));
+        assert!(text.contains("admin_check_last_date = 0"));
     }
 
     #[test]
     fn parse_mcfg_rejects_bad_magic() {
         assert!(parse_mcfg("not a container").is_err());
+        assert!(parse_mcfg("MCFG1garbage").is_err());
+    }
+
+    /// 白名单外的段名在解析处被跳过（审查 048），body 不得混入结果。
+    #[test]
+    fn parse_mcfg_skips_unknown_sections() {
+        let text = "MCFG1\n--- evil.cfg ---\njunk\n--- system.cfg ---\ntopmost = 1\n--- END ---\n";
+        let files = parse_mcfg(text).expect("解析应成功");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, system::SYSTEM_FILE);
+        assert!(files[0].1.contains("topmost = 1"));
     }
 }

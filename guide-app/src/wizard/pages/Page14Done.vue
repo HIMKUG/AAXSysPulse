@@ -1,8 +1,13 @@
 <script setup>
-import { onMounted } from 'vue'
+import { onMounted, ref } from 'vue'
 import { state, fetchInstallInfo } from '../composables/useGuide.js'
 
-onMounted(() => fetchInstallInfo()) // 取真实安装路径与占用数据
+// 续篇 260：fetchInstallInfo 失败不再静默 —— 留一行提示
+const infoFailed = ref(false)
+onMounted(async () => {
+  const ok = await fetchInstallInfo() // 取真实安装路径与占用数据
+  infoFailed.value = !ok
+})
 </script>
 
 <template>
@@ -15,17 +20,23 @@ onMounted(() => fetchInstallInfo()) // 取真实安装路径与占用数据
       </h1>
 
       <div class="stat-grid" style="margin-top: var(--sp-10)">
-        <div v-if="state.stats.cpu" class="stat-card rise" style="--rise-delay: 200ms">
+        <!-- 续篇 733：v-if 让卡片在数据到达时才插入，原 200/300ms 延迟相对插入
+             时刻而非页面进入时刻 —— 错峰节奏失真。改为到达即入场（0/100ms）。 -->
+        <div v-if="state.stats.cpu" class="stat-card rise" style="--rise-delay: 0ms">
           <span class="stat-card__num">{{ state.stats.cpu }}</span>
           <span class="stat-card__desc">CPU 平均占用</span>
           <span class="stat-card__desc">自本次启动以来的实测均值</span>
         </div>
-        <div v-if="state.stats.mem" class="stat-card rise" style="--rise-delay: 300ms">
+        <div v-if="state.stats.mem" class="stat-card rise" style="--rise-delay: 100ms">
           <span class="stat-card__num">{{ state.stats.mem }}</span>
           <span class="stat-card__desc">内存占用</span>
           <span class="stat-card__desc">任务管理器同款工作集口径</span>
         </div>
       </div>
+
+      <p v-if="infoFailed" class="done-text t-center rise" style="color: var(--text-secondary); --rise-delay: 120ms">
+        运行数据暂时不可用，可稍后在左上角「日志」中查看原因。
+      </p>
 
       <p class="done-text t-center rise" style="--rise-delay: 500ms">
         <template v-if="state.boot.installPath">

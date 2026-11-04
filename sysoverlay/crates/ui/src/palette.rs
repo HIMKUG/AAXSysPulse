@@ -4,7 +4,7 @@
 //! 这里只做表示层转换，不再复制一份阈值判断。
 
 use crate::render::Rgba;
-use aaxsyspulse_core::color::{Palette as CorePalette, Rgb};
+use aaxsyspulse_core::color::{Palette as CorePalette, Rgb, STALE_DESATURATION};
 
 /// 渲染期使用的调色板（预乘 alpha）。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -40,8 +40,8 @@ impl UiPalette {
             name: opaque(core.name),
             value: opaque(core.value),
             sub: opaque(core.sub),
-            name_stale: opaque(core.name.desaturate(0.55)),
-            value_stale: opaque(core.value.desaturate(0.55)),
+            name_stale: opaque(core.name.desaturate(STALE_DESATURATION)),
+            value_stale: opaque(core.value.desaturate(STALE_DESATURATION)),
         }
     }
 }
@@ -86,7 +86,7 @@ impl Style {
 
 impl Default for Style {
     fn default() -> Self {
-        Self::derive(Rgb::default(), Rgb::new(238, 241, 244))
+        Self::derive(Rgb::default(), aaxsyspulse_core::color::DEFAULT_FG)
     }
 }
 
@@ -104,7 +104,12 @@ mod tests {
     #[test]
     fn stale_colors_are_more_gray_than_fresh() {
         let s = Style::default();
-        let spread = |c: Rgba| (c.r as i32 - c.b as i32).abs();
+        // 审查 506：单量 R-B 在 R==B 的颜色上恒 0，改用三通道极差。
+        let spread = |c: Rgba| {
+            let mn = c.r.min(c.g).min(c.b) as i32;
+            let mx = c.r.max(c.g).max(c.b) as i32;
+            mx - mn
+        };
         assert!(
             spread(s.ui.value_stale) <= spread(s.ui.value),
             "陈旧值的通道离散度必须更小（更灰）"
@@ -114,9 +119,11 @@ mod tests {
     #[test]
     fn accent_delegates_to_core() {
         let s = Style::default();
-        assert_eq!(s.accent(90.0), Rgba::opaque(248, 113, 113));
+        // 审查 115：与 core 阈值结果比对，core 调阈值时本测试不再误报。
+        let hot = s.core.hot;
+        assert_eq!(s.accent(90.0), Rgba::opaque(hot.r, hot.g, hot.b));
         let stale = s.stale_accent(90.0);
-        assert!(stale.r < 248, "陈旧强调色必须更暗");
+        assert!(stale.r < hot.r, "陈旧强调色必须更暗");
     }
 
     #[test]
