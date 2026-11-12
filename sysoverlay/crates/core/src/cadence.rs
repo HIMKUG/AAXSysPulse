@@ -37,6 +37,10 @@ pub const EMA_ALPHA: f32 = 0.3;
 
 // 审查 097：编译期关系断言放在模块顶层（普通构建也生效）；原先写在
 // #[cfg(test)] 测试体内的 const 断言在 release 构建里根本不存在。
+// clippy assertions_on_constants：原测试体里的 `assert!(常量…)` 与这些断言重复，
+// 一并上移到编译期，测试模块随之删除。
+const _: () = assert!(EMA_ALPHA > 0.0 && EMA_ALPHA <= 1.0);
+const _: () = assert!(TICK_MS > 0);
 const _: () = assert!(REFRESH_FLOOR_MS.is_multiple_of(TICK_MS));
 const _: () = assert!(IDLE_MAX_MS > REFRESH_FLOOR_MS);
 
@@ -55,16 +59,3 @@ pub const ACTIVE_CPU_PCT: f32 = 30.0;
 /// Active 水位阈值：网络 ≥ 此值时认为是"持续高负载"（1 MB/s）。
 pub const ACTIVE_NET_BPS: f32 = 1_048_576.0;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 审查 622：`assert_eq!(常量, 1500)` 这类恒真式已删除，常量间关系
-    /// 由模块顶层的编译期断言把关；这里只断言派生量纲。
-    #[test]
-    fn constants_derive_sensibly() {
-        assert!(EMA_ALPHA > 0.0 && EMA_ALPHA <= 1.0);
-        assert!(TICK_MS > 0);
-        assert!(REFRESH_FLOOR_MS % TICK_MS == 0);
-    }
-}

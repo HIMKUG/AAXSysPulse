@@ -34,8 +34,10 @@ fn main() {
     // 注入版本号，保证 lib.rs 的 env! 可编译。
     let is_release = std::env::var("PROFILE").as_deref() == Ok("release");
     if !is_release {
-        println!(
-            "cargo:warning=非 release 构建：跳过主程序同源编译（仅 tauri build 打包需要），\
+        // 走 stderr 而非 cargo:warning —— debug 构建每次都会触发，warning 标记会让
+        // `cargo check/clippy` 的输出恒带一条"告警"，掩盖真正的告警。
+        eprintln!(
+            "guide-app build: 非 release 构建，跳过主程序同源编译（仅 tauri build 打包需要），\
              MAIN_PROGRAM_VERSION 取 CARGO_PKG_VERSION"
         );
         let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());

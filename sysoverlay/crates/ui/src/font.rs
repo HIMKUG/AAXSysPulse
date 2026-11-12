@@ -1002,7 +1002,7 @@ mod perf_path_tests {
         let non_zero = px.iter().filter(|&&v| v != 0).count();
         assert!(non_zero > 0, "快路径什么都没画");
         // 不透明绘制：alpha 通道必须全 255（被覆盖处）
-        let opaque_px = px.chunks_exact(4).filter(|c| c[3] == 255).count();
+        let opaque_px = px.as_chunks::<4>().0.iter().filter(|c| c[3] == 255).count();
         assert!(opaque_px > 0, "不透明像素的 alpha 必须为 255");
     }
 
@@ -1013,7 +1013,7 @@ mod perf_path_tests {
         let semi = Rgba::new(255, 255, 255, 128);
         render_with(&mut px, 'A', 1, semi, 0, 0);
         // 半透明下 A 通道应为 128 量级，而不是快路径的 255
-        let has_semi = px.chunks_exact(4).any(|c| c[3] != 0 && c[3] != 255);
+        let has_semi = px.as_chunks::<4>().0.iter().any(|c| c[3] != 0 && c[3] != 255);
         assert!(has_semi, "半透明应走合成路径");
     }
 }

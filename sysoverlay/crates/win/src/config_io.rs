@@ -5,7 +5,7 @@
 //! - `appearance.cfg`  颜色/字号/间距/阴影描边（含 `[meta]`）
 //! - `monitor.cfg`     监控项开关/顺序/配色/功耗（含 `[meta]`）
 //! - `layout_h.cfg`    横版布局专属（逐指标 4 分量偏移 + order，含 `[meta]`；
-//!                     窗口几何唯一归属 system.cfg，审查 284）
+//!   窗口几何唯一归属 system.cfg，审查 284）
 //! - `layout_v.cfg`    竖版布局专属（含 `[meta]`）
 //!
 //! 旧版单文件 `%APPDATA%\AAXSysPulseC\config.txt`(v2) 启动时若发现且 5 个新文件
@@ -268,10 +268,10 @@ fn write_file_atomic(dir: &std::path::Path, name: &str, content: &str) -> bool {
             windows::core::PCWSTR(wide_target.as_ptr()),
             MOVEFILE_REPLACE_EXISTING,
         );
-        if result.is_err() {
+        if let Err(e) = result {
             // 审查 050：打印 windows crate 返回的错误码 —— 中间再调
             // GetLastError() 的结果可能已被后续调用污染。
-            let hr = result.unwrap_err().code().0 as u32;
+            let hr = e.code().0 as u32;
             eprintln!("[config_io] MoveFileExW 失败: {} (0x{hr:08X})", name);
             let _ = std::fs::remove_file(&temp);
             return false;

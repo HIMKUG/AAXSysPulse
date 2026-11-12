@@ -1999,7 +1999,7 @@ fn find_overlay_hwnd() -> Option<HWND> {
         }
         // 回调已执行完，reconstruct Box 并取结果
         let result = Box::from_raw(result_ptr as *mut Mutex<Option<HWND>>);
-        let found = result.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let found = *result.lock().unwrap_or_else(|e| e.into_inner());
         drop(result);
         found
     }

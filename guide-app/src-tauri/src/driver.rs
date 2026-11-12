@@ -189,8 +189,10 @@ unsafe fn service_binary_path(svc: SC_HANDLE) -> Option<String> {
         return None; // 缓冲内没有 NUL 结尾：拒绝而非越界读
     }
     let wide: Vec<u16> = buf[off..end]
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     String::from_utf16(&wide).ok()
 }

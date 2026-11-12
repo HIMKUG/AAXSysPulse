@@ -55,7 +55,9 @@ fn to_wide(s: &str) -> Vec<u16> {
 
 /// 当前进程的 exe 完整路径（审查 274：循环扩容防截断）。
 fn exe_path() -> Option<String> {
-    let mut buf = [0u16; 512];
+    // 定长数组 + `try_into` 在截断扩容路径上必然失败（1024 → [u16; 512]），
+    // 深路径会 panic 而非重试；改用 Vec + resize 直接扩容（审查 274 的循环重试）。
+    let mut buf = vec![0u16; 512];
     loop {
         let len =
             unsafe { windows::Win32::System::LibraryLoader::GetModuleFileNameW(None, &mut buf) };
@@ -67,8 +69,7 @@ fn exe_path() -> Option<String> {
             return Some(String::from_utf16_lossy(&buf[..l]));
         }
         // 写满（可能截断）→ 扩容重试
-        let bigger = vec![0u16; buf.len() * 2];
-        buf = bigger.try_into().unwrap();
+        buf.resize(buf.len() * 2, 0);
     }
 }
 

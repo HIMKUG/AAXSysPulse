@@ -343,15 +343,12 @@ impl SettingsCtx {
 
     /// 标记单个控件需要重绘。
     fn invalidate_widget(&mut self, idx: usize) {
-        match &mut self.dirty {
-            Some(v) => {
-                if !v.contains(&idx) {
-                    v.push(idx);
-                }
+        // None = 全量重绘 —— 降级成单控件集合会静默丢掉全量语义，
+        // 未重绘的控件残留旧像素（审查 302）。
+        if let Some(v) = &mut self.dirty {
+            if !v.contains(&idx) {
+                v.push(idx);
             }
-            // 审查 302：None = 全量重绘 —— 降级成单控件集合会静默丢掉全量语义，
-            // 未重绘的控件残留旧像素。
-            None => {}
         }
     }
 
@@ -2420,7 +2417,7 @@ unsafe fn on_wm_timer(hwnd: HWND, _msg: u32, wparam: WPARAM, _lparam: LPARAM) ->
             let expired = ctx
             .status
             .as_ref()
-            .map_or(true, |(_, t)| t.elapsed() >= std::time::Duration::from_millis(2400));
+            .is_none_or(|(_, t)| t.elapsed() >= std::time::Duration::from_millis(2400));
             if expired {
             ctx.status = None;
             kill_timer(hwnd, STATUS_TIMER);

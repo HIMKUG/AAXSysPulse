@@ -14,7 +14,7 @@
 //! - **渲染线程**：取请求 → 读配置镜像（`Mutex<Option<Config>>`，UI 线程每次
 //!   请求时覆盖发布；审查 129：原注释"arc_swap 共享、无锁读"与实现不符）
 //!   + `Arc<Snapshot>` → [`crate::gdi::render`]。`SetTimer` / `SetWindowPos`
-//!   跨线程调用均合法（定时器与几何归属窗口本身，WM_TIMER 仍投递回 UI 线程队列）。
+//!     跨线程调用均合法（定时器与几何归属窗口本身，WM_TIMER 仍投递回 UI 线程队列）。
 //! - **D2D 工厂**：render_d2d 与设置页 gfx_d2d 各持独立 SINGLE_THREADED 工厂，
 //!   无跨线程共享；DIB / D2D RT 自此只被渲染线程触碰，线程亲和性一致。
 //!

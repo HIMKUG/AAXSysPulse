@@ -644,7 +644,7 @@ impl Gfx {
                     ));
                     self.rebuild();
                 }
-                return false;
+                false
             }
         }
     }

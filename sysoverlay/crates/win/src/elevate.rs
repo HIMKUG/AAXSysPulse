@@ -40,16 +40,17 @@ pub fn prompt_and_relaunch(lang: Lang) -> bool {
         }
         // 自身路径（审查 275：循环扩容防截断 —— 512 定长缓冲对深路径不够）。
         let exe = {
-            let mut buf = [0u16; 512];
+            // 定长数组 + `try_into` 在截断扩容路径上必然失败（1024 → [u16; 512]），
+            // 深路径会 panic 而非重试；改用 Vec + resize 直接扩容（审查 275）。
+            let mut buf = vec![0u16; 512];
             loop {
                 let len = windows::Win32::System::LibraryLoader::GetModuleFileNameW(None, &mut buf);
                 let l = len as usize;
                 if l < buf.len() || l == 0 {
-                    buf[l..].fill(0);
                     break String::from_utf16_lossy(&buf[..l]);
                 }
                 // 缓冲写满（可能截断）→ 扩容重试
-                buf = vec![0u16; buf.len() * 2].try_into().unwrap();
+                buf.resize(buf.len() * 2, 0);
             }
         };
         let exe_w: Vec<u16> = exe.encode_utf16().chain(Some(0)).collect();

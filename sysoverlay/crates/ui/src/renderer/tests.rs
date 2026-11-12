@@ -49,7 +49,7 @@ fn renderers_render_pixels() {
             "{} 渲染器必须产出文字 cell",
             renderer.name()
         );
-        let lit = s.pixels.chunks_exact(4).filter(|p| p[3] > 0).count();
+        let lit = s.pixels.as_chunks::<4>().0.iter().filter(|p| p[3] > 0).count();
         assert!(lit > 0, "{} 渲染器必须画出像素（lit={}）", renderer.name(), lit);
     }
 }
@@ -241,9 +241,9 @@ fn float_font_measure_matches_render() {
         scale,
         Rgba::opaque(255, 255, 255),
     );
-    assert!(surf.pixels.chunks_exact(4).any(|p| p[3] > 0), "必须画出内容");
+    assert!(surf.pixels.as_chunks::<4>().0.iter().any(|p| p[3] > 0), "必须画出内容");
     let mut max_x = 0i32;
-    for (i, p) in surf.pixels.chunks_exact(4).enumerate() {
+    for (i, p) in surf.pixels.as_chunks::<4>().0.iter().enumerate() {
         if p[3] > 0 {
             max_x = max_x.max((i as i32) % surf.width);
         }

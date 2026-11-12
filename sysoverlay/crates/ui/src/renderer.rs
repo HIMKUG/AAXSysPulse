@@ -107,13 +107,13 @@ const FNV_OFFSET: u64 = 0xcbf29ce4_84222325;
 const FNV_PRIME: u64 = 0x1000_0000_01b3;
 
 fn fnv_mix(acc: &mut u64, bytes: &[u8]) {
-    let mut chunks = bytes.chunks_exact(8);
-    for ch in chunks.by_ref() {
-        let v = u64::from_le_bytes([ch[0], ch[1], ch[2], ch[3], ch[4], ch[5], ch[6], ch[7]]);
+    let (chunks, rest) = bytes.as_chunks::<8>();
+    for ch in chunks {
+        let v = u64::from_le_bytes(*ch);
         *acc ^= v;
         *acc = acc.wrapping_mul(FNV_PRIME);
     }
-    for &b in chunks.remainder() {
+    for &b in rest {
         *acc ^= b as u64;
         *acc = acc.wrapping_mul(FNV_PRIME);
     }
@@ -640,23 +640,18 @@ fn build_row(m: MetricEnum, snap: &Snapshot, cfg: &Config, style: Style) -> Opti
             // 标题按模式区分方向：双向 Net / 上传 NetU / 下载 NetD（单行），
             // 双向单行双值（↓下载 ↑上传）；单向只显对应速率，不再靠箭头猜方向。
             let mut b = StrBuf::new();
-            let slot;
-            let label_long;
-            match cfg.net_mode {
+            let (label_long, slot) = match cfg.net_mode {
                 NetMode::Down => {
-                    label_long = "NetD";
                     fmt_rate(&mut b, snap.net.rx_bps, cfg.net_unit);
                     b.push_str("/s");
-                    slot = SLOT_RATE;
+                    ("NetD", SLOT_RATE)
                 }
                 NetMode::Up => {
-                    label_long = "NetU";
                     fmt_rate(&mut b, snap.net.tx_bps, cfg.net_unit);
                     b.push_str("/s");
-                    slot = SLOT_RATE;
+                    ("NetU", SLOT_RATE)
                 }
                 NetMode::Both => {
-                    label_long = "Net";
                     // ⚠️ `fmt_rate` 内部会 `buf.clear()`。若直接在 b 上连续调用两次，
                     // 第二次会把刚拼好的「↓下载值/s ↑」整段清空，最终只剩上传值/s
                     // ——直接表现为"双向只显示一个值，且与 NetU 相同"。
@@ -670,7 +665,7 @@ fn build_row(m: MetricEnum, snap: &Snapshot, cfg: &Config, style: Style) -> Opti
                     b.push_str("/s \u{2191}");
                     b.push_str(tx.as_str());
                     b.push_str("/s");
-                    slot = SLOT_RATE * 2 + 3;
+                    ("Net", SLOT_RATE * 2 + 3)
                 }
             };
             let label = metric_label(cfg, MetricEnum::Net, label_long, "N");

@@ -1027,33 +1027,23 @@ pub fn ensure_all_files() -> Result<Vec<String>, ConfigError> {
     let dir = config_dir();
     let mut created = Vec::new();
 
-    if !dir.join("system.cfg").exists() {
-        SystemConfig::default().save()?;
-        created.push("system.cfg".to_string());
-    } else if SystemConfig::load().is_err() {
+    // 缺失与"存在但读不出/解析失败"补写相同内容，合并为单条件（clippy
+    // if_same_then_else）：`||` 短路口径与原 if/else if 完全一致。
+    if !dir.join("system.cfg").exists() || SystemConfig::load().is_err() {
         SystemConfig::default().save()?;
         created.push("system.cfg".to_string());
     }
-    if !dir.join("appearance.cfg").exists() {
-        AppearanceConfig::default().save()?;
-        created.push("appearance.cfg".to_string());
-    } else if AppearanceConfig::load().is_err() {
+    if !dir.join("appearance.cfg").exists() || AppearanceConfig::load().is_err() {
         AppearanceConfig::default().save()?;
         created.push("appearance.cfg".to_string());
     }
-    if !dir.join("monitor.cfg").exists() {
-        MonitorConfig::default().save()?;
-        created.push("monitor.cfg".to_string());
-    } else if MonitorConfig::load().is_err() {
+    if !dir.join("monitor.cfg").exists() || MonitorConfig::load().is_err() {
         MonitorConfig::default().save()?;
         created.push("monitor.cfg".to_string());
     }
     for vertical in [false, true] {
         let name = if vertical { "layout_v.cfg" } else { "layout_h.cfg" };
-        if !dir.join(name).exists() {
-            LayoutConfig::default().save(vertical)?;
-            created.push(name.to_string());
-        } else if LayoutConfig::load(vertical).is_err() {
+        if !dir.join(name).exists() || LayoutConfig::load(vertical).is_err() {
             LayoutConfig::default().save(vertical)?;
             created.push(name.to_string());
         }
@@ -1314,7 +1304,7 @@ mod cross_process_tests {
         // 解析端：手写超大值（绕过 u8 类型）经 core parse 也必须收敛到 3
         let text = "[system]\nadmin_check_continue_count = 65535\ndriver_check_continue_count = 256\n";
         let mut c = fresh_core_config();
-        core_cfg::system::parse(&mut c, &text);
+        core_cfg::system::parse(&mut c, text);
         assert_eq!(c.admin_check_continue_count, 3, "core 解析端未把 65535 钳到 3");
         assert_eq!(c.driver_check_continue_count, 3, "core 解析端未把 256 钳到 3");
     }

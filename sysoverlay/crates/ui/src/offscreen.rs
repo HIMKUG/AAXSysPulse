@@ -134,7 +134,7 @@ impl SoftwareSurface {
             let start = ((yy * self.width + x) * 4) as usize;
             let end = ((yy * self.width + x1) * 4) as usize;
             if let Some(row) = self.pixels.get_mut(start..end) {
-                for px in row.chunks_exact_mut(4) {
+                for px in row.as_chunks_mut::<4>().0 {
                     px[0] = 0;
                     px[1] = 0;
                     px[2] = 0;
@@ -159,9 +159,12 @@ impl SoftwareSurface {
             encoder.set_depth(png::BitDepth::Eight);
             let mut writer = encoder.write_header().unwrap();
             // Convert BGRA to RGBA for PNG
-            let rgba_pixels: Vec<u8> = self.pixels
-                .chunks_exact(4)
-                .flat_map(|chunk| [chunk[2], chunk[1], chunk[0], chunk[3]])
+            let rgba_pixels: Vec<u8> = self
+                .pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|c| [c[2], c[1], c[0], c[3]])
                 .collect();
             writer.write_image_data(&rgba_pixels).unwrap();
         }
@@ -283,7 +286,7 @@ impl RenderTarget for SoftwareSurface {
         } else {
             return;
         };
-        for p in self.pixels.chunks_exact_mut(4) {
+        for p in self.pixels.as_chunks_mut::<4>().0 {
             p[0] = (p[0] as f32 * f) as u8;
             p[1] = (p[1] as f32 * f) as u8;
             p[2] = (p[2] as f32 * f) as u8;
@@ -347,7 +350,7 @@ impl RenderTarget for SoftwareSurface {
                 Some(s) => s,
                 None => continue,
             };
-            for p in row.chunks_exact_mut(4) {
+            for p in row.as_chunks_mut::<4>().0 {
                 // BGRA
                 p[0] = (color.b as f32 + p[0] as f32 * factor) as u8;
                 p[1] = (color.g as f32 + p[1] as f32 * factor) as u8;
@@ -489,7 +492,7 @@ mod tests {
         assert_ne!(s.pixels[center + 3], 0, "center pixel alpha must be > 0");
         // 审查 503：四个角落必须仍是全透明（clear_corners 真正生效的回归锁）
         for (cx, cy) in [(0usize, 0usize), (99, 0), (0, 5), (99, 5)] {
-            let o = ((cy * 100 + cx) * 4) as usize;
+            let o = (cy * 100 + cx) * 4;
             assert_eq!(s.pixels[o + 3], 0, "corner ({cx},{cy}) must stay transparent");
         }
     }

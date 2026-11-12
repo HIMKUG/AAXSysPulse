@@ -53,7 +53,7 @@ impl DebouncedSave {
         self.pending
             && self
                 .last_save_ms
-                .map_or(true, |t| now_ms.saturating_sub(t) >= SAVE_DEBOUNCE_MS)
+                .is_none_or(|t| now_ms.saturating_sub(t) >= SAVE_DEBOUNCE_MS)
     }
 }
 

@@ -110,7 +110,7 @@ pub fn end_render(start: u64) {
     }
     // 审查 271：只记慢帧（>2ms）或抽样帧（每 32 帧 1 条）—— 原先每帧无条件
     // 落盘一行，PROBE 开启时日志被逐帧行刷满。
-    if us > 2_000 || FRAMES.load(Ordering::Relaxed) % 32 == 0 {
+    if us > 2_000 || FRAMES.load(Ordering::Relaxed).is_multiple_of(32) {
         write_line(&format!("frame_render ms={} us={}\n", wall_ms() % 1_000_000, us));
     }
     maybe_report();
@@ -386,7 +386,7 @@ pub fn note_barrier_commit(seq: u64, max_delta: f32, mode_active: u32) {
     }
     static COMMIT_N: AtomicU64 = AtomicU64::new(0);
     let n = COMMIT_N.fetch_add(1, Ordering::Relaxed);
-    if n % 16 == 0 {
+    if n.is_multiple_of(16) {
         write_line(&format!(
             "commit seq={} max_delta={:.1} active={}\n",
             seq,

@@ -39,7 +39,7 @@ fn s(dpi: u32, v: i32) -> i32 {
 /// `DeleteObject` 释放。
 pub fn title_font(dpi_value: u32) -> HFONT {
     unsafe {
-        CreateFontW(
+        let font = CreateFontW(
             // 审查 541：12pt@96dpi = 16px（pt→px 换算与 DIP 口径一致），统一走 s()。
             -s(dpi_value, 16),
             0,
@@ -55,9 +55,8 @@ pub fn title_font(dpi_value: u32) -> HFONT {
             5,
             0,
             windows::core::w!("Segoe UI"),
-        )
-        .is_invalid()
-        .then(|| {
+        );
+        if font.is_invalid() {
             // 审查 158：GDI 资源耗尽时回退系统 stock 字体（DeleteObject 对
             // stock 对象是无害 no-op，调用方统一释放的约定不被破坏）。
             crate::probe::log("titlebar: CreateFontW failed -> fallback DEFAULT_GUI_FONT");
@@ -67,8 +66,9 @@ pub fn title_font(dpi_value: u32) -> HFONT {
                 )
                 .0,
             )
-        })
-        .unwrap_or_default()
+        } else {
+            font
+        }
     }
 }
 
